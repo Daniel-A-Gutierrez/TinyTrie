@@ -5,8 +5,12 @@
 //! - `INLINE`: max inline children count (tag 2..=INLINE)
 //! - `PREFIX`: prefix length type (u8, u16, or u32)
 
+#![feature(portable_simd)]
+
 mod prefix_len;
 use prefix_len::PrefixLen;
+
+mod simd;
 
 // Tag encoding:
 //   0           HNode (heap-allocated children)
@@ -123,29 +127,29 @@ impl Leaf {
     }
 }
 
-// --- INode child lookup (scalar fallback) ---
+// --- INode child lookup (SIMD via portable_simd) ---
 
 impl<const INLINE: usize, PREFIX: PrefixLen> INode<INLINE, PREFIX> {
     fn find_child(&self, byte: u8) -> Option<usize> {
-        let count = self.tag as usize;
-        for i in 0..count {
-            if self.symbols[i] == byte {
-                return Some(i);
-            }
-        }
-        None
+        let symbols_offset = core::mem::offset_of!(Self, symbols);
+        simd::inode_find_child(
+            self as *const Self as *const u8,
+            symbols_offset,
+            self.tag as usize,
+            byte,
+        )
     }
 
     /// Returns the index of the first symbol >= `byte`,
     /// or `tag` (past end) if all symbols are < `byte`.
     fn find_child_lower_bound(&self, byte: u8) -> usize {
-        let count = self.tag as usize;
-        for i in 0..count {
-            if self.symbols[i] >= byte {
-                return i;
-            }
-        }
-        count
+        let symbols_offset = core::mem::offset_of!(Self, symbols);
+        simd::inode_find_child_lower_bound(
+            self as *const Self as *const u8,
+            symbols_offset,
+            self.tag as usize,
+            byte,
+        )
     }
 }
 
@@ -166,13 +170,13 @@ impl<PREFIX: PrefixLen> HNode<PREFIX> {
     }
 
     fn find_child<const INLINE: usize>(&self, byte: u8) -> Option<usize> {
-        unsafe { self.discriminants() }.binary_search(&byte).ok()
+        simd::hnode_find_child(self.data, self.len as usize, byte)
     }
 
     /// Returns the index of the first discriminant >= `byte`,
     /// or `len` (past end) if all discriminants are < `byte`.
     fn find_child_lower_bound<const INLINE: usize>(&self, byte: u8) -> usize {
-        unsafe { self.discriminants() }.binary_search(&byte).unwrap_or_else(|p| p)
+        simd::hnode_find_child_lower_bound(self.data, self.len as usize, byte)
     }
 }
 
@@ -279,6 +283,15 @@ pub struct TinyTrie<T: Clone, const INLINE: usize, PREFIX: PrefixLen> {
     root: Option<Box<Trie<INLINE, PREFIX>>>,
     keys: Vec<Vec<u8>>,
     values: Vec<T>,
+}
+
+// Safety: the raw pointers inside Trie/INode/HNode are only dereferenced in
+// &self methods (get, iter — read-only) and &mut self methods (insert, Drop).
+// Sharing &TinyTrie across threads is safe because no &self method mutates
+// through the pointers.
+unsafe impl<T: Clone + Sync, const INLINE: usize, PREFIX: PrefixLen + Sync> Sync
+    for TinyTrie<T, INLINE, PREFIX>
+{
 }
 
 impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TinyTrie<T, INLINE, PREFIX> {
@@ -608,6 +621,18 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TinyTrie<T, INLINE, PREFI
         let mut stack = Vec::new();
         let current = if let Some(ref root) = self.root {
             Some(leftmost_leaf(std::ptr::from_ref(&**root), &mut stack))
+        } else {
+            None
+        };
+        TrieIter { trie: self, stack, current }
+    }
+
+    /// Return a bidirectional iterator positioned at the last (rightmost) key.
+    /// Returns an exhausted iterator if the trie is empty.
+    pub fn iter_last(&self) -> TrieIter<'_, T, INLINE, PREFIX> {
+        let mut stack = Vec::new();
+        let current = if let Some(ref root) = self.root {
+            Some(rightmost_leaf(std::ptr::from_ref(&**root), &mut stack))
         } else {
             None
         };
@@ -1523,5 +1548,120 @@ mod tests {
         }
         let expected: Vec<&[u8]> = vec![b"alpha", b"bravo", b"charlie", b"delta", b"echo"];
         assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn iter_many_keys_forward() {
+        // Insert 200 keys and iterate all of them forward to test for hangs
+        let mut trie: TinyTrie<usize, 6, u8> = TinyTrie::new();
+        let n = 200;
+        for i in 0..n {
+            let key = format!("key_{:04}", i);
+            trie.insert(key.into_bytes(), i).unwrap();
+        }
+
+        let mut iter = trie.iter();
+        let mut count = 0;
+        let mut last_key: Option<Vec<u8>> = None;
+
+        loop {
+            if let Some((k, v)) = iter.current() {
+                // Verify iteration is in sorted order
+                if let Some(ref prev) = last_key {
+                    assert!(k > prev.as_slice(), "iteration not in sorted order: {:?} <= {:?}", k, prev);
+                }
+                assert_eq!(*v, count, "value mismatch at key {:?}", k);
+                last_key = Some(k.to_vec());
+                count += 1;
+            } else {
+                // current() returned None before next() — only valid if exhausted
+            }
+            if iter.next().is_none() {
+                break;
+            }
+            // Safety valve: if we iterate more than n times, something is wrong
+            assert!(count <= n, "iterated more than {} times, likely infinite loop", n);
+        }
+
+        assert_eq!(count, n, "expected {} iterations, got {}", n, count);
+    }
+
+    #[test]
+    fn iter_many_keys_backward() {
+        // Insert 200 keys, seek to end, iterate backward
+        let mut trie: TinyTrie<usize, 6, u8> = TinyTrie::new();
+        let n = 200;
+        for i in 0..n {
+            let key = format!("key_{:04}", i);
+            trie.insert(key.into_bytes(), i).unwrap();
+        }
+
+        // Seek to the last key
+        let mut iter = trie.iter();
+        iter.seek(&format!("key_{:04}", n - 1).into_bytes());
+        assert_eq!(iter.current().map(|(k, _)| k.to_vec()), Some(format!("key_{:04}", n - 1).into_bytes()));
+
+        // Iterate backward
+        let mut count = 1; // already at the last key
+        loop {
+            if iter.prev().is_none() {
+                break;
+            }
+            count += 1;
+            assert!(count <= n, "iterated more than {} times backward, likely infinite loop", n);
+        }
+        assert_eq!(count, n, "expected {} backward iterations, got {}", n, count);
+    }
+
+    #[test]
+    fn iter_seek_and_scan_forward() {
+        // Insert 100 keys, seek to middle, scan forward to end
+        let mut trie: TinyTrie<usize, 6, u8> = TinyTrie::new();
+        let n = 100;
+        for i in 0..n {
+            let key = format!("key_{:04}", i);
+            trie.insert(key.into_bytes(), i).unwrap();
+        }
+
+        let mut iter = trie.iter();
+        let start = 50;
+        iter.seek(&format!("key_{:04}", start).into_bytes());
+        assert_eq!(iter.current(), Some((format!("key_{:04}", start).as_bytes(), &start)));
+
+        let mut count = 0;
+        let mut expected = start;
+        loop {
+            if let Some((k, v)) = iter.current() {
+                assert_eq!(k, format!("key_{:04}", expected).as_bytes());
+                assert_eq!(*v, expected);
+                count += 1;
+                expected += 1;
+            }
+            if iter.next().is_none() { break; }
+            assert!(count <= n - start, "too many iterations");
+        }
+        assert_eq!(count, n - start);
+    }
+
+    #[test]
+    fn iter_last_and_backward() {
+        // iter_last() positions at the last key, then iterate backward
+        let mut trie: TinyTrie<usize, 6, u8> = TinyTrie::new();
+        let n = 50;
+        for i in 0..n {
+            let key = format!("key_{:04}", i);
+            trie.insert(key.into_bytes(), i).unwrap();
+        }
+
+        let mut iter = trie.iter_last();
+        assert_eq!(iter.current(), Some((format!("key_{:04}", n - 1).as_bytes(), &(n - 1))));
+
+        // Iterate backward
+        let mut count = 1; // already at last key
+        while iter.prev().is_some() {
+            count += 1;
+            assert!(count <= n, "too many backward iterations");
+        }
+        assert_eq!(count, n, "expected {} iterations, got {}", n, count);
     }
 }

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check)",
+      "Bash(cargo check --benches 2>&1)",
+      "Bash(cargo bench --no-run 2>&1)"
+    ]
+  }
+}

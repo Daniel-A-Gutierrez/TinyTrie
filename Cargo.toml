@@ -7,3 +7,7 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+
+[[bench]]
+name = "bench"
+harness = false
