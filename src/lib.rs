@@ -11,6 +11,7 @@ mod prefix_len;
 use prefix_len::PrefixLen;
 
 mod simd;
+mod arena_trie;
 
 // Tag encoding:
 //   0           HNode (heap-allocated children)
