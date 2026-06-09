@@ -11,15 +11,53 @@
 use core::simd::cmp::{SimdPartialEq, SimdPartialOrd};
 use core::simd::u8x16;
 
-/// Load 16 bytes from `ptr` into a SIMD vector (unaligned).
+/// Load 16 bytes from `ptr` into a SIMD vector (unaligned), zeroing
+/// padding bytes in the range `[valid_end..align_end)` to avoid Miri UB.
+///
+/// `valid_end` is the first byte after the valid data (e.g., `symbols_offset + count`).
+/// `align_end` is the next alignment boundary (typically 8 for a pointer).
+/// Bytes in `[valid_end..align_end)` are struct padding and are set to zero.
 ///
 /// Unlike `ptr::read::<u8x16>()` which requires 16-byte alignment,
 /// this reads 16 bytes as a `[u8; 16]` (1-byte aligned) and converts.
 #[inline]
-fn load16(ptr: *const u8) -> u8x16 {
+fn load16_zero_pad(ptr: *const u8, valid_end: usize, align_end: usize) -> u8x16 {
+    debug_assert!(valid_end <= align_end);
+    debug_assert!(align_end <= 16);
+    let mut buf = [0u8; 16];
     // SAFETY: caller guarantees ptr points to at least 16 readable bytes.
-    // We read as [u8; 16] (1-byte aligned) and convert, avoiding
-    // the 16-byte alignment requirement of u8x16.
+    unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 16) };
+    // Zero out padding bytes to avoid Miri UB.
+    // These bytes are masked out by the caller's valid_mask anyway,
+    // so zeroing them doesn't change the result.
+    for i in valid_end..align_end {
+        buf[i] = 0;
+    }
+    u8x16::from(buf)
+}
+
+/// Load `n` bytes from `ptr` into a SIMD vector, zero-padding the rest.
+///
+/// Reads `n` bytes from `ptr` and fills the remaining `16 - n` bytes with
+/// zero. This is Miri-safe: it never reads uninitialized bytes beyond the
+/// valid range. The zero-padded bytes are masked out by the caller's
+/// `valid_mask`, so they don't affect the result.
+#[inline]
+fn load16_partial(ptr: *const u8, n: usize) -> u8x16 {
+    debug_assert!(n > 0 && n < 16);
+    let mut buf = [0u8; 16];
+    // SAFETY: caller guarantees `ptr` points to at least `n` readable bytes.
+    unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), n) };
+    u8x16::from(buf)
+}
+
+/// Load 16 bytes from `ptr` into a SIMD vector (unaligned).
+///
+/// Used for contiguous byte arrays (PairVec discriminants) where all 16
+/// bytes starting at `ptr` are known to be initialized (e.g., within a
+/// full chunk where `offset + 16 <= len` and the allocation is zeroed).
+#[inline]
+fn load16(ptr: *const u8) -> u8x16 {
     let mut buf = [0u8; 16];
     unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 16) };
     u8x16::from(buf)
@@ -41,8 +79,11 @@ pub fn inode_find_child(
     byte: u8,
 ) -> Option<usize> {
     let valid_mask = ((1u32 << count) - 1) << symbols_offset;
+    let valid_end = symbols_offset + count;
+    // Padding starts at valid_end, ends at next 8-byte boundary.
+    let align_end = (valid_end + 7) & !7;
 
-    let vec = load16(inode_ptr);
+    let vec = load16_zero_pad(inode_ptr, valid_end, align_end);
     let byte_vec = u8x16::splat(byte);
     let eq = vec.simd_eq(byte_vec);
     let mask = eq.to_bitmask() as u32;
@@ -57,7 +98,12 @@ pub fn inode_find_child(
         let first_in_load1 = 16 - symbols_offset;
         let remaining = count - first_in_load1;
         let valid_mask2 = (1u32 << remaining) - 1;
-        let vec2 = load16(unsafe { inode_ptr.add(16) });
+        // No padding in second load — symbols extend to the end or beyond
+        let vec2 = unsafe {
+            let mut buf = [0u8; 16];
+            core::ptr::copy_nonoverlapping(inode_ptr.add(16), buf.as_mut_ptr(), 16);
+            u8x16::from(buf)
+        };
         let eq2 = vec2.simd_eq(byte_vec);
         let mask2 = eq2.to_bitmask() as u32;
         let hits2 = mask2 & valid_mask2;
@@ -83,10 +129,12 @@ pub fn inode_find_child_lower_bound(
     byte: u8,
 ) -> usize {
     let valid_mask = ((1u32 << count) - 1) << symbols_offset;
+    let valid_end = symbols_offset + count;
+    let align_end = (valid_end + 7) & !7;
 
     let byte_vec = u8x16::splat(byte);
 
-    let vec = load16(inode_ptr);
+    let vec = load16_zero_pad(inode_ptr, valid_end, align_end);
     // simd_lt on u8x16 is unsigned less-than
     let lt = vec.simd_lt(byte_vec);
     let mask = lt.to_bitmask() as u32;
@@ -101,7 +149,11 @@ pub fn inode_find_child_lower_bound(
         let first_in_load1 = 16 - symbols_offset;
         let remaining = count - first_in_load1;
         let valid_mask2 = (1u32 << remaining) - 1;
-        let vec2 = load16(unsafe { inode_ptr.add(16) });
+        let vec2 = unsafe {
+            let mut buf = [0u8; 16];
+            core::ptr::copy_nonoverlapping(inode_ptr.add(16), buf.as_mut_ptr(), 16);
+            u8x16::from(buf)
+        };
         let lt2 = vec2.simd_lt(byte_vec);
         let mask2 = lt2.to_bitmask() as u32;
         let ge2 = (!mask2) & valid_mask2;
@@ -133,11 +185,12 @@ pub fn hnode_find_child(disc_ptr: *const u8, len: usize, byte: u8) -> Option<usi
         offset += 16;
     }
 
-    // Tail (1..15 bytes)
+    // Tail (1..15 bytes) — use partial load to avoid reading uninitialized
+    // memory beyond the valid keys (which could be Trie padding in PairVec).
     if offset < len {
         let tail_len = len - offset;
         let valid_mask = (1u32 << tail_len) - 1;
-        let vec = load16(unsafe { disc_ptr.add(offset) });
+        let vec = load16_partial(unsafe { disc_ptr.add(offset) }, tail_len);
         let eq = vec.simd_eq(byte_vec);
         let mask = eq.to_bitmask() as u32;
         let hits = mask & valid_mask;
@@ -175,11 +228,12 @@ pub fn hnode_find_child_lower_bound(disc_ptr: *const u8, len: usize, byte: u8) -
         offset += 16;
     }
 
-    // Tail (1..15 bytes)
+    // Tail (1..15 bytes) — use partial load to avoid reading uninitialized
+    // memory beyond the valid keys (which could be Trie padding in PairVec).
     if offset < len {
         let tail_len = len - offset;
         let valid_mask = (1u32 << tail_len) - 1;
-        let vec = load16(unsafe { disc_ptr.add(offset) });
+        let vec = load16_partial(unsafe { disc_ptr.add(offset) }, tail_len);
         let lt = vec.simd_lt(byte_vec);
         let mask = lt.to_bitmask() as u32;
         let ge_mask = (!mask) & valid_mask;

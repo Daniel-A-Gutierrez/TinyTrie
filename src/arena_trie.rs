@@ -85,6 +85,7 @@ impl Node {
         u32::from_le_bytes(buf)
     }
 
+    // note : use SIMD. 
     /// Find child index for `byte` in this node's symbols (sorted, 1..=7 entries).
     /// Returns None if not found.
     fn find_child(&self, byte: u8) -> Option<usize> {
