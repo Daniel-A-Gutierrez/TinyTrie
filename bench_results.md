@@ -1,67 +1,36 @@
 ─── Insertion (keys/sec) ───
                    10000      100000    10000000
-    TinyTrie       1.20M       1.35M       1.72M
-    BTreeMap       4.76M       3.51M       3.18M
-     HashMap       7.70M       3.88M       1.75M
-   SortedVec       6.56M       5.71M       3.32M
+    TinyTrie       1.16M       1.12M       1.63M
+  NibbleTrie       3.18M       3.37M       4.24M
+    BTreeMap       5.08M       3.95M       3.24M
+     HashMap       6.33M       4.50M       1.84M
+   SortedVec       5.73M       5.20M       3.33M
 
 ─── Lookup (keys/sec) ───
                    10000      100000    10000000
-    TinyTrie      27.53M      19.71M      16.40M
-    BTreeMap      16.69M      13.01M       9.33M
-     HashMap      57.60M      14.17M       7.47M
-   SortedVec      11.60M       9.00M       6.04M
+    TinyTrie      21.32M      16.27M      11.15M
+  NibbleTrie      31.05M      22.74M      18.67M
+    BTreeMap      17.58M      13.80M       9.97M
+     HashMap      60.72M      16.27M       8.19M
+   SortedVec      12.23M       9.49M       6.22M
 
 ─── Iter forward (keys/sec) ───
                    10000      100000    10000000
-    TinyTrie     171.66M      88.90M      51.29M
-    BTreeMap     776.74M     314.47M      46.15M
-   SortedVec       4.54G       4.63G       4.62G
+    TinyTrie     211.33M     136.51M      58.46M
+  NibbleTrie     184.14M     182.38M     178.51M
+    BTreeMap     821.57M     358.95M      48.37M
+   SortedVec       4.71G       4.78G       4.75G
 
 ─── Iter backward (keys/sec) ───
                    10000      100000    10000000
-    TinyTrie     247.12M     131.20M      59.88M
-    BTreeMap     779.74M     291.17M      44.85M
-
-─── Memory (bytes/key) ───
-                   10000      100000    10000000
-    TinyTrie        81.0        71.5        85.2
-    BTreeMap        71.6        72.6        74.6
-     HashMap        62.1        52.3        66.4
-   SortedVec        40.0        41.0        43.0
-
-
-
-## New Results
-
-─── Insertion (keys/sec) ───
-                   10000      100000    10000000
-    TinyTrie       1.58M       1.92M       2.12M
-    BTreeMap       4.92M       3.09M       2.94M
-     HashMap       7.90M       3.46M       1.45M
-   SortedVec       6.76M       6.10M       2.88M
-
-─── Lookup (keys/sec) ───
-                   10000      100000    10000000
-    TinyTrie      20.68M      13.16M       9.73M
-    BTreeMap      17.38M      13.16M       8.71M
-     HashMap      53.65M      12.69M       5.96M
-   SortedVec      11.37M       9.11M       6.12M
-
-─── Iter forward (keys/sec) ───
-                   10000      100000    10000000
-    TinyTrie     194.53M      67.78M      38.94M
-    BTreeMap     867.11M     350.26M      39.94M
-   SortedVec       4.51G       4.70G       4.81G
-
-─── Iter backward (keys/sec) ───
-                   10000      100000    10000000
-    TinyTrie     310.44M      84.62M      47.27M
-    BTreeMap     827.34M     332.51M      39.37M
+    TinyTrie     204.27M     144.54M      57.50M
+  NibbleTrie     184.10M     181.40M     175.88M
+    BTreeMap     823.49M     348.65M      48.31M
 
 ─── Memory (bytes/key) ───
                    10000      100000    10000000
     TinyTrie        91.6        82.2        95.9
+  NibbleTrie        76.2        63.7        80.8
     BTreeMap        71.6        72.6        74.6
      HashMap        62.1        52.3        66.4
    SortedVec        40.0        41.0        43.0

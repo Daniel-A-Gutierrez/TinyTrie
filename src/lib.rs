@@ -47,6 +47,9 @@ use pairvec::{
     add_child_to_pairvec, free_pairvec_data, promote_inode_to_pairvec, PairVec,
 };
 
+mod nibble_trie;
+pub use nibble_trie::NibbleTrie;
+
 mod simd;
 
 // Tag encoding:

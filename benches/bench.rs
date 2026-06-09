@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tiny_trie::TinyTrie;
+use tiny_trie::{NibbleTrie, TinyTrie};
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -57,6 +57,7 @@ fn sorted_vec_get(sv: &[(Vec<u8>, usize)], key: &[u8]) -> Option<usize> {
 
 struct Structures {
     trie: TinyTrie<usize, 6, u8>,
+    ntrie: NibbleTrie<usize>,
     btree: BTreeMap<Vec<u8>, usize>,
     hmap: HashMap<Vec<u8>, usize>,
     sorted: Vec<(Vec<u8>, usize)>,
@@ -65,10 +66,12 @@ struct Structures {
 
 fn build_all(keys: &[Vec<u8>]) -> Structures {
     let mut trie = TinyTrie::new();
+    let mut ntrie = NibbleTrie::new();
     let mut btree = BTreeMap::new();
     let mut hmap = HashMap::new();
     for (i, k) in keys.iter().enumerate() {
         trie.insert(k.clone(), i).unwrap();
+        ntrie.insert(k.clone(), i).unwrap();
         btree.insert(k.clone(), i);
         hmap.insert(k.clone(), i);
     }
@@ -79,7 +82,7 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
         miss.push(b'z');
         lookup_keys.push(miss);
     }
-    Structures { trie, btree, hmap, sorted: build_sorted_vec(keys), lookup_keys }
+    Structures { trie, ntrie, btree, hmap, sorted: build_sorted_vec(keys), lookup_keys }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -189,11 +192,11 @@ fn main() {
     println!();
 
     // Per-metric result columns, one entry per SIZE
-    let mut ins = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let mut look = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let mut fwd = [Vec::new(), Vec::new(), Vec::new()];
-    let mut rev = [Vec::new(), Vec::new()];
-    let mut mem = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut ins = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut look = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut fwd = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut rev = [Vec::new(), Vec::new(), Vec::new()];
+    let mut mem = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
     for &size in SIZES {
         eprintln!("[n = {size}]");
@@ -209,6 +212,15 @@ fn main() {
             let t = s.spawn(|| {
                 bench(budget, "TinyTrie", || {
                     let mut m: TinyTrie<usize, 6, u8> = TinyTrie::new();
+                    for (i, k) in keys.iter().enumerate() {
+                        m.insert(k.clone(), i).unwrap();
+                    }
+                    black_box(&m);
+                })
+            });
+            let n = s.spawn(|| {
+                bench(budget, "NibbleTrie", || {
+                    let mut m: NibbleTrie<usize> = NibbleTrie::new();
                     for (i, k) in keys.iter().enumerate() {
                         m.insert(k.clone(), i).unwrap();
                     }
@@ -245,10 +257,10 @@ fn main() {
                     black_box(&v);
                 })
             });
-            [t.join().unwrap(), b.join().unwrap(), h.join().unwrap(), v.join().unwrap()]
+            [t.join().unwrap(), n.join().unwrap(), b.join().unwrap(), h.join().unwrap(), v.join().unwrap()]
         });
 
-        for i in 0..4 {
+        for i in 0..5 {
             ins[i].push(ir[i].rate(size as u64));
         }
 
@@ -263,13 +275,20 @@ fn main() {
         let lk = &st.lookup_keys;
         let lr = std::thread::scope(|s| {
             let t = s.spawn(|| bench(budget, "TinyTrie", || { for k in lk { black_box(st.trie.get(k)); } }));
+            let n = s.spawn(|| bench(budget, "NibbleTrie", || {
+                for k in lk {
+                    let mut nt_key = k.clone();
+                    nt_key.push(0);
+                    black_box(st.ntrie.get(&nt_key));
+                }
+            }));
             let b = s.spawn(|| bench(budget, "BTreeMap", || { for k in lk { black_box(st.btree.get(k)); } }));
             let h = s.spawn(|| bench(budget, "HashMap", || { for k in lk { black_box(st.hmap.get(k)); } }));
             let v = s.spawn(|| bench(budget, "SortedVec", || { for k in lk { black_box(sorted_vec_get(&st.sorted, k)); } }));
-            [t.join().unwrap(), b.join().unwrap(), h.join().unwrap(), v.join().unwrap()]
+            [t.join().unwrap(), n.join().unwrap(), b.join().unwrap(), h.join().unwrap(), v.join().unwrap()]
         });
 
-        for i in 0..4 {
+        for i in 0..5 {
             look[i].push(lr[i].rate(lk.len() as u64));
         }
 
@@ -279,6 +298,15 @@ fn main() {
             let t = s.spawn(|| {
                 bench(budget, "TinyTrie", || {
                     let mut it = st.trie.iter();
+                    while let Some((k, v)) = it.next() {
+                        black_box(k);
+                        black_box(v);
+                    }
+                })
+            });
+            let n = s.spawn(|| {
+                bench(budget, "NibbleTrie", || {
+                    let mut it = st.ntrie.iter();
                     while let Some((k, v)) = it.next() {
                         black_box(k);
                         black_box(v);
@@ -301,10 +329,10 @@ fn main() {
                     }
                 })
             });
-            [t.join().unwrap(), b.join().unwrap(), v.join().unwrap()]
+            [t.join().unwrap(), n.join().unwrap(), b.join().unwrap(), v.join().unwrap()]
         });
 
-        for i in 0..3 {
+        for i in 0..4 {
             fwd[i].push(fr[i].rate(size as u64));
         }
 
@@ -320,6 +348,15 @@ fn main() {
                     }
                 })
             });
+            let n = s.spawn(|| {
+                bench(budget, "NibbleTrie", || {
+                    let mut it = st.ntrie.iter_last();
+                    while let Some((k, v)) = it.prev() {
+                        black_box(k);
+                        black_box(v);
+                    }
+                })
+            });
             let b = s.spawn(|| {
                 bench(budget, "BTreeMap", || {
                     for (k, v) in st.btree.iter().rev() {
@@ -328,11 +365,12 @@ fn main() {
                     }
                 })
             });
-            [t.join().unwrap(), b.join().unwrap()]
+            [t.join().unwrap(), n.join().unwrap(), b.join().unwrap()]
         });
 
         rev[0].push(rr[0].rate(size as u64));
         rev[1].push(rr[1].rate(size as u64));
+        rev[2].push(rr[2].rate(size as u64));
 
         // ── Memory (sequential, needs clean allocator state) ────────
         drop(st);
@@ -345,6 +383,15 @@ fn main() {
         let trie_bytes = read_allocated() - before;
         drop(trie);
         eprintln!("    TinyTrie: {} bytes ({:.1}/key)", trie_bytes, trie_bytes as f64 / size as f64);
+
+        let before = read_allocated();
+        let mut ntrie: NibbleTrie<usize> = NibbleTrie::new();
+        for (i, k) in keys.iter().enumerate() {
+            ntrie.insert(k.clone(), i).unwrap();
+        }
+        let ntrie_bytes = read_allocated() - before;
+        drop(ntrie);
+        eprintln!("    NibbleTrie: {} bytes ({:.1}/key)", ntrie_bytes, ntrie_bytes as f64 / size as f64);
 
         let before = read_allocated();
         let mut btree: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
@@ -371,9 +418,10 @@ fn main() {
         eprintln!("    SortedVec: {} bytes ({:.1}/key)", sorted_bytes, sorted_bytes as f64 / size as f64);
 
         mem[0].push(trie_bytes as f64 / size as f64);
-        mem[1].push(btree_bytes as f64 / size as f64);
-        mem[2].push(hmap_bytes as f64 / size as f64);
-        mem[3].push(sorted_bytes as f64 / size as f64);
+        mem[1].push(ntrie_bytes as f64 / size as f64);
+        mem[2].push(btree_bytes as f64 / size as f64);
+        mem[3].push(hmap_bytes as f64 / size as f64);
+        mem[4].push(sorted_bytes as f64 / size as f64);
 
         eprintln!();
     }
@@ -383,22 +431,22 @@ fn main() {
     print_table(
         "Insertion",
         "keys/sec",
-        &["TinyTrie", "BTreeMap", "HashMap", "SortedVec"],
+        &["TinyTrie", "NibbleTrie", "BTreeMap", "HashMap", "SortedVec"],
         &ins,
     );
     print_table(
         "Lookup",
         "keys/sec",
-        &["TinyTrie", "BTreeMap", "HashMap", "SortedVec"],
+        &["TinyTrie", "NibbleTrie", "BTreeMap", "HashMap", "SortedVec"],
         &look,
     );
     print_table(
         "Iter forward",
         "keys/sec",
-        &["TinyTrie", "BTreeMap", "SortedVec"],
+        &["TinyTrie", "NibbleTrie", "BTreeMap", "SortedVec"],
         &fwd,
     );
-    print_table("Iter backward", "keys/sec", &["TinyTrie", "BTreeMap"], &rev);
+    print_table("Iter backward", "keys/sec", &["TinyTrie", "NibbleTrie", "BTreeMap"], &rev);
 
     // Memory table uses different formatting
     println!();
@@ -408,7 +456,7 @@ fn main() {
         print!("{:>12}", s);
     }
     println!();
-    for (name, row) in ["TinyTrie", "BTreeMap", "HashMap", "SortedVec"].iter().zip(&mem) {
+    for (name, row) in ["TinyTrie", "NibbleTrie", "BTreeMap", "HashMap", "SortedVec"].iter().zip(&mem) {
         print!("{:>12}", name);
         for &val in row {
             print!("{:>12}", fmt_bytes_per(val));
