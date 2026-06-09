@@ -39,8 +39,6 @@ pub(crate) struct PairVec<const INLINE: usize, PREFIX: PrefixLen> {
     pub ptr: *mut u8,
 }
 
-unsafe impl<const INLINE: usize, PREFIX: PrefixLen> Send for PairVec<INLINE, PREFIX> {}
-unsafe impl<const INLINE: usize, PREFIX: PrefixLen> Sync for PairVec<INLINE, PREFIX> {}
 
 impl<const INLINE: usize, PREFIX: PrefixLen> PairVec<INLINE, PREFIX> {
     /// Offset from `ptr` to the start of the values section.
@@ -72,6 +70,18 @@ impl<const INLINE: usize, PREFIX: PrefixLen> PairVec<INLINE, PREFIX> {
     ///
     /// All bytes including `#[repr(C)]` padding are initialized,
     /// ensuring Miri-safe reads of the struct.
+    ///
+    /// # Safety justification for `std::mem::zeroed()`
+    ///
+    /// Although `zeroed()` produces a null raw pointer (`*mut u8`) — which would be
+    /// instant UB to dereference — this is safe because:
+    ///
+    /// - All four fields are immediately overwritten after `zeroed()` returns, so the
+    ///   null pointer value is never observed or dereferenced.
+    /// - `PairVec` is `Copy`, so no `Drop` implementation runs that could attempt to
+    ///   free the zeroed pointer.
+    /// - Zeroing initializes every byte including `#[repr(C)]` padding, preventing UB
+    ///   from uninitialized reads under Miri.
     pub(crate) fn new(len: u8, capacity: u8, prefix_len: PREFIX, ptr: *mut u8) -> Self {
         let mut pv: Self = unsafe { std::mem::zeroed() };
         pv.len = len;
@@ -85,7 +95,7 @@ impl<const INLINE: usize, PREFIX: PrefixLen> PairVec<INLINE, PREFIX> {
     ///
     /// # Safety
     /// The PairVec must be valid and its data allocation intact.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn keys(&self) -> &[u8] {
         // SAFETY: caller guarantees the PairVec is valid and its data
         // allocation is intact.
@@ -96,7 +106,7 @@ impl<const INLINE: usize, PREFIX: PrefixLen> PairVec<INLINE, PREFIX> {
     ///
     /// # Safety
     /// The PairVec must be valid and its data allocation intact.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn values(&self) -> &[Trie<INLINE, PREFIX>] {
         // SAFETY: caller guarantees the PairVec is valid and its data
         // allocation is intact. values_offset gives an aligned offset.
@@ -133,6 +143,7 @@ pub(crate) fn alloc_pairvec_data<const INLINE: usize, PREFIX: PrefixLen>(
     let len = keys.len();
     debug_assert_eq!(values.len(), len);
     debug_assert!(capacity >= len);
+    //TODO : assert len != 0
 
     let layout = PairVec::<INLINE, PREFIX>::layout(capacity);
     // SAFETY: layout has non-zero size (capacity >= len >= 1 for PairVec nodes).
@@ -162,14 +173,13 @@ pub(crate) fn alloc_pairvec_data<const INLINE: usize, PREFIX: PrefixLen>(
 /// Free a PairVec data buffer.
 ///
 /// # Safety
-/// `ptr` must point to a valid PairVec data allocation with the given
-/// `capacity` (the `capacity` field from the PairVec struct, NOT `len`).
+/// `pv` must point to a valid PairVec whose data allocation is intact
+/// and whose `capacity` field reflects the original allocation size.
 pub(crate) unsafe fn free_pairvec_data<const INLINE: usize, PREFIX: PrefixLen>(
-    ptr: *mut u8,
-    capacity: u8,
+    pv: &PairVec<INLINE, PREFIX>,
 ) {
-    let layout = PairVec::<INLINE, PREFIX>::layout(capacity as usize);
-    unsafe { alloc::dealloc(ptr, layout) };
+    let layout = PairVec::<INLINE, PREFIX>::layout(pv.capacity as usize);
+    unsafe { alloc::dealloc(pv.ptr, layout) };
 }
 
 /// Promote an INode (with `INLINE` children) to a PairVec (with
@@ -276,7 +286,7 @@ pub(crate) fn add_child_to_pairvec<const INLINE: usize, PREFIX: PrefixLen>(
         pv
     } else {
         // ── Full: double capacity and reallocate ──
-        debug_assert!(
+        assert!(
             (old_len as usize) < 255,
             "PairVec capacity overflow: cannot exceed 255 children"
         );
@@ -305,7 +315,7 @@ pub(crate) fn add_child_to_pairvec<const INLINE: usize, PREFIX: PrefixLen>(
             alloc_pairvec_data::<INLINE, PREFIX>(&merged_keys, &merged_values, new_capacity);
 
         // Free old buffer.
-        unsafe { free_pairvec_data::<INLINE, PREFIX>(pv.ptr, pv.capacity) };
+        unsafe { free_pairvec_data::<INLINE, PREFIX>(&pv) };
 
         PairVec::new((old_len + 1) as u8, new_capacity as u8, pv.prefix_len, new_ptr)
     }

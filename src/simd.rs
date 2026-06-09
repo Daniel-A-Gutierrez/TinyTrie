@@ -78,6 +78,9 @@ pub fn inode_find_child(
     count: usize,
     byte: u8,
 ) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
     let valid_mask = ((1u32 << count) - 1) << symbols_offset;
     let valid_end = symbols_offset + count;
     // Padding starts at valid_end, ends at next 8-byte boundary.
@@ -128,6 +131,9 @@ pub fn inode_find_child_lower_bound(
     count: usize,
     byte: u8,
 ) -> usize {
+    if count == 0 {
+        return 0;
+    }
     let valid_mask = ((1u32 << count) - 1) << symbols_offset;
     let valid_end = symbols_offset + count;
     let align_end = (valid_end + 7) & !7;
@@ -171,6 +177,9 @@ pub fn inode_find_child_lower_bound(
 /// Returns `None` if not found.
 #[inline]
 pub fn hnode_find_child(disc_ptr: *const u8, len: usize, byte: u8) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
     let byte_vec = u8x16::splat(byte);
     let mut offset = 0usize;
 
@@ -212,6 +221,9 @@ pub fn hnode_find_child(disc_ptr: *const u8, len: usize, byte: u8) -> Option<usi
 /// Returns an index in `0..len`, where `len` means all discriminants < byte.
 #[inline]
 pub fn hnode_find_child_lower_bound(disc_ptr: *const u8, len: usize, byte: u8) -> usize {
+    if len == 0 {
+        return 0;
+    }
     let byte_vec = u8x16::splat(byte);
     let mut offset = 0usize;
 

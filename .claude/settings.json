@@ -5,5 +5,16 @@
       "Bash(cargo check --benches 2>&1)",
       "Bash(cargo bench --no-run 2>&1)"
     ]
+  },
+  "mcpServers": {
+    "token-savior-recall": {
+      "command": "/home/d/.local/bin/token-savior",
+      "env": {
+        "WORKSPACE_ROOTS": "/home/d/Documents/Projects/prefix-offset-trie/",
+        "TOKEN_SAVIOR_CLIENT": "claude-code",
+        "TOKEN_SAVIOR_PROFILE": "optimized"
+      }
+    }
   }
+
 }

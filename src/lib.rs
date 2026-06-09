@@ -4,6 +4,38 @@
 //! deterministic finite automaton. Node size is determined by const generics:
 //! - `INLINE`: max inline children count (tag 2..=INLINE)
 //! - `PREFIX`: prefix length type (u8, u16, or u32)
+//!
+//! # Safety: Copy union with raw pointers
+//!
+//! `Trie` is a tagged union whose variants contain raw pointers (`*mut Trie`,
+//! `*mut u8`). All variants (`INode`, `PairVec`, `Leaf`) derive `Copy` so that
+//! `Trie` itself is `Copy` — this allows direct union field access without
+//! `ManuallyDrop` wrappers, which reduces overhead in the hot path.
+//!
+//! Copy is safe here because ownership is managed explicitly, not implicitly:
+//! - `TinyTrie` owns the root `Box<Trie>` and recursively frees subtrees in
+//!   its `Drop` impl. Implicit copies of `Trie` values (e.g., via `ptr::read`)
+//!   are bitwise copies of the struct; they do not claim ownership of the
+//!   pointed-to heap allocations.
+//! - `InternalNodeOwned` holds an owned inode/pairvec extracted via `ptr::read`.
+//! - `Trie` has no `Drop` impl, so copying a `Trie` value does not double-free.
+//!
+//! # Null-Terminator Contract
+//!
+//! All keys stored in the trie are null-terminated internally (a `0x00` byte is
+//! appended). This means:
+//!
+//! - `insert()` rejects keys containing `0x00` bytes and appends the terminator
+//!   internally before storing.
+//! - `get()` and `seek()` **require** null-terminated input. Callers can use
+//!   [`null_terminate`] to add the terminator, or pass a null-terminated `&[u8]`
+//!   directly (e.g., `b"hello\0"`).
+//! - `TrieIter::current()` returns keys **without** the null terminator,
+//!   matching the `insert` API.
+//!
+//! The null byte serves as an implicit sentinel: a leaf node's key always ends
+//! with `0x00`, which acts as a unique terminator distinguishing "ab" from
+//! "abc" during prefix comparison.
 
 #![feature(portable_simd)]
 
@@ -16,15 +48,15 @@ use pairvec::{
 };
 
 mod simd;
-mod arena_trie;
 
 // Tag encoding:
 //   0           Leaf (0 children)
-//   1           Reserved (unused)
+//   1           Reserved (TAG_RESERVED, unused but reserved for future use)
 //   2..=INLINE  INode with that many inline children
 //   >INLINE     PairVec with that many entries (tag IS the length)
 
 const TAG_LEAF: u8 = 0;
+const TAG_RESERVED: u8 = 1; // Unused, reserved for future use.
 
 //   ┌────────┬───────────────────────────────┐
 //   │ PREFIX │ INLINE values with no padding │
@@ -40,6 +72,10 @@ const TAG_LEAF: u8 = 0;
 ///
 /// All bytes including `#[repr(C)]` padding are zero-initialized on
 /// construction, ensuring Miri-safe SIMD loads.
+///
+/// Derives `Copy` for direct union field access. Ownership of the pointed-to
+/// heap allocations is managed explicitly by `TinyTrie::drop` and
+/// `free_subtree`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct INode<const INLINE: usize, PREFIX: PrefixLen> {
@@ -67,6 +103,8 @@ impl<const INLINE: usize, PREFIX: PrefixLen> INode<INLINE, PREFIX> {
 /// Implemented as PairVec — see pairvec.rs for the struct definition.
 
 /// Leaf node: stores a u64 index into the keys/values vecs.
+///
+/// Derives `Copy` for direct union field access.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Leaf {
@@ -75,6 +113,13 @@ struct Leaf {
 }
 
 /// The tagged union. Size determined by the largest variant (INode).
+///
+/// All variants are `Copy`, so `Trie` is `Copy` too. This enables direct union
+/// field access (e.g., `unsafe { node.leaf.tag }`) without `ManuallyDrop`
+/// wrappers, which reduces overhead in the lookup hot path.
+///
+/// Ownership of heap allocations pointed to by `INode::children` and
+/// `PairVec::ptr` is managed explicitly — see the module-level safety comment.
 #[repr(C)]
 union Trie<const INLINE: usize, PREFIX: PrefixLen> {
     inode: INode<INLINE, PREFIX>,
@@ -85,29 +130,21 @@ union Trie<const INLINE: usize, PREFIX: PrefixLen> {
 // --- Tag access ---
 
 impl<const INLINE: usize, PREFIX: PrefixLen> Trie<INLINE, PREFIX> {
+    #[inline(always)]
     fn tag(&self) -> u8 {
+        // SAFETY: The tag byte is at offset 0 in all union variants (Leaf,
+        // INode, PairVec) due to #[repr(C)] layout. Reading byte 0 of the
+        // union gives the tag regardless of the active variant.
         unsafe { self.leaf.tag }
     }
 
-    fn as_inode(&self) -> Option<&INode<INLINE, PREFIX>> {
-        let tag = self.tag();
-        if usize::from(tag) >= 2 && usize::from(tag) <= INLINE {
-            Some(unsafe { &self.inode })
-        } else {
-            None
-        }
-    }
-
-    fn as_pairvec(&self) -> Option<&PairVec<INLINE, PREFIX>> {
-        if self.tag() > INLINE as u8 {
-            Some(unsafe { &self.pairvec })
-        } else {
-            None
-        }
-    }
-
     fn as_leaf(&self) -> Option<&Leaf> {
-        if self.tag() == TAG_LEAF { Some(unsafe { &self.leaf }) } else { None }
+        if self.tag() == TAG_LEAF {
+            // SAFETY: tag confirms the active variant is Leaf.
+            Some(unsafe { &*(&raw const self.leaf) })
+        } else {
+            None
+        }
     }
 
     /// Number of children for an internal node (INode or PairVec).
@@ -119,17 +156,312 @@ impl<const INLINE: usize, PREFIX: PrefixLen> Trie<INLINE, PREFIX> {
         tag as usize
     }
 
-    /// Slice of children for an internal node (INode or PairVec).
-    /// Must not be called on a Leaf or Reserved node.
-    fn children_slice(&self) -> &[Trie<INLINE, PREFIX>] {
+    // --- Inline hot-path methods ---
+    //
+    // These dispatch on tag internally and are #[inline(always)] so the
+    // compiler can inline them into callers, avoiding the overhead of
+    // constructing an intermediate enum.
+
+    /// Returns the prefix length for an internal node.
+    /// Must not be called on a Leaf.
+    #[inline(always)]
+    fn prefix_len(&self) -> usize {
         let tag = self.tag();
-        debug_assert!(tag >= 2, "children_slice called on non-internal node (tag={tag})");
+        debug_assert!(tag >= 2);
         if tag as usize <= INLINE {
-            let inode = unsafe { &self.inode };
+            unsafe { self.inode }.prefix_len.into_usize()
+        } else {
+            unsafe { self.pairvec }.prefix_len.into_usize()
+        }
+    }
+
+    /// Find a child by its discriminant byte.
+    /// Returns the child index, or None if not found.
+    #[inline(always)]
+    fn find_child(&self, byte: u8) -> Option<usize> {
+        let tag = self.tag();
+        debug_assert!(tag >= 2);
+        if tag as usize <= INLINE {
+            unsafe { self.inode }.find_child(byte)
+        } else {
+            unsafe { self.pairvec }.find_child(byte)
+        }
+    }
+
+    /// Find first child with discriminant >= byte.
+    #[inline(always)]
+    fn find_child_lower_bound(&self, byte: u8) -> usize {
+        let tag = self.tag();
+        debug_assert!(tag >= 2);
+        if tag as usize <= INLINE {
+            unsafe { self.inode }.find_child_lower_bound(byte)
+        } else {
+            unsafe { self.pairvec }.find_child_lower_bound(byte)
+        }
+    }
+
+    /// Returns the children slice for an internal node.
+    #[inline(always)]
+    fn children(&self) -> &[Trie<INLINE, PREFIX>] {
+        let tag = self.tag();
+        debug_assert!(tag >= 2);
+        if tag as usize <= INLINE {
+            let inode = unsafe { &*(&raw const self.inode) };
             unsafe { std::slice::from_raw_parts(inode.children, tag as usize) }
         } else {
-            unsafe { self.pairvec.values() }
+            unsafe { (&*(&raw const self.pairvec)).values() }
         }
+    }
+
+    /// Returns the discriminant bytes (symbols/keys) for an internal node.
+    #[inline(always)]
+    fn symbols(&self) -> &[u8] {
+        let tag = self.tag();
+        debug_assert!(tag >= 2);
+        if tag as usize <= INLINE {
+            &unsafe { &*(&raw const self.inode) }.symbols[..tag as usize]
+        } else {
+            unsafe { (&*(&raw const self.pairvec)).keys() }
+        }
+    }
+}
+
+// --- InternalNodeOwned: unified owned/mutable view over INode and PairVec ---
+
+enum InternalNodeOwned<const INLINE: usize, PREFIX: PrefixLen> {
+    Inline(INode<INLINE, PREFIX>),
+    PairVec(PairVec<INLINE, PREFIX>),
+}
+
+impl<const INLINE: usize, PREFIX: PrefixLen> InternalNodeOwned<INLINE, PREFIX> {
+    /// Deconstruct a `Box<Trie>` into an owned internal node.
+    ///
+    /// Uses `ptr::read` to extract the variant data (an ownership transfer),
+    /// then drops the Box (freeing only the 16/24-byte node allocation —
+    /// not the children/data pointers carried in the variant).
+    fn from_box(boxed: Box<Trie<INLINE, PREFIX>>) -> Self {
+        let tag = boxed.tag();
+        match tag {
+            t if t >= 2 && t as usize <= INLINE => {
+                // SAFETY: tag confirms the active variant is INode.
+                // Trie is Copy, so reading the inode field is a bitwise copy.
+                let inode = unsafe { (*boxed).inode };
+                Self::Inline(inode)
+            }
+            _ if tag > INLINE as u8 => {
+                // SAFETY: tag confirms the active variant is PairVec.
+                let pv = unsafe { (*boxed).pairvec };
+                Self::PairVec(pv)
+            }
+            _ => panic!("from_box called on Leaf or Reserved node"),
+        }
+    }
+
+    fn prefix_len(&self) -> usize {
+        match self {
+            Self::Inline(inode) => inode.prefix_len.into_usize(),
+            Self::PairVec(pv) => pv.prefix_len.into_usize(),
+        }
+    }
+
+    fn find_child(&self, byte: u8) -> Option<usize> {
+        match self {
+            Self::Inline(inode) => inode.find_child(byte),
+            Self::PairVec(pv) => pv.find_child(byte),
+        }
+    }
+
+    fn find_child_lower_bound(&self, byte: u8) -> usize {
+        match self {
+            Self::Inline(inode) => inode.find_child_lower_bound(byte),
+            Self::PairVec(pv) => pv.find_child_lower_bound(byte),
+        }
+    }
+
+    fn child_count(&self) -> usize {
+        match self {
+            Self::Inline(inode) => inode.tag as usize,
+            Self::PairVec(pv) => pv.len as usize,
+        }
+    }
+
+    /// Descend to the leftmost leaf and return its key.
+    fn first_key<'a>(&self, keys: &'a [Vec<u8>]) -> &'a [u8] {
+        let first: &Trie<INLINE, PREFIX> = match self {
+            Self::Inline(inode) => unsafe { &*inode.children },
+            Self::PairVec(pv) => {
+                let values_off = PairVec::<INLINE, PREFIX>::values_offset(pv.capacity as usize);
+                unsafe { &*(pv.ptr.add(values_off) as *const Trie<INLINE, PREFIX>) }
+            }
+        };
+        let mut node = first;
+        loop {
+            match node.tag() {
+                TAG_LEAF => {
+                    let index = unsafe { node.leaf.index() } as usize;
+                    return &keys[index];
+                }
+                _ => {
+                    node = &node.children()[0];
+                }
+            }
+        }
+    }
+
+    fn into_trie(self) -> Trie<INLINE, PREFIX> {
+        match self {
+            Self::Inline(inode) => Trie { inode },
+            Self::PairVec(pv) => Trie { pairvec: pv },
+        }
+    }
+
+    /// Read a child by index (ownership transfer via ptr::read).
+    /// The caller takes ownership of the returned value.
+    fn read_child(&self, idx: usize) -> Trie<INLINE, PREFIX> {
+        match self {
+            Self::Inline(inode) => {
+                unsafe { std::ptr::read(inode.children.add(idx)) }
+            }
+            Self::PairVec(pv) => {
+                let values_off = PairVec::<INLINE, PREFIX>::values_offset(pv.capacity as usize);
+                let child_ptr = unsafe { pv.ptr.add(values_off) as *const Trie<INLINE, PREFIX> };
+                unsafe { std::ptr::read(child_ptr.add(idx)) }
+            }
+        }
+    }
+
+    /// Replace a child in-place and return the updated Trie.
+    ///
+    /// For INode, this writes the new child directly into the existing
+    /// children array — O(1), no allocation. For PairVec, same in-place
+    /// write into the values section.
+    fn replace_child(self, idx: usize, new_child: Trie<INLINE, PREFIX>) -> Trie<INLINE, PREFIX> {
+        match self {
+            Self::Inline(inode) => {
+                unsafe { std::ptr::write(inode.children.add(idx), new_child) };
+                Trie { inode }
+            }
+            Self::PairVec(pv) => {
+                let values_off = PairVec::<INLINE, PREFIX>::values_offset(pv.capacity as usize);
+                let child_ptr = unsafe { pv.ptr.add(values_off) as *mut Trie<INLINE, PREFIX> };
+                unsafe { std::ptr::write(child_ptr.add(idx), new_child) };
+                Trie { pairvec: pv }
+            }
+        }
+    }
+
+    /// Add a new (byte, child) pair and return the updated Trie.
+    fn add_child(self, byte: u8, child: Trie<INLINE, PREFIX>) -> Trie<INLINE, PREFIX> {
+        match self {
+            Self::Inline(inode) => add_child_to_inode(inode, byte, child),
+            Self::PairVec(pv) => Trie { pairvec: add_child_to_pairvec(pv, byte, child) },
+        }
+    }
+
+    /// Split this node's prefix at the point where the new key diverges.
+    ///
+    /// Creates a new parent node with two children: this node (with a
+    /// shortened prefix) and a new leaf for the inserted key.
+    fn split_prefix(
+        self,
+        diverged_prefix_len: u8,
+        existing_byte: u8,
+        new_byte: u8,
+        new_index: usize,
+    ) -> Trie<INLINE, PREFIX> {
+        let prefix_len = self.prefix_len();
+        let remaining_prefix = (prefix_len - diverged_prefix_len as usize - 1) as u8;
+
+        let existing_child = match self {
+            Self::Inline(inode) => {
+                let child_inode = INode::new(
+                    inode.tag,
+                    PREFIX::from(remaining_prefix),
+                    inode.symbols,
+                    inode.children,
+                );
+                Trie { inode: child_inode }
+            }
+            Self::PairVec(pv) => {
+                let child_pv = PairVec::new(
+                    pv.len,
+                    pv.capacity,
+                    PREFIX::from(remaining_prefix),
+                    pv.ptr,
+                );
+                Trie { pairvec: child_pv }
+            }
+        };
+
+        let new_child = Trie { leaf: Leaf::new(new_index as u64) };
+
+        let OrderedPair { sym_lo, child_lo, sym_hi, child_hi } = order_pair(
+            existing_byte, existing_child, new_byte, new_child,
+        );
+
+        make_inode_2(diverged_prefix_len, sym_lo, sym_hi, child_lo, child_hi)
+    }
+}
+
+// --- Prefix divergence ---
+
+/// Result of comparing a new key against an existing key from a given offset.
+enum PrefixResult {
+    /// Keys diverge within the checked range.
+    /// `prefix_len` is the number of matching bytes before the divergence.
+    /// `existing_byte` and `new_byte` are the differing bytes at the divergence
+    /// point. If `new_byte` is 0, the new key ended before the existing key.
+    Diverged {
+        prefix_len: u8,
+        existing_byte: u8,
+        new_byte: u8,
+    },
+    /// Keys match through the entire checked prefix of length `max_prefix_len`.
+    /// `byte_offset` is `offset + max_prefix_len` (position of the discriminating
+    /// byte after the shared prefix).
+    Matched {
+        byte_offset: usize,
+    },
+}
+
+/// Compare `new_key` against `existing_key` starting at `offset`, checking
+/// up to `max_prefix_len` bytes. If they diverge within that range, returns
+/// `PrefixResult::Diverged`. If they match through the entire prefix, returns
+/// `PrefixResult::Matched`.
+///
+/// For Leaf nodes, pass `max_prefix_len = existing_key.len() - offset`.
+/// For internal nodes, pass `max_prefix_len = node.prefix_len()`.
+fn find_prefix_divergence(
+    existing_key: &[u8],
+    new_key: &[u8],
+    offset: usize,
+    max_prefix_len: usize,
+) -> PrefixResult {
+    for i in 0..max_prefix_len {
+        let ki = offset + i;
+        if ki >= new_key.len() {
+            return PrefixResult::Diverged {
+                prefix_len: i as u8,
+                // NOTE: When the new key is shorter than the existing key, existing_byte
+                // falls back to the actual key byte (which includes the null terminator).
+                // This is safe because: (1) user keys can't contain 0x00, so 0x00 uniquely
+                // identifies the end-of-key marker; (2) the null terminator is always present
+                // in stored keys. The sentinel value of 0 for "new key ended" is distinct
+                // from any user key byte because of the no-null-byte invariant.
+                existing_byte: if ki < existing_key.len() { existing_key[ki] } else { 0 },
+                new_byte: 0,
+            };
+        }
+        if ki >= existing_key.len() || new_key[ki] != existing_key[ki] {
+            return PrefixResult::Diverged {
+                prefix_len: i as u8,
+                existing_byte: if ki < existing_key.len() { existing_key[ki] } else { 0 },
+                new_byte: new_key[ki],
+            };
+        }
+    }
+    PrefixResult::Matched {
+        byte_offset: offset + max_prefix_len,
     }
 }
 
@@ -210,12 +542,11 @@ fn leftmost_leaf<const INLINE: usize, PREFIX: PrefixLen>(
         let node_ref = unsafe { &*node };
         match node_ref.tag() {
             TAG_LEAF => {
-                return unsafe { node_ref.leaf }.index() as usize;
+                return unsafe { node_ref.leaf.index() } as usize;
             }
             _ => {
                 stack.push((node, 0));
-                let children = node_ref.children_slice();
-                node = std::ptr::from_ref(&children[0]);
+                node = std::ptr::from_ref(&node_ref.children()[0]);
             }
         }
     }
@@ -233,13 +564,12 @@ fn rightmost_leaf<const INLINE: usize, PREFIX: PrefixLen>(
         let node_ref = unsafe { &*node };
         match node_ref.tag() {
             TAG_LEAF => {
-                return unsafe { node_ref.leaf }.index() as usize;
+                return unsafe { node_ref.leaf.index() } as usize;
             }
             _ => {
                 let last = node_ref.child_count() - 1;
                 stack.push((node, last));
-                let children = node_ref.children_slice();
-                node = std::ptr::from_ref(&children[last]);
+                node = std::ptr::from_ref(&node_ref.children()[last]);
             }
         }
     }
@@ -267,44 +597,49 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TinyTrie<T, INLINE, PREFI
         TinyTrie { root: None, keys: Vec::new(), values: Vec::new() }
     }
 
-    /// Look up a key and return its index, or `None` if not found.
-    /// The key should NOT include a null terminator; one is appended internally.
+    /// Look up a null-terminated key and return its index, or `None` if not found.
+    ///
+    /// The key **must** end with a null byte (`0x00`). Use [`null_terminate`]
+    /// to add one if needed. No allocation is performed on the lookup path.
     pub fn get(&self, key: &[u8]) -> Option<usize> {
+        debug_assert!(key.last() == Some(&0), "key must be null-terminated");
         let root = self.root.as_ref()?;
-        let mut nt_key = key.to_vec();
-        nt_key.push(0);
         let mut node: &Trie<INLINE, PREFIX> = root;
         let mut offset = 0usize;
 
         loop {
-            match node.tag() {
+            let tag = node.tag();
+            match tag {
                 TAG_LEAF => {
-                    let leaf = node.as_leaf().unwrap();
+                    let leaf = unsafe { node.leaf };
                     let index = leaf.index() as usize;
-                    if index < self.keys.len() && self.keys[index] == nt_key {
+                    if index < self.keys.len() && self.keys[index] == key {
                         return Some(index);
                     }
                     return None;
                 }
-                tag if tag >= 2 && tag as usize <= INLINE => {
-                    let inode = node.as_inode().unwrap();
+                t if t as usize <= INLINE => {
+                    // SAFETY: tag confirms INode variant is active.
+                    let inode = unsafe { node.inode };
                     offset += inode.prefix_len.into_usize();
-                    if offset >= nt_key.len() { return None; }
-                    let byte = nt_key[offset];
+                    if offset >= key.len() { return None; }
+                    let byte = key[offset];
                     offset += 1;
                     let idx = inode.find_child(byte)?;
-                    let children = unsafe { std::slice::from_raw_parts(inode.children, tag as usize) };
+                    let children = unsafe { std::slice::from_raw_parts(inode.children, t as usize) };
                     node = &children[idx];
                 }
                 _ => {
-                    // PairVec (tag > INLINE)
-                    let pv = node.as_pairvec().unwrap();
+                    // SAFETY: tag confirms PairVec variant is active.
+                    let pv = unsafe { node.pairvec };
                     offset += pv.prefix_len.into_usize();
-                    if offset >= nt_key.len() { return None; }
-                    let byte = nt_key[offset];
+                    if offset >= key.len() { return None; }
+                    let byte = key[offset];
                     offset += 1;
                     let idx = pv.find_child(byte)?;
-                    let children = unsafe { pv.values() };
+                    let values_off = PairVec::<INLINE, PREFIX>::values_offset(pv.capacity as usize);
+                    let children_ptr = unsafe { pv.ptr.add(values_off) as *const Trie<INLINE, PREFIX> };
+                    let children = unsafe { std::slice::from_raw_parts(children_ptr, pv.len as usize) };
                     node = &children[idx];
                 }
             }
@@ -314,14 +649,13 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TinyTrie<T, INLINE, PREFI
     /// Insert a new key-value pair. Returns `Ok(index)` on success.
     /// Returns `Err(())` if the key already exists.
     /// Panics if the key contains a null byte (0x00).
+    ///
+    /// The key must **not** contain null bytes. Internally, a `0x00` terminator
+    /// is appended before storing.
     pub fn insert(&mut self, key: Vec<u8>, value: T) -> Result<usize, ()> {
         assert!(!key.contains(&0), "key must not contain null bytes");
         let mut nt_key = key;
         nt_key.push(0);
-
-        if self.get(&nt_key[..nt_key.len() - 1]).is_some() {
-            return Err(());
-        }
 
         let index = self.keys.len();
         self.keys.push(nt_key.clone());
@@ -334,13 +668,22 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TinyTrie<T, INLINE, PREFI
                 Ok(index)
             }
             Some(_) => {
-                self.root = Some(self.insert_into_root(index, &nt_key));
-                Ok(index)
+                match self.insert_into_root(index, &nt_key) {
+                    Ok(root) => {
+                        self.root = Some(root);
+                        Ok(index)
+                    }
+                    Err(()) => {
+                        self.keys.pop();
+                        self.values.pop();
+                        Err(())
+                    }
+                }
             }
         }
     }
 
-    fn insert_into_root(&mut self, new_index: usize, new_key: &[u8]) -> Box<Trie<INLINE, PREFIX>> {
+    fn insert_into_root(&mut self, new_index: usize, new_key: &[u8]) -> Result<Box<Trie<INLINE, PREFIX>>, ()> {
         let old_root = self.root.take().unwrap();
         self.insert_into_node(old_root, new_key, new_index, 0)
     }
@@ -351,216 +694,94 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TinyTrie<T, INLINE, PREFI
         new_key: &[u8],
         new_index: usize,
         offset: usize,
-    ) -> Box<Trie<INLINE, PREFIX>> {
+    ) -> Result<Box<Trie<INLINE, PREFIX>>, ()> {
         match node.tag() {
             TAG_LEAF => {
-                let leaf = unsafe { node.leaf };
+                // SAFETY: tag confirms the active variant is Leaf.
+                // Trie is Copy, so reading the leaf field is a bitwise copy.
+                let leaf = unsafe { (*node).leaf };
                 let existing_key = &self.keys[leaf.index() as usize];
 
-                // Find where the keys diverge.
-                let mut split_len = offset;
-                while split_len < existing_key.len()
-                    && split_len < new_key.len()
-                    && existing_key[split_len] == new_key[split_len]
-                {
-                    split_len += 1;
-                }
-
-                let prefix_len = (split_len - offset) as u8;
-                let existing_byte = existing_key[split_len];
-                let new_byte = new_key[split_len];
-
-                let existing_child = Trie { leaf: Leaf::new(leaf.index()) };
-                let new_child = Trie { leaf: Leaf::new(new_index as u64) };
-
-                let (sym_a, child_a, sym_b, child_b) = if existing_byte < new_byte {
-                    (existing_byte, existing_child, new_byte, new_child)
-                } else {
-                    (new_byte, new_child, existing_byte, existing_child)
-                };
-
-                let inode = make_inode_2(prefix_len, sym_a, sym_b, child_a, child_b);
-                Box::new(inode)
-            }
-
-            tag if tag >= 2 && tag as usize <= INLINE => {
-                let inode = unsafe { node.inode };
-                let prefix_len = inode.prefix_len.into_usize();
-
-                // Check if new key diverges within this node's prefix.
-                let existing_key = self.key_of_subtree_ptr(inode.children, tag as usize);
-                for i in 0..prefix_len {
-                    let ki = offset + i;
-                    if ki >= new_key.len() || (ki < existing_key.len() && new_key[ki] != existing_key[ki]) {
-                        // Split at this point in the prefix.
-                        let new_prefix_len = i as u8;
-                        let remaining_prefix = (prefix_len - i - 1) as u8;
-                        let existing_byte = existing_key[ki];
-                        let new_byte = if ki < new_key.len() { new_key[ki] } else { 0 };
-
-                        let child_inode = INode::new(
-                            inode.tag,
-                            PREFIX::from(remaining_prefix),
-                            inode.symbols,
-                            inode.children,
-                        );
-                        let existing_child = Trie { inode: child_inode };
+                match find_prefix_divergence(existing_key, new_key, offset, existing_key.len() - offset) {
+                    PrefixResult::Diverged { prefix_len, existing_byte, new_byte } => {
+                        let existing_child = Trie { leaf: Leaf::new(leaf.index()) };
                         let new_child = Trie { leaf: Leaf::new(new_index as u64) };
-
-                        let (sym_a, child_a, sym_b, child_b) = if existing_byte < new_byte {
-                            (existing_byte, existing_child, new_byte, new_child)
-                        } else {
-                            (new_byte, new_child, existing_byte, existing_child)
-                        };
-
-                        let parent = make_inode_2(new_prefix_len, sym_a, sym_b, child_a, child_b);
-                        return Box::new(parent);
-                    }
-                }
-
-                // Key matches prefix — look up the discriminating byte.
-                let byte_offset = offset + prefix_len;
-                let byte = new_key[byte_offset];
-
-                match inode.find_child(byte) {
-                    Some(child_idx) => {
-                        // Descend into existing child.
-                        let child_count = tag as usize;
-                        let old_children = unsafe {
-                            std::slice::from_raw_parts(inode.children, child_count)
-                        };
-
-                        // Recursively insert into the child.
-                        let old_child = unsafe { std::ptr::read(&old_children[child_idx]) };
-                        let new_child_box = self.insert_into_node(
-                            Box::new(old_child), new_key, new_index, byte_offset + 1,
+                        let OrderedPair { sym_lo, child_lo, sym_hi, child_hi } = order_pair(
+                            existing_byte, existing_child, new_byte, new_child,
                         );
-
-                        // Rebuild children array with updated child.
-                        let mut new_children = Vec::with_capacity(child_count);
-                        for i in 0..child_count {
-                            if i == child_idx {
-                                new_children.push(unsafe { std::ptr::read(&*new_child_box) });
-                            } else {
-                                new_children.push(unsafe { std::ptr::read(&old_children[i]) });
-                            }
-                        }
-                        let new_children_ptr = Box::into_raw(new_children.into_boxed_slice())
-                            as *mut Trie<INLINE, PREFIX>;
-
-                        unsafe { free_children_slice(inode.children, child_count); }
-
-                        let trie = Trie {
-                            inode: INode::new(
-                                inode.tag,
-                                inode.prefix_len,
-                                inode.symbols,
-                                new_children_ptr,
-                            ),
-                        };
-                        Box::new(trie)
+                        Ok(Box::new(make_inode_2(prefix_len, sym_lo, sym_hi, child_lo, child_hi)))
                     }
-                    None => {
-                        // New symbol — add a child.
-                        let new_leaf = Trie { leaf: Leaf::new(new_index as u64) };
-                        add_child_to_inode(inode, byte, new_leaf)
-                    }
+                    PrefixResult::Matched { .. } => Err(()),
                 }
             }
 
             _ => {
-                // PairVec (tag > INLINE)
-                let pv = unsafe { node.pairvec };
-                let prefix_len = pv.prefix_len.into_usize();
+                let internal = InternalNodeOwned::from_box(node);
+                let prefix_len = internal.prefix_len();
+                let existing_key = internal.first_key(&self.keys);
 
-                // Check if new key diverges within this node's prefix.
-                let existing_key = {
-                    let children = unsafe { pv.values() };
-                    self.key_of_subtree(&children[0])
-                };
-                for i in 0..prefix_len {
-                    let ki = offset + i;
-                    if ki >= new_key.len() || (ki < existing_key.len() && new_key[ki] != existing_key[ki]) {
-                        let new_prefix_len = i as u8;
-                        let remaining_prefix = (prefix_len - i - 1) as u8;
-                        let existing_byte = existing_key[ki];
-                        let new_byte = if ki < new_key.len() { new_key[ki] } else { 0 };
-
-                        // Create a PairVec child with the remaining prefix.
-                        // Reuse the existing data allocation — just change prefix_len.
-                        let child_pv = PairVec::new(
-                            pv.len,
-                            pv.capacity,
-                            PREFIX::from(remaining_prefix),
-                            pv.ptr,
-                        );
-                        let existing_child = Trie { pairvec: child_pv };
-                        let new_child = Trie { leaf: Leaf::new(new_index as u64) };
-
-                        let (sym_a, child_a, sym_b, child_b) = if existing_byte < new_byte {
-                            (existing_byte, existing_child, new_byte, new_child)
-                        } else {
-                            (new_byte, new_child, existing_byte, existing_child)
-                        };
-
-                        let parent = make_inode_2(new_prefix_len, sym_a, sym_b, child_a, child_b);
-                        return Box::new(parent);
+                match find_prefix_divergence(existing_key, new_key, offset, prefix_len) {
+                    PrefixResult::Diverged { prefix_len: matched, existing_byte, new_byte } => {
+                        Ok(Box::new(internal.split_prefix(matched, existing_byte, new_byte, new_index)))
                     }
-                }
-
-                // Key matches prefix — look up the discriminating byte.
-                let byte_offset = offset + prefix_len;
-                let byte = new_key[byte_offset];
-
-                match pv.find_child(byte) {
-                    Some(child_idx) => {
-                        // Descend into existing child — update in place, no reallocation!
-                        let values_off = PairVec::<INLINE, PREFIX>::values_offset(pv.capacity as usize);
-                        let child_ptr = unsafe { pv.ptr.add(values_off) as *mut Trie<INLINE, PREFIX> };
-                        let old_child = unsafe { std::ptr::read(child_ptr.add(child_idx)) };
-
-                        let new_child_box = self.insert_into_node(
-                            Box::new(old_child), new_key, new_index, byte_offset + 1,
-                        );
-
-                        // Write the updated child back to the same slot.
-                        unsafe { std::ptr::write(child_ptr.add(child_idx), *new_child_box) };
-
-                        Box::new(Trie { pairvec: pv })
-                    }
-                    None => {
-                        // New symbol — add a child (may or may not reallocate).
-                        let new_leaf = Trie { leaf: Leaf::new(new_index as u64) };
-                        let new_pv = add_child_to_pairvec(pv, byte, new_leaf);
-                        Box::new(Trie { pairvec: new_pv })
+                    PrefixResult::Matched { byte_offset } => {
+                        let byte = new_key[byte_offset];
+                        match internal.find_child(byte) {
+                            Some(child_idx) => {
+                                // Descend: read old child, recurse, write back in-place.
+                                let old_child = internal.read_child(child_idx);
+                                let new_child_box = self.insert_into_node(
+                                    Box::new(old_child), new_key, new_index, byte_offset + 1,
+                                )?;
+                                Ok(Box::new(internal.replace_child(child_idx, *new_child_box)))
+                            }
+                            None => {
+                                let new_leaf = Trie { leaf: Leaf::new(new_index as u64) };
+                                Ok(Box::new(internal.add_child(byte, new_leaf)))
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    fn key_of_subtree_ptr(&self, children: *mut Trie<INLINE, PREFIX>, count: usize) -> &[u8] {
-        let children = unsafe { std::slice::from_raw_parts(children, count) };
-        self.key_of_subtree(&children[0])
+    /// Returns the number of key-value pairs stored in the trie.
+    pub fn len(&self) -> usize {
+        self.keys.len()
     }
 
-    //has to traverse all the way down the tree to find a concrete string to compare the prefix.
-    //so insertion is log(n)^2
-    //we could improve this if, whenever we make a leaf, we make it the first child of its parent.
-    fn key_of_subtree(&self, node: &Trie<INLINE, PREFIX>) -> &[u8] {
-        let mut node = node;
-        loop {
-            match node.tag() {
-                TAG_LEAF => {
-                    let index = unsafe { node.leaf }.index() as usize;
-                    return &self.keys[index];
-                }
-                _ => {
-                    let children = node.children_slice();
-                    node = &children[0];
-                }
-            }
+    /// Returns `true` if the trie contains no key-value pairs.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Look up a null-terminated key and return a reference to its value,
+    /// or `None` if not found.
+    ///
+    /// The key **must** end with a null byte (`0x00`), matching the
+    /// [`get`](Self::get) contract. This is a convenience wrapper around
+    /// [`get`](Self::get) that returns `&T` directly instead of the index.
+    pub fn get_value(&self, key: &[u8]) -> Option<&T> {
+        let idx = self.get(key)?;
+        Some(&self.values[idx])
+    }
+
+    /// Consume the trie and return the stored keys and values.
+    ///
+    /// Frees all heap-allocated trie nodes before extracting the key/value
+    /// vectors, so the returned data owns its memory with no dangling pointers.
+    pub fn into_keys_values(mut self) -> (Vec<Vec<u8>>, Vec<T>) {
+        // Free all heap-allocated trie nodes first.
+        if let Some(ref root) = self.root {
+            unsafe { Self::free_subtree(root) };
         }
+        // Setting root to None makes Drop a no-op (it guards on `if let Some`).
+        self.root = None;
+        // Now safe to take ownership of the fields — Drop runs on empty Vecs.
+        let keys = std::mem::take(&mut self.keys);
+        let values = std::mem::take(&mut self.values);
+        (keys, values)
     }
 
     /// Return a bidirectional iterator positioned at the first (leftmost) key.
@@ -597,8 +818,9 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> Drop for TinyTrie<T, INLI
             unsafe { Self::free_subtree(root) };
         }
         // self.root (Option<Box<Trie>>) drops automatically after this,
-        // freeing the root node's 16 bytes. Since Trie is Copy with no Drop,
-        // the Box<Trie> doesn't follow the (now-dangling) children/data pointers.
+        // freeing the root node's 16/24 bytes. Trie is not Copy and has
+        // no Drop impl, so the Box<Trie> does not follow the (now-dangling)
+        // children/data pointers — it only frees its own allocation.
     }
 }
 
@@ -612,23 +834,19 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TinyTrie<T, INLINE, PREFI
     unsafe fn free_subtree(node: &Trie<INLINE, PREFIX>) {
         match node.tag() {
             TAG_LEAF => {}
-            tag if tag >= 2 && tag as usize <= INLINE => {
-                let inode = node.as_inode().unwrap();
-                let count = tag as usize;
-                let children = unsafe { std::slice::from_raw_parts(inode.children, count) };
-                for child in children {
+            t if t as usize <= INLINE => {
+                let inode = unsafe { &*(&raw const node.inode) };
+                for child in node.children() {
                     unsafe { Self::free_subtree(child) };
                 }
-                unsafe { free_children_slice(inode.children, count) };
+                unsafe { free_children_slice(inode.children, inode.tag as usize) };
             }
             _ => {
-                // PairVec (tag > INLINE)
-                let pv = unsafe { node.pairvec };
-                let children = unsafe { pv.values() };
-                for child in children {
+                let pv = unsafe { &*(&raw const node.pairvec) };
+                for child in node.children() {
                     unsafe { Self::free_subtree(child) };
                 }
-                unsafe { free_pairvec_data::<INLINE, PREFIX>(pv.ptr, pv.capacity) };
+                unsafe { free_pairvec_data::<INLINE, PREFIX>(pv) };
             }
         }
     }
@@ -680,7 +898,7 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TrieIter<'_, T, INLINE, P
                 self.stack.truncate(i + 1);
                 self.stack[i].1 = new_idx;
                 // Descend to leftmost leaf from the new sibling
-                let children = node_ref.children_slice();
+                let children = node_ref.children();
                 let leaf_idx = leftmost_leaf(
                     std::ptr::from_ref(&children[new_idx]),
                     &mut self.stack,
@@ -704,7 +922,7 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TrieIter<'_, T, INLINE, P
                 self.stack.truncate(i + 1);
                 self.stack[i].1 = new_idx;
                 let node_ref = unsafe { &*node };
-                let children = node_ref.children_slice();
+                let children = node_ref.children();
                 let leaf_idx = rightmost_leaf(
                     std::ptr::from_ref(&children[new_idx]),
                     &mut self.stack,
@@ -719,11 +937,11 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TrieIter<'_, T, INLINE, P
 
     /// Position at the first key >= `key` (or where `key` would go).
     ///
-    /// The key should NOT include a null terminator; one is appended internally.
-    /// If no such key exists, the iterator becomes exhausted.
+    /// The key **must** end with a null byte (`0x00`). Use [`null_terminate`]
+    /// to add one if needed. If no such key exists, the iterator becomes exhausted.
     pub fn seek(&mut self, key: &[u8]) {
-        let mut nt_key = key.to_vec();
-        nt_key.push(0);
+        debug_assert!(key.last() == Some(&0), "key must be null-terminated");
+        let nt_key = key;  // key is already null-terminated
         self.stack.clear();
         self.current = None;
 
@@ -736,92 +954,46 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TrieIter<'_, T, INLINE, P
 
             match node_ref.tag() {
                 TAG_LEAF => {
-                    let leaf_idx = unsafe { node_ref.leaf }.index() as usize;
+                    let leaf_idx = unsafe { node_ref.leaf.index() } as usize;
                     self.current = Some(leaf_idx);
                     // If leaf key < seek key, advance forward
-                    if self.trie.keys[leaf_idx].as_slice() < nt_key.as_slice() {
+                    if self.trie.keys[leaf_idx].as_slice() < key {
                         self.next();
                     }
                     return;
                 }
 
-                tag if tag >= 2 && tag as usize <= INLINE => {
-                    let inode = node_ref.as_inode().unwrap();
-                    offset += inode.prefix_len.into_usize();
+                _ => {
+                    offset += node_ref.prefix_len();
 
                     if offset >= nt_key.len() {
                         // Seek key exhausted — leftmost leaf is >= seek key
                         self.stack.push((node, 0));
-                        let children = unsafe {
-                            std::slice::from_raw_parts(inode.children, tag as usize)
-                        };
                         self.current = Some(leftmost_leaf(
-                            std::ptr::from_ref(&children[0]), &mut self.stack,
+                            std::ptr::from_ref(&node_ref.children()[0]), &mut self.stack,
                         ));
                         return;
                     }
 
                     let byte = nt_key[offset];
                     offset += 1;
-                    let lb = inode.find_child_lower_bound(byte);
+                    let lb = node_ref.find_child_lower_bound(byte);
+                    let child_count = node_ref.child_count();
 
-                    if lb < tag as usize && inode.symbols[lb] == byte {
+                    if lb < child_count && node_ref.symbols()[lb] == byte {
                         // Exact match — descend
                         self.stack.push((node, lb));
-                        node = unsafe { inode.children.add(lb) };
-                    } else if lb < tag as usize {
+                        node = std::ptr::from_ref(&node_ref.children()[lb]);
+                    } else if lb < child_count {
                         // First child > byte — its leftmost leaf is >= seek key
                         self.stack.push((node, lb));
-                        let children = unsafe {
-                            std::slice::from_raw_parts(inode.children, tag as usize)
-                        };
                         self.current = Some(leftmost_leaf(
-                            std::ptr::from_ref(&children[lb]), &mut self.stack,
+                            std::ptr::from_ref(&node_ref.children()[lb]), &mut self.stack,
                         ));
                         return;
                     } else {
                         // All children < byte — push sentinel, advance via next()
-                        self.stack.push((node, tag as usize));
-                        self.next();
-                        return;
-                    }
-                }
-
-                _ => {
-                    // PairVec (tag > INLINE)
-                    let pv = node_ref.as_pairvec().unwrap();
-                    offset += pv.prefix_len.into_usize();
-
-                    if offset >= nt_key.len() {
-                        self.stack.push((node, 0));
-                        let children = unsafe { pv.values() };
-                        self.current = Some(leftmost_leaf(
-                            std::ptr::from_ref(&children[0]), &mut self.stack,
-                        ));
-                        return;
-                    }
-
-                    let byte = nt_key[offset];
-                    offset += 1;
-                    let lb = pv.find_child_lower_bound(byte);
-
-                    let keys = unsafe { pv.keys() };
-                    if lb < pv.len as usize && keys[lb] == byte {
-                        // Exact match — descend
-                        self.stack.push((node, lb));
-                        let children = unsafe { pv.values() };
-                        node = std::ptr::from_ref(&children[lb]);
-                    } else if lb < pv.len as usize {
-                        // First child > byte — its leftmost leaf is >= seek key
-                        self.stack.push((node, lb));
-                        let children = unsafe { pv.values() };
-                        self.current = Some(leftmost_leaf(
-                            std::ptr::from_ref(&children[lb]), &mut self.stack,
-                        ));
-                        return;
-                    } else {
-                        // All children < byte — push sentinel, advance via next()
-                        self.stack.push((node, pv.len as usize));
+                        self.stack.push((node, child_count));
                         self.next();
                         return;
                     }
@@ -833,17 +1005,48 @@ impl<T: Clone, const INLINE: usize, PREFIX: PrefixLen> TrieIter<'_, T, INLINE, P
 
 // --- Free functions ---
 
+struct OrderedPair<const INLINE: usize, PREFIX: PrefixLen> {
+    sym_lo: u8,
+    child_lo: Trie<INLINE, PREFIX>,
+    sym_hi: u8,
+    child_hi: Trie<INLINE, PREFIX>,
+}
+
+fn order_pair<const INLINE: usize, PREFIX: PrefixLen>(
+    byte_a: u8, child_a: Trie<INLINE, PREFIX>,
+    byte_b: u8, child_b: Trie<INLINE, PREFIX>,
+) -> OrderedPair<INLINE, PREFIX> {
+    if byte_a <= byte_b {
+        OrderedPair { sym_lo: byte_a, child_lo: child_a, sym_hi: byte_b, child_hi: child_b }
+    } else {
+        OrderedPair { sym_lo: byte_b, child_lo: child_b, sym_hi: byte_a, child_hi: child_a }
+    }
+}
+
+/// Append a null byte (`0x00`) to a key, producing a null-terminated key
+/// suitable for [`TinyTrie::get`] and [`TrieIter::seek`].
+///
+/// ```
+/// let nt = tiny_trie::null_terminate(b"hello");
+/// assert_eq!(&nt[..], b"hello\0");
+/// ```
+pub fn null_terminate(key: &[u8]) -> Vec<u8> {
+    let mut v = key.to_vec();
+    v.push(0);
+    v
+}
+
 fn make_inode_2<const INLINE: usize, PREFIX: PrefixLen>(
     prefix_len: u8,
-    sym_a: u8,
-    sym_b: u8,
-    child_a: Trie<INLINE, PREFIX>,
-    child_b: Trie<INLINE, PREFIX>,
+    sym_lo: u8,
+    sym_hi: u8,
+    child_lo: Trie<INLINE, PREFIX>,
+    child_hi: Trie<INLINE, PREFIX>,
 ) -> Trie<INLINE, PREFIX> {
     let mut symbols = [0u8; INLINE];
-    symbols[0] = sym_a;
-    symbols[1] = sym_b;
-    let children = vec![child_a, child_b];
+    symbols[0] = sym_lo;
+    symbols[1] = sym_hi;
+    let children = vec![child_lo, child_hi];
     let children_ptr = Box::into_raw(children.into_boxed_slice()) as *mut Trie<INLINE, PREFIX>;
     Trie {
         inode: INode::new(2, PREFIX::from(prefix_len), symbols, children_ptr),
@@ -854,7 +1057,7 @@ fn add_child_to_inode<const INLINE: usize, PREFIX: PrefixLen>(
     inode: INode<INLINE, PREFIX>,
     byte: u8,
     new_child: Trie<INLINE, PREFIX>,
-) -> Box<Trie<INLINE, PREFIX>> {
+) -> Trie<INLINE, PREFIX> {
     let old_tag = inode.tag as usize;
 
     if old_tag < INLINE {
@@ -881,9 +1084,9 @@ fn add_child_to_inode<const INLINE: usize, PREFIX: PrefixLen>(
 
         unsafe { free_children_slice(inode.children, old_tag); }
 
-        Box::new(Trie {
+        Trie {
             inode: INode::new(new_tag, inode.prefix_len, symbols, new_children_ptr),
-        })
+        }
     } else {
         // INode is full — promote to PairVec.
         let new_pv = promote_inode_to_pairvec(
@@ -895,7 +1098,7 @@ fn add_child_to_inode<const INLINE: usize, PREFIX: PrefixLen>(
             inode.prefix_len,
         );
         unsafe { free_children_slice(inode.children, old_tag); }
-        Box::new(Trie { pairvec: new_pv })
+        Trie { pairvec: new_pv }
     }
 }
 
@@ -969,8 +1172,8 @@ mod tests {
         let mut trie: TinyTrie<&str, 6, u8> = TinyTrie::new();
         let idx = trie.insert(b"hello".to_vec(), "world").unwrap();
         assert_eq!(idx, 0);
-        assert_eq!(trie.get(b"hello"), Some(0));
-        assert_eq!(trie.get(b"world"), None);
+        assert_eq!(trie.get(b"hello\0"), Some(0));
+        assert_eq!(trie.get(b"world\0"), None);
     }
 
     #[test]
@@ -994,10 +1197,10 @@ mod tests {
         let mut trie: TinyTrie<&str, 6, u8> = TinyTrie::new();
         trie.insert(b"abc".to_vec(), "first").unwrap();
         trie.insert(b"abd".to_vec(), "second").unwrap();
-        assert_eq!(trie.get(b"abc"), Some(0));
-        assert_eq!(trie.get(b"abd"), Some(1));
-        assert_eq!(trie.get(b"abe"), None);
-        assert_eq!(trie.get(b"ab"), None);
+        assert_eq!(trie.get(b"abc\0"), Some(0));
+        assert_eq!(trie.get(b"abd\0"), Some(1));
+        assert_eq!(trie.get(b"abe\0"), None);
+        assert_eq!(trie.get(b"ab\0"), None);
     }
 
     #[test]
@@ -1006,10 +1209,10 @@ mod tests {
         trie.insert(b"abc".to_vec(), "1").unwrap();
         trie.insert(b"abd".to_vec(), "2").unwrap();
         trie.insert(b"abe".to_vec(), "3").unwrap();
-        assert_eq!(trie.get(b"abc"), Some(0));
-        assert_eq!(trie.get(b"abd"), Some(1));
-        assert_eq!(trie.get(b"abe"), Some(2));
-        assert_eq!(trie.get(b"abf"), None);
+        assert_eq!(trie.get(b"abc\0"), Some(0));
+        assert_eq!(trie.get(b"abd\0"), Some(1));
+        assert_eq!(trie.get(b"abe\0"), Some(2));
+        assert_eq!(trie.get(b"abf\0"), None);
     }
 
     #[test]
@@ -1017,9 +1220,9 @@ mod tests {
         let mut trie: TinyTrie<&str, 6, u8> = TinyTrie::new();
         trie.insert(b"abc".to_vec(), "long").unwrap();
         trie.insert(b"ab".to_vec(), "short").unwrap();
-        assert_eq!(trie.get(b"abc"), Some(0));
-        assert_eq!(trie.get(b"ab"), Some(1));
-        assert_eq!(trie.get(b"abd"), None);
+        assert_eq!(trie.get(b"abc\0"), Some(0));
+        assert_eq!(trie.get(b"ab\0"), Some(1));
+        assert_eq!(trie.get(b"abd\0"), None);
     }
 
     #[test]
@@ -1028,8 +1231,8 @@ mod tests {
         let mut trie: TinyTrie<&str, 6, u8> = TinyTrie::new();
         trie.insert(b"ab".to_vec(), "short").unwrap();
         trie.insert(b"abc".to_vec(), "long").unwrap();
-        assert_eq!(trie.get(b"ab"), Some(0));
-        assert_eq!(trie.get(b"abc"), Some(1));
+        assert_eq!(trie.get(b"ab\0"), Some(0));
+        assert_eq!(trie.get(b"abc\0"), Some(1));
     }
 
     #[test]
@@ -1038,10 +1241,10 @@ mod tests {
         let mut trie: TinyTrie<&str, 6, u8> = TinyTrie::new();
         trie.insert(b"abc".to_vec(), "1").unwrap();
         trie.insert(b"xyz".to_vec(), "2").unwrap();
-        assert_eq!(trie.get(b"abc"), Some(0));
-        assert_eq!(trie.get(b"xyz"), Some(1));
-        assert_eq!(trie.get(b"ab"), None);
-        assert_eq!(trie.get(b"abcz"), None);
+        assert_eq!(trie.get(b"abc\0"), Some(0));
+        assert_eq!(trie.get(b"xyz\0"), Some(1));
+        assert_eq!(trie.get(b"ab\0"), None);
+        assert_eq!(trie.get(b"abcz\0"), None);
     }
 
     #[test]
@@ -1050,10 +1253,10 @@ mod tests {
         trie.insert(b"a".to_vec(), "1").unwrap();
         trie.insert(b"b".to_vec(), "2").unwrap();
         trie.insert(b"c".to_vec(), "3").unwrap();
-        assert_eq!(trie.get(b"a"), Some(0));
-        assert_eq!(trie.get(b"b"), Some(1));
-        assert_eq!(trie.get(b"c"), Some(2));
-        assert_eq!(trie.get(b"d"), None);
+        assert_eq!(trie.get(b"a\0"), Some(0));
+        assert_eq!(trie.get(b"b\0"), Some(1));
+        assert_eq!(trie.get(b"c\0"), Some(2));
+        assert_eq!(trie.get(b"d\0"), None);
     }
 
     #[test]
@@ -1064,11 +1267,11 @@ mod tests {
             key.push(b'a' + i);
             trie.insert(key, i as usize).unwrap();
         }
-        assert_eq!(trie.get(b"prefixa"), Some(0));
-        assert_eq!(trie.get(b"prefixb"), Some(1));
-        assert_eq!(trie.get(b"prefixf"), Some(5));
-        assert_eq!(trie.get(b"prefixg"), None);
-        assert_eq!(trie.get(b"prefi"), None);
+        assert_eq!(trie.get(b"prefixa\0"), Some(0));
+        assert_eq!(trie.get(b"prefixb\0"), Some(1));
+        assert_eq!(trie.get(b"prefixf\0"), Some(5));
+        assert_eq!(trie.get(b"prefixg\0"), None);
+        assert_eq!(trie.get(b"prefi\0"), None);
     }
 
     #[test]
@@ -1079,12 +1282,12 @@ mod tests {
         trie.insert(b"ab".to_vec(), 1).unwrap();
         trie.insert(b"abc".to_vec(), 2).unwrap();
         trie.insert(b"abcd".to_vec(), 3).unwrap();
-        assert_eq!(trie.get(b"a"), Some(0));
-        assert_eq!(trie.get(b"ab"), Some(1));
-        assert_eq!(trie.get(b"abc"), Some(2));
-        assert_eq!(trie.get(b"abcd"), Some(3));
-        assert_eq!(trie.get(b"abcde"), None);
-        assert_eq!(trie.get(b"b"), None);
+        assert_eq!(trie.get(b"a\0"), Some(0));
+        assert_eq!(trie.get(b"ab\0"), Some(1));
+        assert_eq!(trie.get(b"abc\0"), Some(2));
+        assert_eq!(trie.get(b"abcd\0"), Some(3));
+        assert_eq!(trie.get(b"abcde\0"), None);
+        assert_eq!(trie.get(b"b\0"), None);
     }
 
     #[test]
@@ -1094,11 +1297,11 @@ mod tests {
         trie.insert(b"aaa".to_vec(), 0).unwrap();
         trie.insert(b"bbb".to_vec(), 1).unwrap();
         trie.insert(b"ccc".to_vec(), 2).unwrap();
-        assert_eq!(trie.get(b"aaa"), Some(0));
-        assert_eq!(trie.get(b"bbb"), Some(1));
-        assert_eq!(trie.get(b"ccc"), Some(2));
-        assert_eq!(trie.get(b"ddd"), None);
-        assert_eq!(trie.get(b"aab"), None);
+        assert_eq!(trie.get(b"aaa\0"), Some(0));
+        assert_eq!(trie.get(b"bbb\0"), Some(1));
+        assert_eq!(trie.get(b"ccc\0"), Some(2));
+        assert_eq!(trie.get(b"ddd\0"), None);
+        assert_eq!(trie.get(b"aab\0"), None);
     }
 
     #[test]
@@ -1107,10 +1310,10 @@ mod tests {
         let mut trie: TinyTrie<usize, 6, u8> = TinyTrie::new();
         trie.insert(b"ab".to_vec(), 0).unwrap();
         trie.insert(b"abcd".to_vec(), 1).unwrap();
-        assert_eq!(trie.get(b"ab"), Some(0));
-        assert_eq!(trie.get(b"abcd"), Some(1));
-        assert_eq!(trie.get(b"abc"), None);
-        assert_eq!(trie.get(b"abcde"), None);
+        assert_eq!(trie.get(b"ab\0"), Some(0));
+        assert_eq!(trie.get(b"abcd\0"), Some(1));
+        assert_eq!(trie.get(b"abc\0"), None);
+        assert_eq!(trie.get(b"abcde\0"), None);
     }
 
     #[test]
@@ -1126,9 +1329,10 @@ mod tests {
         for i in 0u8..7 {
             let mut key = b"prefix".to_vec();
             key.push(b'a' + i);
+            key.push(0); // null-terminate for get()
             assert_eq!(trie.get(&key), Some(i as usize));
         }
-        assert_eq!(trie.get(b"prefixh"), None);
+        assert_eq!(trie.get(b"prefixh\0"), None);
     }
 
     #[test]
@@ -1141,10 +1345,10 @@ mod tests {
         }
         for i in 0..20 {
             let key = format!("key{:02}", i);
-            assert_eq!(trie.get(key.as_bytes()), Some(i));
+            assert_eq!(trie.get(&null_terminate(key.as_bytes())), Some(i));
         }
-        assert_eq!(trie.get(b"key20"), None);
-        assert_eq!(trie.get(b"key"), None);
+        assert_eq!(trie.get(b"key20\0"), None);
+        assert_eq!(trie.get(b"key\0"), None);
     }
 
     // --- Iterator tests ---
@@ -1212,7 +1416,7 @@ mod tests {
         trie.insert(b"abd".to_vec(), 1).unwrap();
         trie.insert(b"xyz".to_vec(), 2).unwrap();
         let mut iter = trie.iter();
-        iter.seek(b"abd");
+        iter.seek(b"abd\0");
         assert_eq!(iter.current(), Some((b"abd".as_slice(), &1)));
     }
 
@@ -1222,7 +1426,7 @@ mod tests {
         trie.insert(b"abc".to_vec(), 0).unwrap();
         trie.insert(b"xyz".to_vec(), 1).unwrap();
         let mut iter = trie.iter();
-        iter.seek(b"mno");
+        iter.seek(b"mno\0");
         assert_eq!(iter.current(), Some((b"xyz".as_slice(), &1)));
     }
 
@@ -1232,7 +1436,7 @@ mod tests {
         trie.insert(b"bbb".to_vec(), 0).unwrap();
         trie.insert(b"ccc".to_vec(), 1).unwrap();
         let mut iter = trie.iter();
-        iter.seek(b"aaa");
+        iter.seek(b"aaa\0");
         assert_eq!(iter.current(), Some((b"bbb".as_slice(), &0)));
     }
 
@@ -1242,7 +1446,7 @@ mod tests {
         trie.insert(b"bbb".to_vec(), 0).unwrap();
         trie.insert(b"yyy".to_vec(), 1).unwrap();
         let mut iter = trie.iter();
-        iter.seek(b"zzz");
+        iter.seek(b"zzz\0");
         assert!(iter.current().is_none());
     }
 
@@ -1252,7 +1456,7 @@ mod tests {
         trie.insert(b"ab".to_vec(), 0).unwrap();
         trie.insert(b"abc".to_vec(), 1).unwrap();
         let mut iter = trie.iter();
-        iter.seek(b"ab");
+        iter.seek(b"ab\0");
         assert_eq!(iter.current(), Some((b"ab".as_slice(), &0)));
     }
 
@@ -1263,7 +1467,7 @@ mod tests {
         trie.insert(b"ab".to_vec(), 0).unwrap();
         trie.insert(b"abcd".to_vec(), 1).unwrap();
         let mut iter = trie.iter();
-        iter.seek(b"abc");
+        iter.seek(b"abc\0");
         assert_eq!(iter.current(), Some((b"abcd".as_slice(), &1)));
     }
 
@@ -1275,7 +1479,7 @@ mod tests {
             trie.insert(key.into_bytes(), i).unwrap();
         }
         let mut iter = trie.iter();
-        iter.seek(b"key05");
+        iter.seek(b"key05\0");
         assert_eq!(iter.current(), Some((b"key05".as_slice(), &5)));
         // next should go to key06
         assert_eq!(iter.next(), Some((b"key06".as_slice(), &6)));
@@ -1306,7 +1510,7 @@ mod tests {
 
         // Backward iteration through PairVec
         let mut iter2 = trie.iter();
-        iter2.seek(b"prefixj"); // last key
+        iter2.seek(b"prefixj\0"); // last key
         for i in (0..10).rev() {
             let mut expected_key = b"prefix".to_vec();
             expected_key.push(b'a' + i as u8);
@@ -1410,7 +1614,7 @@ mod tests {
 
         // Seek to the last key
         let mut iter = trie.iter();
-        iter.seek(&format!("key_{:04}", n - 1).into_bytes());
+        iter.seek(&null_terminate(format!("key_{:04}", n - 1).as_bytes()));
         assert_eq!(iter.current().map(|(k, _)| k.to_vec()), Some(format!("key_{:04}", n - 1).into_bytes()));
 
         // Iterate backward
@@ -1437,7 +1641,7 @@ mod tests {
 
         let mut iter = trie.iter();
         let start = 50;
-        iter.seek(&format!("key_{:04}", start).into_bytes());
+        iter.seek(&null_terminate(format!("key_{:04}", start).as_bytes()));
         assert_eq!(iter.current(), Some((format!("key_{:04}", start).as_bytes(), &start)));
 
         let mut count = 0;
@@ -1475,5 +1679,75 @@ mod tests {
             assert!(count <= n, "too many backward iterations");
         }
         assert_eq!(count, n, "expected {} iterations, got {}", n, count);
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let mut trie: TinyTrie<&str, 6, u8> = TinyTrie::new();
+        assert!(trie.is_empty());
+        assert_eq!(trie.len(), 0);
+
+        trie.insert(b"hello".to_vec(), "world").unwrap();
+        assert!(!trie.is_empty());
+        assert_eq!(trie.len(), 1);
+
+        trie.insert(b"abc".to_vec(), "def").unwrap();
+        assert_eq!(trie.len(), 2);
+    }
+
+    #[test]
+    fn get_value_found_and_missing() {
+        let mut trie: TinyTrie<&str, 6, u8> = TinyTrie::new();
+        trie.insert(b"hello".to_vec(), "world").unwrap();
+        trie.insert(b"abc".to_vec(), "def").unwrap();
+
+        assert_eq!(trie.get_value(b"hello\0"), Some(&"world"));
+        assert_eq!(trie.get_value(b"abc\0"), Some(&"def"));
+        assert_eq!(trie.get_value(b"xyz\0"), None);
+    }
+
+    #[test]
+    fn get_value_empty_trie() {
+        let trie: TinyTrie<i32, 6, u8> = TinyTrie::new();
+        assert_eq!(trie.get_value(b"anything\0"), None);
+    }
+
+    #[test]
+    fn into_keys_values_roundtrip() {
+        let mut trie: TinyTrie<i32, 6, u8> = TinyTrie::new();
+        trie.insert(b"alpha".to_vec(), 1).unwrap();
+        trie.insert(b"bravo".to_vec(), 2).unwrap();
+        trie.insert(b"charlie".to_vec(), 3).unwrap();
+
+        let (keys, values) = trie.into_keys_values();
+        // Keys include the null terminator
+        assert_eq!(keys.len(), 3);
+        assert_eq!(values.len(), 3);
+        // Values correspond to insertion order
+        assert_eq!(values[0], 1);
+        assert_eq!(values[1], 2);
+        assert_eq!(values[2], 3);
+    }
+
+    #[test]
+    fn into_keys_values_empty() {
+        let trie: TinyTrie<i32, 6, u8> = TinyTrie::new();
+        let (keys, values) = trie.into_keys_values();
+        assert!(keys.is_empty());
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn into_keys_values_no_double_free() {
+        // This test verifies that into_keys_values does not double-free.
+        // If it did, this would trigger Miri errors or ASan reports.
+        let mut trie: TinyTrie<String, 6, u8> = TinyTrie::new();
+        for i in 0..20 {
+            let key = format!("key_{:04}", i);
+            trie.insert(key.into_bytes(), format!("val_{}", i)).unwrap();
+        }
+        let (keys, values) = trie.into_keys_values();
+        assert_eq!(keys.len(), 20);
+        assert_eq!(values.len(), 20);
     }
 }
