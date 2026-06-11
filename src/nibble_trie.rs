@@ -14,9 +14,11 @@
 //!
 //! # Key Index Encoding
 //!
-//! A dummy empty key occupies `keys[0]`. Real keys start at index 1.
-//! This allows 0 to be used as a sentinel for "empty" in both `children[]`
-//! and the `leaf` field, eliminating +1/-1 arithmetic.
+//! A dummy entry at `index[0] = (0, 0)` points at `buf[0]` (empty key).
+//! Real keys start at index 1. This allows 0 to be used as a sentinel for
+//! "empty" in both `children[]` and the `leaf` field, eliminating +1/-1
+//! arithmetic. Keys are stored contiguously in `buf` with a side index
+//! `(offset, len)`, saving ~24 bytes/key vs `Vec<Vec<u8>>`.
 
 use crate::TinyTrieMap;
 use std::collections::VecDeque;
@@ -32,7 +34,7 @@ use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
 /// - `children`: 16 slots indexed by nibble value. `0` = empty slot.
 ///   For internal nodes, the value is an arena index (≥ 1).
 ///   For leaves (when `leaf_mask` bit is set), the value is a key index (≥ 1,
-///   since `keys[0]` is a dummy).
+///   since `index[0]` is the dummy).
 /// - `prefix_len`: absolute nibble position of this node's discriminating
 ///   nibble. During lookup, use `key_nibble_at(key, prefix_len)` directly —
 ///   no accumulation needed.
@@ -74,7 +76,7 @@ impl Node {
     }
 
     /// Store a leaf key index at `nib`. Key index must be ≥ 1
-    /// (keys[0] is the dummy entry).
+    /// (index[0] is the dummy entry).
     #[inline]
     fn set_leaf_child(&mut self, nib: usize, key_index: u32) {
         debug_assert!(nib < 16);
@@ -139,8 +141,9 @@ impl fmt::Debug for Node {
 #[derive(Clone)]
 pub struct NibbleTrie<T> {
     arena: Vec<Node>,
-    keys: Vec<Vec<u8>>,
-    values: Vec<T>,
+    buf: Vec<u8>,            // all keys concatenated (no null terminators)
+    index: Vec<(u32, u16)>,  // (offset into buf, len) per key
+    values: Vec<T>,          // values[i] ↔ index[i]
 }
 
 // ---------------------------------------------------------------------------
@@ -266,20 +269,28 @@ fn mask_prev(mask: u16, end: usize) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 impl<T> NibbleTrie<T> {
+    /// Return the key slice for `key_index`.
+    #[inline]
+    fn key_slice(&self, key_index: u32) -> &[u8] {
+        let (off, len) = self.index[key_index as usize];
+        &self.buf[off as usize..off as usize + len as usize]
+    }
+
     pub fn new() -> Self {
         NibbleTrie {
             arena: Vec::new(),
-            keys: vec![vec![]], // keys[0] = dummy (empty, not null-terminated)
+            buf: vec![0],           // buf[0] = dummy (unused byte)
+            index: vec![(0, 0)],   // index[0] = dummy entry
             values: Vec::new(),
         }
     }
 
     pub fn len(&self) -> usize {
-        self.keys.len() - 1 // subtract dummy
+        self.index.len() - 1 // subtract dummy
     }
 
     pub fn is_empty(&self) -> bool {
-        self.keys.len() == 1 // only the dummy
+        self.index.len() == 1 // only the dummy
     }
 
     // -----------------------------------------------------------------------
@@ -297,9 +308,9 @@ impl<T> NibbleTrie<T> {
             // Key nibbles exhausted — check if this node is terminal
             if node.prefix_len as usize >= max_nib {
                 if node.terminal {
-                    let ki = node.leaf as usize;
-                    if self.keys[ki] == key {
-                        return Some(ki);
+                    let ki = node.leaf;
+                    if self.key_slice(ki) == key {
+                        return Some(ki as usize);
                     }
                 }
                 return None;
@@ -310,10 +321,10 @@ impl<T> NibbleTrie<T> {
                 return None;
             }
             if node.is_leaf(nib) {
-                let key_index = slot as usize;
+                let key_index = slot;
                 debug_assert!(key_index > 0);
-                return if self.keys[key_index] == key {
-                    Some(key_index)
+                return if self.key_slice(key_index) == key {
+                    Some(key_index as usize)
                 } else {
                     None
                 };
@@ -331,9 +342,12 @@ impl<T> NibbleTrie<T> {
     // -----------------------------------------------------------------------
 
     pub fn insert(&mut self, key: Vec<u8>, value: T) -> Result<usize, ()> {
-        // Real key index: keys[0] is the dummy, so real keys start at 1
-        let new_index = self.keys.len();
-        self.keys.push(key.clone());
+        // Real key index: index[0] is the dummy, so real keys start at 1
+        let new_index = self.index.len() as u32;
+        let key_len = key.len() as u16;
+        let offset = self.buf.len() as u32;
+        self.buf.extend_from_slice(&key);
+        self.index.push((offset, key_len));
         self.values.push(value);
 
         let max_nib = key.len() * 2;
@@ -345,14 +359,14 @@ impl<T> NibbleTrie<T> {
                 root.terminal = true;
                 root.leaf = new_index as u32;
                 self.arena.push(root);
-                return Ok(new_index);
+                return Ok(new_index as usize);
             }
             let first_nib = key_nibble_at(&key, 0) as usize;
             let mut root = Node::new();
             root.set_leaf_child(first_nib, new_index as u32);
             root.leaf = new_index as u32;
             self.arena.push(root);
-            return Ok(new_index);
+            return Ok(new_index as usize);
         }
 
         let mut node_idx: u32 = 0;
@@ -363,12 +377,14 @@ impl<T> NibbleTrie<T> {
 
         loop {
             let node = &self.arena[node_idx as usize];
-            let ref_key = &self.keys[node.leaf as usize];
+            let ref_key = self.key_slice(node.leaf);
             let prefix_len = node.prefix_len as usize;
 
             match simd_find_divergence::<8>(&key, ref_key, confirmed) {
                 DivergeResult::Duplicate => {
-                    self.keys.pop();
+                    // Roll back the key we just appended
+                    let (off, len) = self.index.pop().unwrap();
+                    self.buf.truncate(off as usize);
                     let _ = self.values.pop();
                     return Err(());
                 }
@@ -404,7 +420,7 @@ impl<T> NibbleTrie<T> {
                     }
                     self.sort_internal_children(node_idx);
 
-                    return Ok(new_index);
+                    return Ok(new_index as usize);
                 }
                 DivergeResult::At(_) => {
                     // Divergence at or after prefix_len — follow the child.
@@ -413,7 +429,7 @@ impl<T> NibbleTrie<T> {
                         // Key nibbles exhausted at this node — mark terminal
                         self.arena[node_idx as usize].terminal = true;
                         self.arena[node_idx as usize].leaf = new_index as u32;
-                        return Ok(new_index);
+                        return Ok(new_index as usize);
                     }
 
                     confirmed = prefix_len + 1;
@@ -423,16 +439,17 @@ impl<T> NibbleTrie<T> {
                     if slot == 0 {
                         // Empty slot — new key diverges here
                         self.arena[node_idx as usize].set_leaf_child(nib, new_index as u32);
-                        return Ok(new_index);
+                        return Ok(new_index as usize);
                     }
 
                     if node.is_leaf(nib) {
-                        let existing_key_index = slot as usize;
-                        let existing_key = self.keys[existing_key_index].clone();
+                        let existing_key_index = slot;
+                        let existing_key = self.key_slice(existing_key_index).to_vec();
 
                         match simd_find_divergence::<8>(&key, &existing_key, confirmed) {
                             DivergeResult::Duplicate => {
-                                self.keys.pop();
+                                let (off, len) = self.index.pop().unwrap();
+                                self.buf.truncate(off as usize);
                                 let _ = self.values.pop();
                                 return Err(());
                             }
@@ -467,7 +484,7 @@ impl<T> NibbleTrie<T> {
                                 self.arena[node_idx as usize].set_internal_child(nib, split_idx);
                                 self.sort_internal_children(node_idx);
 
-                                return Ok(new_index);
+                                return Ok(new_index as usize);
                             }
                         }
                     }
@@ -492,8 +509,11 @@ impl<T> NibbleTrie<T> {
     }
 
     pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
-        // Skip keys[0] (dummy)
-        let keys: Vec<Vec<u8>> = self.keys.into_iter().skip(1).collect();
+        // Skip index[0] (dummy)
+        let buf = self.buf;
+        let keys: Vec<Vec<u8>> = self.index.into_iter().skip(1).map(|(off, len)| {
+            buf[off as usize..off as usize + len as usize].to_vec()
+        }).collect();
         (keys, self.values)
     }
 
@@ -772,12 +792,12 @@ impl<'a, T> NibbleIter<'a, T> {
         let node = &self.trie.arena[arena_idx as usize];
         if nib == TERMINAL_NIB {
             // Terminal value of this node
-            let key_index = node.leaf as usize;
-            let key = &self.trie.keys[key_index];
-            let value = &self.trie.values[key_index - 1];
+            let key_index = node.leaf;
+            let key = self.trie.key_slice(key_index);
+            let value = &self.trie.values[key_index as usize - 1];
             Some((key, value))
         } else if let Some(key_index) = node.leaf_key_index(nib) {
-            let key = &self.trie.keys[key_index as usize];
+            let key = self.trie.key_slice(key_index);
             let value = &self.trie.values[key_index as usize - 1];
             Some((key, value))
         } else {
@@ -969,8 +989,8 @@ impl<'a, T> NibbleIter<'a, T> {
 
             // Check if this node is terminal and its key >= seek key
             if node.terminal && node.prefix_len as usize >= max_nib {
-                let ki = node.leaf as usize;
-                if self.trie.keys[ki].as_slice() >= key {
+                let ki = node.leaf;
+                if self.trie.key_slice(ki) >= key {
                     self.stack.push((node_idx, mask, TERMINAL_NIB));
                     return self.current();
                 }
@@ -1010,9 +1030,8 @@ impl<'a, T> NibbleIter<'a, T> {
                 self.stack.push((node_idx, mask, nib));
                 if node.is_leaf(nib) {
                     // Check if the leaf key is >= the seek key
-                    let key_index = slot as usize;
-                    let leaf_key = &self.trie.keys[key_index];
-                    if leaf_key.as_slice() >= key {
+                    let leaf_key = self.trie.key_slice(slot);
+                    if leaf_key >= key {
                         return self.current();
                     }
                     // Leaf key < seek key: advance past it
