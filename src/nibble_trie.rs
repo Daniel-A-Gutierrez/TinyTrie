@@ -785,6 +785,97 @@ impl<'a, T> NibbleIter<'a, T> {
         }
     }
 
+    /// Return just the key index at the current cursor position, skipping
+    /// the key buffer and value reads. Useful when only the position matters
+    /// (e.g., random-access cursor patterns where key/value reads hit scattered
+    /// offsets and defeat prefetching).
+    pub fn current_index(&self) -> Option<usize> {
+        let &(arena_idx, _mask, nib) = self.stack.last()?;
+        if nib == usize::MAX {
+            return None;
+        }
+        let node = &self.trie.arena[arena_idx as usize];
+        if nib == TERMINAL_NIB {
+            Some(node.leaf as usize)
+        } else {
+            node.leaf_key_index(nib).map(|ki| ki as usize)
+        }
+    }
+
+    /// Advance to the next key in sorted order, returning only its index.
+    /// Identical navigation to [`next()`](Self::next) but skips key/value reads.
+    pub fn next_index(&mut self) -> Option<usize> {
+        loop {
+            let (arena_idx, mask, nib) = self.stack.pop()?;
+
+            if nib == TERMINAL_NIB {
+                let node = &self.trie.arena[arena_idx as usize];
+                let mask = node.children_mask();
+                if let Some(first_nib) = mask_next(mask, 0) {
+                    self.stack.push((arena_idx, mask, first_nib));
+                    if node.is_leaf(first_nib) {
+                        return self.current_index();
+                    } else {
+                        self.descend_first(node.children[first_nib]);
+                        return self.current_index();
+                    }
+                }
+                continue;
+            }
+
+            let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
+
+            if let Some(next_nib) = mask_next(mask, search_start) {
+                let node = &self.trie.arena[arena_idx as usize];
+                self.stack.push((arena_idx, mask, next_nib));
+                if node.is_leaf(next_nib) {
+                    return self.current_index();
+                } else {
+                    self.descend_first(node.children[next_nib]);
+                    return self.current_index();
+                }
+            }
+        }
+    }
+
+    /// Move to the previous key in sorted order, returning only its index.
+    /// Identical navigation to [`prev()`](Self::prev) but skips key/value reads.
+    pub fn prev_index(&mut self) -> Option<usize> {
+        loop {
+            let (arena_idx, mask, nib) = self.stack.pop()?;
+
+            if nib == TERMINAL_NIB {
+                continue;
+            }
+
+            if nib == 0 || nib == usize::MAX {
+                let node = &self.trie.arena[arena_idx as usize];
+                if node.terminal {
+                    self.stack.push((arena_idx, mask, TERMINAL_NIB));
+                    return self.current_index();
+                }
+                continue;
+            }
+
+            if let Some(prev_nib) = mask_prev(mask, nib) {
+                let node = &self.trie.arena[arena_idx as usize];
+                self.stack.push((arena_idx, mask, prev_nib));
+                if node.is_leaf(prev_nib) {
+                    return self.current_index();
+                } else {
+                    self.descend_last(node.children[prev_nib]);
+                    return self.current_index();
+                }
+            }
+
+            let node = &self.trie.arena[arena_idx as usize];
+            if node.terminal {
+                self.stack.push((arena_idx, mask, TERMINAL_NIB));
+                return self.current_index();
+            }
+        }
+    }
+
     pub fn next(&mut self) -> Option<(&[u8], &T)> {
         loop {
             let (arena_idx, mask, nib) = self.stack.pop()?;
@@ -977,6 +1068,16 @@ impl TinyTrieMap for NibbleTrie<usize> {
         let mut it = self.iter_last();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.prev() { f(k, v); }
+    }
+    fn trie_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
+        let mut it = self.iter();
+        if let Some(i) = it.current_index() { f(i); }
+        while let Some(i) = it.next_index() { f(i); }
+    }
+    fn trie_iter_rev_index(&self, mut f: impl FnMut(usize)) {
+        let mut it = self.iter_last();
+        if let Some(i) = it.current_index() { f(i); }
+        while let Some(i) = it.prev_index() { f(i); }
     }
     fn trie_len(&self) -> usize { self.len() }
     fn trie_optimize(&mut self) { self.optimize(); }

@@ -32,6 +32,20 @@ pub trait TinyTrieMap: Sized {
     /// Iterate all key-value pairs in reverse (descending) order.
     fn trie_iter_rev(&self, f: impl FnMut(&[u8], &usize));
 
+    /// Iterate all key indices in forward (ascending) order.
+    /// Only NibbleTrie implements this — index-only iteration skips key/value reads.
+    /// Default: panic (not all tries support index-only iteration).
+    fn trie_iter_fwd_index(&self, _f: impl FnMut(usize)) {
+        unimplemented!("index-only iteration not supported for this trie type")
+    }
+
+    /// Iterate all key indices in reverse (descending) order.
+    /// Only NibbleTrie implements this — index-only iteration skips key/value reads.
+    /// Default: panic (not all tries support index-only iteration).
+    fn trie_iter_rev_index(&self, _f: impl FnMut(usize)) {
+        unimplemented!("index-only iteration not supported for this trie type")
+    }
+
     /// Number of entries in the trie.
     fn trie_len(&self) -> usize;
 
