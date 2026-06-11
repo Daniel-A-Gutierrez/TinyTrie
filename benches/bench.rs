@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tiny_trie::{BitTrie, NibbleTrie, PolyTrie, TinyTrie};
+use tiny_trie::{BitTrie, NibbleTrie, PolyTrie, TinyTrie, TinyTrieMap};
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -76,6 +76,7 @@ struct Structures {
     hmap: HashMap<Vec<u8>, usize>,
     sorted: Vec<(Vec<u8>, usize)>,
     lookup_keys: Vec<Vec<u8>>,
+    lookup_keys_null: Vec<Vec<u8>>,
 }
 
 fn build_all(keys: &[Vec<u8>]) -> Structures {
@@ -94,17 +95,27 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
         hmap.insert(k.clone(), i);
     }
     let mut lookup_keys = Vec::with_capacity(keys.len() * 2);
+    let mut lookup_keys_null = Vec::with_capacity(keys.len() * 2);
     for k in keys {
+        // Hit key (non-null-terminated for std collections)
         lookup_keys.push(k.clone());
+        // Hit key (null-terminated for trie lookups)
+        let mut nt = k.clone();
+        nt.push(0);
+        lookup_keys_null.push(nt);
+        // Miss key (non-null-terminated)
         let mut miss = k.clone();
         miss.push(b'z');
-        lookup_keys.push(miss);
+        lookup_keys.push(miss.clone());
+        // Miss key (null-terminated)
+        miss.push(0);
+        lookup_keys_null.push(miss);
     }
     let mut ptrie_opt = ptrie.clone();
     ptrie_opt.optimize();
     let mut ntrie_opt = ntrie.clone();
     ntrie_opt.optimize();
-    Structures { trie, ntrie, ntrie_opt, btrie, ptrie, ptrie_opt, btree, hmap, sorted: build_sorted_vec(keys), lookup_keys }
+    Structures { trie, ntrie, ntrie_opt, btrie, ptrie, ptrie_opt, btree, hmap, sorted: build_sorted_vec(keys), lookup_keys, lookup_keys_null }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -143,31 +154,149 @@ fn bench(budget: Duration, label: &str, f: impl Fn()) -> BenchResult {
     BenchResult { iters, elapsed }
 }
 
-// ── Macros ──────────────────────────────────────────────────────────
+// ── Per-test bench traits ───────────────────────────────────────────
 
-/// Conditionally run a benchmark. Only runs if $cond is true.
-/// The body block is wrapped in `||` to form the bench closure.
-macro_rules! bench_run {
-    ($results:expr, $budget:expr, $rate_arg:expr, $cond:expr, $name:expr, $body:block) => {
-        if $cond {
-            let r = bench($budget, $name, || $body);
-            $results.entry($name.to_string()).or_default().push(r.rate($rate_arg));
+trait InsertBench {
+    fn run(keys: &[Vec<u8>]);
+}
+
+trait LookupBench {
+    fn run(&self, keys_null: &[Vec<u8>], keys: &[Vec<u8>]);
+}
+
+trait FwdIterBench {
+    fn run(&self);
+}
+
+trait RevIterBench {
+    fn run(&self);
+}
+
+trait OptimizeBench {
+    fn run(keys: &[Vec<u8>]);
+}
+
+// ── Macro: generate bench trait impls for TinyTrieMap types ────────
+
+macro_rules! impl_trie_benches {
+    ($type:ty) => {
+        impl InsertBench for $type {
+            fn run(keys: &[Vec<u8>]) {
+                let mut m = <$type>::trie_new();
+                for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+                black_box(&m);
+            }
+        }
+        impl LookupBench for $type {
+            fn run(&self, keys_null: &[Vec<u8>], _keys: &[Vec<u8>]) {
+                for k in keys_null { black_box(self.trie_get(k)); }
+            }
+        }
+        impl FwdIterBench for $type {
+            fn run(&self) { self.trie_iter_fwd(|k, v| { black_box(k); black_box(v); }); }
+        }
+        impl RevIterBench for $type {
+            fn run(&self) { self.trie_iter_rev(|k, v| { black_box(k); black_box(v); }); }
         }
     };
 }
 
-/// Snapshot allocator, build structure, measure bytes/key, drop.
-macro_rules! mem_measure {
-    ($active:expr, $name:expr, $size:expr, $results:expr, $build:expr) => {{
-        if $active {
-            let before = read_allocated();
-            let s = $build;
-            let bytes = read_allocated() - before;
-            drop(s);
-            eprintln!("    {}: {} bytes ({:.1}/key)", $name, bytes, bytes as f64 / $size as f64);
-            $results.entry($name.to_string()).or_default().push(bytes as f64 / $size as f64);
+impl_trie_benches!(TinyTrie<usize, 6, u8>);
+impl_trie_benches!(NibbleTrie<usize>);
+impl_trie_benches!(BitTrie<usize>);
+impl_trie_benches!(PolyTrie<usize>);
+
+// NibbleOpt and PolyOpt use the same types as NibbleTrie/PolyTrie —
+// they're just built with optimize(). The trait impls are shared.
+
+// OptimizeBench — only for types that support optimize
+impl OptimizeBench for NibbleTrie<usize> {
+    fn run(keys: &[Vec<u8>]) {
+        let mut m = NibbleTrie::trie_new();
+        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        m.trie_optimize();
+        black_box(&m);
+    }
+}
+
+impl OptimizeBench for PolyTrie<usize> {
+    fn run(keys: &[Vec<u8>]) {
+        let mut m = PolyTrie::trie_new();
+        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        m.trie_optimize();
+        black_box(&m);
+    }
+}
+
+// ── Manual trait impls for std collections ──────────────────────────
+
+impl InsertBench for BTreeMap<Vec<u8>, usize> {
+    fn run(keys: &[Vec<u8>]) {
+        let mut m = BTreeMap::new();
+        for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); }
+        black_box(&m);
+    }
+}
+
+impl LookupBench for BTreeMap<Vec<u8>, usize> {
+    fn run(&self, _keys_null: &[Vec<u8>], keys: &[Vec<u8>]) {
+        for k in keys { black_box(self.get(k)); }
+    }
+}
+
+impl FwdIterBench for BTreeMap<Vec<u8>, usize> {
+    fn run(&self) { for (k, v) in self.iter() { black_box(k); black_box(v); } }
+}
+
+impl RevIterBench for BTreeMap<Vec<u8>, usize> {
+    fn run(&self) { for (k, v) in self.iter().rev() { black_box(k); black_box(v); } }
+}
+
+impl InsertBench for HashMap<Vec<u8>, usize> {
+    fn run(keys: &[Vec<u8>]) {
+        let mut m = HashMap::new();
+        for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); }
+        black_box(&m);
+    }
+}
+
+impl LookupBench for HashMap<Vec<u8>, usize> {
+    fn run(&self, _keys_null: &[Vec<u8>], keys: &[Vec<u8>]) {
+        for k in keys { black_box(self.get(k)); }
+    }
+}
+
+impl InsertBench for Vec<(Vec<u8>, usize)> {
+    fn run(keys: &[Vec<u8>]) {
+        let mut v: Vec<(Vec<u8>, usize)> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            match v.binary_search_by(|e| e.0.as_slice().cmp(k)) {
+                Ok(_) => {}
+                Err(pos) => v.insert(pos, (k.clone(), i)),
+            }
         }
-    }};
+        black_box(&v);
+    }
+}
+
+impl LookupBench for Vec<(Vec<u8>, usize)> {
+    fn run(&self, _keys_null: &[Vec<u8>], keys: &[Vec<u8>]) {
+        for k in keys { black_box(sorted_vec_get(self, k)); }
+    }
+}
+
+impl FwdIterBench for Vec<(Vec<u8>, usize)> {
+    fn run(&self) { for (k, v) in self.iter() { black_box(k); black_box(v); } }
+}
+
+// ── Contestant ──────────────────────────────────────────────────────
+
+/// Measure memory: snapshot allocator, run build closure (which returns bytes used), compute bytes/key.
+/// The build closure must measure allocation before dropping the structure.
+fn mem_measure(name: &str, size: usize, mem: &mut ResultMap, build: impl FnOnce() -> u64) {
+    let bytes = build();
+    eprintln!("    {name}: {bytes} bytes ({:.1}/key)", bytes as f64 / size as f64);
+    mem.entry(name.into()).or_default().push(bytes as f64 / size as f64);
 }
 
 // ── Formatting ──────────────────────────────────────────────────────
@@ -329,82 +458,88 @@ fn main() {
         let keys = string_keys(size);
         eprintln!("✓");
 
-        // ── Insertion ────────────────────────────────────────────────
+        // ── Build contestants ──────────────────────────────────────────
+        // Insertion runs first (no pre-built structure needed)
         eprintln!("  insertion:");
-        bench_run!(ins, budget, size as u64, active[0], "TinyTrie",   { let mut m: TinyTrie<usize, 6, u8> = TinyTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } black_box(&m); });
-        bench_run!(ins, budget, size as u64, active[1], "NibbleTrie", { let mut m: NibbleTrie<usize> = NibbleTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } black_box(&m); });
-        bench_run!(ins, budget, size as u64, active[2], "BitTrie",    { let mut m: BitTrie<usize> = BitTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } black_box(&m); });
-        bench_run!(ins, budget, size as u64, active[3], "PolyTrie",   { let mut m: PolyTrie<usize> = PolyTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } black_box(&m); });
-        bench_run!(ins, budget, size as u64, active[4], "BTreeMap",   { let mut m: BTreeMap<Vec<u8>, usize> = BTreeMap::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); } black_box(&m); });
-        bench_run!(ins, budget, size as u64, active[5], "HashMap",    { let mut m: HashMap<Vec<u8>, usize> = HashMap::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); } black_box(&m); });
-        bench_run!(ins, budget, size as u64, active[6], "SortedVec",  { let mut v: Vec<(Vec<u8>, usize)> = Vec::new(); for (i, k) in keys.iter().enumerate() { match v.binary_search_by(|e| e.0.as_slice().cmp(k)) { Ok(_) => {} Err(pos) => v.insert(pos, (k.clone(), i)), } } black_box(&v); });
+        let any_insert = active[0] || active[1] || active[2] || active[3] || active[4] || active[5] || active[6];
+        if any_insert {
+            if active[0] { let r = bench(budget, "TinyTrie", || <TinyTrie<usize, 6, u8> as InsertBench>::run(&keys)); ins.entry("TinyTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[1] { let r = bench(budget, "NibbleTrie", || <NibbleTrie<usize> as InsertBench>::run(&keys)); ins.entry("NibbleTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[2] { let r = bench(budget, "BitTrie", || <BitTrie<usize> as InsertBench>::run(&keys)); ins.entry("BitTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[3] { let r = bench(budget, "PolyTrie", || <PolyTrie<usize> as InsertBench>::run(&keys)); ins.entry("PolyTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[4] { let r = bench(budget, "BTreeMap", || <BTreeMap<Vec<u8>, usize> as InsertBench>::run(&keys)); ins.entry("BTreeMap".into()).or_default().push(r.rate(size as u64)); }
+            if active[5] { let r = bench(budget, "HashMap", || <HashMap<Vec<u8>, usize> as InsertBench>::run(&keys)); ins.entry("HashMap".into()).or_default().push(r.rate(size as u64)); }
+            if active[6] { let r = bench(budget, "SortedVec", || <Vec<(Vec<u8>, usize)> as InsertBench>::run(&keys)); ins.entry("SortedVec".into()).or_default().push(r.rate(size as u64)); }
+        }
 
-        // ── Build structures for seek / iteration ────────────────────
+        // ── Build structures for lookup / iteration ─────────────────────
         eprint!("  building structures... ");
         let t0 = Instant::now();
         let st = build_all(&keys);
         eprintln!("{:.2}s ✓", t0.elapsed().as_secs_f64());
 
+        let lk = &st.lookup_keys;
+        let lk_null = &st.lookup_keys_null;
+
         // ── Lookup ───────────────────────────────────────────────────
         eprintln!("  lookup:");
-        let lk = &st.lookup_keys;
-        bench_run!(look, budget, lk.len() as u64, active[0], "TinyTrie",   { for k in lk { black_box(st.trie.get(k)); } });
-        bench_run!(look, budget, lk.len() as u64, active[1], "NibbleTrie", { for k in lk { let mut nt = k.clone(); nt.push(0); black_box(st.ntrie.get(&nt)); } });
-        bench_run!(look, budget, lk.len() as u64, active[2], "BitTrie",    { for k in lk { let mut nt = k.clone(); nt.push(0); black_box(st.btrie.get(&nt)); } });
-        bench_run!(look, budget, lk.len() as u64, active[3], "PolyTrie",   { for k in lk { let mut nt = k.clone(); nt.push(0); black_box(st.ptrie.get(&nt)); } });
-        bench_run!(look, budget, lk.len() as u64, active[4], "BTreeMap",   { for k in lk { black_box(st.btree.get(k)); } });
-        bench_run!(look, budget, lk.len() as u64, active[5], "HashMap",    { for k in lk { black_box(st.hmap.get(k)); } });
-        bench_run!(look, budget, lk.len() as u64, active[6], "SortedVec",  { for k in lk { black_box(sorted_vec_get(&st.sorted, k)); } });
-        bench_run!(look, budget, lk.len() as u64, active[7], "NibbleOpt",  { for k in lk { let mut nt = k.clone(); nt.push(0); black_box(st.ntrie_opt.get(&nt)); } });
-        bench_run!(look, budget, lk.len() as u64, active[8], "PolyOpt",   { for k in lk { let mut nt = k.clone(); nt.push(0); black_box(st.ptrie_opt.get(&nt)); } });
+        if active[0] { let r = bench(budget, "TinyTrie", || <TinyTrie<usize, 6, u8> as LookupBench>::run(&st.trie, lk_null, lk)); look.entry("TinyTrie".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[1] { let r = bench(budget, "NibbleTrie", || <NibbleTrie<usize> as LookupBench>::run(&st.ntrie, lk_null, lk)); look.entry("NibbleTrie".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[2] { let r = bench(budget, "BitTrie", || <BitTrie<usize> as LookupBench>::run(&st.btrie, lk_null, lk)); look.entry("BitTrie".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[3] { let r = bench(budget, "PolyTrie", || <PolyTrie<usize> as LookupBench>::run(&st.ptrie, lk_null, lk)); look.entry("PolyTrie".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[4] { let r = bench(budget, "BTreeMap", || <BTreeMap<Vec<u8>, usize> as LookupBench>::run(&st.btree, lk_null, lk)); look.entry("BTreeMap".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[5] { let r = bench(budget, "HashMap", || <HashMap<Vec<u8>, usize> as LookupBench>::run(&st.hmap, lk_null, lk)); look.entry("HashMap".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[6] { let r = bench(budget, "SortedVec", || <Vec<(Vec<u8>, usize)> as LookupBench>::run(&st.sorted, lk_null, lk)); look.entry("SortedVec".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[7] { let r = bench(budget, "NibbleOpt", || <NibbleTrie<usize> as LookupBench>::run(&st.ntrie_opt, lk_null, lk)); look.entry("NibbleOpt".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[8] { let r = bench(budget, "PolyOpt", || <PolyTrie<usize> as LookupBench>::run(&st.ptrie_opt, lk_null, lk)); look.entry("PolyOpt".into()).or_default().push(r.rate(lk.len() as u64)); }
 
         // ── Forward iteration ─────────────────────────────────────────
         let any_fwd = active[0] || active[1] || active[2] || active[3] || active[4] || active[6] || active[7] || active[8];
         if any_fwd {
             eprintln!("  iteration (forward):");
-            bench_run!(fwd, budget, size as u64, active[0], "TinyTrie",   { let mut it = st.trie.iter(); while let Some((k, v)) = it.next() { black_box(k); black_box(v); } });
-            bench_run!(fwd, budget, size as u64, active[1], "NibbleTrie", { let mut it = st.ntrie.iter(); while let Some((k, v)) = it.next() { black_box(k); black_box(v); } });
-            bench_run!(fwd, budget, size as u64, active[2], "BitTrie",    { let mut it = st.btrie.iter(); while let Some((k, v)) = it.next() { black_box(k); black_box(v); } });
-            bench_run!(fwd, budget, size as u64, active[3], "PolyTrie",   { let mut it = st.ptrie.iter(); while let Some((k, v)) = it.next() { black_box(k); black_box(v); } });
-            bench_run!(fwd, budget, size as u64, active[4], "BTreeMap",   { for (k, v) in st.btree.iter() { black_box(k); black_box(v); } });
-            bench_run!(fwd, budget, size as u64, active[6], "SortedVec",  { for (k, v) in st.sorted.iter() { black_box(k); black_box(v); } });
-            bench_run!(fwd, budget, size as u64, active[7], "NibbleOpt",  { let mut it = st.ntrie_opt.iter(); while let Some((k, v)) = it.next() { black_box(k); black_box(v); } });
-            bench_run!(fwd, budget, size as u64, active[8], "PolyOpt",   { let mut it = st.ptrie_opt.iter(); while let Some((k, v)) = it.next() { black_box(k); black_box(v); } });
+            if active[0] { let r = bench(budget, "TinyTrie", || <TinyTrie<usize, 6, u8> as FwdIterBench>::run(&st.trie)); fwd.entry("TinyTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[1] { let r = bench(budget, "NibbleTrie", || <NibbleTrie<usize> as FwdIterBench>::run(&st.ntrie)); fwd.entry("NibbleTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[2] { let r = bench(budget, "BitTrie", || <BitTrie<usize> as FwdIterBench>::run(&st.btrie)); fwd.entry("BitTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[3] { let r = bench(budget, "PolyTrie", || <PolyTrie<usize> as FwdIterBench>::run(&st.ptrie)); fwd.entry("PolyTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[4] { let r = bench(budget, "BTreeMap", || <BTreeMap<Vec<u8>, usize> as FwdIterBench>::run(&st.btree)); fwd.entry("BTreeMap".into()).or_default().push(r.rate(size as u64)); }
+            if active[6] { let r = bench(budget, "SortedVec", || <Vec<(Vec<u8>, usize)> as FwdIterBench>::run(&st.sorted)); fwd.entry("SortedVec".into()).or_default().push(r.rate(size as u64)); }
+            if active[7] { let r = bench(budget, "NibbleOpt", || <NibbleTrie<usize> as FwdIterBench>::run(&st.ntrie_opt)); fwd.entry("NibbleOpt".into()).or_default().push(r.rate(size as u64)); }
+            if active[8] { let r = bench(budget, "PolyOpt", || <PolyTrie<usize> as FwdIterBench>::run(&st.ptrie_opt)); fwd.entry("PolyOpt".into()).or_default().push(r.rate(size as u64)); }
         }
 
         // ── Backward iteration ───────────────────────────────────────
         let any_rev = active[0] || active[1] || active[2] || active[3] || active[4] || active[7] || active[8];
         if any_rev {
             eprintln!("  iteration (backward):");
-            bench_run!(rev, budget, size as u64, active[0], "TinyTrie",   { let mut it = st.trie.iter_last(); while let Some((k, v)) = it.prev() { black_box(k); black_box(v); } });
-            bench_run!(rev, budget, size as u64, active[1], "NibbleTrie", { let mut it = st.ntrie.iter_last(); while let Some((k, v)) = it.prev() { black_box(k); black_box(v); } });
-            bench_run!(rev, budget, size as u64, active[2], "BitTrie",    { let mut it = st.btrie.iter_last(); while let Some((k, v)) = it.prev() { black_box(k); black_box(v); } });
-            bench_run!(rev, budget, size as u64, active[3], "PolyTrie",   { let mut it = st.ptrie.iter_last(); loop { match it.current() { Some((k, v)) => { black_box(k); black_box(v); } None => break, } if it.prev().is_none() { break; } } });
-            bench_run!(rev, budget, size as u64, active[4], "BTreeMap",   { for (k, v) in st.btree.iter().rev() { black_box(k); black_box(v); } });
-            bench_run!(rev, budget, size as u64, active[7], "NibbleOpt",  { let mut it = st.ntrie_opt.iter_last(); while let Some((k, v)) = it.prev() { black_box(k); black_box(v); } });
-            bench_run!(rev, budget, size as u64, active[8], "PolyOpt",   { let mut it = st.ptrie_opt.iter_last(); loop { match it.current() { Some((k, v)) => { black_box(k); black_box(v); } None => break, } if it.prev().is_none() { break; } } });
+            if active[0] { let r = bench(budget, "TinyTrie", || <TinyTrie<usize, 6, u8> as RevIterBench>::run(&st.trie)); rev.entry("TinyTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[1] { let r = bench(budget, "NibbleTrie", || <NibbleTrie<usize> as RevIterBench>::run(&st.ntrie)); rev.entry("NibbleTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[2] { let r = bench(budget, "BitTrie", || <BitTrie<usize> as RevIterBench>::run(&st.btrie)); rev.entry("BitTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[3] { let r = bench(budget, "PolyTrie", || <PolyTrie<usize> as RevIterBench>::run(&st.ptrie)); rev.entry("PolyTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[4] { let r = bench(budget, "BTreeMap", || <BTreeMap<Vec<u8>, usize> as RevIterBench>::run(&st.btree)); rev.entry("BTreeMap".into()).or_default().push(r.rate(size as u64)); }
+            if active[7] { let r = bench(budget, "NibbleOpt", || <NibbleTrie<usize> as RevIterBench>::run(&st.ntrie_opt)); rev.entry("NibbleOpt".into()).or_default().push(r.rate(size as u64)); }
+            if active[8] { let r = bench(budget, "PolyOpt", || <PolyTrie<usize> as RevIterBench>::run(&st.ptrie_opt)); rev.entry("PolyOpt".into()).or_default().push(r.rate(size as u64)); }
         }
 
         // ── Optimize time ─────────────────────────────────────────────
         if active[7] || active[8] {
             eprintln!("  optimize:");
-            bench_run!(opt, budget, size as u64, active[7], "NibbleOpt", { let mut m: NibbleTrie<usize> = NibbleTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m.optimize(); black_box(&m); });
-            bench_run!(opt, budget, size as u64, active[8], "PolyOpt",  { let mut m: PolyTrie<usize> = PolyTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m.optimize(); black_box(&m); });
+            if active[7] { let r = bench(budget, "NibbleOpt", || <NibbleTrie<usize> as OptimizeBench>::run(&keys)); opt.entry("NibbleOpt".into()).or_default().push(r.rate(size as u64)); }
+            if active[8] { let r = bench(budget, "PolyOpt", || <PolyTrie<usize> as OptimizeBench>::run(&keys)); opt.entry("PolyOpt".into()).or_default().push(r.rate(size as u64)); }
         }
 
         // ── Memory (sequential, needs clean allocator state) ────────
         drop(st);
         eprintln!("  memory:");
 
-        mem_measure!(active[0], "TinyTrie",   size, mem, { let mut m: TinyTrie<usize, 6, u8> = TinyTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m });
-        mem_measure!(active[1], "NibbleTrie", size, mem, { let mut m: NibbleTrie<usize> = NibbleTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m });
-        mem_measure!(active[2], "BitTrie",    size, mem, { let mut m: BitTrie<usize> = BitTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m });
-        mem_measure!(active[3], "PolyTrie",  size, mem, { let mut m: PolyTrie<usize> = PolyTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m });
-        mem_measure!(active[4], "BTreeMap",  size, mem, { let mut m: BTreeMap<Vec<u8>, usize> = BTreeMap::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); } m });
-        mem_measure!(active[5], "HashMap",   size, mem, { let mut m: HashMap<Vec<u8>, usize> = HashMap::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); } m });
-        mem_measure!(active[6], "SortedVec", size, mem, { build_sorted_vec(&keys) });
-        mem_measure!(active[7], "NibbleOpt", size, mem, { let mut m: NibbleTrie<usize> = NibbleTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m.optimize(); m });
-        mem_measure!(active[8], "PolyOpt",  size, mem, { let mut m: PolyTrie<usize> = PolyTrie::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); } m.optimize(); m });
+        if active[0] { mem_measure("TinyTrie", size, &mut mem, || { let before = read_allocated(); let mut m: TinyTrie<usize, 6, u8> = TinyTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[1] { mem_measure("NibbleTrie", size, &mut mem, || { let before = read_allocated(); let mut m: NibbleTrie<usize> = NibbleTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[2] { mem_measure("BitTrie", size, &mut mem, || { let before = read_allocated(); let mut m: BitTrie<usize> = BitTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[3] { mem_measure("PolyTrie", size, &mut mem, || { let before = read_allocated(); let mut m: PolyTrie<usize> = PolyTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[4] { mem_measure("BTreeMap", size, &mut mem, || { let before = read_allocated(); let mut m: BTreeMap<Vec<u8>, usize> = BTreeMap::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); } let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[5] { mem_measure("HashMap", size, &mut mem, || { let before = read_allocated(); let mut m: HashMap<Vec<u8>, usize> = HashMap::new(); for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i); } let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[6] { mem_measure("SortedVec", size, &mut mem, || { let before = read_allocated(); let s = build_sorted_vec(&keys); let bytes = read_allocated() - before; drop(s); bytes }); }
+        if active[7] { mem_measure("NibbleOpt", size, &mut mem, || { let before = read_allocated(); let mut m: NibbleTrie<usize> = NibbleTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } m.trie_optimize(); let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[8] { mem_measure("PolyOpt", size, &mut mem, || { let before = read_allocated(); let mut m: PolyTrie<usize> = PolyTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } m.trie_optimize(); let bytes = read_allocated() - before; drop(m); bytes }); }
 
         eprintln!();
     }

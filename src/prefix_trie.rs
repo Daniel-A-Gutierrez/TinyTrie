@@ -1,4 +1,5 @@
 use crate::prefix_len::PrefixLen;
+use crate::TinyTrieMap;
 use crate::pairvec::{
     add_child_to_pairvec, free_pairvec_data, promote_inode_to_pairvec, PairVec,
 };
@@ -1056,6 +1057,24 @@ fn add_child_to_inode<const INLINE: usize, PREFIX: PrefixLen>(
         unsafe { free_children_slice(inode.children, old_tag); }
         Trie { pairvec: new_pv }
     }
+}
+
+impl TinyTrieMap for TinyTrie<usize, 6, u8> {
+    fn trie_new() -> Self { Self::new() }
+    fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
+    fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn trie_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
+        let mut it = self.iter();
+        if let Some((k, v)) = it.current() { f(k, v); }
+        while let Some((k, v)) = it.next() { f(k, v); }
+    }
+    fn trie_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
+        let mut it = self.iter_last();
+        if let Some((k, v)) = it.current() { f(k, v); }
+        while let Some((k, v)) = it.prev() { f(k, v); }
+    }
+    fn trie_len(&self) -> usize { self.len() }
+    // trie_optimize: default no-op (TinyTrie has no optimize)
 }
 
 #[cfg(test)]

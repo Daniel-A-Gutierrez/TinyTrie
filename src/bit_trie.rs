@@ -19,6 +19,7 @@
 //! This allows 0 to be used as a sentinel for "empty" in `children[]`,
 //! eliminating +1/-1 arithmetic.
 
+use crate::TinyTrieMap;
 use std::simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq};
 
 // ---------------------------------------------------------------------------
@@ -684,6 +685,24 @@ impl<'a, T> BitIter<'a, T> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+impl TinyTrieMap for BitTrie<usize> {
+    fn trie_new() -> Self { Self::new() }
+    fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
+    fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn trie_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
+        let mut it = self.iter();
+        if let Some((k, v)) = it.current() { f(k, v); }
+        while let Some((k, v)) = it.next() { f(k, v); }
+    }
+    fn trie_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
+        let mut it = self.iter_last();
+        if let Some((k, v)) = it.current() { f(k, v); }
+        while let Some((k, v)) = it.prev() { f(k, v); }
+    }
+    fn trie_len(&self) -> usize { self.len() }
+    // trie_optimize: default no-op (BitTrie has no optimize)
+}
 
 #[cfg(test)]
 mod tests {

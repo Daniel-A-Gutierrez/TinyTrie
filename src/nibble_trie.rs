@@ -17,6 +17,7 @@
 //! start at index 1. This allows 0 to be used as a sentinel for "empty" in
 //! both `children[]` and the `leaf` field, eliminating +1/-1 arithmetic.
 
+use crate::TinyTrieMap;
 use std::collections::VecDeque;
 use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
 
@@ -864,6 +865,24 @@ impl<'a, T> NibbleIter<'a, T> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+impl TinyTrieMap for NibbleTrie<usize> {
+    fn trie_new() -> Self { Self::new() }
+    fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
+    fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn trie_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
+        let mut it = self.iter();
+        if let Some((k, v)) = it.current() { f(k, v); }
+        while let Some((k, v)) = it.next() { f(k, v); }
+    }
+    fn trie_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
+        let mut it = self.iter_last();
+        if let Some((k, v)) = it.current() { f(k, v); }
+        while let Some((k, v)) = it.prev() { f(k, v); }
+    }
+    fn trie_len(&self) -> usize { self.len() }
+    fn trie_optimize(&mut self) { self.optimize(); }
+}
 
 #[cfg(test)]
 mod tests {
