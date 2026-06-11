@@ -1,46 +1,46 @@
 
 ─── Insertion (keys/sec) ───
                    10000      100000    10000000
-    BTreeMap       9.94M       6.75M       4.40M
-     BitTrie       5.25M       4.40M       2.66M
+    BTreeMap      10.20M       6.46M       4.41M
+     BitTrie       5.45M       4.55M       2.29M
      HashMap      16.13M       7.05M       1.79M
-  NibbleTrie      13.27M      14.66M      12.32M
-    PolyTrie       6.21M       5.57M       4.43M
+  NibbleTrie      13.33M      14.59M       9.90M
+    PolyTrie       5.84M       5.62M       4.28M
    SortedVec       9.56M       7.67M       2.78M
-    TinyTrie       5.55M       4.91M       3.40M
+    TinyTrie       5.62M       4.70M       3.27M
 
 ─── Iter backward (keys/sec) ───
                    10000      100000    10000000
-    BTreeMap     691.18M     149.26M      43.36M
-     BitTrie     155.36M     149.19M     146.03M
+    BTreeMap     901.17M     221.79M      46.52M
+     BitTrie     189.21M     177.78M     162.71M
    NibbleOpt     187.17M     183.77M     184.91M
-  NibbleTrie     183.72M     179.40M     173.65M
+  NibbleTrie     193.56M     205.69M     193.33M
      PolyOpt     103.41M     102.19M     102.32M
-    PolyTrie     101.68M      95.63M      91.00M
-    TinyTrie     206.20M     128.96M      47.57M
+    PolyTrie     149.01M     143.70M     113.27M
+    TinyTrie     334.58M     196.51M      54.36M
 
 ─── Iter forward (keys/sec) ───
                    10000      100000    10000000
-    BTreeMap     764.78M     135.03M      42.90M
-     BitTrie     161.55M     154.39M     145.51M
+    BTreeMap     984.29M     324.12M      41.60M
+     BitTrie     188.07M     174.33M     130.41M
    NibbleOpt     176.73M     174.91M     172.69M
-  NibbleTrie     177.55M     174.73M     173.81M
+  NibbleTrie     200.21M     200.26M     196.47M
      PolyOpt     122.54M     121.31M     121.07M
-    PolyTrie     122.90M     118.20M     115.04M
+    PolyTrie     148.62M     147.10M     134.07M
    SortedVec       2.44G       2.44G       2.45G
-    TinyTrie     207.48M     114.47M      48.48M
+    TinyTrie     311.99M     179.85M      55.16M
 
 ─── Lookup (keys/sec) ───
                    10000      100000    10000000
-    BTreeMap      16.00M      10.51M       7.48M
-     BitTrie      13.32M       9.29M       7.42M
+    BTreeMap      17.53M      11.60M       8.36M
+     BitTrie      20.99M      12.32M       8.98M
      HashMap      56.56M      12.76M       6.77M
    NibbleOpt      31.61M      27.54M      23.42M
-  NibbleTrie      30.42M      17.93M      15.78M
+  NibbleTrie      96.44M      28.55M      26.66M
      PolyOpt      22.84M      19.81M      15.86M
-    PolyTrie      21.12M      14.23M      11.82M
+    PolyTrie      34.87M      17.38M      14.03M
    SortedVec      11.40M       9.20M       6.35M
-    TinyTrie      19.73M      12.57M       9.46M
+    TinyTrie      20.42M      11.00M       9.58M
 
 ─── Memory (bytes/key) ───
                    10000      100000    10000000
