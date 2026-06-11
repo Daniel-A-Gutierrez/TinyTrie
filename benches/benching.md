@@ -36,7 +36,7 @@ The `trie_` prefix on `TinyTrieMap` methods avoids collisions with inherent meth
 
 ### Null-terminator normalization
 
-`Structures` stores both `lookup_keys` (non-null-terminated, for std collections) and `lookup_keys_null` (null-terminated, for tries). This eliminates per-entry `let mut nt = k.clone(); nt.push(0);` scaffolding.
+`Structures` stores both `lookup_keys` (plain, for std collections and NibbleTrie) and `lookup_keys_null` (null-terminated, for TinyTrie, BitTrie, and PolyTrie). NibbleTrie's `LookupBench` impl uses plain keys; the other tries use null-terminated keys.
 
 ### Iterator semantics
 
