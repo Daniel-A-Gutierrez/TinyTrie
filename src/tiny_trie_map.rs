@@ -18,11 +18,12 @@ pub trait TinyTrieMap: Sized {
     /// Create an empty trie.
     fn trie_new() -> Self;
 
-    /// Insert a key-value pair. Panics on null keys (matching bench behavior
-    /// where `.unwrap()` is always called on `Result<usize, ()>`).
+    /// Insert a key-value pair. For TinyTrie, BitTrie, and PolyTrie, keys
+    /// must not contain `0x00`. NibbleTrie accepts any byte including `0x00`.
     fn trie_insert(&mut self, key: Vec<u8>, value: usize);
 
-    /// Look up a key. The key must be null-terminated for all trie types.
+    /// Look up a key. For TinyTrie, BitTrie, and PolyTrie, the key must be
+    /// null-terminated. NibbleTrie accepts plain `&[u8]` keys.
     fn trie_get(&self, key: &[u8]) -> Option<usize>;
 
     /// Iterate all key-value pairs in forward (ascending) order.

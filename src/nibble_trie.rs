@@ -5,15 +5,16 @@
 //! simplicity and lookup speed: no comparison loops, no branch misprediction
 //! on the child search path.
 //!
-//! # Null-Terminator Contract
+//! # Terminal Nodes
 //!
-//! Same as [`TinyTrie`]: `insert()` rejects keys containing `0x00` and appends
-//! a null terminator internally. `get()` and `seek()` require null-terminated
-//! input.
+//! Keys that are prefixes of other keys (e.g. "ab" in {"ab", "abc"}) are
+//! represented by a `terminal` flag on the node where the key ends, rather
+//! than a null-byte leaf child. This eliminates null terminators, allows
+//! `0x00` bytes in keys, and makes `get()` accept plain `&[u8]`.
 //!
 //! # Key Index Encoding
 //!
-//! A dummy key (`b"\0"`) occupies `keys[0]`. Real keys start at index 1.
+//! A dummy empty key occupies `keys[0]`. Real keys start at index 1.
 //! This allows 0 to be used as a sentinel for "empty" in both `children[]`
 //! and the `leaf` field, eliminating +1/-1 arithmetic.
 
@@ -27,29 +28,31 @@ use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
 
 /// A single node in the nibble trie arena.
 ///
-/// Layout (72 bytes):
-/// - `prefix_len`: absolute nibble position of this node's discriminating
-///   nibble. During lookup, use `key_nibble_at(key, prefix_len)` directly —
-///   no accumulation needed.
-/// - `leaf_mask`: bit N set → `children[N]` holds a leaf key index.
-/// - `leaf`: key index of any descendant leaf. Set once at node creation,
-///   used during insertion to find a reference key in O(1).
+/// Layout (76 bytes):
 /// - `children`: 16 slots indexed by nibble value. `0` = empty slot.
 ///   For internal nodes, the value is an arena index (≥ 1).
 ///   For leaves (when `leaf_mask` bit is set), the value is a key index (≥ 1,
 ///   since `keys[0]` is a dummy).
-// #[repr(C)]
+/// - `prefix_len`: absolute nibble position of this node's discriminating
+///   nibble. During lookup, use `key_nibble_at(key, prefix_len)` directly —
+///   no accumulation needed.
+/// - `leaf_mask`: bit N set → `children[N]` holds a leaf key index.
+/// - `leaf`: key index of a reference key. When `terminal` is true, this is
+///   the node's own key index. When false, it's a descendant leaf key index.
+/// - `terminal`: true if this node represents a complete key (the key ends
+///   at this node's prefix position, without needing to descend further).
 #[derive(Copy, Clone)]
 struct Node {
     children: [u32; 16],
     prefix_len: u16,
     leaf_mask: u16,
     leaf: u32,
+    terminal: bool,
 }
 
 impl Node {
     fn new() -> Self {
-        Node { prefix_len: 0, leaf_mask: 0, leaf: 0, children: [0; 16] }
+        Node { prefix_len: 0, leaf_mask: 0, leaf: 0, terminal: false, children: [0; 16] }
     }
 
     #[inline]
@@ -96,18 +99,6 @@ impl Node {
     fn leaf_key_index(&self, nib: usize) -> Option<u32> {
         debug_assert!(nib < 16);
         if self.is_leaf(nib) && self.children[nib] != 0 {
-            Some(self.children[nib])
-        } else {
-            None
-        }
-    }
-
-    /// Get the arena index of an internal child at `nib`.
-    /// Returns `None` if the slot is empty or is a leaf.
-    #[inline]
-    fn internal_child(&self, nib: usize) -> Option<u32> {
-        debug_assert!(nib < 16);
-        if !self.is_leaf(nib) && self.children[nib] != 0 {
             Some(self.children[nib])
         } else {
             None
@@ -278,7 +269,7 @@ impl<T> NibbleTrie<T> {
     pub fn new() -> Self {
         NibbleTrie {
             arena: Vec::new(),
-            keys: vec![vec![0]], // keys[0] = dummy key (null-terminated empty string)
+            keys: vec![vec![]], // keys[0] = dummy (empty, not null-terminated)
             values: Vec::new(),
         }
     }
@@ -300,15 +291,26 @@ impl<T> NibbleTrie<T> {
             return None;
         }
         let mut node_idx: u32 = 0;
+        let max_nib = key.len() * 2;
         loop {
             let node = &self.arena[node_idx as usize];
+            // Key nibbles exhausted — check if this node is terminal
+            if node.prefix_len as usize >= max_nib {
+                if node.terminal {
+                    let ki = node.leaf as usize;
+                    if self.keys[ki] == key {
+                        return Some(ki);
+                    }
+                }
+                return None;
+            }
             let nib = key_nibble_at(key, node.prefix_len as usize) as usize;
             let slot = node.children[nib];
             if slot == 0 {
                 return None;
             }
             if node.is_leaf(nib) {
-                let key_index = slot as usize; // direct index, no -1
+                let key_index = slot as usize;
                 debug_assert!(key_index > 0);
                 return if self.keys[key_index] == key {
                     Some(key_index)
@@ -329,20 +331,23 @@ impl<T> NibbleTrie<T> {
     // -----------------------------------------------------------------------
 
     pub fn insert(&mut self, key: Vec<u8>, value: T) -> Result<usize, ()> {
-        if key.contains(&0) {
-            return Err(());
-        }
-
-        let mut nt_key = key;
-        nt_key.push(0);
-
         // Real key index: keys[0] is the dummy, so real keys start at 1
         let new_index = self.keys.len();
-        self.keys.push(nt_key.clone());
+        self.keys.push(key.clone());
         self.values.push(value);
 
+        let max_nib = key.len() * 2;
+
         if self.arena.is_empty() {
-            let first_nib = key_nibble_at(&nt_key, 0) as usize;
+            if max_nib == 0 {
+                // Empty key — root node itself is terminal
+                let mut root = Node::new();
+                root.terminal = true;
+                root.leaf = new_index as u32;
+                self.arena.push(root);
+                return Ok(new_index);
+            }
+            let first_nib = key_nibble_at(&key, 0) as usize;
             let mut root = Node::new();
             root.set_leaf_child(first_nib, new_index as u32);
             root.leaf = new_index as u32;
@@ -350,7 +355,6 @@ impl<T> NibbleTrie<T> {
             return Ok(new_index);
         }
 
-        let new_key = &nt_key;
         let mut node_idx: u32 = 0;
         // Nibbles 0..confirmed-1 are known to match between new_key and any
         // key in the current subtree. Skipping them avoids re-scanning the
@@ -362,7 +366,7 @@ impl<T> NibbleTrie<T> {
             let ref_key = &self.keys[node.leaf as usize];
             let prefix_len = node.prefix_len as usize;
 
-            match simd_find_divergence::<8>(new_key, ref_key, confirmed) {
+            match simd_find_divergence::<8>(&key, ref_key, confirmed) {
                 DivergeResult::Duplicate => {
                     self.keys.pop();
                     let _ = self.values.pop();
@@ -370,34 +374,54 @@ impl<T> NibbleTrie<T> {
                 }
                 DivergeResult::At(diverge) if diverge < prefix_len => {
                     // Divergence before the discriminating nibble — split this node
-                    let new_nib = key_nibble_at(new_key, diverge) as usize;
+                    let new_nib = key_nibble_at(&key, diverge) as usize;
                     let ref_nib = key_nibble_at(ref_key, diverge) as usize;
 
                     let mut new_parent = Node::new();
                     new_parent.prefix_len = diverge as u16;
-                    new_parent.set_leaf_child(new_nib, new_index as u32);
-                    new_parent.leaf = new_index as u32;
+
+                    if diverge >= max_nib {
+                        // New key ends at the split point — terminal
+                        new_parent.terminal = true;
+                        new_parent.leaf = new_index as u32;
+                        new_parent.set_internal_child(ref_nib, /* filled below */ 0);
+                    } else {
+                        new_parent.set_leaf_child(new_nib, new_index as u32);
+                        new_parent.leaf = new_index as u32;
+                    }
 
                     let old_node = std::mem::replace(
                         &mut self.arena[node_idx as usize],
-                        Node::new(),
+                        new_parent,
                     );
                     let old_idx = self.arena.len() as u32;
                     self.arena.push(old_node);
 
-                    self.arena[node_idx as usize] = new_parent;
-                    self.arena[node_idx as usize].set_internal_child(ref_nib, old_idx);
+                    if diverge >= max_nib {
+                        self.arena[node_idx as usize].set_internal_child(ref_nib, old_idx);
+                    } else {
+                        self.arena[node_idx as usize].set_internal_child(ref_nib, old_idx);
+                    }
                     self.sort_internal_children(node_idx);
 
                     return Ok(new_index);
                 }
                 DivergeResult::At(_) => {
-                    // Divergence at or after prefix_len — follow the child
+                    // Divergence at or after prefix_len — follow the child.
+                    // But first check if the new key is a prefix that ends here.
+                    if max_nib <= prefix_len {
+                        // Key nibbles exhausted at this node — mark terminal
+                        self.arena[node_idx as usize].terminal = true;
+                        self.arena[node_idx as usize].leaf = new_index as u32;
+                        return Ok(new_index);
+                    }
+
                     confirmed = prefix_len + 1;
-                    let nib = key_nibble_at(new_key, prefix_len) as usize;
+                    let nib = key_nibble_at(&key, prefix_len) as usize;
                     let slot = node.children[nib];
 
                     if slot == 0 {
+                        // Empty slot — new key diverges here
                         self.arena[node_idx as usize].set_leaf_child(nib, new_index as u32);
                         return Ok(new_index);
                     }
@@ -406,22 +430,37 @@ impl<T> NibbleTrie<T> {
                         let existing_key_index = slot as usize;
                         let existing_key = self.keys[existing_key_index].clone();
 
-                        match simd_find_divergence::<8>(new_key, &existing_key, confirmed) {
+                        match simd_find_divergence::<8>(&key, &existing_key, confirmed) {
                             DivergeResult::Duplicate => {
                                 self.keys.pop();
                                 let _ = self.values.pop();
                                 return Err(());
                             }
                             DivergeResult::At(d) => {
-                                let new_nib = key_nibble_at(new_key, d) as usize;
-                                let exist_nib = key_nibble_at(&existing_key, d) as usize;
-                                debug_assert_ne!(new_nib, exist_nib);
-
                                 let mut split_node = Node::new();
                                 split_node.prefix_len = d as u16;
-                                split_node.set_leaf_child(new_nib, new_index as u32);
-                                split_node.set_leaf_child(exist_nib, existing_key_index as u32);
-                                split_node.leaf = existing_key_index as u32;
+
+                                if d >= max_nib {
+                                    // New key ends at the split point — terminal
+                                    let exist_nib = key_nibble_at(&existing_key, d) as usize;
+                                    split_node.terminal = true;
+                                    split_node.leaf = new_index as u32;
+                                    split_node.set_leaf_child(exist_nib, existing_key_index as u32);
+                                } else if d >= existing_key.len() * 2 {
+                                    // Existing key ends at the split point — terminal
+                                    let new_nib = key_nibble_at(&key, d) as usize;
+                                    split_node.terminal = true;
+                                    split_node.leaf = existing_key_index as u32;
+                                    split_node.set_leaf_child(new_nib, new_index as u32);
+                                } else {
+                                    // Neither key ends at the split point — they diverge here
+                                    let new_nib = key_nibble_at(&key, d) as usize;
+                                    let exist_nib = key_nibble_at(&existing_key, d) as usize;
+                                    debug_assert_ne!(new_nib, exist_nib);
+                                    split_node.set_leaf_child(new_nib, new_index as u32);
+                                    split_node.set_leaf_child(exist_nib, existing_key_index as u32);
+                                    split_node.leaf = existing_key_index as u32;
+                                }
 
                                 let split_idx = self.arena.len() as u32;
                                 self.arena.push(split_node);
@@ -453,8 +492,8 @@ impl<T> NibbleTrie<T> {
     }
 
     pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
-        // Skip keys[0] (dummy), strip null terminators
-        let keys = self.keys.into_iter().skip(1).map(|mut k| { k.pop(); k }).collect();
+        // Skip keys[0] (dummy)
+        let keys: Vec<Vec<u8>> = self.keys.into_iter().skip(1).collect();
         (keys, self.values)
     }
 
@@ -618,6 +657,9 @@ impl<T> Default for NibbleTrie<T> {
 // Iterator
 // ---------------------------------------------------------------------------
 
+/// Sentinel nib value meaning "positioned at the terminal value of this node."
+const TERMINAL_NIB: usize = 16;
+
 pub struct NibbleIter<'a, T> {
     trie: &'a NibbleTrie<T>,
     /// Stack of (arena_index, children_mask, nibble_position) triples.
@@ -625,11 +667,10 @@ pub struct NibbleIter<'a, T> {
     /// - `arena_idx`: index into the arena (which node)
     /// - `mask`: full `children_mask()` of that node, computed once on push.
     ///   Used for O(1) sibling navigation via TZ/LZ instead of linear scan.
-    /// - `nib`: current child position (0–15), or `usize::MAX` sentinel meaning
-    ///   "before first child" (initial state).
-    ///
-    /// Layout: `(u32, u16, usize)` — the u16 fits in the padding between u32
-    /// and usize, so this is the same 16 bytes as the old `(u32, usize)`.
+    /// - `nib`: current position. Values:
+    ///   - `usize::MAX`: before-first (initial state, no position)
+    ///   - `0..16`: positioned at child slot `nib` (may be leaf or internal)
+    ///   - `TERMINAL_NIB (16)`: positioned at the node's terminal value
     stack: Vec<(u32, u16, usize)>,
 }
 
@@ -639,7 +680,10 @@ impl<'a, T> NibbleIter<'a, T> {
             return NibbleIter { trie, stack: Vec::new() };
         }
         let mask = trie.arena[0].children_mask();
-        NibbleIter { trie, stack: vec![(0, mask, usize::MAX)] }
+        // If root is terminal, start at the terminal value.
+        // Otherwise, start before the first child (usize::MAX).
+        let nib = if trie.arena[0].terminal { TERMINAL_NIB } else { usize::MAX };
+        NibbleIter { trie, stack: vec![(0, mask, nib)] }
     }
 
     fn new_last(trie: &'a NibbleTrie<T>) -> Self {
@@ -659,6 +703,10 @@ impl<'a, T> NibbleIter<'a, T> {
                 } else {
                     idx = node.children[nib];
                 }
+            } else if node.terminal {
+                // Node has no children but is terminal — position at terminal
+                stack.push((idx, mask, TERMINAL_NIB));
+                break;
             } else {
                 break;
             }
@@ -666,12 +714,22 @@ impl<'a, T> NibbleIter<'a, T> {
         NibbleIter { trie, stack }
     }
 
-    /// Descend from internal node `idx` to its leftmost leaf, pushing
-    /// `(idx, mask, first_nib)` entries onto the stack along the way.
+    /// Descend from internal node `idx` to its leftmost position.
+    /// If the first node encountered is terminal, position at its terminal value.
+    /// Otherwise find the leftmost child.
     fn descend_first(&mut self, mut idx: u32) {
         loop {
             let node = &self.trie.arena[idx as usize];
+            if node.terminal {
+                let mask = node.children_mask();
+                self.stack.push((idx, mask, TERMINAL_NIB));
+                return;
+            }
             let mask = node.children_mask();
+            if mask == 0 {
+                // No children and not terminal — shouldn't happen in a well-formed trie
+                return;
+            }
             let nib = mask.trailing_zeros() as usize; // lowest set bit
             self.stack.push((idx, mask, nib));
             if node.is_leaf(nib) {
@@ -682,12 +740,20 @@ impl<'a, T> NibbleIter<'a, T> {
         }
     }
 
-    /// Descend from internal node `idx` to its rightmost leaf, pushing
-    /// `(idx, mask, last_nib)` entries onto the stack along the way.
+    /// Descend from internal node `idx` to its rightmost position, pushing
+    /// entries onto the stack. For terminal nodes with no children, positions
+    /// at the terminal value. Otherwise follows the highest child to the
+    /// rightmost leaf.
     fn descend_last(&mut self, mut idx: u32) {
         loop {
             let node = &self.trie.arena[idx as usize];
             let mask = node.children_mask();
+            if mask == 0 {
+                if node.terminal {
+                    self.stack.push((idx, mask, TERMINAL_NIB));
+                }
+                return;
+            }
             let nib = 15 - mask.leading_zeros() as usize; // highest set bit
             self.stack.push((idx, mask, nib));
             if node.is_leaf(nib) {
@@ -704,10 +770,16 @@ impl<'a, T> NibbleIter<'a, T> {
             return None;
         }
         let node = &self.trie.arena[arena_idx as usize];
-        if let Some(key_index) = node.leaf_key_index(nib) {
+        if nib == TERMINAL_NIB {
+            // Terminal value of this node
+            let key_index = node.leaf as usize;
+            let key = &self.trie.keys[key_index];
+            let value = &self.trie.values[key_index - 1];
+            Some((key, value))
+        } else if let Some(key_index) = node.leaf_key_index(nib) {
             let key = &self.trie.keys[key_index as usize];
-            let value = &self.trie.values[key_index as usize - 1]; // values[0] = keys[1]
-            Some((&key[..key.len().saturating_sub(1)], value))
+            let value = &self.trie.values[key_index as usize - 1];
+            Some((key, value))
         } else {
             None
         }
@@ -716,6 +788,24 @@ impl<'a, T> NibbleIter<'a, T> {
     pub fn next(&mut self) -> Option<(&[u8], &T)> {
         loop {
             let (arena_idx, mask, nib) = self.stack.pop()?;
+
+            if nib == TERMINAL_NIB {
+                // After terminal value, move to first child
+                let node = &self.trie.arena[arena_idx as usize];
+                let mask = node.children_mask();
+                if let Some(first_nib) = mask_next(mask, 0) {
+                    self.stack.push((arena_idx, mask, first_nib));
+                    if node.is_leaf(first_nib) {
+                        return self.current();
+                    } else {
+                        self.descend_first(node.children[first_nib]);
+                        return self.current();
+                    }
+                }
+                // No children — backtrack (continue loop)
+                continue;
+            }
+
             let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
 
             if let Some(next_nib) = mask_next(mask, search_start) {
@@ -728,6 +818,7 @@ impl<'a, T> NibbleIter<'a, T> {
                     return self.current();
                 }
             }
+            // No more siblings — backtrack (continue loop)
         }
     }
 
@@ -735,8 +826,20 @@ impl<'a, T> NibbleIter<'a, T> {
         loop {
             let (arena_idx, mask, nib) = self.stack.pop()?;
 
+            if nib == TERMINAL_NIB {
+                // After terminal value in backward direction — backtrack
+                continue;
+            }
+
             if nib == 0 || nib == usize::MAX {
-                continue; // no previous sibling at this level
+                // No previous sibling. Check if node is terminal.
+                let node = &self.trie.arena[arena_idx as usize];
+                if node.terminal {
+                    self.stack.push((arena_idx, mask, TERMINAL_NIB));
+                    return self.current();
+                }
+                // Not terminal — backtrack (continue loop)
+                continue;
             }
 
             if let Some(prev_nib) = mask_prev(mask, nib) {
@@ -749,6 +852,13 @@ impl<'a, T> NibbleIter<'a, T> {
                     return self.current();
                 }
             }
+            // No previous sibling — check if node is terminal
+            let node = &self.trie.arena[arena_idx as usize];
+            if node.terminal {
+                self.stack.push((arena_idx, mask, TERMINAL_NIB));
+                return self.current();
+            }
+            // Not terminal — backtrack (continue loop)
         }
     }
 
@@ -760,12 +870,50 @@ impl<'a, T> NibbleIter<'a, T> {
 
         self.stack.clear();
         let mut node_idx: u32 = 0;
+        let max_nib = key.len() * 2;
 
         loop {
             let node = &self.trie.arena[node_idx as usize];
             let mask = node.children_mask();
-            let nib = key_nibble_at(key, node.prefix_len as usize) as usize;
 
+            // Check if this node is terminal and its key >= seek key
+            if node.terminal && node.prefix_len as usize >= max_nib {
+                let ki = node.leaf as usize;
+                if self.trie.keys[ki].as_slice() >= key {
+                    self.stack.push((node_idx, mask, TERMINAL_NIB));
+                    return self.current();
+                }
+            }
+
+            if node.prefix_len as usize >= max_nib {
+                // Key exhausted, terminal key < seek key (or not terminal)
+                // Look for a child at or after nibble 0
+                if let Some(next_nib) = mask_next(mask, 0) {
+                    self.stack.push((node_idx, mask, next_nib));
+                    if node.is_leaf(next_nib) {
+                        return self.current();
+                    } else {
+                        self.descend_first(node.children[next_nib]);
+                        return self.current();
+                    }
+                }
+                // No children — backtrack
+                loop {
+                    let (parent_idx, parent_mask, child_nib) = self.stack.pop()?;
+                    if let Some(next_nib) = mask_next(parent_mask, child_nib + 1) {
+                        self.stack.push((parent_idx, parent_mask, next_nib));
+                        let parent = &self.trie.arena[parent_idx as usize];
+                        if parent.is_leaf(next_nib) {
+                            return self.current();
+                        } else {
+                            self.descend_first(parent.children[next_nib]);
+                            return self.current();
+                        }
+                    }
+                }
+            }
+
+            let nib = key_nibble_at(key, node.prefix_len as usize) as usize;
             let slot = node.children[nib];
             if slot != 0 {
                 self.stack.push((node_idx, mask, nib));
@@ -812,7 +960,6 @@ impl<'a, T> NibbleIter<'a, T> {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -841,16 +988,16 @@ mod tests {
 
     #[test]
     fn node_size() {
-        assert_eq!(std::mem::size_of::<Node>(), 72);
+        assert_eq!(std::mem::size_of::<Node>(), 76);
     }
 
     #[test]
     fn insert_empty_and_get() {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
         let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
-        assert_eq!(trie.get(b"hello\0"), Some(idx));
-        assert_eq!(trie.get_value(b"hello\0"), Some(&42));
-        assert_eq!(trie.get(b"world\0"), None);
+        assert_eq!(trie.get(b"hello"), Some(idx));
+        assert_eq!(trie.get_value(b"hello"), Some(&42));
+        assert_eq!(trie.get(b"world"), None);
     }
 
     #[test]
@@ -863,10 +1010,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_rejects_null_byte() {
+    fn insert_null_byte_allowed() {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
-        let result = trie.insert(b"hel\0lo".to_vec(), 1);
-        assert_eq!(result, Err(()));
+        // Null bytes are now valid in keys
+        let idx = trie.insert(b"hel\0lo".to_vec(), 1).unwrap();
+        assert_eq!(trie.get(b"hel\0lo"), Some(idx));
     }
 
     #[test]
@@ -874,8 +1022,8 @@ mod tests {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
         let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
         let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
-        assert_eq!(trie.get(b"abc\0"), Some(i1));
-        assert_eq!(trie.get(b"abd\0"), Some(i2));
+        assert_eq!(trie.get(b"abc"), Some(i1));
+        assert_eq!(trie.get(b"abd"), Some(i2));
         assert_eq!(trie.len(), 2);
     }
 
@@ -884,8 +1032,8 @@ mod tests {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
         let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
         let i2 = trie.insert(b"abcd".to_vec(), 2).unwrap();
-        assert_eq!(trie.get(b"abc\0"), Some(i1));
-        assert_eq!(trie.get(b"abcd\0"), Some(i2));
+        assert_eq!(trie.get(b"abc"), Some(i1));
+        assert_eq!(trie.get(b"abcd"), Some(i2));
     }
 
     #[test]
@@ -893,8 +1041,8 @@ mod tests {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
         let i1 = trie.insert(b"abcd".to_vec(), 1).unwrap();
         let i2 = trie.insert(b"abc".to_vec(), 2).unwrap();
-        assert_eq!(trie.get(b"abcd\0"), Some(i1));
-        assert_eq!(trie.get(b"abc\0"), Some(i2));
+        assert_eq!(trie.get(b"abcd"), Some(i1));
+        assert_eq!(trie.get(b"abc"), Some(i2));
     }
 
     #[test]
@@ -902,8 +1050,8 @@ mod tests {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
         let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
         let i2 = trie.insert(b"xyz".to_vec(), 2).unwrap();
-        assert_eq!(trie.get(b"abc\0"), Some(i1));
-        assert_eq!(trie.get(b"xyz\0"), Some(i2));
+        assert_eq!(trie.get(b"abc"), Some(i1));
+        assert_eq!(trie.get(b"xyz"), Some(i2));
     }
 
     #[test]
@@ -912,9 +1060,9 @@ mod tests {
         let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
         let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
         let i3 = trie.insert(b"abe".to_vec(), 3).unwrap();
-        assert_eq!(trie.get(b"abc\0"), Some(i1));
-        assert_eq!(trie.get(b"abd\0"), Some(i2));
-        assert_eq!(trie.get(b"abe\0"), Some(i3));
+        assert_eq!(trie.get(b"abc"), Some(i1));
+        assert_eq!(trie.get(b"abd"), Some(i2));
+        assert_eq!(trie.get(b"abe"), Some(i3));
     }
 
     #[test]
@@ -926,7 +1074,7 @@ mod tests {
             indices.push(idx);
         }
         for (i, c) in (b'a'..=b'f').enumerate() {
-            let key = vec![c, 0];
+            let key = vec![c];
             assert_eq!(trie.get(&key), Some(indices[i]));
         }
     }
@@ -939,7 +1087,7 @@ mod tests {
             trie.insert(key.into_bytes(), i).unwrap();
         }
         for i in 0..50 {
-            let key = format!("prefix_{:02}\0", i);
+            let key = format!("prefix_{:02}", i);
             assert!(trie.get(key.as_bytes()).is_some());
         }
     }
@@ -951,9 +1099,7 @@ mod tests {
         for i in 0..100 {
             key.push(b'a');
             let idx = trie.insert(key.clone(), i).unwrap();
-            let mut nt_key = key.clone();
-            nt_key.push(0);
-            assert_eq!(trie.get(&nt_key), Some(idx));
+            assert_eq!(trie.get(&key), Some(idx));
         }
     }
 
@@ -1039,7 +1185,7 @@ mod tests {
         trie.insert(b"abe".to_vec(), 3).unwrap();
 
         let mut iter = trie.iter();
-        let (k, _) = iter.seek(b"abd\0").unwrap();
+        let (k, _) = iter.seek(b"abd").unwrap();
         assert_eq!(k, b"abd");
     }
 
@@ -1051,7 +1197,7 @@ mod tests {
         trie.insert(b"abe".to_vec(), 3).unwrap();
 
         let mut iter = trie.iter();
-        let (k, _) = iter.seek(b"abc\x7f\0").unwrap();
+        let (k, _) = iter.seek(b"abc\x7f").unwrap();
         assert_eq!(k, b"abd");
     }
 
@@ -1062,7 +1208,7 @@ mod tests {
         trie.insert(b"abcd".to_vec(), 2).unwrap();
 
         let mut iter = trie.iter();
-        let (k, _) = iter.seek(b"abc\0").unwrap();
+        let (k, _) = iter.seek(b"abc").unwrap();
         assert_eq!(k, b"abc");
     }
 
@@ -1070,8 +1216,8 @@ mod tests {
     fn get_value_found_and_missing() {
         let mut trie: NibbleTrie<String> = NibbleTrie::new();
         trie.insert(b"hello".to_vec(), "world".to_string()).unwrap();
-        assert_eq!(trie.get_value(b"hello\0"), Some(&"world".to_string()));
-        assert_eq!(trie.get_value(b"world\0"), None);
+        assert_eq!(trie.get_value(b"hello"), Some(&"world".to_string()));
+        assert_eq!(trie.get_value(b"world"), None);
     }
 
     #[test]
@@ -1121,7 +1267,7 @@ mod tests {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
         let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
         trie.optimize();
-        assert_eq!(trie.get(b"hello\0"), Some(idx));
+        assert_eq!(trie.get(b"hello"), Some(idx));
         assert_eq!(trie.len(), 1);
     }
 
@@ -1136,7 +1282,7 @@ mod tests {
         }
         trie.optimize();
         for i in 0..100 {
-            let key = format!("key_{:03}\0", i);
+            let key = format!("key_{:03}", i);
             assert_eq!(trie.get(key.as_bytes()), Some(indices[i]),
                 "lookup failed after optimize for i={}", i);
         }
@@ -1188,7 +1334,7 @@ mod tests {
         }
         trie.optimize();
         let mut it = trie.iter();
-        let (k, v) = it.seek(b"key_00025\0").unwrap();
+        let (k, v) = it.seek(b"key_00025").unwrap();
         assert_eq!(k, b"key_00025");
         assert_eq!(*v, 25);
     }
@@ -1206,7 +1352,7 @@ mod tests {
         let arena_len_2 = trie.arena.len();
         assert_eq!(arena_len_1, arena_len_2, "second optimize changed arena size");
         for i in 0..100 {
-            let key = format!("key_{:03}\0", i);
+            let key = format!("key_{:03}", i);
             assert!(trie.get(key.as_bytes()).is_some());
         }
     }
@@ -1221,7 +1367,7 @@ mod tests {
         }
         trie.optimize();
         for (i, b) in (1u8..=255).enumerate() {
-            let key = vec![b, 0];
+            let key = vec![b];
             assert_eq!(trie.get(&key), Some(indices[i]),
                 "lookup failed after optimize for byte {}", b);
         }
@@ -1238,7 +1384,7 @@ mod tests {
         }
         trie.optimize();
         for i in 0..1000u32 {
-            let key = format!("key_{:05}\0", i);
+            let key = format!("key_{:05}", i);
             assert_eq!(trie.get(key.as_bytes()), Some(indices[i as usize]),
                 "lookup failed after optimize at i={}", i);
         }
@@ -1256,9 +1402,90 @@ mod tests {
         }
         trie.optimize();
         for i in 0..100 {
-            let mut nt_key = vec![b'a'; i + 1];
-            nt_key.push(0);
-            assert_eq!(trie.get(&nt_key), Some(indices[i]));
+            let mut key = vec![b'a'; i + 1];
+            assert_eq!(trie.get(&key), Some(indices[i]));
         }
+    }
+
+    #[test]
+    fn iter_forward_prefix_keys() {
+        // "ab" < "abc" in forward order
+        let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+        trie.insert(b"abc".to_vec(), 1).unwrap();
+        trie.insert(b"ab".to_vec(), 2).unwrap();
+        trie.insert(b"abd".to_vec(), 3).unwrap();
+
+        let mut results = Vec::new();
+        let mut iter = trie.iter();
+        if let Some((k, _)) = iter.current() { results.push(k.to_vec()); }
+        while let Some((k, _)) = iter.next() { results.push(k.to_vec()); }
+        assert_eq!(results, vec![b"ab".to_vec(), b"abc".to_vec(), b"abd".to_vec()]);
+    }
+
+    #[test]
+    fn iter_backward_prefix_keys() {
+        // "abd" > "abc" > "ab" in backward order
+        let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+        trie.insert(b"abc".to_vec(), 1).unwrap();
+        trie.insert(b"ab".to_vec(), 2).unwrap();
+        trie.insert(b"abd".to_vec(), 3).unwrap();
+
+        let mut iter = trie.iter_last();
+        let mut results = Vec::new();
+        loop {
+            match iter.current() {
+                Some((k, _)) => results.push(k.to_vec()),
+                None => break,
+            }
+            if iter.prev().is_none() { break; }
+        }
+        assert_eq!(results, vec![b"abd".to_vec(), b"abc".to_vec(), b"ab".to_vec()]);
+    }
+
+    #[test]
+    fn iter_forward_empty_key() {
+        let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+        trie.insert(b"".to_vec(), 0).unwrap();
+        trie.insert(b"abc".to_vec(), 1).unwrap();
+
+        let mut results = Vec::new();
+        let mut iter = trie.iter();
+        if let Some((k, _)) = iter.current() { results.push(k.to_vec()); }
+        while let Some((k, _)) = iter.next() { results.push(k.to_vec()); }
+        assert_eq!(results, vec![b"".to_vec(), b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn optimize_preserves_terminal_flags() {
+        let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+        let i1 = trie.insert(b"ab".to_vec(), 1).unwrap();
+        let i2 = trie.insert(b"abcd".to_vec(), 2).unwrap();
+        trie.optimize();
+        assert_eq!(trie.get(b"ab"), Some(i1), "terminal key 'ab' lost after optimize");
+        assert_eq!(trie.get(b"abcd"), Some(i2));
+        assert_eq!(trie.len(), 2);
+
+        // Also test reverse order
+        let mut trie2: NibbleTrie<i32> = NibbleTrie::new();
+        let i1 = trie2.insert(b"abcd".to_vec(), 1).unwrap();
+        let i2 = trie2.insert(b"ab".to_vec(), 2).unwrap();
+        trie2.optimize();
+        assert_eq!(trie2.get(b"abcd"), Some(i1));
+        assert_eq!(trie2.get(b"ab"), Some(i2), "terminal key 'ab' lost after optimize (reverse insert)");
+    }
+
+    #[test]
+    fn null_bytes_in_keys() {
+        let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+        let i1 = trie.insert(b"a\0b".to_vec(), 1).unwrap();
+        let i2 = trie.insert(b"a\0c".to_vec(), 2).unwrap();
+        let i3 = trie.insert(b"\0".to_vec(), 3).unwrap();
+        let i4 = trie.insert(b"\0\0".to_vec(), 4).unwrap();
+
+        assert_eq!(trie.get(b"a\0b"), Some(i1));
+        assert_eq!(trie.get(b"a\0c"), Some(i2));
+        assert_eq!(trie.get(b"\0"), Some(i3));
+        assert_eq!(trie.get(b"\0\0"), Some(i4));
+        assert_eq!(trie.len(), 4);
     }
 }

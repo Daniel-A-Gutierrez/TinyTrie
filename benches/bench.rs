@@ -202,9 +202,28 @@ macro_rules! impl_trie_benches {
 }
 
 impl_trie_benches!(TinyTrie<usize, 6, u8>);
-impl_trie_benches!(NibbleTrie<usize>);
 impl_trie_benches!(BitTrie<usize>);
 impl_trie_benches!(PolyTrie<usize>);
+
+// NibbleTrie no longer requires null-terminated keys — use plain keys for lookup.
+impl InsertBench for NibbleTrie<usize> {
+    fn run(keys: &[Vec<u8>]) {
+        let mut m = NibbleTrie::trie_new();
+        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        black_box(&m);
+    }
+}
+impl LookupBench for NibbleTrie<usize> {
+    fn run(&self, _keys_null: &[Vec<u8>], keys: &[Vec<u8>]) {
+        for k in keys { black_box(self.trie_get(k)); }
+    }
+}
+impl FwdIterBench for NibbleTrie<usize> {
+    fn run(&self) { self.trie_iter_fwd(|k, v| { black_box(k); black_box(v); }); }
+}
+impl RevIterBench for NibbleTrie<usize> {
+    fn run(&self) { self.trie_iter_rev(|k, v| { black_box(k); black_box(v); }); }
+}
 
 // NibbleOpt and PolyOpt use the same types as NibbleTrie/PolyTrie —
 // they're just built with optimize(). The trait impls are shared.

@@ -64,6 +64,7 @@ pub use poly_trie::PolyTrie;
 mod simd;
 mod prefix_trie;
 pub use prefix_trie::TinyTrie;
+pub use prefix_trie::null_terminate;
 
 mod tiny_trie_map;
 pub use tiny_trie_map::TinyTrieMap;
