@@ -3,7 +3,12 @@
     "allow": [
       "Bash(cargo check)",
       "Bash(cargo check --benches 2>&1)",
-      "Bash(cargo bench --no-run 2>&1)"
+      "Bash(cargo bench --no-run 2>&1)",
+      "Bash(cargo test)"
+    ],
+    "deny": [
+      "Edit(Cargo.toml)",
+      "Write(Cargo.toml)"
     ]
   },
   "mcpServers": {
