@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(cargo check *)",
-      "Bash(rtk grep *)"
+      "Bash(rtk grep *)",
+      "Bash(cargo bench *)",
+      "Bash(rtk find *)",
+      "Bash(rtk ls *)"
     ]
   }
 }

@@ -9,6 +9,7 @@
 //! instructions on the target platform automatically — no intrinsics needed.
 
 use core::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+use core::simd::u32x16;
 use core::simd::u8x16;
 
 /// Load 16 bytes from `ptr` into a SIMD vector (unaligned), zeroing
@@ -257,6 +258,25 @@ pub fn hnode_find_child_lower_bound(disc_ptr: *const u8, len: usize, byte: u8) -
     len
 }
 
+/// Compute a 16-bit occupancy mask from a `[u32; 16]` children array.
+///
+/// Bit N is set if `children[N] != 0`. Used by NibbleTrie iteration to find
+/// occupied child slots via `trailing_zeros` / `leading_zeros` instead of
+/// linear scanning the 16-slot array.
+///
+/// Loads the full 64-byte children array into a `u32x16` vector, compares
+/// with zero, and extracts a bitmask. The compiler lowers this to the
+/// optimal instruction sequence for the target (e.g., two AVX2 loads +
+/// movemask, or one AVX-512 load + kmove).
+#[inline]
+pub fn children_mask(children: &[u32; 16]) -> u16 {
+    let vec = u32x16::from(*children);
+    let zero = u32x16::splat(0);
+    let eq = vec.simd_eq(zero);
+    let empty = eq.to_bitmask() as u16; // bit N = 1 if children[N] == 0
+    !empty & 0xFFFF // invert: bit N = 1 if children[N] != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +494,27 @@ mod tests {
         assert_eq!(hnode_find_child_lower_bound(buf.as_ptr(), 6, 0x80), 3);
         assert_eq!(hnode_find_child_lower_bound(buf.as_ptr(), 6, 0x90), 4);
         assert_eq!(hnode_find_child_lower_bound(buf.as_ptr(), 6, 0xFF), 5);
+    }
+
+    #[test]
+    fn test_children_mask() {
+        let mut children = [0u32; 16];
+        assert_eq!(children_mask(&children), 0);
+
+        children[0] = 1;
+        assert_eq!(children_mask(&children), 0b0000_0000_0000_0001);
+
+        children[7] = 42;
+        assert_eq!(children_mask(&children), 0b0000_0000_1000_0001);
+
+        children[15] = 255;
+        assert_eq!(children_mask(&children), 0b1000_0000_1000_0001);
+
+        // All non-zero
+        for i in 0..16 {
+            children[i] = (i + 1) as u32;
+        }
+        assert_eq!(children_mask(&children), 0xFFFF);
     }
 
     #[test]

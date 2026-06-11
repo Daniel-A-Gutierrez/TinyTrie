@@ -9,8 +9,8 @@
 //! Only the first `len` entries in each section are valid. The spare
 //! capacity beyond `len` absorbs insertions via in-place shifts,
 //! avoiding allocation until `len == capacity`.
-
-use crate::{align_up, PrefixLen, Trie};
+use crate::PrefixLen;
+use crate::prefix_trie::{align_up,  Trie};
 use std::alloc::{self, Layout};
 use std::mem::size_of;
 
