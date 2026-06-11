@@ -272,9 +272,9 @@ pub fn hnode_find_child_lower_bound(disc_ptr: *const u8, len: usize, byte: u8) -
 pub fn children_mask(children: &[u32; 16]) -> u16 {
     let vec = u32x16::from(*children);
     let zero = u32x16::splat(0);
-    let eq = vec.simd_eq(zero);
+    let eq = vec.simd_ne(zero);
     let empty = eq.to_bitmask() as u16; // bit N = 1 if children[N] == 0
-    !empty & 0xFFFF // invert: bit N = 1 if children[N] != 0
+    empty // invert: bit N = 1 if children[N] != 0
 }
 
 #[cfg(test)]

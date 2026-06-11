@@ -16,12 +16,18 @@
 //!
 //! A dummy entry at `index[0] = (0, 0)` points at `buf[0]` (empty key).
 //! Real keys start at index 1. This allows 0 to be used as a sentinel for
-//! "empty" in both `children[]` and the `leaf` field, eliminating +1/-1
-//! arithmetic. Keys are stored contiguously in `buf` with a side index
-//! `(offset, len)`, saving ~24 bytes/key vs `Vec<Vec<u8>>`.
+//! "empty" in `children[]` slots. Keys are stored contiguously in `buf` with
+//! a side index `(offset, len)`, saving ~24 bytes/key vs `Vec<Vec<u8>>`.
+//!
+//! # Leaf and Offset Fields
+//!
+//! `Node.leaf` is a key index (into `index[]`), used for retrieval — it
+//! gives the value index via `values[leaf - 1]` and the key via `index[leaf]`.
+//! `Node.offset` is a direct offset into `buf`, used for insertion divergence
+//! comparison and the `get()` terminal fast path. For terminal nodes, the key
+//! is `buf[offset..offset + prefix_len/2]` — no `index` lookup needed.
 
 use crate::TinyTrieMap;
-use std::collections::VecDeque;
 use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
 
 // ---------------------------------------------------------------------------
@@ -30,7 +36,7 @@ use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
 
 /// A single node in the nibble trie arena.
 ///
-/// Layout (76 bytes):
+/// Layout (80 bytes):
 /// - `children`: 16 slots indexed by nibble value. `0` = empty slot.
 ///   For internal nodes, the value is an arena index (≥ 1).
 ///   For leaves (when `leaf_mask` bit is set), the value is a key index (≥ 1,
@@ -41,6 +47,12 @@ use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
 /// - `leaf_mask`: bit N set → `children[N]` holds a leaf key index.
 /// - `leaf`: key index of a reference key. When `terminal` is true, this is
 ///   the node's own key index. When false, it's a descendant leaf key index.
+///   Used for retrieval: value lookup via `values[leaf - 1]` and key via
+///   `index[leaf]`.
+/// - `offset`: direct offset into `buf` for this node's reference key.
+///   For terminal nodes, the key is `buf[offset..offset + prefix_len/2]`,
+///   avoiding an `index` lookup entirely. For non-terminal nodes, used during
+///   insertion to get the reference key for divergence comparison.
 /// - `terminal`: true if this node represents a complete key (the key ends
 ///   at this node's prefix position, without needing to descend further).
 #[derive(Copy, Clone)]
@@ -49,12 +61,13 @@ struct Node {
     prefix_len: u16,
     leaf_mask: u16,
     leaf: u32,
+    offset : u32,
     terminal: bool,
 }
 
 impl Node {
     fn new() -> Self {
-        Node { prefix_len: 0, leaf_mask: 0, leaf: 0, terminal: false, children: [0; 16] }
+        Node { prefix_len: 0, leaf_mask: 0, leaf: 0, offset: 0, terminal: false, children: [0; 16] }
     }
 
     #[inline]
@@ -129,6 +142,7 @@ impl fmt::Debug for Node {
             .field("prefix_len", &self.prefix_len)
             .field("leaf_mask", &format_args!("0x{:04x}", self.leaf_mask))
             .field("leaf", &self.leaf)
+            .field("offset", &self.offset)
             .field("children", &active)
             .finish()
     }
@@ -188,6 +202,34 @@ fn diverging_nibble(xor: u8, byte_idx: usize) -> usize {
     byte_idx * 2 + ((xor >> 4 == 0) as usize)
 }
 
+/// SIMD-accelerated byte equality check. Returns `true` if both slices have
+/// the same length and identical content. Uses 16-byte lanes for the bulk
+/// of the comparison, with a scalar tail for the remainder.
+#[inline]
+fn simd_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let len = a.len();
+    let mut i = 0;
+    while i + 16 <= len {
+        let va = Simd::<u8, 16>::from_slice(unsafe { a.get_unchecked(i..i + 16) });
+        let vb = Simd::<u8, 16>::from_slice(unsafe { b.get_unchecked(i..i + 16) });
+        if va.simd_ne(vb).any() {
+            return false;
+        }
+        i += 16;
+    }
+    // Scalar tail
+    while i < len {
+        if unsafe { *a.get_unchecked(i) != *b.get_unchecked(i) } {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 fn simd_find_divergence<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult
 where
     LaneCount<N>: SupportedLaneCount,
@@ -234,36 +276,6 @@ fn nibble_count(key: &[u8]) -> usize {
     key.len() * 2
 }
 
-/// Find the first set bit in `mask` at or after position `start`.
-/// Returns the bit position, or `None` if no such bit exists.
-#[inline]
-fn mask_next(mask: u16, start: usize) -> Option<usize> {
-    if start >= 16 {
-        return None;
-    }
-    let shifted = mask >> start;
-    if shifted != 0 {
-        Some(start + shifted.trailing_zeros() as usize)
-    } else {
-        None
-    }
-}
-
-/// Find the last set bit in `mask` strictly before position `end`.
-/// Returns the bit position, or `None` if no such bit exists.
-#[inline]
-fn mask_prev(mask: u16, end: usize) -> Option<usize> {
-    if end == 0 {
-        return None;
-    }
-    let below = mask & ((1u16 << end) - 1);
-    if below != 0 {
-        Some(15 - below.leading_zeros() as usize)
-    } else {
-        None
-    }
-}
-
 // ---------------------------------------------------------------------------
 // NibbleTrie implementation
 // ---------------------------------------------------------------------------
@@ -308,9 +320,10 @@ impl<T> NibbleTrie<T> {
             // Key nibbles exhausted — check if this node is terminal
             if node.prefix_len as usize >= max_nib {
                 if node.terminal {
-                    let ki = node.leaf;
-                    if self.key_slice(ki) == key {
-                        return Some(ki as usize);
+                    let key_len = node.prefix_len as usize / 2;
+                    let key_in_buf = &self.buf[node.offset as usize..node.offset as usize + key_len];
+                    if simd_eq(key_in_buf, key) {
+                        return Some(node.leaf as usize);
                     }
                 }
                 return None;
@@ -323,7 +336,7 @@ impl<T> NibbleTrie<T> {
             if node.is_leaf(nib) {
                 let key_index = slot;
                 debug_assert!(key_index > 0);
-                return if self.key_slice(key_index) == key {
+                return if simd_eq(self.key_slice(key_index), key) {
                     Some(key_index as usize)
                 } else {
                     None
@@ -357,14 +370,16 @@ impl<T> NibbleTrie<T> {
                 // Empty key — root node itself is terminal
                 let mut root = Node::new();
                 root.terminal = true;
-                root.leaf = new_index as u32;
+                root.leaf = new_index;
+                root.offset = offset;
                 self.arena.push(root);
                 return Ok(new_index as usize);
             }
             let first_nib = key_nibble_at(&key, 0) as usize;
             let mut root = Node::new();
-            root.set_leaf_child(first_nib, new_index as u32);
-            root.leaf = new_index as u32;
+            root.set_leaf_child(first_nib, new_index);
+            root.leaf = new_index;
+            root.offset = offset;
             self.arena.push(root);
             return Ok(new_index as usize);
         }
@@ -377,7 +392,9 @@ impl<T> NibbleTrie<T> {
 
         loop {
             let node = &self.arena[node_idx as usize];
-            let ref_key = self.key_slice(node.leaf);
+            // Use node.offset for direct buf access — no index lookup needed
+            let (_, ref_len) = self.index[node.leaf as usize];
+            let ref_key = &self.buf[node.offset as usize..node.offset as usize + ref_len as usize];
             let prefix_len = node.prefix_len as usize;
 
             match simd_find_divergence::<8>(&key, ref_key, confirmed) {
@@ -399,11 +416,13 @@ impl<T> NibbleTrie<T> {
                     if diverge >= max_nib {
                         // New key ends at the split point — terminal
                         new_parent.terminal = true;
-                        new_parent.leaf = new_index as u32;
+                        new_parent.leaf = new_index;
+                        new_parent.offset = offset;
                         new_parent.set_internal_child(ref_nib, /* filled below */ 0);
                     } else {
-                        new_parent.set_leaf_child(new_nib, new_index as u32);
-                        new_parent.leaf = new_index as u32;
+                        new_parent.set_leaf_child(new_nib, new_index);
+                        new_parent.leaf = new_index;
+                        new_parent.offset = offset;
                     }
 
                     let old_node = std::mem::replace(
@@ -428,7 +447,8 @@ impl<T> NibbleTrie<T> {
                     if max_nib <= prefix_len {
                         // Key nibbles exhausted at this node — mark terminal
                         self.arena[node_idx as usize].terminal = true;
-                        self.arena[node_idx as usize].leaf = new_index as u32;
+                        self.arena[node_idx as usize].leaf = new_index;
+                        self.arena[node_idx as usize].offset = offset;
                         return Ok(new_index as usize);
                     }
 
@@ -444,9 +464,10 @@ impl<T> NibbleTrie<T> {
 
                     if node.is_leaf(nib) {
                         let existing_key_index = slot;
-                        let existing_key = self.key_slice(existing_key_index).to_vec();
+                        let (existing_offset, existing_len) = self.index[existing_key_index as usize];
+                        let existing_key = &self.buf[existing_offset as usize..existing_offset as usize + existing_len as usize];
 
-                        match simd_find_divergence::<8>(&key, &existing_key, confirmed) {
+                        match simd_find_divergence::<8>(&key, existing_key, confirmed) {
                             DivergeResult::Duplicate => {
                                 let (off, len) = self.index.pop().unwrap();
                                 self.buf.truncate(off as usize);
@@ -459,24 +480,27 @@ impl<T> NibbleTrie<T> {
 
                                 if d >= max_nib {
                                     // New key ends at the split point — terminal
-                                    let exist_nib = key_nibble_at(&existing_key, d) as usize;
+                                    let exist_nib = key_nibble_at(existing_key, d) as usize;
                                     split_node.terminal = true;
-                                    split_node.leaf = new_index as u32;
-                                    split_node.set_leaf_child(exist_nib, existing_key_index as u32);
+                                    split_node.leaf = new_index;
+                                    split_node.offset = offset;
+                                    split_node.set_leaf_child(exist_nib, existing_key_index);
                                 } else if d >= existing_key.len() * 2 {
                                     // Existing key ends at the split point — terminal
                                     let new_nib = key_nibble_at(&key, d) as usize;
                                     split_node.terminal = true;
-                                    split_node.leaf = existing_key_index as u32;
-                                    split_node.set_leaf_child(new_nib, new_index as u32);
+                                    split_node.leaf = existing_key_index;
+                                    split_node.offset = existing_offset;
+                                    split_node.set_leaf_child(new_nib, new_index);
                                 } else {
                                     // Neither key ends at the split point — they diverge here
                                     let new_nib = key_nibble_at(&key, d) as usize;
-                                    let exist_nib = key_nibble_at(&existing_key, d) as usize;
+                                    let exist_nib = key_nibble_at(existing_key, d) as usize;
                                     debug_assert_ne!(new_nib, exist_nib);
-                                    split_node.set_leaf_child(new_nib, new_index as u32);
-                                    split_node.set_leaf_child(exist_nib, existing_key_index as u32);
-                                    split_node.leaf = existing_key_index as u32;
+                                    split_node.set_leaf_child(new_nib, new_index);
+                                    split_node.set_leaf_child(exist_nib, existing_key_index);
+                                    split_node.leaf = existing_key_index;
+                                    split_node.offset = existing_offset;
                                 }
 
                                 let split_idx = self.arena.len() as u32;
@@ -578,18 +602,14 @@ impl<T> NibbleTrie<T> {
     }
 
     // -----------------------------------------------------------------------
-    // Optimize (in-place BFS reorder)
+    // Optimize (DFS key-sorted buf rewrite)
     // -----------------------------------------------------------------------
 
-    /// Reorder the arena in breadth-first order for cache locality.
+    /// Rewrite `buf` so that keys appear in sorted order, with contiguous
+    /// layout for sequential access during iteration.
     ///
-    /// After `optimize()`, nodes are laid out so that:
-    /// - Siblings (children of the same parent) are adjacent in the arena
-    /// - Children are near their parent (BFS groups by depth)
-    /// - The root remains at arena index 0
-    ///
-    /// This improves iteration performance (sequential memory access) and
-    /// can improve lookup locality on deep tries.
+    /// After `optimize()`, a forward iteration hits `buf` in ascending
+    /// memory order — sequential, prefetcher-friendly access.
     ///
     /// No-op for empty tries.
     pub fn optimize(&mut self) {
@@ -597,72 +617,65 @@ impl<T> NibbleTrie<T> {
             return;
         }
 
-        let n = self.arena.len();
+        // Pre-allocate at exact size. Writing into a pre-sized slice avoids
+        // per-key Vec::extend_from_slice overhead (capacity checks, memcpy).
+        let mut new_buf = vec![0u8; self.buf.len()];
+        let mut cursor: u32 = 1; // position 0 is the dummy byte
 
-        // Phase 1: BFS walk → build remap (old arena index → new arena index)
-        let mut remap = vec![u32::MAX; n];
-        let mut queue: VecDeque<u32> = VecDeque::new();
-        let mut next_new_idx: u32 = 1; // 0 = root
+        self.walk_optimize(0, &mut new_buf, &mut cursor);
 
-        remap[0] = 0;
-        queue.push_back(0);
+        new_buf.truncate(cursor as usize);
+        self.buf = new_buf;
+    }
 
-        while let Some(old_idx) = queue.pop_front() {
-            let node = &self.arena[old_idx as usize];
-            for nib in 0..16 {
-                let child = node.children[nib];
-                if child == 0 || node.is_leaf(nib) {
-                    continue;
-                }
-                if remap[child as usize] == u32::MAX {
-                    remap[child as usize] = next_new_idx;
-                    next_new_idx += 1;
-                    queue.push_back(child);
-                }
-            }
+    /// Recursive DFS walk that copies keys into the pre-allocated `new_buf`
+    /// slice in sorted order and updates `index` offsets and `node.offset`
+    /// fields to point at the new locations.
+    ///
+    /// Visit order: terminal key first, then children 0–15 (leaf children
+    /// inline, internal children via recursion). This yields keys in sorted
+    /// order within each subtree.
+    fn walk_optimize(
+        &mut self,
+        node_idx: u32,
+        new_buf: &mut [u8],
+        cursor: &mut u32,
+    ) {
+        let node: Node = self.arena[node_idx as usize]; // copy to avoid borrow conflicts
+
+        if node.terminal {
+            let ki = node.leaf;
+            let (old_off, len) = self.index[ki as usize];
+            let start = *cursor as usize;
+            new_buf[start..start + len as usize].copy_from_slice(
+                &self.buf[old_off as usize..old_off as usize + len as usize]
+            );
+            self.index[ki as usize].0 = *cursor;
+            *cursor += len as u32;
         }
 
-        debug_assert_eq!(
-            next_new_idx as usize, n,
-            "BFS visited {} nodes but arena has {} — unreachable nodes exist",
-            next_new_idx, n
-        );
-
-        // Phase 2: In-place permutation via cycle-following
-        let mut visited = vec![false; n];
-        for start in 0..n {
-            if visited[start] || remap[start] == start as u32 {
-                visited[start] = true;
+        for nib in 0..16 {
+            if node.children[nib] == 0 {
                 continue;
             }
-
-            // Carry-forward: follow the cycle from start, carrying each
-            // element to its new position (remap[old] = new).
-            let mut saved = self.arena[start];
-            let mut prev = start;
-            let mut curr = remap[start] as usize;
-
-            loop {
-                let temp = self.arena[curr];
-                self.arena[curr] = saved;
-                visited[prev] = true;
-                saved = temp;
-                prev = curr;
-                if curr == start {
-                    break;
-                }
-                curr = remap[curr] as usize;
+            if node.is_leaf(nib) {
+                let ki = node.children[nib];
+                let (old_off, len) = self.index[ki as usize];
+                let start = *cursor as usize;
+                new_buf[start..start + len as usize].copy_from_slice(
+                    &self.buf[old_off as usize..old_off as usize + len as usize]
+                );
+                self.index[ki as usize].0 = *cursor;
+                *cursor += len as u32;
+            } else {
+                self.walk_optimize(node.children[nib], new_buf, cursor);
             }
-            visited[start] = true;
         }
 
-        // Phase 3: Remap all internal children
-        for node in &mut self.arena {
-            for nib in 0..16 {
-                if node.children[nib] != 0 && !node.is_leaf(nib) {
-                    node.children[nib] = remap[node.children[nib] as usize];
-                }
-            }
+        // All descendant keys have been written and index offsets updated.
+        // Now set this node's offset from its leaf's index entry.
+        if node.leaf != 0 {
+            self.arena[node_idx as usize].offset = self.index[node.leaf as usize].0;
         }
     }
 }
@@ -678,6 +691,9 @@ impl<T> Default for NibbleTrie<T> {
 // ---------------------------------------------------------------------------
 
 /// Sentinel nib value meaning "positioned at the terminal value of this node."
+/// A terminal key is always lexicographically before all of its children —
+/// in forward order, terminal is emitted first, then children 0–15.
+/// In backward order, children 15→0 are visited first, then terminal.
 const TERMINAL_NIB: usize = 16;
 
 pub struct NibbleIter<'a, T> {
@@ -686,7 +702,6 @@ pub struct NibbleIter<'a, T> {
     ///
     /// - `arena_idx`: index into the arena (which node)
     /// - `mask`: full `children_mask()` of that node, computed once on push.
-    ///   Used for O(1) sibling navigation via TZ/LZ instead of linear scan.
     /// - `nib`: current position. Values:
     ///   - `usize::MAX`: before-first (initial state, no position)
     ///   - `0..16`: positioned at child slot `nib` (may be leaf or internal)
@@ -716,7 +731,8 @@ impl<'a, T> NibbleIter<'a, T> {
             let node = &trie.arena[idx as usize];
             let mask = node.children_mask();
             if mask != 0 {
-                let nib = 15 - mask.leading_zeros() as usize; // highest set bit
+                // Find the highest set bit (rightmost child)
+                let nib = 15 - mask.leading_zeros() as usize;
                 stack.push((idx, mask, nib));
                 if node.is_leaf(nib) {
                     break;
@@ -724,7 +740,7 @@ impl<'a, T> NibbleIter<'a, T> {
                     idx = node.children[nib];
                 }
             } else if node.terminal {
-                // Node has no children but is terminal — position at terminal
+                // No children, just terminal — position at terminal
                 stack.push((idx, mask, TERMINAL_NIB));
                 break;
             } else {
@@ -737,6 +753,7 @@ impl<'a, T> NibbleIter<'a, T> {
     /// Descend from internal node `idx` to its leftmost position.
     /// If the first node encountered is terminal, position at its terminal value.
     /// Otherwise find the leftmost child.
+    #[inline]
     fn descend_first(&mut self, mut idx: u32) {
         loop {
             let node = &self.trie.arena[idx as usize];
@@ -746,11 +763,8 @@ impl<'a, T> NibbleIter<'a, T> {
                 return;
             }
             let mask = node.children_mask();
-            if mask == 0 {
-                // No children and not terminal — shouldn't happen in a well-formed trie
-                return;
-            }
-            let nib = mask.trailing_zeros() as usize; // lowest set bit
+            debug_assert!(mask != 0, "descend_first: non-terminal node with no children");
+            let nib = mask.trailing_zeros() as usize;
             self.stack.push((idx, mask, nib));
             if node.is_leaf(nib) {
                 return;
@@ -764,9 +778,20 @@ impl<'a, T> NibbleIter<'a, T> {
     /// entries onto the stack. For terminal nodes with no children, positions
     /// at the terminal value. Otherwise follows the highest child to the
     /// rightmost leaf.
+    #[inline]
     fn descend_last(&mut self, mut idx: u32) {
         loop {
             let node = &self.trie.arena[idx as usize];
+            if node.terminal {
+                let mask = node.children_mask();
+                if mask == 0 {
+                    self.stack.push((idx, mask, TERMINAL_NIB));
+                    return;
+                }
+                // Terminal but has children — need to find rightmost child
+                // Terminal value comes before children in backward order,
+                // so the rightmost position is the rightmost leaf descendant.
+            }
             let mask = node.children_mask();
             if mask == 0 {
                 if node.terminal {
@@ -774,12 +799,46 @@ impl<'a, T> NibbleIter<'a, T> {
                 }
                 return;
             }
-            let nib = 15 - mask.leading_zeros() as usize; // highest set bit
+            // Find the highest set bit
+            let nib = 15 - mask.leading_zeros() as usize;
             self.stack.push((idx, mask, nib));
             if node.is_leaf(nib) {
                 return;
             } else {
                 idx = node.children[nib];
+            }
+        }
+    }
+
+    /// Scan children of `arena_idx` starting from `start_nib`.
+    /// Push the first found child slot onto the stack. If the child
+    /// is an internal node, descend to its leftmost position.
+    /// Returns `true` if a child was found and pushed.
+    #[inline]
+    fn push_next_child(&mut self, arena_idx: u32, mask: u16, start_nib: usize) -> bool {
+        // Mask off bits below start_nib, then find the first set bit with TZCNT
+        let shifted = if start_nib >= 16 { 0u16 } else { mask >> start_nib };
+        if shifted == 0 {
+            return false;
+        }
+        let nib = start_nib + shifted.trailing_zeros() as usize;
+        debug_assert!(nib < 16);
+        debug_assert!(mask & (1 << nib) != 0);
+        self.stack.push((arena_idx, mask, nib));
+        if !self.trie.arena[arena_idx as usize].is_leaf(nib) {
+            self.descend_first(self.trie.arena[arena_idx as usize].children[nib]);
+        }
+        true
+    }
+
+    /// Pop stack frames and find the next sibling at a higher nibble.
+    /// Used when all children at the current level have been exhausted.
+    #[inline]
+    fn backtrack_to_next(&mut self) -> Option<(&[u8], &T)> {
+        loop {
+            let (parent_idx, parent_mask, child_nib) = self.stack.pop()?;
+            if self.push_next_child(parent_idx, parent_mask, child_nib + 1) {
+                return self.current();
             }
         }
     }
@@ -791,10 +850,10 @@ impl<'a, T> NibbleIter<'a, T> {
         }
         let node = &self.trie.arena[arena_idx as usize];
         if nib == TERMINAL_NIB {
-            // Terminal value of this node
-            let key_index = node.leaf;
-            let key = self.trie.key_slice(key_index);
-            let value = &self.trie.values[key_index as usize - 1];
+            // Terminal value — use direct buf offset, no index lookup needed
+            let key_len = node.prefix_len as usize / 2;
+            let key = &self.trie.buf[node.offset as usize..node.offset as usize + key_len];
+            let value = &self.trie.values[node.leaf as usize - 1];
             Some((key, value))
         } else if let Some(key_index) = node.leaf_key_index(nib) {
             let key = self.trie.key_slice(key_index);
@@ -822,155 +881,92 @@ impl<'a, T> NibbleIter<'a, T> {
         }
     }
 
-    /// Advance to the next key in sorted order, returning only its index.
-    /// Identical navigation to [`next()`](Self::next) but skips key/value reads.
-    pub fn next_index(&mut self) -> Option<usize> {
+    /// Advance cursor to the next position. Returns `true` if positioned,
+    /// `false` if exhausted. Shared navigation for [`next`] and [`next_index`].
+    #[inline]
+    fn advance_next(&mut self) -> bool {
         loop {
-            let (arena_idx, mask, nib) = self.stack.pop()?;
+            let (arena_idx, mask, nib) = match self.stack.pop() {
+                Some(v) => v,
+                None => return false,
+            };
 
             if nib == TERMINAL_NIB {
-                let node = &self.trie.arena[arena_idx as usize];
-                let mask = node.children_mask();
-                if let Some(first_nib) = mask_next(mask, 0) {
-                    self.stack.push((arena_idx, mask, first_nib));
-                    if node.is_leaf(first_nib) {
-                        return self.current_index();
-                    } else {
-                        self.descend_first(node.children[first_nib]);
-                        return self.current_index();
-                    }
+                if self.push_next_child(arena_idx, mask, 0) {
+                    return true;
                 }
                 continue;
             }
 
             let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
-
-            if let Some(next_nib) = mask_next(mask, search_start) {
-                let node = &self.trie.arena[arena_idx as usize];
-                self.stack.push((arena_idx, mask, next_nib));
-                if node.is_leaf(next_nib) {
-                    return self.current_index();
-                } else {
-                    self.descend_first(node.children[next_nib]);
-                    return self.current_index();
-                }
+            if self.push_next_child(arena_idx, mask, search_start) {
+                return true;
             }
         }
+    }
+
+    /// Advance cursor to the previous position. Returns `true` if positioned,
+    /// `false` if exhausted. Shared navigation for [`prev`] and [`prev_index`].
+    #[inline]
+    fn advance_prev(&mut self) -> bool {
+        loop {
+            let (arena_idx, mask, nib) = match self.stack.pop() {
+                Some(v) => v,
+                None => return false,
+            };
+
+            if nib == TERMINAL_NIB {
+                continue;
+            }
+
+            if nib == 0 || nib == usize::MAX {
+                if self.trie.arena[arena_idx as usize].terminal {
+                    self.stack.push((arena_idx, mask, TERMINAL_NIB));
+                    return true;
+                }
+                continue;
+            }
+
+            // Scan backward: find highest set bit below nib using LZCNT
+            let mask_below = mask & ((1 << nib) - 1);
+            if mask_below != 0 {
+                let prev_nib = 15 - mask_below.leading_zeros() as usize;
+                self.stack.push((arena_idx, mask, prev_nib));
+                if !self.trie.arena[arena_idx as usize].is_leaf(prev_nib) {
+                    self.descend_last(self.trie.arena[arena_idx as usize].children[prev_nib]);
+                }
+                return true;
+            }
+
+            if self.trie.arena[arena_idx as usize].terminal {
+                self.stack.push((arena_idx, mask, TERMINAL_NIB));
+                return true;
+            }
+        }
+    }
+
+    /// Advance to the next key in sorted order, returning only its index.
+    /// Identical navigation to [`next()`](Self::next) but skips key/value reads.
+    #[inline]
+    pub fn next_index(&mut self) -> Option<usize> {
+        if self.advance_next() { self.current_index() } else { None }
     }
 
     /// Move to the previous key in sorted order, returning only its index.
     /// Identical navigation to [`prev()`](Self::prev) but skips key/value reads.
+    #[inline]
     pub fn prev_index(&mut self) -> Option<usize> {
-        loop {
-            let (arena_idx, mask, nib) = self.stack.pop()?;
-
-            if nib == TERMINAL_NIB {
-                continue;
-            }
-
-            if nib == 0 || nib == usize::MAX {
-                let node = &self.trie.arena[arena_idx as usize];
-                if node.terminal {
-                    self.stack.push((arena_idx, mask, TERMINAL_NIB));
-                    return self.current_index();
-                }
-                continue;
-            }
-
-            if let Some(prev_nib) = mask_prev(mask, nib) {
-                let node = &self.trie.arena[arena_idx as usize];
-                self.stack.push((arena_idx, mask, prev_nib));
-                if node.is_leaf(prev_nib) {
-                    return self.current_index();
-                } else {
-                    self.descend_last(node.children[prev_nib]);
-                    return self.current_index();
-                }
-            }
-
-            let node = &self.trie.arena[arena_idx as usize];
-            if node.terminal {
-                self.stack.push((arena_idx, mask, TERMINAL_NIB));
-                return self.current_index();
-            }
-        }
+        if self.advance_prev() { self.current_index() } else { None }
     }
 
+    #[inline]
     pub fn next(&mut self) -> Option<(&[u8], &T)> {
-        loop {
-            let (arena_idx, mask, nib) = self.stack.pop()?;
-
-            if nib == TERMINAL_NIB {
-                // After terminal value, move to first child
-                let node = &self.trie.arena[arena_idx as usize];
-                let mask = node.children_mask();
-                if let Some(first_nib) = mask_next(mask, 0) {
-                    self.stack.push((arena_idx, mask, first_nib));
-                    if node.is_leaf(first_nib) {
-                        return self.current();
-                    } else {
-                        self.descend_first(node.children[first_nib]);
-                        return self.current();
-                    }
-                }
-                // No children — backtrack (continue loop)
-                continue;
-            }
-
-            let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
-
-            if let Some(next_nib) = mask_next(mask, search_start) {
-                let node = &self.trie.arena[arena_idx as usize];
-                self.stack.push((arena_idx, mask, next_nib));
-                if node.is_leaf(next_nib) {
-                    return self.current();
-                } else {
-                    self.descend_first(node.children[next_nib]);
-                    return self.current();
-                }
-            }
-            // No more siblings — backtrack (continue loop)
-        }
+        if self.advance_next() { self.current() } else { None }
     }
 
+    #[inline]
     pub fn prev(&mut self) -> Option<(&[u8], &T)> {
-        loop {
-            let (arena_idx, mask, nib) = self.stack.pop()?;
-
-            if nib == TERMINAL_NIB {
-                // After terminal value in backward direction — backtrack
-                continue;
-            }
-
-            if nib == 0 || nib == usize::MAX {
-                // No previous sibling. Check if node is terminal.
-                let node = &self.trie.arena[arena_idx as usize];
-                if node.terminal {
-                    self.stack.push((arena_idx, mask, TERMINAL_NIB));
-                    return self.current();
-                }
-                // Not terminal — backtrack (continue loop)
-                continue;
-            }
-
-            if let Some(prev_nib) = mask_prev(mask, nib) {
-                let node = &self.trie.arena[arena_idx as usize];
-                self.stack.push((arena_idx, mask, prev_nib));
-                if node.is_leaf(prev_nib) {
-                    return self.current();
-                } else {
-                    self.descend_last(node.children[prev_nib]);
-                    return self.current();
-                }
-            }
-            // No previous sibling — check if node is terminal
-            let node = &self.trie.arena[arena_idx as usize];
-            if node.terminal {
-                self.stack.push((arena_idx, mask, TERMINAL_NIB));
-                return self.current();
-            }
-            // Not terminal — backtrack (continue loop)
-        }
+        if self.advance_prev() { self.current() } else { None }
     }
 
     pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &T)> {
@@ -989,8 +985,9 @@ impl<'a, T> NibbleIter<'a, T> {
 
             // Check if this node is terminal and its key >= seek key
             if node.terminal && node.prefix_len as usize >= max_nib {
-                let ki = node.leaf;
-                if self.trie.key_slice(ki) >= key {
+                let key_len = node.prefix_len as usize / 2;
+                let node_key = &self.trie.buf[node.offset as usize..node.offset as usize + key_len];
+                if node_key >= key {
                     self.stack.push((node_idx, mask, TERMINAL_NIB));
                     return self.current();
                 }
@@ -998,30 +995,11 @@ impl<'a, T> NibbleIter<'a, T> {
 
             if node.prefix_len as usize >= max_nib {
                 // Key exhausted, terminal key < seek key (or not terminal)
-                // Look for a child at or after nibble 0
-                if let Some(next_nib) = mask_next(mask, 0) {
-                    self.stack.push((node_idx, mask, next_nib));
-                    if node.is_leaf(next_nib) {
-                        return self.current();
-                    } else {
-                        self.descend_first(node.children[next_nib]);
-                        return self.current();
-                    }
+                // Look for a child at or after nibble 0, or backtrack
+                if self.push_next_child(node_idx, mask, 0) {
+                    return self.current();
                 }
-                // No children — backtrack
-                loop {
-                    let (parent_idx, parent_mask, child_nib) = self.stack.pop()?;
-                    if let Some(next_nib) = mask_next(parent_mask, child_nib + 1) {
-                        self.stack.push((parent_idx, parent_mask, next_nib));
-                        let parent = &self.trie.arena[parent_idx as usize];
-                        if parent.is_leaf(next_nib) {
-                            return self.current();
-                        } else {
-                            self.descend_first(parent.children[next_nib]);
-                            return self.current();
-                        }
-                    }
-                }
+                return self.backtrack_to_next();
             }
 
             let nib = key_nibble_at(key, node.prefix_len as usize) as usize;
@@ -1042,31 +1020,11 @@ impl<'a, T> NibbleIter<'a, T> {
                 }
             }
 
-            // No exact match — find next higher child
-            if let Some(next_nib) = mask_next(mask, nib + 1) {
-                self.stack.push((node_idx, mask, next_nib));
-                if node.is_leaf(next_nib) {
-                    return self.current();
-                } else {
-                    self.descend_first(node.children[next_nib]);
-                    return self.current();
-                }
+            // No exact match — find next higher child, or backtrack
+            if self.push_next_child(node_idx, mask, nib + 1) {
+                return self.current();
             }
-
-            // No child at or above nib — backtrack
-            loop {
-                let (parent_idx, parent_mask, child_nib) = self.stack.pop()?;
-                if let Some(next_nib) = mask_next(parent_mask, child_nib + 1) {
-                    self.stack.push((parent_idx, parent_mask, next_nib));
-                    let parent = &self.trie.arena[parent_idx as usize];
-                    if parent.is_leaf(next_nib) {
-                        return self.current();
-                    } else {
-                        self.descend_first(parent.children[next_nib]);
-                        return self.current();
-                    }
-                }
-            }
+            return self.backtrack_to_next();
         }
     }
 }
@@ -1108,7 +1066,7 @@ mod tests {
 
     #[test]
     fn node_size() {
-        assert_eq!(std::mem::size_of::<Node>(), 76);
+        assert_eq!(std::mem::size_of::<Node>(), 80);
     }
 
     #[test]
@@ -1365,12 +1323,17 @@ mod tests {
     }
 
     #[test]
-    fn leaf_field_set_on_creation() {
+    fn leaf_and_offset_set_on_creation() {
         let mut trie: NibbleTrie<i32> = NibbleTrie::new();
         trie.insert(b"abc".to_vec(), 1).unwrap();
-        // Root should have leaf field set
+        // Root should have leaf and offset fields set
         let root = &trie.arena[0];
         assert_ne!(root.leaf, 0, "root leaf field should be set");
+        assert_ne!(root.offset, 0, "root offset field should be set");
+        // offset should point to the key in buf
+        let (off, len) = trie.index[root.leaf as usize];
+        assert_eq!(root.offset, off, "offset should match index offset");
+        assert_eq!(&trie.buf[root.offset as usize..root.offset as usize + len as usize], b"abc");
     }
 
     // ── optimize() tests ──────────────────────────────────────────────
@@ -1524,6 +1487,36 @@ mod tests {
         for i in 0..100 {
             let mut key = vec![b'a'; i + 1];
             assert_eq!(trie.get(&key), Some(indices[i]));
+        }
+    }
+
+    #[test]
+    fn optimize_sorts_buf() {
+        // After optimize(), keys in buf should appear in contiguous sorted order.
+        let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+        for i in (0..100u32).rev() {
+            let key = format!("key_{:05}", i);
+            trie.insert(key.into_bytes(), i as i32).unwrap();
+        }
+        trie.optimize();
+
+        // Iterate in forward order and verify keys are sorted and contiguous in buf
+        let mut it = trie.iter();
+        let mut prev_key: Option<Vec<u8>> = None;
+        let mut prev_end: usize = 1; // first key starts after dummy byte
+        while let Some((k, _)) = it.current() {
+            if let Some(ref pk) = prev_key {
+                assert!(pk.as_slice() <= k, "keys not sorted: {:?} > {:?}",
+                    std::str::from_utf8(pk), std::str::from_utf8(k));
+            }
+            let ki = it.current_index().unwrap();
+            let (off, len) = trie.index[ki];
+            assert_eq!(off as usize, prev_end,
+                "key {:?} not contiguous: expected offset {}, got {}",
+                std::str::from_utf8(k), prev_end, off);
+            prev_key = Some(k.to_vec());
+            prev_end = off as usize + len as usize;
+            it.next();
         }
     }
 

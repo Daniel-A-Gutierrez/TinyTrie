@@ -1,5 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, LinkedList};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -18,7 +18,7 @@ const BENCH_SECS: u64 = 3;
 
 const CONTESTANT_NAMES: &[&str] = &[
     "TinyTrie", "NibbleTrie", "BitTrie", "PolyTrie",
-    "BTreeMap", "HashMap", "SortedVec", "NibbleOpt", "PolyOpt",
+    "BTreeMap", "HashMap", "SortedVec", "NibbleOpt", "PolyOpt", "LinkedList",
 ];
 
 // ── Allocation tracker ──────────────────────────────────────────────
@@ -75,6 +75,7 @@ struct Structures {
     btree: BTreeMap<Vec<u8>, usize>,
     hmap: HashMap<Vec<u8>, usize>,
     sorted: Vec<(Vec<u8>, usize)>,
+    llist: LinkedList<(Vec<u8>, usize)>,
     lookup_keys: Vec<Vec<u8>>,
     lookup_keys_null: Vec<Vec<u8>>,
 }
@@ -94,6 +95,7 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
         btree.insert(k.clone(), i);
         hmap.insert(k.clone(), i);
     }
+    let llist: LinkedList<_> = keys.iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
     let mut lookup_keys = Vec::with_capacity(keys.len() * 2);
     let mut lookup_keys_null = Vec::with_capacity(keys.len() * 2);
     for k in keys {
@@ -115,7 +117,7 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
     ptrie_opt.optimize();
     let mut ntrie_opt = ntrie.clone();
     ntrie_opt.optimize();
-    Structures { trie, ntrie, ntrie_opt, btrie, ptrie, ptrie_opt, btree, hmap, sorted: build_sorted_vec(keys), lookup_keys, lookup_keys_null }
+    Structures { trie, ntrie, ntrie_opt, btrie, ptrie, ptrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -308,6 +310,28 @@ impl FwdIterBench for Vec<(Vec<u8>, usize)> {
     fn run(&self) { for (k, v) in self.iter() { black_box(k); black_box(v); } }
 }
 
+impl InsertBench for LinkedList<(Vec<u8>, usize)> {
+    fn run(keys: &[Vec<u8>]) {
+        let mut list: LinkedList<(Vec<u8>, usize)> = LinkedList::new();
+        for (i, k) in keys.iter().enumerate() { list.push_back((k.clone(), i)); }
+        black_box(&list);
+    }
+}
+
+impl LookupBench for LinkedList<(Vec<u8>, usize)> {
+    fn run(&self, _keys_null: &[Vec<u8>], keys: &[Vec<u8>]) {
+        for k in keys { black_box(self.iter().find(|(key, _)| key == k)); }
+    }
+}
+
+impl FwdIterBench for LinkedList<(Vec<u8>, usize)> {
+    fn run(&self) { for (k, v) in self.iter() { black_box(k); black_box(v); } }
+}
+
+impl RevIterBench for LinkedList<(Vec<u8>, usize)> {
+    fn run(&self) { for (k, v) in self.iter().rev() { black_box(k); black_box(v); } }
+}
+
 // ── Contestant ──────────────────────────────────────────────────────
 
 /// Measure memory: snapshot allocator, run build closure (which returns bytes used), compute bytes/key.
@@ -463,6 +487,8 @@ fn main() {
     let mut look = ResultMap::new();
     let mut fwd  = ResultMap::new();
     let mut rev  = ResultMap::new();
+    let mut fwd_idx = ResultMap::new();
+    let mut rev_idx = ResultMap::new();
     let mut mem  = ResultMap::new();
     let mut opt  = ResultMap::new();
 
@@ -480,7 +506,7 @@ fn main() {
         // ── Build contestants ──────────────────────────────────────────
         // Insertion runs first (no pre-built structure needed)
         eprintln!("  insertion:");
-        let any_insert = active[0] || active[1] || active[2] || active[3] || active[4] || active[5] || active[6];
+        let any_insert = active[0] || active[1] || active[2] || active[3] || active[4] || active[5] || active[6] || active[9];
         if any_insert {
             if active[0] { let r = bench(budget, "TinyTrie", || <TinyTrie<usize, 6, u8> as InsertBench>::run(&keys)); ins.entry("TinyTrie".into()).or_default().push(r.rate(size as u64)); }
             if active[1] { let r = bench(budget, "NibbleTrie", || <NibbleTrie<usize> as InsertBench>::run(&keys)); ins.entry("NibbleTrie".into()).or_default().push(r.rate(size as u64)); }
@@ -489,6 +515,7 @@ fn main() {
             if active[4] { let r = bench(budget, "BTreeMap", || <BTreeMap<Vec<u8>, usize> as InsertBench>::run(&keys)); ins.entry("BTreeMap".into()).or_default().push(r.rate(size as u64)); }
             if active[5] { let r = bench(budget, "HashMap", || <HashMap<Vec<u8>, usize> as InsertBench>::run(&keys)); ins.entry("HashMap".into()).or_default().push(r.rate(size as u64)); }
             if active[6] { let r = bench(budget, "SortedVec", || <Vec<(Vec<u8>, usize)> as InsertBench>::run(&keys)); ins.entry("SortedVec".into()).or_default().push(r.rate(size as u64)); }
+            if active[9] { let r = bench(budget, "LinkedList", || <LinkedList<(Vec<u8>, usize)> as InsertBench>::run(&keys)); ins.entry("LinkedList".into()).or_default().push(r.rate(size as u64)); }
         }
 
         // ── Build structures for lookup / iteration ─────────────────────
@@ -511,9 +538,10 @@ fn main() {
         if active[6] { let r = bench(budget, "SortedVec", || <Vec<(Vec<u8>, usize)> as LookupBench>::run(&st.sorted, lk_null, lk)); look.entry("SortedVec".into()).or_default().push(r.rate(lk.len() as u64)); }
         if active[7] { let r = bench(budget, "NibbleOpt", || <NibbleTrie<usize> as LookupBench>::run(&st.ntrie_opt, lk_null, lk)); look.entry("NibbleOpt".into()).or_default().push(r.rate(lk.len() as u64)); }
         if active[8] { let r = bench(budget, "PolyOpt", || <PolyTrie<usize> as LookupBench>::run(&st.ptrie_opt, lk_null, lk)); look.entry("PolyOpt".into()).or_default().push(r.rate(lk.len() as u64)); }
+        if active[9] { let r = bench(budget, "LinkedList", || <LinkedList<(Vec<u8>, usize)> as LookupBench>::run(&st.llist, lk_null, lk)); look.entry("LinkedList".into()).or_default().push(r.rate(lk.len() as u64)); }
 
         // ── Forward iteration ─────────────────────────────────────────
-        let any_fwd = active[0] || active[1] || active[2] || active[3] || active[4] || active[6] || active[7] || active[8];
+        let any_fwd = active[0] || active[1] || active[2] || active[3] || active[4] || active[6] || active[7] || active[8] || active[9];
         if any_fwd {
             eprintln!("  iteration (forward):");
             if active[0] { let r = bench(budget, "TinyTrie", || <TinyTrie<usize, 6, u8> as FwdIterBench>::run(&st.trie)); fwd.entry("TinyTrie".into()).or_default().push(r.rate(size as u64)); }
@@ -524,10 +552,11 @@ fn main() {
             if active[6] { let r = bench(budget, "SortedVec", || <Vec<(Vec<u8>, usize)> as FwdIterBench>::run(&st.sorted)); fwd.entry("SortedVec".into()).or_default().push(r.rate(size as u64)); }
             if active[7] { let r = bench(budget, "NibbleOpt", || <NibbleTrie<usize> as FwdIterBench>::run(&st.ntrie_opt)); fwd.entry("NibbleOpt".into()).or_default().push(r.rate(size as u64)); }
             if active[8] { let r = bench(budget, "PolyOpt", || <PolyTrie<usize> as FwdIterBench>::run(&st.ptrie_opt)); fwd.entry("PolyOpt".into()).or_default().push(r.rate(size as u64)); }
+            if active[9] { let r = bench(budget, "LinkedList", || <LinkedList<(Vec<u8>, usize)> as FwdIterBench>::run(&st.llist)); fwd.entry("LinkedList".into()).or_default().push(r.rate(size as u64)); }
         }
 
         // ── Backward iteration ───────────────────────────────────────
-        let any_rev = active[0] || active[1] || active[2] || active[3] || active[4] || active[7] || active[8];
+        let any_rev = active[0] || active[1] || active[2] || active[3] || active[4] || active[7] || active[8] || active[9];
         if any_rev {
             eprintln!("  iteration (backward):");
             if active[0] { let r = bench(budget, "TinyTrie", || <TinyTrie<usize, 6, u8> as RevIterBench>::run(&st.trie)); rev.entry("TinyTrie".into()).or_default().push(r.rate(size as u64)); }
@@ -537,6 +566,21 @@ fn main() {
             if active[4] { let r = bench(budget, "BTreeMap", || <BTreeMap<Vec<u8>, usize> as RevIterBench>::run(&st.btree)); rev.entry("BTreeMap".into()).or_default().push(r.rate(size as u64)); }
             if active[7] { let r = bench(budget, "NibbleOpt", || <NibbleTrie<usize> as RevIterBench>::run(&st.ntrie_opt)); rev.entry("NibbleOpt".into()).or_default().push(r.rate(size as u64)); }
             if active[8] { let r = bench(budget, "PolyOpt", || <PolyTrie<usize> as RevIterBench>::run(&st.ptrie_opt)); rev.entry("PolyOpt".into()).or_default().push(r.rate(size as u64)); }
+            if active[9] { let r = bench(budget, "LinkedList", || <LinkedList<(Vec<u8>, usize)> as RevIterBench>::run(&st.llist)); rev.entry("LinkedList".into()).or_default().push(r.rate(size as u64)); }
+        }
+
+        // ── Forward index iteration (NibbleTrie only) ──────────────────
+        if active[1] || active[7] {
+            eprintln!("  iteration (forward index):");
+            if active[1] { let r = bench(budget, "NibbleTrie", || { let mut it = st.ntrie.iter(); if let Some(i) = it.current_index() { black_box(i); } while let Some(i) = it.next_index() { black_box(i); } }); fwd_idx.entry("NibbleTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[7] { let r = bench(budget, "NibbleOpt", || { let mut it = st.ntrie_opt.iter(); if let Some(i) = it.current_index() { black_box(i); } while let Some(i) = it.next_index() { black_box(i); } }); fwd_idx.entry("NibbleOpt".into()).or_default().push(r.rate(size as u64)); }
+        }
+
+        // ── Backward index iteration (NibbleTrie only) ─────────────────
+        if active[1] || active[7] {
+            eprintln!("  iteration (backward index):");
+            if active[1] { let r = bench(budget, "NibbleTrie", || { let mut it = st.ntrie.iter_last(); if let Some(i) = it.current_index() { black_box(i); } while let Some(i) = it.prev_index() { black_box(i); } }); rev_idx.entry("NibbleTrie".into()).or_default().push(r.rate(size as u64)); }
+            if active[7] { let r = bench(budget, "NibbleOpt", || { let mut it = st.ntrie_opt.iter_last(); if let Some(i) = it.current_index() { black_box(i); } while let Some(i) = it.prev_index() { black_box(i); } }); rev_idx.entry("NibbleOpt".into()).or_default().push(r.rate(size as u64)); }
         }
 
         // ── Optimize time ─────────────────────────────────────────────
@@ -559,6 +603,7 @@ fn main() {
         if active[6] { mem_measure("SortedVec", size, &mut mem, || { let before = read_allocated(); let s = build_sorted_vec(&keys); let bytes = read_allocated() - before; drop(s); bytes }); }
         if active[7] { mem_measure("NibbleOpt", size, &mut mem, || { let before = read_allocated(); let mut m: NibbleTrie<usize> = NibbleTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } m.trie_optimize(); let bytes = read_allocated() - before; drop(m); bytes }); }
         if active[8] { mem_measure("PolyOpt", size, &mut mem, || { let before = read_allocated(); let mut m: PolyTrie<usize> = PolyTrie::trie_new(); for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); } m.trie_optimize(); let bytes = read_allocated() - before; drop(m); bytes }); }
+        if active[9] { mem_measure("LinkedList", size, &mut mem, || { let before = read_allocated(); let mut m: LinkedList<(Vec<u8>, usize)> = LinkedList::new(); for (i, k) in keys.iter().enumerate() { m.push_back((k.clone(), i)); } let bytes = read_allocated() - before; drop(m); bytes }); }
 
         eprintln!();
     }
@@ -569,6 +614,8 @@ fn main() {
     print_table("Lookup", "keys/sec", &look);
     print_table("Iter forward", "keys/sec", &fwd);
     print_table("Iter backward", "keys/sec", &rev);
+    print_table("Iter fwd index", "keys/sec", &fwd_idx);
+    print_table("Iter rev index", "keys/sec", &rev_idx);
     print_table("Optimize", "keys/sec", &opt);
     print_mem_table(&mem);
 
@@ -577,6 +624,8 @@ fn main() {
     merge_results(&mut results, "Lookup (keys/sec)",     &look);
     merge_results(&mut results, "Iter forward (keys/sec)",  &fwd);
     merge_results(&mut results, "Iter backward (keys/sec)", &rev);
+    merge_results(&mut results, "Iter fwd index (keys/sec)", &fwd_idx);
+    merge_results(&mut results, "Iter rev index (keys/sec)", &rev_idx);
     merge_results(&mut results, "Optimize (keys/sec)",  &opt);
     merge_results(&mut results, "Memory (bytes/key)",   &mem);
     save_results(&results);
