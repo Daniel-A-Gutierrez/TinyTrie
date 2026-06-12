@@ -6,7 +6,8 @@
       "Bash(cargo bench *)",
       "Bash(rtk find *)",
       "Bash(rtk ls *)",
-      "Bash(rtk read *)"
+      "Bash(rtk read *)",
+      "Bash(rtk cargo build *)"
     ]
   }
 }

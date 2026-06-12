@@ -31,7 +31,7 @@
 //! Real keys start at index 1. This allows 0 to be used as a sentinel for
 //! "empty" in `children[]` slots.
 
-use crate::TinyTrieMap;
+use crate::{KeyStore, TinyTrieMap, TrieKey};
 use std::simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq};
 
 // ---------------------------------------------------------------------------
@@ -191,12 +191,10 @@ impl std::fmt::Debug for Node {
 // BitTrie
 // ---------------------------------------------------------------------------
 
-pub struct BitTrie<T> {
+pub struct BitTrie<K: TrieKey, V> {
     arena: Vec<Node>,
-    buf: Vec<u8>,
-    /// (offset into buf, byte length) per key. index[0] = dummy entry.
-    index: Vec<(usize, u16)>,
-    values: Vec<T>,
+    keys: K::Store,
+    values: Vec<V>,
     /// The root node has no parent, so its prefix_len is stored here.
     root_prefix_len: u16,
 }
@@ -351,30 +349,22 @@ fn bit_count(key: &[u8]) -> usize {
 // BitTrie implementation
 // ---------------------------------------------------------------------------
 
-impl<T> BitTrie<T> {
+impl<K: TrieKey, V> BitTrie<K, V> {
     pub fn new() -> Self {
         BitTrie {
             arena: Vec::new(),
-            buf: Vec::new(),
-            index: vec![(0, 0)], // index[0] = dummy entry
+            keys: K::Store::default(),
             values: Vec::new(),
             root_prefix_len: 0,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.index.len() - 1 // index[0] is dummy
+        self.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.len() == 1
-    }
-
-    /// Look up a key slice by its index into the index array.
-    #[inline]
-    fn key_slice(&self, key_index: usize) -> &[u8] {
-        let (off, len) = self.index[key_index];
-        &self.buf[off..off + len as usize]
+        self.keys.len() == 0
     }
 
     // -----------------------------------------------------------------------
@@ -396,10 +386,10 @@ impl<T> BitTrie<T> {
             // Key bits exhausted — check if this node is terminal
             if prefix_len >= max_bits {
                 if node.is_terminal() {
-                    let ki = node.leaf_key_index_val() as usize;
-                    let key_in_buf = self.key_slice(ki);
+                    let ki = node.leaf_key_index_val();
+                    let key_in_buf = self.keys.key_bytes(ki);
                     if simd_eq(key_in_buf, key) {
-                        return Some(ki);
+                        return Some(ki as usize);
                     }
                 }
                 return None;
@@ -415,9 +405,9 @@ impl<T> BitTrie<T> {
 
             if child & LEAF_BIT != 0 {
                 // Leaf — verify full key match
-                let ki = (child & !LEAF_BIT) as usize;
-                return if simd_eq(self.key_slice(ki), key) {
-                    Some(ki)
+                let ki = child & !LEAF_BIT;
+                return if simd_eq(self.keys.key_bytes(ki), key) {
+                    Some(ki as usize)
                 } else {
                     None
                 };
@@ -429,7 +419,7 @@ impl<T> BitTrie<T> {
         }
     }
 
-    pub fn get_value(&self, key: &[u8]) -> Option<&T> {
+    pub fn get_value(&self, key: &[u8]) -> Option<&V> {
         self.get(key).map(|idx| &self.values[idx - 1])
     }
 
@@ -437,17 +427,14 @@ impl<T> BitTrie<T> {
     // Insertion
     // -----------------------------------------------------------------------
 
-    pub fn insert(&mut self, key: Vec<u8>, value: T) -> Result<usize, ()> {
+    pub fn insert(&mut self, key: K, value: V) -> Result<usize, ()> {
         // No null byte rejection — 0x00 bytes are valid in keys.
 
-        let new_index = self.index.len() as u32;
-        let key_len = key.len() as u16;
-        let offset = self.buf.len();
-        self.buf.extend_from_slice(&key);
-        self.index.push((offset, key_len));
+        let new_index = self.keys.push(key);
         self.values.push(value);
 
-        let max_bits = key.len() * 8;
+        let new_key = self.keys.key_bytes(new_index);
+        let max_bits = new_key.len() * 8;
 
         if self.arena.is_empty() {
             if max_bits == 0 {
@@ -460,7 +447,7 @@ impl<T> BitTrie<T> {
                 return Ok(new_index as usize);
             }
             // First key: create root at bit 0
-            let first_bit = key_bit_at(&key, 0) as usize;
+            let first_bit = key_bit_at(new_key, 0) as usize;
             let mut root = Node::new();
             root.set_leaf_child(first_bit, new_index, max_bits as u16);
             root.set_leaf_key_index(new_index);
@@ -469,7 +456,6 @@ impl<T> BitTrie<T> {
             return Ok(new_index as usize);
         }
 
-        let new_key = &key;
         let mut node_idx: u32 = 0;
         let mut confirmed: usize = 0;
         let mut prefix_len = self.root_prefix_len as usize;
@@ -480,8 +466,8 @@ impl<T> BitTrie<T> {
         loop {
             let node = &self.arena[node_idx as usize];
             // Use leaf field for reference key (O(1), no find_any_leaf)
-            let ref_ki = node.leaf_key_index_val() as usize;
-            let ref_key = self.key_slice(ref_ki);
+            let ref_ki = node.leaf_key_index_val();
+            let ref_key = self.keys.key_bytes(ref_ki);
 
             // Fast path: bounded comparison from confirmed to prefix_len.
             // We only need to know if the new key matches the reference key
@@ -510,15 +496,14 @@ impl<T> BitTrie<T> {
 
                 if child & LEAF_BIT != 0 {
                     // Leaf child — need full divergence scan for the split
-                    let existing_ki = (child & !LEAF_BIT) as usize;
-                    let existing_key = self.key_slice(existing_ki);
+                    let existing_ki = child & !LEAF_BIT;
+                    let existing_key = self.keys.key_bytes(existing_ki);
                     let existing_prefix = node.prefix_lens[bit];
 
                     match simd_find_divergence::<8>(new_key, existing_key, confirmed) {
                         DivergeResult::Duplicate => {
                             // Should not happen — caught above via prefix_matches
-                            let (off, _len) = self.index.pop().unwrap();
-                            self.buf.truncate(off);
+                            self.keys.rollback();
                             let _ = self.values.pop();
                             return Err(());
                         }
@@ -530,12 +515,12 @@ impl<T> BitTrie<T> {
                                 let exist_bit = key_bit_at(existing_key, d) as usize;
                                 split_node.set_terminal(true);
                                 split_node.set_leaf_key_index(new_index);
-                                split_node.set_leaf_child(exist_bit, existing_ki as u32, existing_prefix);
+                                split_node.set_leaf_child(exist_bit, existing_ki, existing_prefix);
                             } else if d >= existing_key.len() * 8 {
                                 // Existing key ends at the split point — terminal
                                 let new_child_bit = key_bit_at(new_key, d) as usize;
                                 split_node.set_terminal(true);
-                                split_node.set_leaf_key_index(existing_ki as u32);
+                                split_node.set_leaf_key_index(existing_ki);
                                 split_node.set_leaf_child(new_child_bit, new_index, max_bits as u16);
                             } else {
                                 // Neither key ends at the split point
@@ -543,8 +528,8 @@ impl<T> BitTrie<T> {
                                 let exist_bit = key_bit_at(existing_key, d) as usize;
                                 debug_assert_ne!(new_child_bit, exist_bit);
                                 split_node.set_leaf_child(new_child_bit, new_index, max_bits as u16);
-                                split_node.set_leaf_child(exist_bit, existing_ki as u32, existing_prefix);
-                                split_node.set_leaf_key_index(existing_ki as u32);
+                                split_node.set_leaf_child(exist_bit, existing_ki, existing_prefix);
+                                split_node.set_leaf_key_index(existing_ki);
                             }
 
                             let split_idx = self.arena.len() as u32;
@@ -567,8 +552,7 @@ impl<T> BitTrie<T> {
                 match simd_find_divergence::<8>(new_key, ref_key, confirmed) {
                     DivergeResult::Duplicate => {
                         // Duplicate key — roll back
-                        let (off, _len) = self.index.pop().unwrap();
-                        self.buf.truncate(off);
+                        self.keys.rollback();
                         let _ = self.values.pop();
                         return Err(());
                     }
@@ -621,24 +605,21 @@ impl<T> BitTrie<T> {
     // Iteration
     // -----------------------------------------------------------------------
 
-    pub fn iter(&self) -> BitIter<'_, T> {
+    pub fn iter(&self) -> BitIter<'_, K, V> {
         BitIter::new(self)
     }
 
-    pub fn iter_last(&self) -> BitIter<'_, T> {
+    pub fn iter_last(&self) -> BitIter<'_, K, V> {
         BitIter::new_last(self)
     }
 
-    pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
-        let buf = self.buf;
-        let keys: Vec<Vec<u8>> = self.index.into_iter().skip(1).map(|(off, len)| {
-            buf[off..off + len as usize].to_vec()
-        }).collect();
+    pub fn into_keys_values(self) -> (Vec<K>, Vec<V>) {
+        let keys = self.keys.into_keys();
         (keys, self.values)
     }
 }
 
-impl<T> Default for BitTrie<T> {
+impl<K: TrieKey, V> Default for BitTrie<K, V> {
     fn default() -> Self {
         Self::new()
     }
@@ -648,8 +629,8 @@ impl<T> Default for BitTrie<T> {
 // Iterator
 // ---------------------------------------------------------------------------
 
-pub struct BitIter<'a, T> {
-    trie: &'a BitTrie<T>,
+pub struct BitIter<'a, K: TrieKey, V> {
+    trie: &'a BitTrie<K, V>,
     /// Stack of (arena_index, which_child) pairs.
     ///
     /// - `arena_idx`: index into the arena (which node)
@@ -658,15 +639,15 @@ pub struct BitIter<'a, T> {
     stack: Vec<(u32, u8)>,
 }
 
-impl<'a, T> BitIter<'a, T> {
-    fn new(trie: &'a BitTrie<T>) -> Self {
+impl<'a, K: TrieKey, V> BitIter<'a, K, V> {
+    fn new(trie: &'a BitTrie<K, V>) -> Self {
         if trie.arena.is_empty() {
             return BitIter { trie, stack: Vec::new() };
         }
         BitIter { trie, stack: vec![(0, u8::MAX)] }
     }
 
-    fn new_last(trie: &'a BitTrie<T>) -> Self {
+    fn new_last(trie: &'a BitTrie<K, V>) -> Self {
         if trie.arena.is_empty() {
             return BitIter { trie, stack: Vec::new() };
         }
@@ -741,9 +722,9 @@ impl<'a, T> BitIter<'a, T> {
     }
 
     /// Return the key and value at the current cursor position.
-    pub fn current(&self) -> Option<(&[u8], &T)> {
+    pub fn current(&self) -> Option<(&[u8], &V)> {
         let ki = self.current_index()?;
-        let key = self.trie.key_slice(ki);
+        let key = self.trie.keys.key_bytes(ki as u32);
         let value = &self.trie.values[ki - 1];
         Some((key, value))
     }
@@ -891,13 +872,13 @@ impl<'a, T> BitIter<'a, T> {
 
     /// Advance to the next key in sorted order, returning key and value.
     #[inline]
-    pub fn next(&mut self) -> Option<(&[u8], &T)> {
+    pub fn next(&mut self) -> Option<(&[u8], &V)> {
         if self.advance_next() { self.current() } else { None }
     }
 
     /// Move to the previous key in sorted order, returning key and value.
     #[inline]
-    pub fn prev(&mut self) -> Option<(&[u8], &T)> {
+    pub fn prev(&mut self) -> Option<(&[u8], &V)> {
         if self.advance_prev() { self.current() } else { None }
     }
 
@@ -913,7 +894,7 @@ impl<'a, T> BitIter<'a, T> {
         if self.advance_prev() { self.current_index() } else { None }
     }
 
-    pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &T)> {
+    pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &V)> {
         if self.trie.arena.is_empty() {
             self.stack.clear();
             return None;
@@ -956,8 +937,8 @@ impl<'a, T> BitIter<'a, T> {
                 self.stack.push((node_idx, bit as u8));
                 if child & LEAF_BIT != 0 {
                     // Leaf — check if leaf key >= seek key
-                    let ki = (child & !LEAF_BIT) as usize;
-                    let leaf_key = self.trie.key_slice(ki);
+                    let ki = child & !LEAF_BIT;
+                    let leaf_key = self.trie.keys.key_bytes(ki);
                     if leaf_key >= key {
                         return self.current();
                     }
@@ -987,8 +968,8 @@ impl<'a, T> BitIter<'a, T> {
             // Check terminal before trying to go up
             if node.is_terminal() && bit == 0 {
                 // Terminal key at this node — is it >= seek key?
-                let ki = node.leaf_key_index_val() as usize;
-                let term_key = self.trie.key_slice(ki);
+                let ki = node.leaf_key_index_val();
+                let term_key = self.trie.keys.key_bytes(ki);
                 if term_key >= key {
                     self.stack.push((node_idx, TERMINAL_POS));
                     return self.current();
@@ -1037,7 +1018,7 @@ impl<'a, T> BitIter<'a, T> {
 // Tests
 // ---------------------------------------------------------------------------
 
-impl TinyTrieMap for BitTrie<usize> {
+impl TinyTrieMap for BitTrie<Vec<u8>, usize> {
     fn trie_new() -> Self { Self::new() }
     fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
     fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }

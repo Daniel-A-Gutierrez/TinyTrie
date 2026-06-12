@@ -2,67 +2,67 @@
 ─── Insertion (keys/sec) ───
                               10             100            1000           10000          100000        10000000
         TinyTrie          14.52M           9.77M           7.84M           5.10M           3.61M                
-        PolyTrie           8.94M           7.73M           8.58M           5.76M           4.62M                
-      LinkedList           8.08M           8.11M           7.79M           7.56M           6.12M           6.65M
-       SortedVec           6.27M           4.03M           3.03M           2.47M           2.05M           1.00M
-        BTreeMap           3.45M           1.93M           1.28M          953.2K          724.3K          541.3K
-      NibbleTrie           2.57M           2.15M           1.93M           1.48M           1.30M           1.08M
-   DynNibbleTrie           2.56M           2.23M           1.90M           1.45M           1.31M           1.07M
-         HashMap           1.79M           1.73M           1.36M           1.48M           1.06M          647.7K
-         BitTrie           1.26M           1.03M          838.1K          888.7K          734.3K          547.2K
+      LinkedList           8.43M           8.37M           8.21M           8.11M           7.80M           7.03M
+       SortedVec           6.53M           4.18M           3.10M           2.59M           2.12M           1.23M
+        BTreeMap           3.65M           1.98M           1.36M           1.05M          800.8K          585.1K
+      NibbleTrie           2.64M           2.30M           2.02M           1.54M           1.26M           1.10M
+   DynNibbleTrie           2.54M           2.26M           1.94M           1.48M           1.35M           1.05M
+         BitTrie           2.19M           2.29M           2.08M           1.75M           1.48M           1.17M
+         HashMap           1.88M           1.82M           1.44M           1.58M           1.40M          828.5K
+        PolyTrie           1.16M           7.73M           8.58M           5.76M           4.62M                
 
 ─── Iter backward (keys/sec) ───
                               10             100            1000           10000          100000        10000000
         TinyTrie         174.43M         333.45M         354.19M         265.16M          69.99M                
-      LinkedList         119.70M         183.65M         190.98M         165.08M          95.97M          53.61M
+      LinkedList         135.17M         190.32M         197.42M         185.83M         190.22M         186.03M
          PolyOpt          93.85M         133.60M         138.47M         140.04M         139.20M                
         PolyTrie          93.42M         133.17M         138.24M         137.22M         130.78M                
-        BTreeMap          28.63M          31.68M          31.63M          31.12M          27.73M          23.58M
-   DynNibbleTrie           8.98M          10.19M          10.34M          10.44M           9.86M           9.81M
-    DynNibbleOpt           8.98M          10.25M          10.36M          10.43M           9.86M           9.92M
-       NibbleOpt           8.60M           9.88M          10.04M           9.99M           9.90M          10.02M
-      NibbleTrie           8.59M           9.91M          10.06M           9.99M           9.80M          10.26M
-         BitTrie           8.22M           8.68M           8.68M           8.60M           7.52M           7.41M
+        BTreeMap          30.34M          32.15M          32.46M          31.23M          29.53M          26.41M
+    DynNibbleOpt           9.36M          10.61M          10.62M          10.41M          10.22M          10.15M
+   DynNibbleTrie           9.30M          10.69M          10.63M          10.39M          10.15M          10.20M
+       NibbleOpt           8.75M          10.03M          10.30M           9.98M          10.05M          10.12M
+      NibbleTrie           8.69M          10.00M          10.29M          10.06M          10.14M          10.14M
+         BitTrie           8.50M           8.82M           9.00M           8.65M           8.72M           8.41M
 
 ─── Iter forward (keys/sec) ───
                               10             100            1000           10000          100000        10000000
         TinyTrie         174.42M         321.42M         331.96M         246.86M          69.08M                
-      LinkedList         148.37M         219.42M         226.77M         198.49M         110.45M         223.07M
-       SortedVec         132.14M         216.27M         229.39M         232.83M         233.04M         240.50M
+      LinkedList         156.25M         224.54M         233.06M         222.23M         227.24M         214.61M
+       SortedVec         136.88M         222.46M         238.67M         233.84M         232.11M         237.52M
          PolyOpt          88.34M         127.68M         131.08M         131.59M         131.04M                
         PolyTrie          87.46M         127.49M         131.09M         130.91M         127.71M                
-        BTreeMap          29.67M          31.86M          31.84M          30.75M          22.66M          24.54M
-    DynNibbleOpt           8.35M          10.31M          10.33M          10.24M           9.80M           9.53M
-   DynNibbleTrie           8.34M          10.35M          10.35M          10.29M           9.85M          10.21M
-         BitTrie           8.29M           9.35M           9.36M           9.36M           7.88M           8.96M
-       NibbleOpt           7.96M           9.72M           9.90M           9.88M           9.89M          10.26M
-      NibbleTrie           7.90M           9.78M           9.80M           9.95M           9.77M          10.29M
+        BTreeMap          31.28M          32.65M          32.88M          31.74M          28.58M          24.09M
+   DynNibbleTrie           8.65M          10.49M          10.54M          10.46M          10.17M          10.12M
+         BitTrie           8.63M           9.51M           9.67M           8.46M           9.41M           8.80M
+    DynNibbleOpt           8.63M          10.48M          10.61M          10.32M          10.17M          10.14M
+       NibbleOpt           8.08M           9.84M           9.93M          10.04M          10.05M          10.09M
+      NibbleTrie           8.08M           9.89M          10.17M           9.99M           9.99M          10.03M
 
 ─── Iter fwd index (keys/sec) ───
                               10             100            1000           10000          100000        10000000
-      NibbleTrie          10.86M          14.24M          14.77M          13.68M          14.79M          15.06M
-       NibbleOpt          10.85M          14.03M          14.77M          14.38M          14.76M          14.78M
+       NibbleOpt          10.83M          14.36M          15.15M          14.81M          15.00M          14.98M
+      NibbleTrie          10.69M          14.31M          15.10M          14.68M          14.98M          14.97M
 
 ─── Iter rev index (keys/sec) ───
                               10             100            1000           10000          100000        10000000
-      NibbleTrie          12.10M          14.21M          15.00M          14.90M          14.77M          14.70M
-       NibbleOpt          12.07M          14.42M          15.02M          14.92M          14.81M          14.91M
+      NibbleTrie          12.19M          14.78M          15.26M          15.01M          14.99M          14.96M
+       NibbleOpt          12.16M          14.71M          15.22M          14.99M          14.91M          14.92M
 
 ─── Lookup (keys/sec) ───
                               10             100            1000           10000          100000        10000000
          PolyOpt         133.10M          76.23M          50.61M          29.51M          20.77M                
         PolyTrie         132.67M          76.15M          50.56M          22.08M          16.47M                
         TinyTrie          78.42M          44.42M          31.12M          15.69M          11.79M                
- NibbleUnchecked          15.66M          11.79M           9.20M           7.78M           6.56M           5.10M
-NibbleOptUnchecked          15.65M          11.77M           9.21M           7.90M           6.57M           5.08M
-   DynNibbleTrie          11.55M           9.73M           8.23M           7.22M           5.84M           5.02M
-    DynNibbleOpt          11.52M           9.68M           8.21M           7.19M           5.75M           4.99M
-      NibbleTrie          11.20M           9.35M           7.77M           6.84M           5.67M           4.73M
-       NibbleOpt          11.19M           9.37M           7.86M           6.84M           5.70M           4.72M
-         BitTrie          11.17M           7.53M           5.56M           4.40M           3.52M           2.73M
-       SortedVec           9.98M           6.65M           4.91M           3.64M           3.06M           2.28M
-        BTreeMap           6.28M           3.97M           2.65M           1.93M           1.59M           1.13M
-         HashMap           4.19M           3.94M           3.96M           3.47M           2.39M           1.72M
+NibbleOptUnchecked          16.27M          12.00M           9.55M           8.01M           6.74M           4.54M
+ NibbleUnchecked          16.26M          12.01M           9.56M           8.00M           6.74M           5.03M
+   DynNibbleTrie          11.99M           9.96M           8.63M           7.42M           6.16M           4.92M
+    DynNibbleOpt          11.96M           9.95M           8.62M           7.40M           6.15M           5.00M
+         BitTrie          11.81M           7.78M           5.87M           4.60M           3.79M           2.75M
+      NibbleTrie          11.64M           9.60M           8.17M           7.10M           6.22M           4.66M
+       NibbleOpt          11.59M           9.57M           8.20M           7.05M           6.22M           4.87M
+       SortedVec          10.29M           6.90M           5.17M           3.82M           3.14M           2.29M
+        BTreeMap           6.53M           4.05M           2.79M           2.01M           1.65M           1.13M
+         HashMap           4.27M           4.12M           4.18M           3.55M           3.09M           2.20M
       LinkedList           77.9K            8.1K                                                                
 
 ─── Memory (bytes/key) ───
@@ -83,6 +83,6 @@ NibbleOptUnchecked          15.65M          11.77M           9.21M           7.9
 ─── Optimize (keys/sec) ───
                               10             100            1000           10000          100000        10000000
          PolyOpt           8.42M           7.46M           8.11M           4.73M           3.70M                
-       NibbleOpt           2.13M           1.94M           1.77M           1.36M           1.26M           1.03M
-    DynNibbleOpt           2.12M           1.95M           1.69M           1.35M           1.18M           1.04M
+       NibbleOpt           2.19M           2.02M           1.84M           1.39M           1.29M           1.02M
+    DynNibbleOpt           2.02M           1.97M           1.77M           1.35M           1.20M           1.01M
 

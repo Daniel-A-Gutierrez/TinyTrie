@@ -43,11 +43,20 @@
 
 mod simd;
 
+mod key_store;
+pub use key_store::{BufKeyStore, KeyStore, TrieKey, U64Key, VecKeyStore};
+
+mod arena;
+pub use arena::Arena;
+
 mod bit_trie;
 pub use bit_trie::BitTrie;
 
 mod nibble_trie;
 pub use nibble_trie::{NibbleTrie, Node, TrieIndex};
+
+mod poly_trie;
+pub use poly_trie::{NodeRef, PolyTrie};
 
 #[cfg(feature = "archive")]
 pub use archive::prefix_trie::null_terminate;
