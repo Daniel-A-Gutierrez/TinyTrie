@@ -50,7 +50,10 @@ use pairvec::{
 mod pairvec;
 
 mod nibble_trie;
-pub use nibble_trie::NibbleTrie;
+pub use nibble_trie::{NibbleTrie, TrieIndex};
+
+mod dyn_nibble_trie;
+pub use dyn_nibble_trie::DynNibbleTrie;
 
 mod bit_trie;
 pub use bit_trie::BitTrie;

@@ -1,71 +1,98 @@
 # Benchmarking
 
-Run from the project root:
+## Running the Suite
 
 ```bash
-# Run all structures, all sizes
-cargo bench --bench bench
-
-# Run only a specific structure (case-insensitive substring match)
-cargo bench --bench bench -- NibbleTrie
-cargo bench --bench bench -- nibble
-cargo bench --bench bench -- bit
-cargo bench --bench bench -- BTreeMap
-
-# Match multiple structures with a shared substring
-cargo bench --bench bench -- trie    # TinyTrie, NibbleTrie, BitTrie, PolyTrie
-cargo bench --bench bench -- opt    # NibbleOpt, PolyOpt
-cargo bench --bench bench -- map    # BTreeMap, HashMap
+cargo bench
 ```
 
-The filter matches against: TinyTrie, NibbleTrie, BitTrie, PolyTrie, BTreeMap, HashMap, SortedVec, NibbleOpt, PolyOpt
+Runs all contestants at all sizes (10, 100, 1K, 100K, 10M) with 2s per bench.
 
-Each bench runs for 3 seconds per size (10K, 100K, 10M keys). Benches run sequentially per structure within each section.
+## Targeted Runs
 
-## Architecture
+The bench accepts up to three space-separated arguments, each a comma-separated list:
 
-The bench uses a **trait-based design** with two layers:
+```
+cargo bench -- [TESTS] [SIZES] [STRUCTURES]
+```
 
-1. **`TinyTrieMap`** (in `src/tiny_trie_map.rs`): A library-level trait unifying all four trie types behind a common API (`trie_new`, `trie_insert`, `trie_get`, `trie_iter_fwd`, `trie_iter_rev`, `trie_len`, `trie_optimize`). This abstracts away the different iterator types and null-terminator requirements.
+Any argument may be omitted or left empty to mean "all."
 
-2. **Per-test bench traits** (in `benches/bench.rs`): `InsertBench`, `LookupBench`, `FwdIterBench`, `RevIterBench`, `OptimizeBench` — each with one `run()` method. The `impl_trie_benches!` macro generates trivially identical impls for any type implementing `TinyTrieMap`. BTreeMap, HashMap, and SortedVec have manual impls.
+### Tests
 
-3. **`mem_measure()`** function: Snapshots the allocator, runs a build closure, computes bytes/key. Not a trait — memory measurement needs allocation tracking before/after construction.
+Comma-list of benchmark types to run:
 
-The `trie_` prefix on `TinyTrieMap` methods avoids collisions with inherent methods. `trie_iter_fwd`/`trie_iter_rev` use callbacks instead of returning named iterator types, since each trie has its own iterator type.
+| Name       | Description                    |
+|------------|--------------------------------|
+| `insert`   | Key insertion                  |
+| `lookup`   | Key lookup (hits + misses)     |
+| `fwd`      | Forward iteration              |
+| `rev`      | Backward iteration             |
+| `fwd_idx`  | Forward index-only iteration    |
+| `rev_idx`  | Backward index-only iteration   |
+| `optimize` | Optimize (DFS buf rewrite)    |
+| `memory`   | Bytes per key                  |
 
-### Null-terminator normalization
+### Sizes
 
-`Structures` stores both `lookup_keys` (plain, for std collections and NibbleTrie) and `lookup_keys_null` (null-terminated, for TinyTrie, BitTrie, and PolyTrie). NibbleTrie's `LookupBench` impl uses plain keys; the other tries use null-terminated keys.
+Comma-list of key counts. Must be one of the canonical sizes: `10`, `100`, `1000`, `100000`, `10000000`.
 
-### Iterator semantics
+### Structures
 
-`trie_iter_fwd` and `trie_iter_rev` use the `current() + next()/prev()` pattern, which correctly handles both TinyTrie (where `iter()` positions at the first key) and the other tries (where `iter()` positions before the first key). Similarly, all tries' `iter_last()` positions at the last key, so `current()` reads it before `prev()` advances backward.
+Comma-list of substring filters (case-insensitive). A contestant matches if its name contains any filter.
 
-## What gets filtered
+### Examples
 
-- **Insertion**: TinyTrie, NibbleTrie, BitTrie, PolyTrie, BTreeMap, HashMap, SortedVec (7 structures)
-- **Lookup, Memory**: all 9 structures
-- **Forward iteration**: TinyTrie, NibbleTrie, BitTrie, PolyTrie, BTreeMap, SortedVec, NibbleOpt, PolyOpt (HashMap lacks iteration)
-- **Backward iteration**: TinyTrie, NibbleTrie, BitTrie, PolyTrie, BTreeMap, NibbleOpt, PolyOpt (HashMap and SortedVec lack reverse iter)
-- **Optimize**: NibbleOpt, PolyOpt only
+```bash
+# All tests, all sizes, all structures
+cargo bench
 
-If no structures in a section match the filter, that section is skipped entirely.
+# Lookup only, sizes 10 and 100, all structures
+cargo bench -- lookup 10,100
 
-## Results files
+# All tests, size 10 only, all structures
+cargo bench -- "" 10
 
-`benches/bench_results.json` is the canonical data store — raw f64 values, persisted across runs. Filtering to a subset of structures only updates their rows; previous results for other structures are preserved.
+# Lookup only, all sizes, only NibbleTrie variants
+cargo bench -- lookup "" NibbleTrie
 
-`benches/bench_results.md` is regenerated from the JSON each run with human-readable formatting.
+# All tests, all sizes, only unchecked variants
+cargo bench -- "" "" Unchecked
 
-## Modifying bench parameters
+# Insert + lookup, size 1M, HashMap vs BTreeMap
+cargo bench -- insert,lookup 1000000 HashMap,BTreeMap
+```
 
-- **Sizes**: edit `SIZES` constant in `benches/bench.rs`
-- **Duration per bench**: edit `BENCH_SECS` constant in `benches/bench.rs`
+## Contestants
 
-## Adding a new structure
+| Name                | Tests                                             | Notes                                    |
+|---------------------|---------------------------------------------------|------------------------------------------|
+| `TinyTrie`          | insert, lookup, fwd, rev, memory                 | 6-bit inline, null-terminated keys      |
+| `NibbleTrie`        | insert, lookup, fwd, rev, fwd_idx, rev_idx, memory | u32/u32 default                          |
+| `BitTrie`           | insert, lookup, fwd, rev, memory                 | Bit-level trie, null-terminated keys     |
+| `PolyTrie`          | insert, lookup, fwd, rev, memory                 | Graduated node sizes                     |
+| `BTreeMap`          | insert, lookup, fwd, rev, memory                 | std::collections baseline                |
+| `HashMap`           | insert, lookup, memory                           | std::collections baseline                |
+| `SortedVec`        | insert, lookup, fwd, memory                      | Binary search on sorted vec              |
+| `NibbleOpt`         | lookup, fwd, rev, fwd_idx, rev_idx, optimize, memory | NibbleTrie after optimize()              |
+| `PolyOpt`           | lookup, fwd, rev, optimize, memory               | PolyTrie after optimize()                |
+| `LinkedList`        | insert, fwd, rev, memory                         | O(n) lookup, baseline                    |
+| `NibbleUnchecked`   | lookup                                            | get_unchecked (assumes key in set)      |
+| `NibbleOptUnchecked`| lookup                                            | get_unchecked on optimized trie          |
+| `DynNibbleTrie`    | insert, lookup, fwd, rev, memory                 | Auto-promoting PTR u8→u16→u32→u64       |
+| `DynNibbleOpt`      | lookup, fwd, rev, optimize, memory               | DynNibbleTrie after optimize()           |
 
-1. Implement `TinyTrieMap` in the struct's source file
-2. Add `impl_trie_benches!(YourType);` in `benches/bench.rs`
-3. Add `impl OptimizeBench` if it has `optimize()`
-4. Add the name to `CONTESTANT_NAMES` and the corresponding `if active[N]` blocks in main()
+## Output
+
+Results print to stdout as sorted tables (fastest first for rates, smallest first for memory) and persist to:
+
+- `benches/bench_results.json` — full structured data
+- `benches/bench_results.md` — markdown tables (sorted, merged across runs)
+
+Each run merges into the existing results, overwriting only the contestants and sizes that were actually run. Previous results for other sizes/contestants are preserved.
+
+## Unchecked Lookup
+
+`NibbleUnchecked` and `NibbleOptUnchecked` use `get_unchecked()`, which skips key comparison at terminal and leaf nodes. The assumption is that the queried key **is present in the trie** — once the nibble path reaches a terminal node or leaf, the index is returned directly with no SIMD verification.
+
+The bench uses `hit_keys` (keys known to be in the trie) rather than the mixed hit/miss `lookup_keys` used by other contestants. The ops/sec rate is computed per hit key, so the numbers are directly comparable across lookup methods.
