@@ -19,7 +19,7 @@
 //! This allows 0 to be used as a sentinel for "empty" in `children[]`,
 //! eliminating +1/-1 arithmetic.
 
-use crate::TinyTrieMap;
+use super::TinyTrieMap;
 use std::simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq};
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,7 @@
 #![feature(iter_array_chunks)]
 #![feature(generic_const_exprs)]
+#![feature(portable_simd)]
+
 //! Compact DFA String Index
 //!
 //! A prefix-compressed radix trie with existence guarantee, viewed as a
@@ -39,35 +41,57 @@
 //! with `0x00`, which acts as a unique terminator distinguishing "ab" from
 //! "abc" during prefix comparison.
 
-#![feature(portable_simd)]
-
-mod prefix_len;
-use prefix_len::PrefixLen;
-use pairvec::{
-    add_child_to_pairvec, free_pairvec_data, promote_inode_to_pairvec, PairVec,
-};
-
-mod pairvec;
+mod simd;
 
 mod nibble_trie;
-pub use nibble_trie::{NibbleTrie, TrieIndex};
+pub use nibble_trie::{NibbleTrie, Node, TrieIndex};
+
+#[cfg(feature = "archive")]
+pub use archive::prefix_trie::null_terminate;
 
 mod dyn_nibble_trie;
 pub use dyn_nibble_trie::DynNibbleTrie;
 
-mod bit_trie;
-pub use bit_trie::BitTrie;
-
-mod arena;
-pub use arena::Arena;
-
-mod poly_trie;
-pub use poly_trie::PolyTrie;
-
-mod simd;
-mod prefix_trie;
-pub use prefix_trie::TinyTrie;
-pub use prefix_trie::null_terminate;
-
 mod tiny_trie_map;
 pub use tiny_trie_map::TinyTrieMap;
+
+#[cfg(feature = "archive")]
+mod archive;
+
+// ---------------------------------------------------------------------------
+// Corpus key loading (shared between trie-stats and bench)
+// ---------------------------------------------------------------------------
+
+/// Load unique sorted keys from a file, one per line.
+pub fn load_corpus_lines(path: &str) -> Vec<Vec<u8>> {
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read corpus '{}': {e}", path);
+        std::process::exit(1);
+    });
+    let mut keys: Vec<Vec<u8>> = data.split(|&b| b == b'\n')
+        .map(|line| {
+            let mut v = line.to_vec();
+            v.truncate(v.len().saturating_sub(b"\r".len()));
+            v
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Load unique sorted keys from a file, split by whitespace.
+pub fn load_corpus_words(path: &str) -> Vec<Vec<u8>> {
+    let data = std::fs::read(path).unwrap_or_else(|e| {
+        eprintln!("Failed to read corpus '{}': {e}", path);
+        std::process::exit(1);
+    });
+    let mut keys: Vec<Vec<u8>> = data.split(|&b| b.is_ascii_whitespace())
+        .map(|w| w.to_vec())
+        .filter(|w| !w.is_empty())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}

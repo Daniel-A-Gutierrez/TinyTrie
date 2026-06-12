@@ -136,12 +136,12 @@ const TERMINAL_BIT: u64 = 1u64 << 63;
 ///   lookup entirely. For non-terminal nodes, used during insertion to get
 ///   the reference key for divergence comparison.
 #[derive(Copy, Clone)]
-struct Node<PTR: TrieIndex, LEN: TrieIndex> {
-    children: [PTR; 16],
-    prefix_len: LEN,
-    leaf_mask: u16,
-    leaf: PTR,
-    offset: u64,  // bit 63 = terminal, bits 0-62 = raw buf offset
+pub struct Node<PTR: TrieIndex, LEN: TrieIndex> {
+    pub children: [PTR; 16],
+    pub prefix_len: LEN,
+    pub leaf_mask: u16,
+    pub leaf: PTR,
+    pub offset: u64,  // bit 63 = terminal, bits 0-62 = raw buf offset
 }
 
 impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
@@ -156,7 +156,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
     }
 
     #[inline]
-    fn is_terminal(&self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         (self.offset & TERMINAL_BIT) != 0
     }
 
@@ -180,7 +180,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
     }
 
     #[inline]
-    fn is_leaf(&self, nib: usize) -> bool {
+    pub fn is_leaf(&self, nib: usize) -> bool {
         debug_assert!(nib < 16);
         (self.leaf_mask >> nib) & 1 == 1
     }
@@ -232,7 +232,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
     /// Compute a 16-bit mask where bit N is set if `children[N] != 0`.
     /// Uses SIMD (for u16/u32/u64) to evaluate all 16 slots in parallel.
     #[inline]
-    fn children_mask(&self) -> u16 {
+    pub fn children_mask(&self) -> u16 {
         PTR::children_mask(&self.children)
     }
 }
@@ -263,10 +263,10 @@ impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for Node<PTR, LEN> {
 
 #[derive(Clone)]
 pub struct NibbleTrie<T, PTR: TrieIndex = u32, LEN: TrieIndex = u16> {
-    arena: Vec<Node<PTR, LEN>>,
-    buf: Vec<u8>,                // all keys concatenated (no null terminators)
-    index: Vec<(usize, LEN)>,    // (offset into buf, len) per key — offset is usize, len is compact
-    values: Vec<T>,              // values[i] ↔ index[i]
+    pub arena: Vec<Node<PTR, LEN>>,
+    pub buf: Vec<u8>,                // all keys concatenated (no null terminators)
+    pub index: Vec<(usize, LEN)>,    // (offset into buf, len) per key — offset is usize, len is compact
+    pub values: Vec<T>,              // values[i] ↔ index[i]
 }
 
 // ---------------------------------------------------------------------------

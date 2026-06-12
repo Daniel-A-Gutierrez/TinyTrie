@@ -1,9 +1,9 @@
-use crate::prefix_len::PrefixLen;
-use crate::TinyTrieMap;
-use crate::pairvec::{
+use super::prefix_len::PrefixLen;
+use super::TinyTrieMap;
+use super::pairvec::{
     add_child_to_pairvec, free_pairvec_data, promote_inode_to_pairvec, PairVec,
 };
-use crate::simd;
+use super::simd;
 
 
 // Tag encoding:

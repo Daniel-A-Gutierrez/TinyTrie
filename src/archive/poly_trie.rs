@@ -20,8 +20,8 @@
 
 use std::collections::VecDeque;
 
-use crate::arena::Arena;
-use crate::TinyTrieMap;
+use super::arena::Arena;
+use super::TinyTrieMap;
 
 // ---------------------------------------------------------------------------
 // NodeRef — tagged reference (8 bytes, #[repr(u8)])

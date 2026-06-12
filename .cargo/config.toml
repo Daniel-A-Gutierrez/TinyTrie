@@ -1,0 +1,2 @@
+[alias]
+bencher = "run --release --bin bencher --"

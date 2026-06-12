@@ -4,16 +4,16 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use tiny_trie::{BitTrie, DynNibbleTrie, NibbleTrie, PolyTrie, TinyTrie, TinyTrieMap};
+use tiny_trie::{DynNibbleTrie, NibbleTrie, TinyTrieMap};
 
 // NibbleTrie with u32 LEN so buf can hold >64KB (needed for 10K+ keys).
 type NT = NibbleTrie<usize, u32, u32>;
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const SIZES: &[usize] = &[10, 100, 1000, 100_000, 10_000_000];
-const BENCH_SECS: u64 = 2;
+const SIZES: &[usize] = &[10, 100, 1000, 10_000, 100_000, 10_000_000];
 const COL: usize = 16; // table column width
 
 // ── Allocation tracker ──────────────────────────────────────────────
@@ -46,6 +46,137 @@ fn string_keys(n: usize) -> Vec<Vec<u8>> {
     (0..n).map(|i| format!("key_{i:0>w$}").into_bytes()).collect()
 }
 
+fn random_keys(n: usize) -> Vec<Vec<u8>> {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let mut keys = std::collections::BTreeSet::new();
+    while keys.len() < n {
+        let len = rng.random_range(4..=16);
+        let key: Vec<u8> = (0..len).map(|_| rng.random()).collect();
+        keys.insert(key);
+    }
+    keys.into_iter().collect()
+}
+
+fn load_corpus_lines(path: &str) -> Vec<Vec<u8>> {
+    tiny_trie::load_corpus_lines(path)
+}
+
+fn load_corpus_words(path: &str) -> Vec<Vec<u8>> {
+    tiny_trie::load_corpus_words(path)
+}
+
+/// Key generation mode.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum KeyMode {
+    Sequential,  // default: "key_0001" style
+    Random,
+    Lines,       // from corpus file, newline-delimited
+    Words,       // from corpus file, whitespace-delimited
+}
+
+// ── CLI ───────────────────────────────────────────────────────────────
+
+const ALL_TESTS: &[&str] = &["insert", "lookup", "fwd", "rev", "fwd_idx", "rev_idx", "optimize", "memory"];
+
+#[derive(Parser)]
+#[command(name = "bencher", bin_name = "bencher")]
+#[command(about = "TinyTrie Benchmark Suite")]
+#[command(version)]
+struct Cli {
+    /// Test names to run (comma-separated: insert,lookup,fwd,rev,fwd_idx,rev_idx,optimize,memory)
+    #[arg(long, short, value_delimiter = ',', default_values = ALL_TESTS)]
+    tests: Vec<String>,
+
+    /// Sizes to benchmark — comma-separated list (10,100,1000) or inclusive range (100..100000)
+    #[arg(long, short)]
+    sizes: Option<String>,
+
+    /// Structure name filters (comma-separated, substring match)
+    #[arg(long, value_delimiter = ',')]
+    structures: Option<Vec<String>>,
+
+    /// Key generation mode
+    #[arg(long, default_value = "sequential")]
+    keys: KeyMode,
+
+    /// Path to corpus file (required for --keys=words or --keys=lines)
+    #[arg(long)]
+    corpus: Option<String>,
+
+    /// Seconds per benchmark
+    #[arg(long, default_value_t = 2)]
+    time: u64,
+}
+
+/// Parse the --sizes argument: either a comma-separated list or an inclusive range (lo..hi).
+/// Returns the subset of SIZES that match, preserving SIZES order.
+fn resolve_sizes(arg: Option<&str>) -> Vec<usize> {
+    let all_sizes: Vec<usize> = SIZES.to_vec();
+    let Some(arg) = arg else { return all_sizes };
+    let arg = arg.trim();
+
+    // Range syntax: lo..hi (inclusive both ends)
+    if let Some((lo_s, hi_s)) = arg.split_once("..") {
+        let lo: usize = lo_s.trim().parse().unwrap_or_else(|_| {
+            eprintln!("Error: invalid range lower bound '{}'", lo_s.trim());
+            std::process::exit(1);
+        });
+        let hi: usize = hi_s.trim().parse().unwrap_or_else(|_| {
+            eprintln!("Error: invalid range upper bound '{}'", hi_s.trim());
+            std::process::exit(1);
+        });
+        if lo > hi {
+            eprintln!("Error: range lower bound {lo} > upper bound {hi}");
+            std::process::exit(1);
+        }
+        let filtered: Vec<usize> = all_sizes.iter().filter(|&&s| s >= lo && s <= hi).copied().collect();
+        if filtered.is_empty() {
+            eprintln!("Error: no canonical sizes in range {lo}..{hi}. Available: {:?}", all_sizes);
+            std::process::exit(1);
+        }
+        return filtered;
+    }
+
+    // Comma-separated list
+    let requested: Vec<usize> = arg.split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .collect();
+    let filtered: Vec<usize> = requested.iter().filter(|s| all_sizes.contains(s)).copied().collect();
+    let rejected: Vec<usize> = requested.iter().filter(|s| !all_sizes.contains(s)).copied().collect();
+    if !rejected.is_empty() {
+        eprintln!("Warning: sizes {rejected:?} not in canonical sizes {:?}, ignoring", all_sizes);
+    }
+    if filtered.is_empty() {
+        eprintln!("Error: no valid sizes remaining. Available: {:?}", all_sizes);
+        std::process::exit(1);
+    }
+    filtered
+}
+
+fn generate_keys(mode: &KeyMode, n: usize, corpus_path: Option<&str>) -> Vec<Vec<u8>> {
+    match mode {
+        KeyMode::Sequential => string_keys(n),
+        KeyMode::Random => random_keys(n),
+        KeyMode::Lines => {
+            let path = corpus_path.expect("--lines requires --corpus <file>");
+            let all = load_corpus_lines(path);
+            if n > all.len() {
+                eprintln!("Warning: requested {n} keys but corpus has only {} lines, using {}", n, all.len());
+            }
+            all[..n.min(all.len())].to_vec()
+        }
+        KeyMode::Words => {
+            let path = corpus_path.expect("--words requires --corpus <file>");
+            let all = load_corpus_words(path);
+            if n > all.len() {
+                eprintln!("Warning: requested {n} keys but corpus has only {} words, using {}", n, all.len());
+            }
+            all[..n.min(all.len())].to_vec()
+        }
+    }
+}
+
 // ── Sorted-vec helpers ──────────────────────────────────────────────
 
 fn build_sorted_vec(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, usize)> {
@@ -61,12 +192,8 @@ fn sorted_vec_get(sv: &[(Vec<u8>, usize)], key: &[u8]) -> Option<usize> {
 // ── Pre-built structures for lookup / iteration ───────────────────────
 
 struct Structures {
-    trie: TinyTrie<usize, 6, u8>,
     ntrie: NT,
     ntrie_opt: NT,
-    btrie: BitTrie<usize>,
-    ptrie: PolyTrie<usize>,
-    ptrie_opt: PolyTrie<usize>,
     dyn_ntrie: DynNibbleTrie<usize>,
     dyn_ntrie_opt: DynNibbleTrie<usize>,
     btree: BTreeMap<Vec<u8>, usize>,
@@ -80,18 +207,12 @@ struct Structures {
 }
 
 fn build_all(keys: &[Vec<u8>]) -> Structures {
-    let mut trie = TinyTrie::new();
     let mut ntrie = NT::new();
-    let mut btrie = BitTrie::new();
-    let mut ptrie = PolyTrie::new();
     let mut dyn_ntrie = DynNibbleTrie::new();
     let mut btree = BTreeMap::new();
     let mut hmap = HashMap::new();
     for (i, k) in keys.iter().enumerate() {
-        trie.insert(k.clone(), i).unwrap();
         ntrie.insert(k.clone(), i).unwrap();
-        btrie.insert(k.clone(), i).unwrap();
-        ptrie.insert(k.clone(), i).unwrap();
         dyn_ntrie.insert(k.clone(), i).unwrap();
         btree.insert(k.clone(), i);
         hmap.insert(k.clone(), i);
@@ -110,14 +231,12 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
         miss.push(0);
         lookup_keys_null.push(miss);
     }
-    let mut ptrie_opt = ptrie.clone();
-    ptrie_opt.optimize();
     let mut ntrie_opt = ntrie.clone();
     ntrie_opt.optimize();
     let mut dyn_ntrie_opt = DynNibbleTrie::new();
     for (i, k) in keys.iter().enumerate() { dyn_ntrie_opt.insert(k.clone(), i).unwrap(); }
     dyn_ntrie_opt.optimize();
-    Structures { trie, ntrie, ntrie_opt, btrie, ptrie, ptrie_opt, dyn_ntrie, dyn_ntrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, hit_keys: keys.to_vec() }
+    Structures { ntrie, ntrie_opt, dyn_ntrie, dyn_ntrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, hit_keys: keys.to_vec() }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -220,15 +339,11 @@ trait MemBench {
 
 // ── Contestant unit structs ─────────────────────────────────────────
 
-struct TinyTrieBench;
 struct NibbleTrieBench;
-struct BitTrieBench;
-struct PolyTrieBench;
 struct BTreeMapBench;
 struct HashMapBench;
 struct SortedVecBench;
 struct NibbleOptBench;
-struct PolyOptBench;
 struct LinkedListBench;
 struct NibbleUncheckedBench;
 struct NibbleOptUncheckedBench;
@@ -256,16 +371,6 @@ struct Contestant {
 fn all_contestants() -> Vec<Contestant> {
     vec![
         Contestant {
-            name: "TinyTrie", max_size: None,
-            ops: Ops::INSERT | Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::MEMORY,
-            insert: Some(Box::new(TinyTrieBench)),
-            lookup: Some(Box::new(TinyTrieBench)),
-            fwd_iter: Some(Box::new(TinyTrieBench)),
-            rev_iter: Some(Box::new(TinyTrieBench)),
-            fwd_idx: None, rev_idx: None, optimize: None,
-            mem: Some(Box::new(TinyTrieBench)),
-        },
-        Contestant {
             name: "NibbleTrie", max_size: None,
             ops: Ops::INSERT | Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::FWD_IDX | Ops::REV_IDX | Ops::MEMORY,
             insert: Some(Box::new(NibbleTrieBench)),
@@ -275,26 +380,6 @@ fn all_contestants() -> Vec<Contestant> {
             fwd_idx: Some(Box::new(NibbleTrieBench)),
             rev_idx: Some(Box::new(NibbleTrieBench)), optimize: None,
             mem: Some(Box::new(NibbleTrieBench)),
-        },
-        Contestant {
-            name: "BitTrie", max_size: None,
-            ops: Ops::INSERT | Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::MEMORY,
-            insert: Some(Box::new(BitTrieBench)),
-            lookup: Some(Box::new(BitTrieBench)),
-            fwd_iter: Some(Box::new(BitTrieBench)),
-            rev_iter: Some(Box::new(BitTrieBench)),
-            fwd_idx: None, rev_idx: None, optimize: None,
-            mem: Some(Box::new(BitTrieBench)),
-        },
-        Contestant {
-            name: "PolyTrie", max_size: None,
-            ops: Ops::INSERT | Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::MEMORY,
-            insert: Some(Box::new(PolyTrieBench)),
-            lookup: Some(Box::new(PolyTrieBench)),
-            fwd_iter: Some(Box::new(PolyTrieBench)),
-            rev_iter: Some(Box::new(PolyTrieBench)),
-            fwd_idx: None, rev_idx: None, optimize: None,
-            mem: Some(Box::new(PolyTrieBench)),
         },
         Contestant {
             name: "BTreeMap", max_size: None,
@@ -334,17 +419,6 @@ fn all_contestants() -> Vec<Contestant> {
             rev_idx: Some(Box::new(NibbleOptBench)),
             optimize: Some(Box::new(NibbleOptBench)),
             mem: Some(Box::new(NibbleOptBench)),
-        },
-        Contestant {
-            name: "PolyOpt", max_size: None,
-            ops: Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::OPTIMIZE | Ops::MEMORY,
-            insert: None,
-            lookup: Some(Box::new(PolyOptBench)),
-            fwd_iter: Some(Box::new(PolyOptBench)),
-            rev_iter: Some(Box::new(PolyOptBench)),
-            fwd_idx: None, rev_idx: None,
-            optimize: Some(Box::new(PolyOptBench)),
-            mem: Some(Box::new(PolyOptBench)),
         },
         Contestant {
             name: "LinkedList", max_size: None,
@@ -394,37 +468,6 @@ fn all_contestants() -> Vec<Contestant> {
 
 // ── Trait implementations ───────────────────────────────────────────
 
-// TinyTrie — uses null-terminated keys for lookup
-
-impl InsertBench for TinyTrieBench {
-    fn run(&self, keys: &[Vec<u8>]) {
-        let mut m = TinyTrie::<usize, 6, u8>::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        black_box(&m);
-    }
-}
-impl LookupBench for TinyTrieBench {
-    fn run(&self, st: &Structures) {
-        for k in &st.lookup_keys_null { black_box(st.trie.trie_get(k)); }
-    }
-}
-impl FwdIterBench for TinyTrieBench {
-    fn run(&self, st: &Structures) { st.trie.trie_iter_fwd(|k, v| { black_box(k); black_box(v); }); }
-}
-impl RevIterBench for TinyTrieBench {
-    fn run(&self, st: &Structures) { st.trie.trie_iter_rev(|k, v| { black_box(k); black_box(v); }); }
-}
-impl MemBench for TinyTrieBench {
-    fn run(&self, keys: &[Vec<u8>]) -> u64 {
-        let before = read_allocated();
-        let mut m: TinyTrie<usize, 6, u8> = TinyTrie::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        let bytes = read_allocated() - before;
-        drop(m);
-        bytes
-    }
-}
-
 // NibbleTrie — plain keys, no null terminator
 
 impl InsertBench for NibbleTrieBench {
@@ -463,68 +506,6 @@ impl MemBench for NibbleTrieBench {
     fn run(&self, keys: &[Vec<u8>]) -> u64 {
         let before = read_allocated();
         let mut m = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        let bytes = read_allocated() - before;
-        drop(m);
-        bytes
-    }
-}
-
-// BitTrie — uses null-terminated keys for lookup
-
-impl InsertBench for BitTrieBench {
-    fn run(&self, keys: &[Vec<u8>]) {
-        let mut m = BitTrie::<usize>::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        black_box(&m);
-    }
-}
-impl LookupBench for BitTrieBench {
-    fn run(&self, st: &Structures) {
-        for k in &st.lookup_keys_null { black_box(st.btrie.trie_get(k)); }
-    }
-}
-impl FwdIterBench for BitTrieBench {
-    fn run(&self, st: &Structures) { st.btrie.trie_iter_fwd(|k, v| { black_box(k); black_box(v); }); }
-}
-impl RevIterBench for BitTrieBench {
-    fn run(&self, st: &Structures) { st.btrie.trie_iter_rev(|k, v| { black_box(k); black_box(v); }); }
-}
-impl MemBench for BitTrieBench {
-    fn run(&self, keys: &[Vec<u8>]) -> u64 {
-        let before = read_allocated();
-        let mut m: BitTrie<usize> = BitTrie::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        let bytes = read_allocated() - before;
-        drop(m);
-        bytes
-    }
-}
-
-// PolyTrie — uses null-terminated keys for lookup
-
-impl InsertBench for PolyTrieBench {
-    fn run(&self, keys: &[Vec<u8>]) {
-        let mut m = PolyTrie::<usize>::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        black_box(&m);
-    }
-}
-impl LookupBench for PolyTrieBench {
-    fn run(&self, st: &Structures) {
-        for k in &st.lookup_keys_null { black_box(st.ptrie.trie_get(k)); }
-    }
-}
-impl FwdIterBench for PolyTrieBench {
-    fn run(&self, st: &Structures) { st.ptrie.trie_iter_fwd(|k, v| { black_box(k); black_box(v); }); }
-}
-impl RevIterBench for PolyTrieBench {
-    fn run(&self, st: &Structures) { st.ptrie.trie_iter_rev(|k, v| { black_box(k); black_box(v); }); }
-}
-impl MemBench for PolyTrieBench {
-    fn run(&self, keys: &[Vec<u8>]) -> u64 {
-        let before = read_allocated();
-        let mut m: PolyTrie<usize> = PolyTrie::trie_new();
         for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
         let bytes = read_allocated() - before;
         drop(m);
@@ -659,39 +640,6 @@ impl MemBench for NibbleOptBench {
     fn run(&self, keys: &[Vec<u8>]) -> u64 {
         let before = read_allocated();
         let mut m = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        m.trie_optimize();
-        let bytes = read_allocated() - before;
-        drop(m);
-        bytes
-    }
-}
-
-// PolyOpt (optimized PolyTrie)
-
-impl LookupBench for PolyOptBench {
-    fn run(&self, st: &Structures) {
-        for k in &st.lookup_keys_null { black_box(st.ptrie_opt.trie_get(k)); }
-    }
-}
-impl FwdIterBench for PolyOptBench {
-    fn run(&self, st: &Structures) { st.ptrie_opt.trie_iter_fwd(|k, v| { black_box(k); black_box(v); }); }
-}
-impl RevIterBench for PolyOptBench {
-    fn run(&self, st: &Structures) { st.ptrie_opt.trie_iter_rev(|k, v| { black_box(k); black_box(v); }); }
-}
-impl OptimizeBench for PolyOptBench {
-    fn run(&self, keys: &[Vec<u8>]) {
-        let mut m = PolyTrie::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        m.trie_optimize();
-        black_box(&m);
-    }
-}
-impl MemBench for PolyOptBench {
-    fn run(&self, keys: &[Vec<u8>]) -> u64 {
-        let before = read_allocated();
-        let mut m: PolyTrie<usize> = PolyTrie::trie_new();
         for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
         m.trie_optimize();
         let bytes = read_allocated() - before;
@@ -878,21 +826,28 @@ struct ResultsFile {
     sections: BTreeMap<String, BTreeMap<String, Vec<f64>>>,
 }
 
-const RESULTS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/benches/bench_results.json");
-const RESULTS_MD: &str   = concat!(env!("CARGO_MANIFEST_DIR"), "/benches/bench_results.md");
+fn results_paths(key_mode: &KeyMode) -> (String, String) {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/benches/");
+    let suffix = match key_mode {
+        KeyMode::Sequential | KeyMode::Random => "",
+        KeyMode::Lines => "_lines",
+        KeyMode::Words => "_words",
+    };
+    (format!("{base}bench_results{suffix}.json"), format!("{base}bench_results{suffix}.md"))
+}
 
-fn load_results() -> ResultsFile {
-    match std::fs::read_to_string(RESULTS_JSON) {
+fn load_results(json_path: &str) -> ResultsFile {
+    match std::fs::read_to_string(json_path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => ResultsFile::default(),
     }
 }
 
-fn save_results(data: &ResultsFile) {
+fn save_results(data: &ResultsFile, json_path: &str, md_path: &str) {
     // JSON
     let json = serde_json::to_string_pretty(data).unwrap();
-    std::fs::write(RESULTS_JSON, &json).unwrap();
-    eprintln!("  wrote {RESULTS_JSON}");
+    std::fs::write(json_path, &json).unwrap();
+    eprintln!("  wrote {json_path}");
 
     // Markdown — rows sorted by first-column value (fastest first for rates, smallest first for memory).
     // Collect all sizes that appear in any row across all sections, sorted.
@@ -941,8 +896,8 @@ fn save_results(data: &ResultsFile) {
         }
     }
     if !md.is_empty() { md.push('\n'); }
-    std::fs::write(RESULTS_MD, &md).unwrap();
-    eprintln!("  wrote {RESULTS_MD}");
+    std::fs::write(md_path, &md).unwrap();
+    eprintln!("  wrote {md_path}");
 }
 
 /// Merge new bench results into the persistent data.
@@ -991,64 +946,31 @@ fn runnable(c: &Contestant, i: usize, active: &[bool], size: usize) -> bool {
 
 // ── Main ────────────────────────────────────────────────────────────
 
-fn parse_args(args: &[String]) -> (Vec<String>, Vec<usize>, Vec<String>) {
-    // Usage: bench [TESTS] [SIZES] [STRUCTURES]
-    //   TESTS       – comma-list of test names (insert,lookup,fwd,rev,fwd_idx,rev_idx,optimize,memory)
-    //   SIZES       – comma-list of sizes (10,100,1000,100000,10000000)
-    //   STRUCTURES  – comma-list of structure name substrings (NibbleTrie,BTreeMap,…)
-    // Any arg may be omitted or empty to mean "all".
-    // Examples:
-    //   bench                               – all tests, all sizes, all structures
-    //   bench lookup 10,100                – lookup only, sizes 10 and 100, all structures
-    //   bench "" 10                        – all tests, size 10 only, all structures
-    //   bench lookup "" NibbleTrie         – lookup only, all sizes, only NibbleTrie variants
-    //   bench "" "" Unchecked              – all tests, all sizes, only Unchecked variants
-    //   bench lookup 1000 NibbleTrie       – lookup at 1K, NibbleTrie only
-    let all_tests = ["insert", "lookup", "fwd", "rev", "fwd_idx", "rev_idx", "optimize", "memory"];
-    let all_sizes = SIZES.to_vec();
-
-    let positional: Vec<String> = args.iter().skip(1)
-        .filter(|a| !a.starts_with("--"))
-        .cloned()
-        .collect();
-
-    let tests_arg  = positional.get(0).map(|s| s.as_str()).unwrap_or("");
-    let sizes_arg   = positional.get(1).map(|s| s.as_str()).unwrap_or("");
-    let struct_arg  = positional.get(2).map(|s| s.as_str()).unwrap_or("");
-
-    let tests: Vec<String> = if tests_arg.is_empty() {
-        all_tests.iter().map(|t| t.to_string()).collect()
-    } else {
-        tests_arg.split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-
-    let sizes: Vec<usize> = if sizes_arg.is_empty() {
-        all_sizes
-    } else {
-        sizes_arg.split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .filter(|s| all_sizes.contains(s))
-            .collect()
-    };
-
-    let struct_filters: Vec<String> = if struct_arg.is_empty() {
-        Vec::new() // empty = all
-    } else {
-        struct_arg.split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
-    };
-
-    (tests, sizes, struct_filters)
-}
-
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let (tests, sizes, struct_filters) = parse_args(&args);
+    let cli = Cli::parse();
+
+    // Cross-field validation
+    if matches!(cli.keys, KeyMode::Words | KeyMode::Lines) && cli.corpus.is_none() {
+        eprintln!("Error: --keys={} requires --corpus <file>",
+            match cli.keys { KeyMode::Words => "words", KeyMode::Lines => "lines", _ => unreachable!() });
+        std::process::exit(1);
+    }
+
+    // Resolve tests (default is all)
+    let tests: Vec<String> = cli.tests.iter().map(|s| s.to_ascii_lowercase()).collect();
+
+    // Resolve sizes (range, comma-list, or default to all)
+    let sizes = resolve_sizes(cli.sizes.as_deref());
+
+    // Resolve struct filters (empty → all)
+    let struct_filters: Vec<String> = match &cli.structures {
+        Some(s) if !s.is_empty() => s.iter().map(|f| f.to_ascii_lowercase()).collect(),
+        _ => Vec::new(),
+    };
+
+    let key_mode = cli.keys;
+    let corpus_path = cli.corpus;
+    let bench_secs = cli.time;
 
     let contestants = all_contestants();
     let active: Vec<bool> = contestants.iter().map(|c| {
@@ -1060,7 +982,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let budget = Duration::from_secs(BENCH_SECS);
+    let budget = Duration::from_secs(bench_secs);
     let names: Vec<&str> = contestants.iter().map(|c| c.name).collect();
 
     // Resolve test enablement
@@ -1080,8 +1002,9 @@ fn main() {
         eprintln!("Tests:    {}", tests.join(", "));
         eprintln!("Sizes:    {}", sizes.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "));
         eprintln!("Structs:  {}", if struct_filters.is_empty() { "all".to_string() } else { active_names.join(", ") });
+        eprintln!("Keys:     {:?}", key_mode);
     }
-    println!("{BENCH_SECS}s per bench · sequential per size");
+    println!("{bench_secs}s per bench · sequential per size");
     println!();
 
     let mut ins  = ResultMap::new();
@@ -1093,7 +1016,9 @@ fn main() {
     let mut mem  = ResultMap::new();
     let mut opt  = ResultMap::new();
 
-    let mut results = load_results();
+    let (json_path, md_path) = results_paths(&key_mode);
+
+    let mut results = load_results(&json_path);
     // Merge run sizes into the stored sizes, preserving any sizes from previous runs.
     for &sz in &sizes {
         if !results.sizes.contains(&sz) {
@@ -1109,9 +1034,9 @@ fn main() {
         eprintln!("[n = {size}]");
 
         // ── Generate keys ─────────────────────────────────────────────
-        eprint!("  generating keys... ");
-        let keys = string_keys(size);
-        eprintln!("✓");
+        eprint!("  generating keys ({:?})... ", key_mode);
+        let keys = generate_keys(&key_mode, size, corpus_path.as_deref());
+        eprintln!("✓ ({} keys)", keys.len());
 
         // ── Insertion ──────────────────────────────────────────────────
         if run_insert {
@@ -1266,7 +1191,7 @@ fn main() {
     if run_rev_idx   { merge_results(&mut results, "Iter rev index (keys/sec)", &rev_idx, &sizes); }
     if run_optimize  { merge_results(&mut results, "Optimize (keys/sec)",  &opt, &sizes); }
     if run_memory    { merge_results(&mut results, "Memory (bytes/key)",   &mem, &sizes); }
-    save_results(&results);
+    save_results(&results, &json_path, &md_path);
 
     println!();
 }
