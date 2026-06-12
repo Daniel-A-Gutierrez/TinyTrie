@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use tiny_trie::{DynNibbleTrie, NibbleTrie, TinyTrieMap};
+use tiny_trie::{BitTrie, DynNibbleTrie, NibbleTrie, TinyTrieMap};
 
 // NibbleTrie with u32 LEN so buf can hold >64KB (needed for 10K+ keys).
 type NT = NibbleTrie<usize, u32, u32>;
@@ -196,6 +196,7 @@ struct Structures {
     ntrie_opt: NT,
     dyn_ntrie: DynNibbleTrie<usize>,
     dyn_ntrie_opt: DynNibbleTrie<usize>,
+    btrie: BitTrie<usize>,
     btree: BTreeMap<Vec<u8>, usize>,
     hmap: HashMap<Vec<u8>, usize>,
     sorted: Vec<(Vec<u8>, usize)>,
@@ -209,11 +210,13 @@ struct Structures {
 fn build_all(keys: &[Vec<u8>]) -> Structures {
     let mut ntrie = NT::new();
     let mut dyn_ntrie = DynNibbleTrie::new();
+    let mut btrie = BitTrie::new();
     let mut btree = BTreeMap::new();
     let mut hmap = HashMap::new();
     for (i, k) in keys.iter().enumerate() {
         ntrie.insert(k.clone(), i).unwrap();
         dyn_ntrie.insert(k.clone(), i).unwrap();
+        btrie.insert(k.clone(), i).unwrap();
         btree.insert(k.clone(), i);
         hmap.insert(k.clone(), i);
     }
@@ -236,7 +239,7 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
     let mut dyn_ntrie_opt = DynNibbleTrie::new();
     for (i, k) in keys.iter().enumerate() { dyn_ntrie_opt.insert(k.clone(), i).unwrap(); }
     dyn_ntrie_opt.optimize();
-    Structures { ntrie, ntrie_opt, dyn_ntrie, dyn_ntrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, hit_keys: keys.to_vec() }
+    Structures { ntrie, ntrie_opt, dyn_ntrie, dyn_ntrie_opt, btrie, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, hit_keys: keys.to_vec() }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -339,6 +342,7 @@ trait MemBench {
 
 // ── Contestant unit structs ─────────────────────────────────────────
 
+struct BitTrieBench;
 struct NibbleTrieBench;
 struct BTreeMapBench;
 struct HashMapBench;
@@ -380,6 +384,16 @@ fn all_contestants() -> Vec<Contestant> {
             fwd_idx: Some(Box::new(NibbleTrieBench)),
             rev_idx: Some(Box::new(NibbleTrieBench)), optimize: None,
             mem: Some(Box::new(NibbleTrieBench)),
+        },
+        Contestant {
+            name: "BitTrie", max_size: None,
+            ops: Ops::INSERT | Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::MEMORY,
+            insert: Some(Box::new(BitTrieBench)),
+            lookup: Some(Box::new(BitTrieBench)),
+            fwd_iter: Some(Box::new(BitTrieBench)),
+            rev_iter: Some(Box::new(BitTrieBench)),
+            fwd_idx: None, rev_idx: None, optimize: None,
+            mem: Some(Box::new(BitTrieBench)),
         },
         Contestant {
             name: "BTreeMap", max_size: None,
@@ -507,6 +521,45 @@ impl MemBench for NibbleTrieBench {
         let before = read_allocated();
         let mut m = NT::trie_new();
         for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let bytes = read_allocated() - before;
+        drop(m);
+        bytes
+    }
+}
+
+// BitTrie — binary radix trie, null-terminated keys
+
+impl InsertBench for BitTrieBench {
+    fn run(&self, keys: &[Vec<u8>]) {
+        let mut m = BitTrie::new();
+        for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); }
+        black_box(&m);
+    }
+}
+impl LookupBench for BitTrieBench {
+    fn run(&self, st: &Structures) {
+        for k in &st.lookup_keys_null { black_box(st.btrie.get(k)); }
+    }
+}
+impl FwdIterBench for BitTrieBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.btrie.iter();
+        if let Some((k, v)) = it.current() { black_box(k); black_box(v); }
+        while let Some((k, v)) = it.next() { black_box(k); black_box(v); }
+    }
+}
+impl RevIterBench for BitTrieBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.btrie.iter_last();
+        if let Some((k, v)) = it.current() { black_box(k); black_box(v); }
+        while let Some((k, v)) = it.prev() { black_box(k); black_box(v); }
+    }
+}
+impl MemBench for BitTrieBench {
+    fn run(&self, keys: &[Vec<u8>]) -> u64 {
+        let before = read_allocated();
+        let mut m: BitTrie<usize> = BitTrie::new();
+        for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); }
         let bytes = read_allocated() - before;
         drop(m);
         bytes

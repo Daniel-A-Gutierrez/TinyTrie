@@ -1,0 +1,106 @@
+=== NibbleTrie Stats: 10000 keys [words] ===
+Arena nodes:    6545
+Key count:      10000
+Nodes/key:      0.65
+Avg depth:      7.53
+Max depth:      26
+
+Depth distribution:
+  depth   0:      1 (  0.0%)
+  depth   1:      6 (  0.1%)
+  depth   2:     75 (  1.1%)
+  depth   3:    230 (  3.5%)
+  depth   4:    652 ( 10.0%)
+  depth   5:    802 ( 12.3%)
+  depth   6:   1007 ( 15.4%)
+  depth   7:    936 ( 14.3%)
+  depth   8:    783 ( 12.0%)
+  depth   9:    622 (  9.5%)
+  depth  10:    415 (  6.3%)
+  depth  11:    322 (  4.9%)
+  depth  12:    231 (  3.5%)
+  depth  13:    163 (  2.5%)
+  depth  14:    119 (  1.8%)
+  depth  15:     65 (  1.0%)
+  depth  16:     30 (  0.5%)
+  depth  17:     20 (  0.3%)
+  depth  18:     17 (  0.3%)
+  depth  19:     13 (  0.2%)
+  depth  20:     15 (  0.2%)
+  depth  21:      8 (  0.1%)
+  depth  22:      4 (  0.1%)
+  depth  23:      2 (  0.0%)
+  depth  24:      4 (  0.1%)
+  depth  25:      2 (  0.0%)
+  depth  26:      1 (  0.0%)
+
+Fanout histogram (total occupied slots per node):
+   1 slots:   1211 ( 18.5%)
+   2 slots:   3935 ( 60.1%)
+   3 slots:    831 ( 12.7%)
+   4 slots:    306 (  4.7%)
+   5 slots:    107 (  1.6%)
+   6 slots:     64 (  1.0%)
+   7 slots:     41 (  0.6%)
+   8 slots:     15 (  0.2%)
+   9 slots:      9 (  0.1%)
+  10 slots:      5 (  0.1%)
+  11 slots:      4 (  0.1%)
+  12 slots:      6 (  0.1%)
+  13 slots:      4 (  0.1%)
+  14 slots:      2 (  0.0%)
+  15 slots:      1 (  0.0%)
+  16 slots:      4 (  0.1%)
+
+Fanout split:
+  Avg internal children: 1.00
+  Avg leaf children:      1.22
+
+Terminal nodes:    2014 (30.8%)
+Leaf-only nodes:      0 (0.0%)
+
+Parent-child nibble overlap (6544 internal edges):
+   0 overlap:   3795 ( 58.0%) <-- stackable
+   1 overlap:   1857 ( 28.4%)
+   2 overlap:    699 ( 10.7%)
+   3 overlap:    110 (  1.7%)
+   4 overlap:     39 (  0.6%)
+   5 overlap:     18 (  0.3%)
+   6 overlap:     23 (  0.4%)
+   7 overlap:      3 (  0.0%)
+
+Sibling nibble overlap (1725 nodes with ≥2 internal children, 5272 pairs):
+   0 overlap:   2227 ( 42.2%) <-- co-stackable
+   1 overlap:   1571 ( 29.8%)
+   2 overlap:   1111 ( 21.1%)
+   3 overlap:    178 (  3.4%)
+   4 overlap:    108 (  2.0%)
+   5 overlap:     40 (  0.8%)
+   6 overlap:     14 (  0.3%)
+   7 overlap:      8 (  0.2%)
+   8 overlap:      1 (  0.0%)
+   9 overlap:      1 (  0.0%)
+  10 overlap:      1 (  0.0%)
+  11 overlap:      1 (  0.0%)
+  12 overlap:      2 (  0.0%)
+  14 overlap:      6 (  0.1%)
+  16 overlap:      3 (  0.1%)
+
+STAK chain depth (nodes that can absorb their child chain):
+  depth  0:   5047 ( 77.1%) (can't absorb)
+  depth  1:   1294 ( 19.8%)
+  depth  2:    189 (  2.9%)
+  depth  3:     14 (  0.2%)
+  depth  4:      1 (  0.0%)
+  Total absorbable nodes: 1498 (22.9%)
+  Total nodes absorbed:   1718
+
+Memory breakdown:
+  Node size:      88 bytes
+  Arena:           720896 bytes (72.0896/key) — 6545 nodes (cap 8192), 58% of total
+    empty slots:   360760 bytes (36.076/key) — 90190/104720 slots empty (86.1%), 50% of arena
+  Buf:             131072 bytes (13.1072/key) — 11% of total
+  Index:           262144 bytes (26.2144/key) — 10001 entries × 16B, 21% of total
+  Values:          131072 bytes (13.1072/key) — 11% of total
+  Total:         1245184 bytes (124.5/key)
+

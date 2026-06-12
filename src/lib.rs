@@ -43,6 +43,9 @@
 
 mod simd;
 
+mod bit_trie;
+pub use bit_trie::BitTrie;
+
 mod nibble_trie;
 pub use nibble_trie::{NibbleTrie, Node, TrieIndex};
 

@@ -1,2 +1,3 @@
 [alias]
 bencher = "run --release --bin bencher --"
+trie-stats = "run --bin trie-stats -- "
