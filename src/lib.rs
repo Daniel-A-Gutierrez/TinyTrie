@@ -64,6 +64,9 @@ pub use archive::prefix_trie::null_terminate;
 mod dyn_nibble_trie;
 pub use dyn_nibble_trie::DynNibbleTrie;
 
+mod fixed_len_nibble_trie;
+pub use fixed_len_nibble_trie::{FixedLenNibbleTrie, FixedLenNode};
+
 mod tiny_trie_map;
 pub use tiny_trie_map::TinyTrieMap;
 

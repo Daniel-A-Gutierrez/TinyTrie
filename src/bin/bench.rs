@@ -1,12 +1,12 @@
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::{BTreeMap, HashMap, LinkedList};
+use std::collections::{BTreeMap, HashMap, HashSet, LinkedList};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use tiny_trie::{BitTrie, DynNibbleTrie, NibbleTrie, PolyTrie, TinyTrieMap};
+use tiny_trie::{BitTrie, DynNibbleTrie, FixedLenNibbleTrie, NibbleTrie, PolyTrie, TinyTrieMap};
 
 // NibbleTrie with u32 LEN so buf can hold >64KB (needed for 10K+ keys).
 type NT = NibbleTrie<usize, u32, u32>;
@@ -14,7 +14,8 @@ type NT = NibbleTrie<usize, u32, u32>;
 // ── Config ──────────────────────────────────────────────────────────
 
 const SIZES: &[usize] = &[10, 100, 1000, 10_000, 100_000, 1_000_000, 10_000_000];
-const COL: usize = 16; // table column width
+const COL: usize = 16; // data column width
+const NAME_COL: usize = 22; // name column width (left-aligned)
 
 // ── Allocation tracker ──────────────────────────────────────────────
 
@@ -214,28 +215,39 @@ struct Structures {
     btrie: BitTrie<Vec<u8>, usize>,
     ptrie: PolyTrie<usize>,
     ptrie_opt: PolyTrie<usize>,
+    fltrie: FixedLenNibbleTrie<usize, u32>,
+    fltrie_opt: FixedLenNibbleTrie<usize, u32>,
     btree: BTreeMap<Vec<u8>, usize>,
     hmap: HashMap<Vec<u8>, usize>,
     sorted: Vec<(Vec<u8>, usize)>,
     llist: LinkedList<(Vec<u8>, usize)>,
     lookup_keys: Vec<Vec<u8>>,
     lookup_keys_null: Vec<Vec<u8>>,
+    /// Truncated lookup keys for FixedLen (capped at FIXED_LEN_MAX bytes).
+    fl_lookup_keys: Vec<Vec<u8>>,
     /// Keys that are known to be in the trie (for unchecked lookup benches).
     hit_keys: Vec<Vec<u8>>,
 }
 
 fn build_all(keys: &[Vec<u8>]) -> Structures {
+    let max_len = max_key_len(keys);
     let mut ntrie = NT::new();
     let mut dyn_ntrie = DynNibbleTrie::new();
     let mut btrie = BitTrie::<Vec<u8>, usize>::new();
     let mut ptrie = PolyTrie::new();
+    let mut fltrie = FixedLenNibbleTrie::<usize, u32>::new(max_len);
     let mut btree = BTreeMap::new();
     let mut hmap = HashMap::new();
+    let mut fl_seen: HashSet<Vec<u8>> = HashSet::new();
     for (i, k) in keys.iter().enumerate() {
         ntrie.insert(k.clone(), i).unwrap();
         dyn_ntrie.insert(k.clone(), i).unwrap();
         btrie.insert(k.clone(), i).unwrap();
         ptrie.insert(k.clone(), i).unwrap();
+        let flk = truncate_key(k);
+        if fl_seen.insert(flk.clone()) {
+            fltrie.insert(flk, i).unwrap();
+        }
         btree.insert(k.clone(), i);
         hmap.insert(k.clone(), i);
     }
@@ -253,6 +265,11 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
         miss.push(0);
         lookup_keys_null.push(miss);
     }
+    // Truncated lookup keys for FixedLen: same hits/misses but capped at FIXED_LEN_MAX
+    let mut fl_lookup_keys = Vec::with_capacity(lookup_keys.len());
+    for k in &lookup_keys {
+        fl_lookup_keys.push(truncate_key(k));
+    }
     let mut ntrie_opt = ntrie.clone();
     ntrie_opt.optimize();
     let mut dyn_ntrie_opt = DynNibbleTrie::new();
@@ -261,7 +278,9 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
     let mut ptrie_opt = PolyTrie::new();
     for (i, k) in keys.iter().enumerate() { ptrie_opt.insert(k.clone(), i).unwrap(); }
     ptrie_opt.optimize();
-    Structures { ntrie, ntrie_opt, dyn_ntrie, dyn_ntrie_opt, btrie, ptrie, ptrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, hit_keys: keys.to_vec() }
+    let mut fltrie_opt = fltrie.clone();
+    fltrie_opt.optimize();
+    Structures { ntrie, ntrie_opt, dyn_ntrie, dyn_ntrie_opt, btrie, ptrie, ptrie_opt, fltrie, fltrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, fl_lookup_keys, hit_keys: keys.to_vec() }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -377,6 +396,8 @@ struct DynNibbleTrieBench;
 struct DynNibbleOptBench;
 struct PolyTrieBench;
 struct PolyOptBench;
+struct FixedLenBench;
+struct FixedLenOptBench;
 
 // ── Contestant registry ────────────────────────────────────────────
 
@@ -522,6 +543,29 @@ fn all_contestants() -> Vec<Contestant> {
             fwd_idx: None, rev_idx: None,
             optimize: Some(Box::new(PolyOptBench)),
             mem: Some(Box::new(PolyOptBench)),
+        },
+        Contestant {
+            name: "FixedLen", max_size: None,
+            ops: Ops::INSERT | Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::FWD_IDX | Ops::REV_IDX | Ops::MEMORY,
+            insert: Some(Box::new(FixedLenBench)),
+            lookup: Some(Box::new(FixedLenBench)),
+            fwd_iter: Some(Box::new(FixedLenBench)),
+            rev_iter: Some(Box::new(FixedLenBench)),
+            fwd_idx: Some(Box::new(FixedLenBench)),
+            rev_idx: Some(Box::new(FixedLenBench)), optimize: None,
+            mem: Some(Box::new(FixedLenBench)),
+        },
+        Contestant {
+            name: "FixedLenOpt", max_size: None,
+            ops: Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::FWD_IDX | Ops::REV_IDX | Ops::OPTIMIZE | Ops::MEMORY,
+            insert: None,
+            lookup: Some(Box::new(FixedLenOptBench)),
+            fwd_iter: Some(Box::new(FixedLenOptBench)),
+            rev_iter: Some(Box::new(FixedLenOptBench)),
+            fwd_idx: Some(Box::new(FixedLenOptBench)),
+            rev_idx: Some(Box::new(FixedLenOptBench)),
+            optimize: Some(Box::new(FixedLenOptBench)),
+            mem: Some(Box::new(FixedLenOptBench)),
         },
     ]
 }
@@ -947,6 +991,154 @@ impl MemBench for PolyOptBench {
     }
 }
 
+// FixedLenNibbleTrie — fixed-length key slots, no index vector
+
+const FIXED_LEN_MAX: usize = 16;
+
+/// Truncate a key to FIXED_LEN_MAX bytes for FixedLenNibbleTrie.
+/// Longer keys are clipped; shorter keys are unchanged.
+fn truncate_key(key: &[u8]) -> Vec<u8> {
+    if key.len() <= FIXED_LEN_MAX { key.to_vec() } else { key[..FIXED_LEN_MAX].to_vec() }
+}
+
+fn max_key_len(keys: &[Vec<u8>]) -> usize {
+    keys.iter().map(|k| k.len().min(FIXED_LEN_MAX)).max().unwrap_or(1)
+}
+
+impl InsertBench for FixedLenBench {
+    fn run(&self, keys: &[Vec<u8>]) {
+        let max_len = max_key_len(keys);
+        let mut m = FixedLenNibbleTrie::<usize, u32>::new(max_len);
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for (i, k) in keys.iter().enumerate() {
+            let tk = truncate_key(k);
+            if seen.insert(tk.clone()) {
+                m.insert(tk, i).unwrap();
+            }
+        }
+        black_box(&m);
+    }
+}
+impl LookupBench for FixedLenBench {
+    fn run(&self, st: &Structures) {
+        for k in &st.fl_lookup_keys { black_box(st.fltrie.get(k)); }
+    }
+}
+impl FwdIterBench for FixedLenBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie.iter();
+        if let Some((k, v)) = it.current() { black_box(k); black_box(v); }
+        while let Some((k, v)) = it.next() { black_box(k); black_box(v); }
+    }
+}
+impl RevIterBench for FixedLenBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie.iter_last();
+        if let Some((k, v)) = it.current() { black_box(k); black_box(v); }
+        while let Some((k, v)) = it.prev() { black_box(k); black_box(v); }
+    }
+}
+impl FwdIdxBench for FixedLenBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie.iter();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.next_index() { black_box(i); }
+    }
+}
+impl RevIdxBench for FixedLenBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie.iter_last();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.prev_index() { black_box(i); }
+    }
+}
+impl MemBench for FixedLenBench {
+    fn run(&self, keys: &[Vec<u8>]) -> u64 {
+        let max_len = max_key_len(keys);
+        let before = read_allocated();
+        let mut m = FixedLenNibbleTrie::<usize, u32>::new(max_len);
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for (i, k) in keys.iter().enumerate() {
+            let tk = truncate_key(k);
+            if seen.insert(tk.clone()) {
+                m.insert(tk, i).unwrap();
+            }
+        }
+        let bytes = read_allocated() - before;
+        drop(m);
+        bytes
+    }
+}
+
+// FixedLenOpt (optimized FixedLenNibbleTrie)
+
+impl LookupBench for FixedLenOptBench {
+    fn run(&self, st: &Structures) {
+        for k in &st.fl_lookup_keys { black_box(st.fltrie_opt.get(k)); }
+    }
+}
+impl FwdIterBench for FixedLenOptBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie_opt.iter();
+        if let Some((k, v)) = it.current() { black_box(k); black_box(v); }
+        while let Some((k, v)) = it.next() { black_box(k); black_box(v); }
+    }
+}
+impl RevIterBench for FixedLenOptBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie_opt.iter_last();
+        if let Some((k, v)) = it.current() { black_box(k); black_box(v); }
+        while let Some((k, v)) = it.prev() { black_box(k); black_box(v); }
+    }
+}
+impl FwdIdxBench for FixedLenOptBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie_opt.iter();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.next_index() { black_box(i); }
+    }
+}
+impl RevIdxBench for FixedLenOptBench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.fltrie_opt.iter_last();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.prev_index() { black_box(i); }
+    }
+}
+impl OptimizeBench for FixedLenOptBench {
+    fn run(&self, keys: &[Vec<u8>]) {
+        let max_len = max_key_len(keys);
+        let mut m = FixedLenNibbleTrie::<usize, u32>::new(max_len);
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for (i, k) in keys.iter().enumerate() {
+            let tk = truncate_key(k);
+            if seen.insert(tk.clone()) {
+                m.insert(tk, i).unwrap();
+            }
+        }
+        m.optimize();
+        black_box(&m);
+    }
+}
+impl MemBench for FixedLenOptBench {
+    fn run(&self, keys: &[Vec<u8>]) -> u64 {
+        let max_len = max_key_len(keys);
+        let before = read_allocated();
+        let mut m = FixedLenNibbleTrie::<usize, u32>::new(max_len);
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for (i, k) in keys.iter().enumerate() {
+            let tk = truncate_key(k);
+            if seen.insert(tk.clone()) {
+                m.insert(tk, i).unwrap();
+            }
+        }
+        m.optimize();
+        let bytes = read_allocated() - before;
+        drop(m);
+        bytes
+    }
+}
+
 // ── Formatting ──────────────────────────────────────────────────────
 
 fn fmt_rate(rate: f64) -> String {
@@ -983,11 +1175,11 @@ fn fmt_table(title: &str, unit: &str, data: &ResultMap, sizes: &[usize], names: 
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut s = format!("\n─── {title} ({unit}) ───\n");
-    s.push_str(&format!("{:>COL$}", ""));
+    s.push_str(&format!("{:<NAME_COL$}", ""));
     for &sz in sizes { s.push_str(&format!("{:>COL$}", sz)); }
     s.push('\n');
     for name in &sorted {
-        s.push_str(&format!("{:>COL$}", name));
+        s.push_str(&format!("{:<NAME_COL$}", name));
         for &val in data.get(**name as &str).unwrap() { s.push_str(&format!("{:>COL$}", fmt_val(val))); }
         s.push('\n');
     }
@@ -1064,11 +1256,11 @@ fn save_results(data: &ResultsFile, json_path: &str, md_path: &str) {
             entries.sort_by(|a, b| b.1.first().partial_cmp(&a.1.first()).unwrap_or(std::cmp::Ordering::Equal));
         }
         md.push_str(&format!("\n─── {section} ───\n"));
-        md.push_str(&format!("{:>COL$}", ""));
+        md.push_str(&format!("{:<NAME_COL$}", ""));
         for &sz in &all_sizes { md.push_str(&format!("{:>COL$}", sz)); }
         md.push('\n');
         for (name, vals) in entries {
-            md.push_str(&format!("{:>COL$}", name));
+            md.push_str(&format!("{:<NAME_COL$}", name));
             for (i, &sz) in all_sizes.iter().enumerate() {
                 // Find the index of this size in data.sizes to get the right value.
                 if let Some(pos) = data.sizes.iter().position(|&s| s == sz) {
