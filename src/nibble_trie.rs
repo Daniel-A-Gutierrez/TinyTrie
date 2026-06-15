@@ -283,6 +283,17 @@ enum DivergeResult {
     At(usize),
 }
 
+/// Outcome of a bounded prefix check: scan nibbles `from..to` and report
+/// whether the keys match in that range or diverge at a specific nibble.
+/// Unlike `DivergeResult`, this does not scan past `to` and has no
+/// `Duplicate` variant — a full match within the bound is `Matches`.
+enum PrefixCheck {
+    /// The keys match at every nibble position in `from..to`.
+    Matches,
+    /// The keys diverge at this nibble position (within `from..to`).
+    Diverges(usize),
+}
+
 /// Scan two keys from `from` onward to find the first diverging nibble.
 #[inline]
 fn find_divergence(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult {
@@ -390,6 +401,56 @@ where
 
     // Scalar tail
     find_divergence(key_a, key_b, i * 2)
+}
+
+/// Scan nibbles `from..to` of two keys. Returns `Diverges(pos)` if they differ
+/// at any nibble in that range, or `Matches` if they agree throughout.
+/// An empty range (`from >= to`) is trivially `Matches`.
+#[inline]
+fn check_prefix(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixCheck {
+    for nib in from..to {
+        if key_nibble_at(key_a, nib) != key_nibble_at(key_b, nib) {
+            return PrefixCheck::Diverges(nib);
+        }
+    }
+    PrefixCheck::Matches
+}
+
+/// SIMD-accelerated bounded prefix check. Scans nibbles `from..to` and stops
+/// at the first divergence within that range. Returns `Matches` if the keys
+/// agree throughout, or `Diverges(pos)` at the first differing nibble.
+fn simd_check_prefix<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixCheck
+where
+    LaneCount<N>: SupportedLaneCount,
+{
+    if from >= to {
+        return PrefixCheck::Matches;
+    }
+
+    let from_byte = from / 2;
+    let to_byte = (to + 1) / 2; // first byte fully outside the nibble range
+    let minlen = key_a.len().min(key_b.len()).min(to_byte);
+    let mut i = from_byte;
+
+    while i + N <= minlen {
+        let a = Simd::<u8, N>::from_slice(unsafe { key_a.get_unchecked(i..i + N) });
+        let b = Simd::<u8, N>::from_slice(unsafe { key_b.get_unchecked(i..i + N) });
+        let mask = a.simd_ne(b);
+        if mask.any() {
+            let diff_byte_idx = i + mask.first_set().unwrap();
+            let xor = unsafe { *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx) };
+            let nib = diverging_nibble(xor, diff_byte_idx);
+            if nib < to {
+                return PrefixCheck::Diverges(nib);
+            }
+            // Divergence past the bound — keys match within range
+            return PrefixCheck::Matches;
+        }
+        i += N;
+    }
+
+    // Scalar tail
+    check_prefix(key_a, key_b, i * 2, to)
 }
 
 // ---------------------------------------------------------------------------
@@ -594,22 +655,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
         let max_nib = key.len() * 2;
 
         if self.arena.is_empty() {
-            if max_nib == 0 {
-                // Empty key — root node itself is terminal
-                let mut root = Node::new();
-                root.set_terminal(true);
-                root.leaf = new_index;
-                root.set_raw_offset(offset);
-                self.arena.push(root);
-                return Ok(new_index.as_usize());
-            }
-            let first_nib = key_nibble_at(&key, 0) as usize;
-            let mut root = Node::new();
-            root.set_leaf_child(first_nib, new_index);
-            root.leaf = new_index;
-            root.set_raw_offset(offset);
-            self.arena.push(root);
-            return Ok(new_index.as_usize());
+            return Ok(self.insert_into_empty_trie(&key, new_index, offset, max_nib));
         }
 
         let mut node_idx: PTR = PTR::zero();
@@ -626,50 +672,23 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
             let ref_key = &self.buf[off..off + ref_len.as_usize()];
             let prefix_len = node.prefix_len.as_usize();
 
-            match simd_find_divergence::<8>(&key, ref_key, confirmed) {
-                DivergeResult::Duplicate => {
-                    // Roll back the key we just appended
-                    let (off, _len) = self.index.pop().unwrap();
-                    self.buf.truncate(off);
-                    let _ = self.values.pop();
-                    return Err(());
+            match simd_check_prefix::<8>(&key, ref_key, confirmed, prefix_len) {
+                PrefixCheck::Diverges(diverge) => {
+                    // Divergence before prefix_len — split this node
+                    return Ok(self.split_node_before_prefix(
+                        node_idx, diverge, new_index, offset, &key, max_nib,
+                    ));
                 }
-                DivergeResult::At(diverge) if diverge < prefix_len => {
-                    // Divergence before the discriminating nibble — split this node
-                    let new_nib = key_nibble_at(&key, diverge) as usize;
-                    let ref_nib = key_nibble_at(ref_key, diverge) as usize;
-
-                    let mut new_parent = Node::new();
-                    new_parent.prefix_len = LEN::from_usize(diverge);
-
-                    if diverge >= max_nib {
-                        // New key ends at the split point — terminal
-                        new_parent.set_terminal(true);
-                        new_parent.leaf = new_index;
-                        new_parent.set_raw_offset(offset);
-                    } else {
-                        new_parent.set_leaf_child(new_nib, new_index);
-                        new_parent.leaf = new_index;
-                        new_parent.set_raw_offset(offset);
-                    }
-
-                    let old_node = std::mem::replace(
-                        &mut self.arena[node_idx.as_usize()],
-                        new_parent,
-                    );
-                    let old_idx = PTR::from_usize(self.arena.len());
-                    self.arena.push(old_node);
-
-                    self.arena[node_idx.as_usize()].set_internal_child(ref_nib, old_idx);
-                    self.sort_internal_children(node_idx);
-
-                    return Ok(new_index.as_usize());
-                }
-                DivergeResult::At(_) => {
-                    // Divergence at or after prefix_len — follow the child.
-                    // But first check if the new key is a prefix that ends here.
-                    if max_nib <= prefix_len {
-                        // Key nibbles exhausted at this node — mark terminal
+                PrefixCheck::Matches => {
+                    // Keys match from confirmed to prefix_len.
+                    if max_nib == prefix_len {
+                        // Key ends at this node — duplicate or prefix
+                        if key.len() == ref_key.len() {
+                            // Exact duplicate of the reference key
+                            self.rollback_last_insert();
+                            return Err(());
+                        }
+                        // Key is a proper prefix of ref_key — mark terminal
                         self.arena[node_idx.as_usize()].set_terminal(true);
                         self.arena[node_idx.as_usize()].leaf = new_index;
                         self.arena[node_idx.as_usize()].set_raw_offset(offset);
@@ -687,59 +706,159 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
                     }
 
                     if node.is_leaf(nib) {
-                        let existing_key_index = slot;
-                        let (existing_offset, existing_len) = self.index[existing_key_index.as_usize()];
-                        let existing_key = &self.buf[existing_offset..existing_offset + existing_len.as_usize()];
-
-                        match simd_find_divergence::<8>(&key, existing_key, confirmed) {
-                            DivergeResult::Duplicate => {
-                                let (off, _len) = self.index.pop().unwrap();
-                                self.buf.truncate(off);
-                                let _ = self.values.pop();
-                                return Err(());
-                            }
-                            DivergeResult::At(d) => {
-                                let mut split_node = Node::new();
-                                split_node.prefix_len = LEN::from_usize(d);
-
-                                if d >= max_nib {
-                                    // New key ends at the split point — terminal
-                                    let exist_nib = key_nibble_at(existing_key, d) as usize;
-                                    split_node.set_terminal(true);
-                                    split_node.leaf = new_index;
-                                    split_node.set_raw_offset(offset);
-                                    split_node.set_leaf_child(exist_nib, existing_key_index);
-                                } else if d >= existing_key.len() * 2 {
-                                    // Existing key ends at the split point — terminal
-                                    let new_nib = key_nibble_at(&key, d) as usize;
-                                    split_node.set_terminal(true);
-                                    split_node.leaf = existing_key_index;
-                                    split_node.set_raw_offset(existing_offset as u64);
-                                    split_node.set_leaf_child(new_nib, new_index);
-                                } else {
-                                    // Neither key ends at the split point — they diverge here
-                                    let new_nib = key_nibble_at(&key, d) as usize;
-                                    let exist_nib = key_nibble_at(existing_key, d) as usize;
-                                    debug_assert_ne!(new_nib, exist_nib);
-                                    split_node.set_leaf_child(new_nib, new_index);
-                                    split_node.set_leaf_child(exist_nib, existing_key_index);
-                                    split_node.leaf = existing_key_index;
-                                    split_node.set_raw_offset(existing_offset as u64);
-                                }
-
-                                let split_idx = PTR::from_usize(self.arena.len());
-                                self.arena.push(split_node);
-                                self.arena[node_idx.as_usize()].set_internal_child(nib, split_idx);
-                                self.sort_internal_children(node_idx);
-
-                                return Ok(new_index.as_usize());
-                            }
-                        }
+                        return self.split_leaf_child(
+                            nib, node_idx, slot, new_index, offset, &key, max_nib, confirmed,
+                        );
                     }
 
                     // Internal node — descend
                     node_idx = slot;
                 }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Insert helpers
+    // -----------------------------------------------------------------------
+
+    /// Roll back the last key/value/index entry appended during an insert
+    /// that turned out to be a duplicate.
+    #[inline]
+    fn rollback_last_insert(&mut self) {
+        let (off, _len) = self.index.pop().unwrap();
+        self.buf.truncate(off);
+        let _ = self.values.pop();
+    }
+
+    /// Insert the first key into an empty trie, creating the root node.
+    #[inline]
+    fn insert_into_empty_trie(&mut self, key: &[u8], new_index: PTR, offset: u64, max_nib: usize) -> usize {
+        if max_nib == 0 {
+            // Empty key — root node itself is terminal
+            let mut root = Node::new();
+            root.set_terminal(true);
+            root.leaf = new_index;
+            root.set_raw_offset(offset);
+            self.arena.push(root);
+            return new_index.as_usize();
+        }
+        let first_nib = key_nibble_at(key, 0) as usize;
+        let mut root = Node::new();
+        root.set_leaf_child(first_nib, new_index);
+        root.leaf = new_index;
+        root.set_raw_offset(offset);
+        self.arena.push(root);
+        new_index.as_usize()
+    }
+
+    /// Split an existing node at a divergence point that falls before its
+    /// `prefix_len`. The existing node becomes a child of the new parent,
+    /// and the new key is inserted as the other child (or as the terminal
+    /// entry if it ends at the split point).
+    #[inline]
+    fn split_node_before_prefix(
+        &mut self,
+        node_idx: PTR,
+        diverge: usize,
+        new_index: PTR,
+        offset: u64,
+        key: &[u8],
+        max_nib: usize,
+    ) -> usize {
+        // Look up the reference key from the node being split
+        let node = &self.arena[node_idx.as_usize()];
+        let (_, ref_len) = self.index[node.leaf.as_usize()];
+        let off = node.raw_offset() as usize;
+        let ref_key = &self.buf[off..off + ref_len.as_usize()];
+
+        let new_nib = key_nibble_at(key, diverge) as usize;
+        let ref_nib = key_nibble_at(ref_key, diverge) as usize;
+
+        let mut new_parent = Node::new();
+        new_parent.prefix_len = LEN::from_usize(diverge);
+
+        if diverge >= max_nib {
+            // New key ends at the split point — terminal
+            new_parent.set_terminal(true);
+            new_parent.leaf = new_index;
+            new_parent.set_raw_offset(offset);
+        } else {
+            new_parent.set_leaf_child(new_nib, new_index);
+            new_parent.leaf = new_index;
+            new_parent.set_raw_offset(offset);
+        }
+
+        let old_node = std::mem::replace(
+            &mut self.arena[node_idx.as_usize()],
+            new_parent,
+        );
+        let old_idx = PTR::from_usize(self.arena.len());
+        self.arena.push(old_node);
+
+        self.arena[node_idx.as_usize()].set_internal_child(ref_nib, old_idx);
+
+        new_index.as_usize()
+    }
+
+    /// Split a leaf child at the divergence point between the new key and the
+    /// existing leaf key. The leaf slot is replaced by an internal node whose
+    /// two children are the new key and the existing key (or one of them is
+    /// the terminal entry if it ends at the split point).
+    #[inline]
+    fn split_leaf_child(
+        &mut self,
+        nib: usize,
+        node_idx: PTR,
+        existing_key_index: PTR,
+        new_index: PTR,
+        offset: u64,
+        key: &[u8],
+        max_nib: usize,
+        confirmed: usize,
+    ) -> Result<usize, ()> {
+        let (existing_offset, existing_len) = self.index[existing_key_index.as_usize()];
+        let existing_key = &self.buf[existing_offset..existing_offset + existing_len.as_usize()];
+
+        match simd_find_divergence::<8>(key, existing_key, confirmed) {
+            DivergeResult::Duplicate => {
+                self.rollback_last_insert();
+                Err(())
+            }
+            DivergeResult::At(d) => {
+                let mut split_node = Node::new();
+                split_node.prefix_len = LEN::from_usize(d);
+
+                if d >= max_nib {
+                    // New key ends at the split point — terminal
+                    let exist_nib = key_nibble_at(existing_key, d) as usize;
+                    split_node.set_terminal(true);
+                    split_node.leaf = new_index;
+                    split_node.set_raw_offset(offset);
+                    split_node.set_leaf_child(exist_nib, existing_key_index);
+                } else if d >= existing_key.len() * 2 {
+                    // Existing key ends at the split point — terminal
+                    let new_nib = key_nibble_at(key, d) as usize;
+                    split_node.set_terminal(true);
+                    split_node.leaf = existing_key_index;
+                    split_node.set_raw_offset(existing_offset as u64);
+                    split_node.set_leaf_child(new_nib, new_index);
+                } else {
+                    // Neither key ends at the split point — they diverge here
+                    let new_nib = key_nibble_at(key, d) as usize;
+                    let exist_nib = key_nibble_at(existing_key, d) as usize;
+                    debug_assert_ne!(new_nib, exist_nib);
+                    split_node.set_leaf_child(new_nib, new_index);
+                    split_node.set_leaf_child(exist_nib, existing_key_index);
+                    split_node.leaf = existing_key_index;
+                    split_node.set_raw_offset(existing_offset as u64);
+                }
+
+                let split_idx = PTR::from_usize(self.arena.len());
+                self.arena.push(split_node);
+                self.arena[node_idx.as_usize()].set_internal_child(nib, split_idx);
+
+                Ok(new_index.as_usize())
             }
         }
     }
@@ -786,44 +905,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
         }
     }
 
-    /// After adding a new internal child to `node_idx`, ensure the invariant
-    /// that lower nibble positions point to lower arena addresses.
-    ///
-    /// The new child is always at the highest arena index (just pushed). Think
-    /// of it as inserting into a sorted array: rotate every internal child at a
-    /// nibble higher than the insertion point one slot right (by swapping with
-    /// the next-higher-nibble's arena node), then the new node fills the hole.
-    fn sort_internal_children(&mut self, node_idx: PTR) {
-        // Collect internal children in nibble order: (nib, arena_idx)
-        let mut internals: [u8; 16] = [0; 16];  // nibble values
-        let mut arena_ids: [PTR; 16] = [PTR::zero(); 16]; // corresponding arena indices
-        let mut count = 0usize;
-        for nib in 0u8..16 {
-            if self.arena[node_idx.as_usize()].children[nib as usize] != PTR::zero()
-                && !self.arena[node_idx.as_usize()].is_leaf(nib as usize)
-            {
-                internals[count] = nib;
-                arena_ids[count] = self.arena[node_idx.as_usize()].children[nib as usize];
-                count += 1;
-            }
-        }
-        if count <= 1 {
-            return;
-        }
-        // Find where the new node (highest arena index) sits in nibble order
-        let max_arena_idx = (0..count).fold(PTR::zero(), |m, i| {
-            if arena_ids[i].as_usize() > m.as_usize() { arena_ids[i] } else { m }
-        });
-        let insert_pos = (0..count).find(|&i| arena_ids[i] == max_arena_idx).unwrap();
-        // Rotate: swap arena nodes so that insert_pos moves to the end
-        for i in insert_pos..count - 1 {
-            self.swap_arena(arena_ids[i], arena_ids[i + 1]);
-            // After swap, update our tracking
-            let tmp = arena_ids[i];
-            arena_ids[i] = arena_ids[i + 1];
-            arena_ids[i + 1] = tmp;
-        }
-    }
 
     // -----------------------------------------------------------------------
     // Optimize (DFS key-sorted buf rewrite)
@@ -912,7 +993,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
     /// capacity and the trie should be promoted to a wider PTR type before the
     /// next insert.
     ///
-    /// DynNibbleTrie calls this before each insert and promotes automatically.
+    /// DynTrie calls this before each insert and promotes automatically.
     pub fn near_capacity(&self) -> bool {
         self.arena.len() >= PTR::max_value() || self.index.len() >= PTR::max_value()
     }

@@ -61,8 +61,8 @@ pub use poly_trie::{NodeRef, PolyTrie};
 #[cfg(feature = "archive")]
 pub use archive::prefix_trie::null_terminate;
 
-mod dyn_nibble_trie;
-pub use dyn_nibble_trie::DynNibbleTrie;
+mod dyn_trie;
+pub use dyn_trie::DynTrie;
 
 mod fixed_len_nibble_trie;
 pub use fixed_len_nibble_trie::{FixedLenNibbleTrie, FixedLenNode};

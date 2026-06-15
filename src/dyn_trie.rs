@@ -1,7 +1,7 @@
 //! Dynamic NibbleTrie — starts with compact u8 arena indices and promotes
 //! to wider types (u16 → u32 → u64) as the trie grows.
 //!
-//! `DynNibbleTrie<T>` wraps an enum over concrete `NibbleTrie<T, PTR, u16>`
+//! `DynTrie<T>` wraps an enum over concrete `NibbleTrie<T, PTR, u16>`
 //! variants. On insert, it checks whether the current PTR type is approaching
 //! capacity and promotes automatically. This gives small tries the memory
 //! efficiency of u8 indices (32-byte nodes) while supporting unbounded growth.
@@ -28,7 +28,7 @@ enum DynInner<T> {
 }
 
 // ---------------------------------------------------------------------------
-// DynNibbleTrie
+// DynTrie
 // ---------------------------------------------------------------------------
 
 /// A nibble trie that starts with compact u8 arena indices and automatically
@@ -43,14 +43,14 @@ enum DynInner<T> {
 /// Promotion is transparent: insert checks capacity and promotes before the
 /// underlying trie overflows. No vtable dispatch or heap allocation on
 /// promotion — just an enum variant swap.
-pub struct DynNibbleTrie<T> {
+pub struct DynTrie<T> {
     inner: DynInner<T>,
 }
 
-impl<T> DynNibbleTrie<T> {
-    /// Create an empty DynNibbleTrie starting with u8 arena indices (32-byte nodes).
+impl<T> DynTrie<T> {
+    /// Create an empty DynTrie starting with u8 arena indices (32-byte nodes).
     pub fn new() -> Self {
-        DynNibbleTrie {
+        DynTrie {
             inner: DynInner::U8(NibbleTrie::new()),
         }
     }
@@ -253,12 +253,12 @@ impl<T> DynNibbleTrie<T> {
     }
 }
 
-impl<T> Default for DynNibbleTrie<T> {
+impl<T> Default for DynTrie<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[cfg(test)]
-#[path = "tests/dyn_nibble_trie.rs"]
+#[path = "tests/dyn_trie.rs"]
 mod tests;

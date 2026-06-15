@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use tiny_trie::{BitTrie, DynNibbleTrie, FixedLenNibbleTrie, NibbleTrie, PolyTrie, TinyTrieMap};
+use tiny_trie::{BitTrie, DynTrie, FixedLenNibbleTrie, NibbleTrie, PolyTrie, TinyTrieMap};
 
 // NibbleTrie with u32 LEN so buf can hold >64KB (needed for 10K+ keys).
 type NT = NibbleTrie<usize, u32, u32>;
@@ -210,8 +210,8 @@ fn sorted_vec_get(sv: &[(Vec<u8>, usize)], key: &[u8]) -> Option<usize> {
 struct Structures {
     ntrie: NT,
     ntrie_opt: NT,
-    dyn_ntrie: DynNibbleTrie<usize>,
-    dyn_ntrie_opt: DynNibbleTrie<usize>,
+    dyn_trie: DynTrie<usize>,
+    dyn_trie_opt: DynTrie<usize>,
     btrie: BitTrie<Vec<u8>, usize>,
     ptrie: PolyTrie<usize>,
     ptrie_opt: PolyTrie<usize>,
@@ -232,7 +232,7 @@ struct Structures {
 fn build_all(keys: &[Vec<u8>]) -> Structures {
     let max_len = max_key_len(keys);
     let mut ntrie = NT::new();
-    let mut dyn_ntrie = DynNibbleTrie::new();
+    let mut dyn_trie = DynTrie::new();
     let mut btrie = BitTrie::<Vec<u8>, usize>::new();
     let mut ptrie = PolyTrie::new();
     let mut fltrie = FixedLenNibbleTrie::<usize, u32>::new(max_len);
@@ -241,7 +241,7 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
     let mut fl_seen: HashSet<Vec<u8>> = HashSet::new();
     for (i, k) in keys.iter().enumerate() {
         ntrie.insert(k.clone(), i).unwrap();
-        dyn_ntrie.insert(k.clone(), i).unwrap();
+        dyn_trie.insert(k.clone(), i).unwrap();
         btrie.insert(k.clone(), i).unwrap();
         ptrie.insert(k.clone(), i).unwrap();
         let flk = truncate_key(k);
@@ -272,15 +272,15 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
     }
     let mut ntrie_opt = ntrie.clone();
     ntrie_opt.optimize();
-    let mut dyn_ntrie_opt = DynNibbleTrie::new();
-    for (i, k) in keys.iter().enumerate() { dyn_ntrie_opt.insert(k.clone(), i).unwrap(); }
-    dyn_ntrie_opt.optimize();
+    let mut dyn_trie_opt = DynTrie::new();
+    for (i, k) in keys.iter().enumerate() { dyn_trie_opt.insert(k.clone(), i).unwrap(); }
+    dyn_trie_opt.optimize();
     let mut ptrie_opt = PolyTrie::new();
     for (i, k) in keys.iter().enumerate() { ptrie_opt.insert(k.clone(), i).unwrap(); }
     ptrie_opt.optimize();
     let mut fltrie_opt = fltrie.clone();
     fltrie_opt.optimize();
-    Structures { ntrie, ntrie_opt, dyn_ntrie, dyn_ntrie_opt, btrie, ptrie, ptrie_opt, fltrie, fltrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, fl_lookup_keys, hit_keys: keys.to_vec() }
+    Structures { ntrie, ntrie_opt, dyn_trie, dyn_trie_opt, btrie, ptrie, ptrie_opt, fltrie, fltrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, fl_lookup_keys, hit_keys: keys.to_vec() }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -392,8 +392,8 @@ struct NibbleOptBench;
 struct LinkedListBench;
 struct NibbleUncheckedBench;
 struct NibbleOptUncheckedBench;
-struct DynNibbleTrieBench;
-struct DynNibbleOptBench;
+struct DynTrieBench;
+struct DynTrieOptBench;
 struct PolyTrieBench;
 struct PolyOptBench;
 struct FixedLenBench;
@@ -502,25 +502,25 @@ fn all_contestants() -> Vec<Contestant> {
             fwd_iter: None, rev_iter: None, fwd_idx: None, rev_idx: None, optimize: None, mem: None,
         },
         Contestant {
-            name: "DynNibbleTrie", max_size: None,
+            name: "DynTrie", max_size: None,
             ops: Ops::INSERT | Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::MEMORY,
-            insert: Some(Box::new(DynNibbleTrieBench)),
-            lookup: Some(Box::new(DynNibbleTrieBench)),
-            fwd_iter: Some(Box::new(DynNibbleTrieBench)),
-            rev_iter: Some(Box::new(DynNibbleTrieBench)),
+            insert: Some(Box::new(DynTrieBench)),
+            lookup: Some(Box::new(DynTrieBench)),
+            fwd_iter: Some(Box::new(DynTrieBench)),
+            rev_iter: Some(Box::new(DynTrieBench)),
             fwd_idx: None, rev_idx: None, optimize: None,
-            mem: Some(Box::new(DynNibbleTrieBench)),
+            mem: Some(Box::new(DynTrieBench)),
         },
         Contestant {
-            name: "DynNibbleOpt", max_size: None,
+            name: "DynTrieOpt", max_size: None,
             ops: Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::OPTIMIZE | Ops::MEMORY,
             insert: None,
-            lookup: Some(Box::new(DynNibbleOptBench)),
-            fwd_iter: Some(Box::new(DynNibbleOptBench)),
-            rev_iter: Some(Box::new(DynNibbleOptBench)),
+            lookup: Some(Box::new(DynTrieOptBench)),
+            fwd_iter: Some(Box::new(DynTrieOptBench)),
+            rev_iter: Some(Box::new(DynTrieOptBench)),
             fwd_idx: None, rev_idx: None,
-            optimize: Some(Box::new(DynNibbleOptBench)),
-            mem: Some(Box::new(DynNibbleOptBench)),
+            optimize: Some(Box::new(DynTrieOptBench)),
+            mem: Some(Box::new(DynTrieOptBench)),
         },
         Contestant {
             name: "PolyTrie", max_size: None,
@@ -839,30 +839,30 @@ impl LookupBench for NibbleOptUncheckedBench {
     }
 }
 
-// DynNibbleTrie
+// DynTrie
 
-impl InsertBench for DynNibbleTrieBench {
+impl InsertBench for DynTrieBench {
     fn run(&self, keys: &[Vec<u8>]) {
-        let mut m = DynNibbleTrie::new();
+        let mut m = DynTrie::new();
         for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); }
         black_box(&m);
     }
 }
-impl LookupBench for DynNibbleTrieBench {
+impl LookupBench for DynTrieBench {
     fn run(&self, st: &Structures) {
-        for k in &st.lookup_keys { black_box(st.dyn_ntrie.get(k)); }
+        for k in &st.lookup_keys { black_box(st.dyn_trie.get(k)); }
     }
 }
-impl FwdIterBench for DynNibbleTrieBench {
-    fn run(&self, st: &Structures) { st.dyn_ntrie.iter_fwd(&mut |k, v| { black_box(k); black_box(v); }); }
+impl FwdIterBench for DynTrieBench {
+    fn run(&self, st: &Structures) { st.dyn_trie.iter_fwd(&mut |k, v| { black_box(k); black_box(v); }); }
 }
-impl RevIterBench for DynNibbleTrieBench {
-    fn run(&self, st: &Structures) { st.dyn_ntrie.iter_rev(&mut |k, v| { black_box(k); black_box(v); }); }
+impl RevIterBench for DynTrieBench {
+    fn run(&self, st: &Structures) { st.dyn_trie.iter_rev(&mut |k, v| { black_box(k); black_box(v); }); }
 }
-impl MemBench for DynNibbleTrieBench {
+impl MemBench for DynTrieBench {
     fn run(&self, keys: &[Vec<u8>]) -> u64 {
         let before = read_allocated();
-        let mut m: DynNibbleTrie<usize> = DynNibbleTrie::new();
+        let mut m: DynTrie<usize> = DynTrie::new();
         for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); }
         let bytes = read_allocated() - before;
         drop(m);
@@ -870,31 +870,31 @@ impl MemBench for DynNibbleTrieBench {
     }
 }
 
-// DynNibbleOpt
+// DynTrieOpt
 
-impl LookupBench for DynNibbleOptBench {
+impl LookupBench for DynTrieOptBench {
     fn run(&self, st: &Structures) {
-        for k in &st.lookup_keys { black_box(st.dyn_ntrie_opt.get(k)); }
+        for k in &st.lookup_keys { black_box(st.dyn_trie_opt.get(k)); }
     }
 }
-impl FwdIterBench for DynNibbleOptBench {
-    fn run(&self, st: &Structures) { st.dyn_ntrie_opt.iter_fwd(&mut |k, v| { black_box(k); black_box(v); }); }
+impl FwdIterBench for DynTrieOptBench {
+    fn run(&self, st: &Structures) { st.dyn_trie_opt.iter_fwd(&mut |k, v| { black_box(k); black_box(v); }); }
 }
-impl RevIterBench for DynNibbleOptBench {
-    fn run(&self, st: &Structures) { st.dyn_ntrie_opt.iter_rev(&mut |k, v| { black_box(k); black_box(v); }); }
+impl RevIterBench for DynTrieOptBench {
+    fn run(&self, st: &Structures) { st.dyn_trie_opt.iter_rev(&mut |k, v| { black_box(k); black_box(v); }); }
 }
-impl OptimizeBench for DynNibbleOptBench {
+impl OptimizeBench for DynTrieOptBench {
     fn run(&self, keys: &[Vec<u8>]) {
-        let mut m = DynNibbleTrie::new();
+        let mut m = DynTrie::new();
         for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); }
         m.optimize();
         black_box(&m);
     }
 }
-impl MemBench for DynNibbleOptBench {
+impl MemBench for DynTrieOptBench {
     fn run(&self, keys: &[Vec<u8>]) -> u64 {
         let before = read_allocated();
-        let mut m: DynNibbleTrie<usize> = DynNibbleTrie::new();
+        let mut m: DynTrie<usize> = DynTrie::new();
         for (i, k) in keys.iter().enumerate() { m.insert(k.clone(), i).unwrap(); }
         m.optimize();
         let bytes = read_allocated() - before;

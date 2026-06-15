@@ -6,7 +6,7 @@
         BTreeMap           4.54M           3.42M          16.60M          14.80M
          BitTrie           2.37M           2.22M          20.33M          12.83M
       NibbleTrie           2.09M           1.38M             0.0             0.0
-   DynNibbleTrie           2.06M           1.40M             0.0             0.0
+   DynTrie           2.06M           1.40M             0.0             0.0
          HashMap           1.75M           1.77M          16.61M          16.71M
 
 ─── Iter backward (keys/sec) ───
@@ -38,9 +38,9 @@
        SortedVec            40.0            40.0            40.0            40.0
         BTreeMap            44.8            73.4            71.8            71.6
       LinkedList            56.0            56.0             0.0             0.0
-    DynNibbleOpt            59.3            43.9             0.0             0.0
+    DynTrieOpt            59.3            43.9             0.0             0.0
          HashMap            62.4            50.4            75.6            62.1
-   DynNibbleTrie            65.6            47.4             0.0             0.0
+   DynTrie            65.6            47.4             0.0             0.0
          BitTrie            76.8            61.4            49.2            78.6
        NibbleOpt            81.7            52.8             0.0             0.0
       NibbleTrie            88.0            56.3             0.0             0.0
