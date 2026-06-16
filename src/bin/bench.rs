@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
-use tiny_trie::{BitTrie, DynTrie, FixedLenNibbleTrie, NibbleTrie, PolyTrie, TinyTrieMap};
+use tiny_trie::{BitTrie, DynTrie, FixedLenNibbleTrie, NibbleTrie, Node, PolyTrie, TinyTrieMap, TrieIndex};
 
 // NibbleTrie with u32 LEN so buf can hold >64KB (needed for 10K+ keys).
 type NT = NibbleTrie<usize, u32, u32>;
+type NT2 = NibbleTrie<usize, u32, u32, 2>;
+type NT4 = NibbleTrie<usize, u32, u32, 4>;
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -193,6 +195,39 @@ fn generate_keys(mode: &KeyMode, n: usize, corpus: Option<&[Vec<u8>]>) -> Vec<Ve
     }
 }
 
+/// Convert a STAK=1 NibbleTrie to a STAK=N trie (1:1 vnode mapping, no stacking).
+/// Internal child addresses are remapped: phys → phys * DST_STAK.
+/// Leaf key indices stay the same (they index into buf/index, not arena).
+fn convert_stak1_to<const DST_STAK: usize>(src: &NT) -> NibbleTrie<usize, u32, u32, DST_STAK> {
+    let mut dst: NibbleTrie<usize, u32, u32, DST_STAK> = NibbleTrie::new();
+    dst.buf = src.buf.clone();
+    dst.index = src.index.clone();
+    dst.values = src.values.clone();
+    for node1 in &src.arena {
+        let mut node_dst: Node<u32, u32, DST_STAK> = Node::new();
+        for nib in 0..16 {
+            if node1.is_occupied(nib, 0) {
+                if node1.is_leaf(nib, 0) {
+                    node_dst.children[nib] = node1.children[nib];
+                } else {
+                    // Internal: remap phys → phys * DST_STAK
+                    node_dst.children[nib] = u32::from_usize(node1.children[nib].as_usize() * DST_STAK);
+                }
+                node_dst.occupancy[0] |= 1 << nib;
+                if node1.is_leaf(nib, 0) {
+                    node_dst.leaf_mask[0] |= 1 << nib;
+                }
+            }
+        }
+        node_dst.prefix_len[0] = node1.prefix_len[0];
+        node_dst.leaf = node1.leaf;
+        node_dst.terminal = if node1.is_terminal(0) { 1 } else { 0 };
+        // nodelen is already 1 from Node::new()
+        dst.arena.push(node_dst);
+    }
+    dst
+}
+
 // ── Sorted-vec helpers ──────────────────────────────────────────────
 
 fn build_sorted_vec(keys: &[Vec<u8>]) -> Vec<(Vec<u8>, usize)> {
@@ -210,6 +245,8 @@ fn sorted_vec_get(sv: &[(Vec<u8>, usize)], key: &[u8]) -> Option<usize> {
 struct Structures {
     ntrie: NT,
     ntrie_opt: NT,
+    ntrie_stak2: NT2,
+    ntrie_stak4: NT4,
     dyn_trie: DynTrie<usize>,
     dyn_trie_opt: DynTrie<usize>,
     btrie: BitTrie<Vec<u8>, usize>,
@@ -272,6 +309,10 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
     }
     let mut ntrie_opt = ntrie.clone();
     ntrie_opt.optimize();
+    let mut ntrie_stak2 = convert_stak1_to::<2>(&ntrie);
+    ntrie_stak2.optimize();
+    let mut ntrie_stak4 = convert_stak1_to::<4>(&ntrie);
+    ntrie_stak4.optimize();
     let mut dyn_trie_opt = DynTrie::new();
     for (i, k) in keys.iter().enumerate() { dyn_trie_opt.insert(k.clone(), i).unwrap(); }
     dyn_trie_opt.optimize();
@@ -280,7 +321,7 @@ fn build_all(keys: &[Vec<u8>]) -> Structures {
     ptrie_opt.optimize();
     let mut fltrie_opt = fltrie.clone();
     fltrie_opt.optimize();
-    Structures { ntrie, ntrie_opt, dyn_trie, dyn_trie_opt, btrie, ptrie, ptrie_opt, fltrie, fltrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, fl_lookup_keys, hit_keys: keys.to_vec() }
+    Structures { ntrie, ntrie_opt, ntrie_stak2, ntrie_stak4, dyn_trie, dyn_trie_opt, btrie, ptrie, ptrie_opt, fltrie, fltrie_opt, btree, hmap, sorted: build_sorted_vec(keys), llist, lookup_keys, lookup_keys_null, fl_lookup_keys, hit_keys: keys.to_vec() }
 }
 
 // ── Bench harness ───────────────────────────────────────────────────
@@ -398,6 +439,8 @@ struct PolyTrieBench;
 struct PolyOptBench;
 struct FixedLenBench;
 struct FixedLenOptBench;
+struct StackedTrie2Bench;
+struct StackedTrie4Bench;
 
 // ── Contestant registry ────────────────────────────────────────────
 
@@ -566,6 +609,30 @@ fn all_contestants() -> Vec<Contestant> {
             rev_idx: Some(Box::new(FixedLenOptBench)),
             optimize: Some(Box::new(FixedLenOptBench)),
             mem: Some(Box::new(FixedLenOptBench)),
+        },
+        Contestant {
+            name: "StackedTrie2", max_size: None,
+            ops: Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::FWD_IDX | Ops::REV_IDX | Ops::OPTIMIZE | Ops::MEMORY,
+            insert: None,
+            lookup: Some(Box::new(StackedTrie2Bench)),
+            fwd_iter: Some(Box::new(StackedTrie2Bench)),
+            rev_iter: Some(Box::new(StackedTrie2Bench)),
+            fwd_idx: Some(Box::new(StackedTrie2Bench)),
+            rev_idx: Some(Box::new(StackedTrie2Bench)),
+            optimize: Some(Box::new(StackedTrie2Bench)),
+            mem: Some(Box::new(StackedTrie2Bench)),
+        },
+        Contestant {
+            name: "StackedTrie4", max_size: None,
+            ops: Ops::LOOKUP | Ops::FWD_ITER | Ops::REV_ITER | Ops::FWD_IDX | Ops::REV_IDX | Ops::OPTIMIZE | Ops::MEMORY,
+            insert: None,
+            lookup: Some(Box::new(StackedTrie4Bench)),
+            fwd_iter: Some(Box::new(StackedTrie4Bench)),
+            rev_iter: Some(Box::new(StackedTrie4Bench)),
+            fwd_idx: Some(Box::new(StackedTrie4Bench)),
+            rev_idx: Some(Box::new(StackedTrie4Bench)),
+            optimize: Some(Box::new(StackedTrie4Bench)),
+            mem: Some(Box::new(StackedTrie4Bench)),
         },
     ]
 }
@@ -1135,6 +1202,118 @@ impl MemBench for FixedLenOptBench {
         m.optimize();
         let bytes = read_allocated() - before;
         drop(m);
+        bytes
+    }
+}
+
+// StackedTrie2 — NibbleTrie with STAK=2 (optimized, vnode-packed)
+
+impl LookupBench for StackedTrie2Bench {
+    fn run(&self, st: &Structures) {
+        for k in &st.lookup_keys { black_box(st.ntrie_stak2.get(k)); }
+    }
+}
+impl FwdIterBench for StackedTrie2Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak2.iter();
+        while let Some((k, v)) = it.next() { black_box(k); black_box(v); }
+    }
+}
+impl RevIterBench for StackedTrie2Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak2.iter_last();
+        while let Some((k, v)) = it.prev() { black_box(k); black_box(v); }
+    }
+}
+impl FwdIdxBench for StackedTrie2Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak2.iter();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.next_index() { black_box(i); }
+    }
+}
+impl RevIdxBench for StackedTrie2Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak2.iter_last();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.prev_index() { black_box(i); }
+    }
+}
+impl OptimizeBench for StackedTrie2Bench {
+    fn run(&self, keys: &[Vec<u8>]) {
+        let mut m = NT::trie_new();
+        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let mut m2 = convert_stak1_to::<2>(&m);
+        m2.optimize();
+        black_box(&m2);
+    }
+}
+impl MemBench for StackedTrie2Bench {
+    fn run(&self, keys: &[Vec<u8>]) -> u64 {
+        let before = read_allocated();
+        let mut m = NT::trie_new();
+        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let mut m2 = convert_stak1_to::<2>(&m);
+        drop(m); // free the intermediate NibbleTrie before measuring
+        m2.optimize();
+        let bytes = read_allocated() - before;
+        drop(m2);
+        bytes
+    }
+}
+
+// StackedTrie4 — NibbleTrie with STAK=4 (optimized, vnode-packed)
+
+impl LookupBench for StackedTrie4Bench {
+    fn run(&self, st: &Structures) {
+        for k in &st.lookup_keys { black_box(st.ntrie_stak4.get(k)); }
+    }
+}
+impl FwdIterBench for StackedTrie4Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak4.iter();
+        while let Some((k, v)) = it.next() { black_box(k); black_box(v); }
+    }
+}
+impl RevIterBench for StackedTrie4Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak4.iter_last();
+        while let Some((k, v)) = it.prev() { black_box(k); black_box(v); }
+    }
+}
+impl FwdIdxBench for StackedTrie4Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak4.iter();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.next_index() { black_box(i); }
+    }
+}
+impl RevIdxBench for StackedTrie4Bench {
+    fn run(&self, st: &Structures) {
+        let mut it = st.ntrie_stak4.iter_last();
+        if let Some(i) = it.current_index() { black_box(i); }
+        while let Some(i) = it.prev_index() { black_box(i); }
+    }
+}
+impl OptimizeBench for StackedTrie4Bench {
+    fn run(&self, keys: &[Vec<u8>]) {
+        let mut m = NT::trie_new();
+        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let mut m4 = convert_stak1_to::<4>(&m);
+        m4.optimize();
+        black_box(&m4);
+    }
+}
+impl MemBench for StackedTrie4Bench {
+    fn run(&self, keys: &[Vec<u8>]) -> u64 {
+        let before = read_allocated();
+        let mut m = NT::trie_new();
+        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let mut m4 = convert_stak1_to::<4>(&m);
+        drop(m); // free the intermediate NibbleTrie before measuring
+        m4.optimize();
+        let bytes = read_allocated() - before;
+        drop(m4);
         bytes
     }
 }

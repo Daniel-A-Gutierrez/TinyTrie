@@ -21,10 +21,10 @@ use crate::nibble_trie::NibbleTrie;
 /// Internal enum holding one of the four concrete `NibbleTrie` variants.
 /// Promotion replaces the variant in-place via `std::mem::replace`.
 enum DynInner<T> {
-    U8(NibbleTrie<T, u8, u16>),
-    U16(NibbleTrie<T, u16, u16>),
-    U32(NibbleTrie<T, u32, u16>),
-    U64(NibbleTrie<T, u64, u16>),
+    U8 (NibbleTrie<T, u8,  u16, 2>),
+    U16(NibbleTrie<T, u16, u16, 2>),
+    U32(NibbleTrie<T, u32, u16, 2>),
+    U64(NibbleTrie<T, u64, u16, 2>),
 }
 
 // ---------------------------------------------------------------------------

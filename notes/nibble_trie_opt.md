@@ -166,3 +166,31 @@ during iteration we'll maintain a parent set, and a set for each position in occ
 
 ## Use size::MAX instead of 0 as sentinel value
 that way we don't have to insert a default just to have a valid structure. 
+
+## Occupancy search bitmasking
+
+The current Node packs the terminal flag into bit 63 of `offset: u64`. I recommend removing `offset` entirely and deriving buf offsets from `index[leaf[v]]` instead. This makes STAK=1 nodes SMALLER (76 vs 80 bytes for u32/u16) and simplifies stacking. The trade-off is one extra index[] cache line access on thffset or drop it? → the nodeterminal bit will be moved from offset to 'terminal', a u8. 
+
+// some of this is kinda butchered idk i copy pasted it out of claude code's window. expanding on the idea below. 
+All stacked nodes share a leaf/offset anyway so idk how mWhile walking the tree Depth first,a node's address has to 'pop' whenever we ascend, so perhaps a Vec Stack would be more appropriate instead of a btree g. But doing that should guarantee that only a node's parents are considered for stacking, so when it is stacked, we take the leaf  and offset of the lower node. Acking 'parents' as a stack ofaddresses, we don't need the whole address per occupancy set do we? we just need a single bit of it. so if parents looks like [3,4,5], 00101 if 3 and 5 have an occupancyin the 1 position. the catch though is that we have to be using physical addresses so if 3 and 5 are cohabitating we're not ableupancy mask, we need to OR together all the occupancy masks in their physical node. but yeah, a bitvec aught to work there, in which case a set intersection i occupancy sets , then we indexparents by the bit index of the first 1. 
+
+This is similar to a bitvec but also we really benefit from doing this ourselves since we know there's 16 parallel stacks. 
+
+i think we just maintain a `vec<u16>`, pushing the physical node occupancy as we go, then when we need to check we just and our new nodes occupancy mask from end->beginning, selecting a spot when the & result is 0. trivially simd'able but lets wait on that for now.
+
+
+# key deduplication
+interestingly, this deduplicates our keys
+        too. if 'abcd' and 'abc' are both stored in the same physical node, if leaf
+      points to 'abcd' then 'abc' + prefix_len 3 and terminal bit fully encode it                        without its own entry in index.         
+
+# uncle problem
+
+I've realized a logic error in the design. Lets call it the uncle problem. 
+Say uncle lives with grandpa. 
+When inserting, if we want to have a single leaf value for the whole physical node, that means the new child must be a descendant of everything in the node. 
+But its not a descendant of uncle. 
+Solution - it has to be a descendant of the *last* vnode in the physical node.
+So we don't put a pnode on the stack while iterating unless the vnode we're on is the final one in the pnode. 
+easy enough. 
+

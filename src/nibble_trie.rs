@@ -5,27 +5,33 @@
 //! simplicity and lookup speed: no comparison loops, no branch misprediction
 //! on the child search path.
 //!
+//! # Node Stacking (STAK)
+//!
+//! Multiple "virtual nodes" (vnodes) can share a single physical `Node` in the
+//! arena, each claiming a subset of the `children[16]` array via an `occupancy`
+//! mask. This is controlled by the `STAK` const generic parameter:
+//!
+//! - `STAK = 1`: no stacking (each physical node holds one vnode, backward-compatible)
+//! - `STAK = 2/4/8`: up to 2/4/8 vnodes per physical node, reducing arena size
+//!
+//! Child pointers encode both physical node index and vnode index:
+//! `address = phys_idx * STAK + vnode_idx`. The sentinel value is `PTR::MAX`.
+//!
 //! # Terminal Nodes
 //!
 //! Keys that are prefixes of other keys (e.g. "ab" in {"ab", "abc"}) are
-//! represented by a `terminal` flag on the node where the key ends, rather
+//! represented by a `terminal` flag on the vnode where the key ends, rather
 //! than a null-byte leaf child. This eliminates null terminators, allows
 //! `0x00` bytes in keys, and makes `get()` accept plain `&[u8]`.
 //!
 //! # Key Index Encoding
 //!
-//! A dummy entry at `index[0] = (0, 0)` points at `buf[0]` (empty key).
-//! Real keys start at index 1. This allows 0 to be used as a sentinel for
-//! "empty" in `children[]` slots. Keys are stored contiguously in `buf` with
-//! a side index `(offset, len)`, saving ~24 bytes/key vs `Vec<Vec<u8>>`.
-//!
-//! # Leaf and Offset Fields
-//!
-//! `Node.leaf` is a key index (into `index[]`), used for retrieval — it
-//! gives the value index via `values[leaf - 1]` and the key via `index[leaf]`.
-//! `Node.offset` is a direct offset into `buf`, used for insertion divergence
-//! comparison and the `get()` terminal fast path. For terminal nodes, the key
-//! is `buf[offset..offset + prefix_len/2]` — no `index` lookup needed.
+//! Real keys start at index 1 (index 0 is the dummy entry). This allows
+//! `PTR::MAX` to be used as sentinel for empty slots in `children[]` when
+//! STAK > 1. For STAK = 1, `PTR::zero()` is also unused as a child index
+//! (root is at phys 0, vnode 0, encoded as address 0, and is never a child
+//! of another node). The `occupancy[v]` mask determines whether a slot is
+//! owned by vnode v, regardless of the value in `children[nib]`.
 
 use crate::TinyTrieMap;
 use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
@@ -36,7 +42,7 @@ use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
 
 /// Trait for types used as arena/key indices and prefix lengths in NibbleTrie.
 ///
-/// Implemented for `u16`, `u32`, and `u64`. The type parameter `PTR` (pointer
+/// Implemented for `u8`, `u16`, `u32`, and `u64`. The type parameter `PTR` (pointer
 /// type) controls the width of `children`, `leaf`, and arena indices. The type
 /// parameter `LEN` (length type) controls the width of `prefix_len` and key
 /// lengths in the index.
@@ -45,12 +51,16 @@ pub trait TrieIndex: Copy + Clone + Default + PartialEq + Eq + fmt::Debug + 'sta
     fn as_usize(self) -> usize;
     /// Maximum representable value (e.g. `u16::MAX` for u16).
     fn max_value() -> usize;
-    /// Zero value, used for empty slots and initial values.
+    /// Zero value, used for initial values.
     fn zero() -> Self;
+    /// Maximum value used as sentinel for empty slots in `children[]`.
+    /// With stacking, encoded addresses use 0 as a valid address (root = phys 0, vnode 0),
+    /// so `PTR::MAX` is the sentinel instead of 0.
+    fn max_value_sentinel() -> Self;
     /// Convert from `usize`. May panic or truncate on overflow in debug builds.
     fn from_usize(n: usize) -> Self;
     /// Compute a 16-bit occupancy mask from a 16-slot children array.
-    /// Bit N is set if `children[N] != 0`.
+    /// Bit N is set if `children[N]` is not the sentinel value.
     fn children_mask(children: &[Self; 16]) -> u16;
 }
 
@@ -58,6 +68,7 @@ impl TrieIndex for u8 {
     #[inline] fn as_usize(self) -> usize { self as usize }
     #[inline] fn max_value() -> usize { u8::MAX as usize }
     #[inline] fn zero() -> Self { 0 }
+    #[inline] fn max_value_sentinel() -> Self { u8::MAX }
     #[inline] fn from_usize(n: usize) -> Self {
         debug_assert!(n <= u8::MAX as usize, "u8 overflow: {n}");
         n as u8
@@ -71,6 +82,7 @@ impl TrieIndex for u16 {
     #[inline] fn as_usize(self) -> usize { self as usize }
     #[inline] fn max_value() -> usize { u16::MAX as usize }
     #[inline] fn zero() -> Self { 0 }
+    #[inline] fn max_value_sentinel() -> Self { u16::MAX }
     #[inline] fn from_usize(n: usize) -> Self {
         debug_assert!(n <= u16::MAX as usize, "u16 overflow: {n}");
         n as u16
@@ -84,6 +96,7 @@ impl TrieIndex for u32 {
     #[inline] fn as_usize(self) -> usize { self as usize }
     #[inline] fn max_value() -> usize { u32::MAX as usize }
     #[inline] fn zero() -> Self { 0 }
+    #[inline] fn max_value_sentinel() -> Self { u32::MAX }
     #[inline] fn from_usize(n: usize) -> Self {
         debug_assert!(n <= u32::MAX as usize, "u32 overflow: {n}");
         n as u32
@@ -97,6 +110,7 @@ impl TrieIndex for u64 {
     #[inline] fn as_usize(self) -> usize { self as usize }
     #[inline] fn max_value() -> usize { u64::MAX as usize }
     #[inline] fn zero() -> Self { 0 }
+    #[inline] fn max_value_sentinel() -> Self { u64::MAX }
     #[inline] fn from_usize(n: usize) -> Self { n as u64 }
     #[inline] fn children_mask(children: &[Self; 16]) -> u16 {
         crate::simd::children_mask_u64(children)
@@ -107,154 +121,278 @@ impl TrieIndex for u64 {
 // Core types
 // ---------------------------------------------------------------------------
 
-/// Bit 63 of `Node.offset` stores the terminal flag.
-const TERMINAL_BIT: u64 = 1u64 << 63;
-
 /// A single node in the nibble trie arena.
 ///
-/// Generic over `PTR` (pointer/index type for children and arena references)
-/// and `LEN` (length type for prefix lengths and key lengths).
+/// Generic over `PTR` (pointer/index type for children and arena references),
+/// `LEN` (length type for prefix lengths and key lengths), and `STAK` (maximum
+/// number of virtual nodes per physical node, must be a power of 2 ≤ 8).
 ///
-/// Layout with PTR=u32, LEN=u16 (default): 80 bytes (backward-compatible).
-/// Layout with PTR=u16, LEN=u16 (compact):  48 bytes (fits a 64-byte cache line).
+/// With stacking, each physical node can hold up to `STAK` virtual nodes (vnodes).
+/// Each vnode has its own `prefix_len`, `leaf_mask`, `occupancy`, `leaf`, and
+/// terminal bit, but they share the `children[16]` array. The `occupancy[v]`
+/// mask determines which nibble slots belong to vnode `v`.
 ///
-/// - `children`: 16 slots indexed by nibble value. `0` = empty slot.
-///   For internal nodes, the value is an arena index (≥ 1).
-///   For leaves (when `leaf_mask` bit is set), the value is a key index (≥ 1,
-///   since `index[0]` is the dummy).
-/// - `prefix_len`: absolute nibble position of this node's discriminating
-///   nibble. During lookup, use `key_nibble_at(key, prefix_len)` directly —
-///   no accumulation needed.
-/// - `leaf_mask`: bit N set → `children[N]` holds a leaf key index.
-/// - `leaf`: key index of a reference key. When terminal, this is the node's
-///   own key index. When not terminal, it's a descendant leaf key index.
-///   Used for retrieval: value lookup via `values[leaf - 1]` and key via
-///   `index[leaf]`.
-/// - `offset`: direct offset into `buf` for this node's reference key,
-///   with the terminal flag packed into bit 63. For terminal nodes, the key
-///   is `buf[raw_offset..raw_offset + prefix_len/2]`, avoiding an `index`
-///   lookup entirely. For non-terminal nodes, used during insertion to get
-///   the reference key for divergence comparison.
+/// Child pointers encode both physical node index and vnode index:
+/// `address = phys_idx * STAK + vnode_idx`. Decode with `address / STAK` and
+/// `address % STAK`. The sentinel value `PTR::MAX` marks empty slots.
+///
+/// Layout with PTR=u32, LEN=u16:
+/// - STAK=1: 76 bytes (4B smaller than pre-stacking 80-byte node)
+/// - STAK=2: 88 bytes (saves 72B vs 2×80, 45%)
+/// - STAK=4: 108 bytes (saves 212B vs 4×80, 66%)
 #[derive(Copy, Clone)]
-pub struct Node<PTR: TrieIndex, LEN: TrieIndex> {
-    pub children: [PTR; 16],
-    pub prefix_len: LEN,
-    pub leaf_mask: u16,
-    pub leaf: PTR,
-    pub offset: u64,  // bit 63 = terminal, bits 0-62 = raw buf offset
+pub struct Node<PTR: TrieIndex, LEN: TrieIndex, const STAK: usize = 1> {
+    pub children: [PTR; 16],     // shared across all vnodes; PTR::MAX = empty
+    pub leaf: PTR,               // key index for prefix comparison (shared by all vnodes)
+    pub prefix_len: [LEN; STAK], // per-vnode prefix length (must be increasing)
+    pub leaf_mask: [u16; STAK],  // per-vnode: bit N = children[N] is leaf key index
+    pub occupancy: [u16; STAK],  // per-vnode: bit N = this vnode owns slot N
+    pub nodelen: u8,             // number of vnodes in this physical node (1..=STAK)
+    pub terminal: u8,            // bitmask: bit V = vnode V is terminal
 }
 
-impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
-    fn new() -> Self {
+impl<PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> Node<PTR, LEN, STAK> {
+    pub fn new() -> Self {
         Node {
-            children: [PTR::zero(); 16],
-            prefix_len: LEN::zero(),
-            leaf_mask: 0,
-            leaf: PTR::zero(),
-            offset: 0,
+            children: [PTR::max_value_sentinel(); 16],
+            leaf: PTR::max_value_sentinel(),
+            prefix_len: [LEN::zero(); STAK],
+            leaf_mask: [0; STAK],
+            occupancy: [0; STAK],
+            nodelen: 1, // new physical node starts with 1 vnode
+            terminal: 0,
         }
     }
 
+    /// Check if vnode `v` is terminal.
     #[inline]
-    pub fn is_terminal(&self) -> bool {
-        (self.offset & TERMINAL_BIT) != 0
+    pub fn is_terminal(&self, v: usize) -> bool {
+        debug_assert!(v < STAK, "vnode index {v} >= STAK {STAK}");
+        (self.terminal >> v) & 1 == 1
     }
 
+    /// Set terminal flag for vnode `v`.
     #[inline]
-    fn set_terminal(&mut self, val: bool) {
+    fn set_terminal(&mut self, v: usize, val: bool) {
+        debug_assert!(v < STAK);
         if val {
-            self.offset |= TERMINAL_BIT;
+            self.terminal |= 1 << v;
         } else {
-            self.offset &= !TERMINAL_BIT;
+            self.terminal &= !(1 << v);
         }
     }
 
+    /// Check if nibble slot `nib` in vnode `v` is a leaf (key index).
     #[inline]
-    fn raw_offset(&self) -> u64 {
-        self.offset & !TERMINAL_BIT
-    }
-
-    #[inline]
-    fn set_raw_offset(&mut self, off: u64) {
-        self.offset = (self.offset & TERMINAL_BIT) | (off & !TERMINAL_BIT);
-    }
-
-    #[inline]
-    pub fn is_leaf(&self, nib: usize) -> bool {
+    pub fn is_leaf(&self, nib: usize, v: usize) -> bool {
         debug_assert!(nib < 16);
-        (self.leaf_mask >> nib) & 1 == 1
+        debug_assert!(v < STAK);
+        (self.leaf_mask[v] >> nib) & 1 == 1
     }
 
+    /// Set the leaf flag for nibble slot `nib` in vnode `v`.
     #[inline]
-    fn set_leaf(&mut self, nib: usize) {
+    fn set_leaf(&mut self, nib: usize, v: usize) {
         debug_assert!(nib < 16);
-        self.leaf_mask |= 1 << nib;
+        debug_assert!(v < STAK);
+        self.leaf_mask[v] |= 1 << nib;
     }
 
+    /// Clear the leaf flag for nibble slot `nib` in vnode `v`.
     #[inline]
-    fn clear_leaf(&mut self, nib: usize) {
+    fn clear_leaf(&mut self, nib: usize, v: usize) {
         debug_assert!(nib < 16);
-        self.leaf_mask &= !(1 << nib);
+        debug_assert!(v < STAK);
+        self.leaf_mask[v] &= !(1 << nib);
     }
 
-    /// Store a leaf key index at `nib`. Key index must be ≥ 1
-    /// (index[0] is the dummy entry).
+    /// Check if nibble slot `nib` is owned by vnode `v`.
     #[inline]
-    fn set_leaf_child(&mut self, nib: usize, key_index: PTR) {
+    pub fn is_occupied(&self, nib: usize, v: usize) -> bool {
         debug_assert!(nib < 16);
-        debug_assert!(key_index != PTR::zero(), "key index 0 is the dummy");
-        self.set_leaf(nib);
+        debug_assert!(v < STAK);
+        (self.occupancy[v] >> nib) & 1 == 1
+    }
+
+    /// Set the occupancy bit for nibble slot `nib` in vnode `v`.
+    #[inline]
+    fn set_occupied(&mut self, nib: usize, v: usize) {
+        debug_assert!(nib < 16);
+        debug_assert!(v < STAK);
+        self.occupancy[v] |= 1 << nib;
+    }
+
+    /// Clear the occupancy bit for nibble slot `nib` in vnode `v`.
+    #[inline]
+    fn clear_occupied(&mut self, nib: usize, v: usize) {
+        debug_assert!(nib < 16);
+        debug_assert!(v < STAK);
+        self.occupancy[v] &= !(1 << nib);
+    }
+
+    /// Store a leaf key index at `nib` in vnode `v`.
+    /// Key index must not be the sentinel value.
+    #[inline]
+    fn set_leaf_child(&mut self, nib: usize, v: usize, key_index: PTR) {
+        debug_assert!(nib < 16);
+        debug_assert!(v < STAK);
+        debug_assert!(key_index != PTR::max_value_sentinel(), "sentinel key index");
+        self.set_leaf(nib, v);
+        self.set_occupied(nib, v);
         self.children[nib] = key_index;
     }
 
-    /// Store an arena index at `nib` (internal node reference).
-    /// Arena index must be ≥ 1 (root at index 0 is never a child of another node).
+    /// Store an encoded address at `nib` in vnode `v` (internal node reference).
     #[inline]
-    fn set_internal_child(&mut self, nib: usize, arena_index: PTR) {
+    fn set_internal_child(&mut self, nib: usize, v: usize, addr: PTR) {
         debug_assert!(nib < 16);
-        debug_assert!(arena_index != PTR::zero());
-        self.clear_leaf(nib);
-        self.children[nib] = arena_index;
+        debug_assert!(v < STAK);
+        debug_assert!(addr != PTR::max_value_sentinel(), "sentinel address");
+        self.clear_leaf(nib, v);
+        self.set_occupied(nib, v);
+        self.children[nib] = addr;
     }
 
-    /// Decode a leaf child at `nib` into a key index.
+    /// Decode a leaf child at `nib` in vnode `v` into a key index.
     /// Returns `None` if the slot is empty or not a leaf.
     #[inline]
-    fn leaf_key_index(&self, nib: usize) -> Option<PTR> {
+    fn leaf_key_index(&self, nib: usize, v: usize) -> Option<PTR> {
         debug_assert!(nib < 16);
-        if self.is_leaf(nib) && self.children[nib] != PTR::zero() {
+        debug_assert!(v < STAK);
+        if self.is_leaf(nib, v) && self.is_occupied(nib, v) {
             Some(self.children[nib])
         } else {
             None
         }
     }
 
-    /// Compute a 16-bit mask where bit N is set if `children[N] != 0`.
-    /// Uses SIMD (for u16/u32/u64) to evaluate all 16 slots in parallel.
+    /// Compute a 16-bit mask where bit N is set if `children[N]` is not the sentinel.
+    /// For STAK=1, this equals `occupancy[0]` which is maintained on every mutation.
+    /// For STAK>1, this returns the merged occupancy across all vnodes.
     #[inline]
     pub fn children_mask(&self) -> u16 {
-        PTR::children_mask(&self.children)
+        self.merged_occupancy()
+    }
+
+    /// Compute the merged occupancy mask: OR of all vnodes' occupancy masks.
+    #[inline]
+    pub fn merged_occupancy(&self) -> u16 {
+        let mut merged = 0u16;
+        for v in 0..STAK {
+            merged |= self.occupancy[v];
+        }
+        merged
+    }
+
+    /// Return the number of vnodes in this physical node (1..=STAK).
+    /// This is maintained by insert (always 1) and optimize (increments when stacking).
+    #[inline]
+    pub fn vnode_count(&self) -> usize {
+        self.nodelen as usize
+    }
+
+    /// Encode a physical node index and vnode index into an address.
+    #[inline]
+    pub fn encode_addr(phys_idx: usize, vnode_idx: usize) -> PTR {
+        PTR::from_usize(phys_idx * STAK + vnode_idx)
+    }
+
+    /// Decode the physical node index from an address.
+    #[inline]
+    pub fn decode_phys(addr: PTR) -> usize {
+        addr.as_usize() / STAK
+    }
+
+    /// Decode the vnode index from an address.
+    #[inline]
+    pub fn decode_vnode(addr: PTR) -> usize {
+        addr.as_usize() % STAK
+    }
+
+    /// Promote this node's PTR type to a wider one, preserving STAK.
+    /// Child addresses and leaf indices are widened via `NewPTR::from_usize`.
+    /// Since STAK is unchanged, no address remapping is needed.
+    pub fn promote<NewPTR: TrieIndex>(self) -> Node<NewPTR, LEN, STAK> {
+        let merged = self.merged_occupancy();
+        let mut children = [NewPTR::max_value_sentinel(); 16];
+        for i in 0..16 {
+            if merged & (1 << i) != 0 {
+                children[i] = NewPTR::from_usize(self.children[i].as_usize());
+            }
+        }
+        Node {
+            children,
+            leaf: NewPTR::from_usize(self.leaf.as_usize()),
+            prefix_len: self.prefix_len,
+            leaf_mask: self.leaf_mask,
+            occupancy: self.occupancy,
+            nodelen: self.nodelen,
+            terminal: self.terminal,
+        }
+    }
+
+    /// Demote this node's PTR type to a narrower one, preserving STAK.
+    /// Returns `Err(self)` if any child address or leaf index doesn't fit
+    /// in the narrower type.
+    pub fn demote<NewPTR: TrieIndex>(self) -> Result<Node<NewPTR, LEN, STAK>, Self> {
+        let merged = self.merged_occupancy();
+        for i in 0..16 {
+            if merged & (1 << i) != 0 {
+                if self.children[i].as_usize() > NewPTR::max_value() {
+                    return Err(self);
+                }
+            }
+        }
+        if self.leaf != PTR::max_value_sentinel() && self.leaf.as_usize() > NewPTR::max_value() {
+            return Err(self);
+        }
+        let mut children = [NewPTR::max_value_sentinel(); 16];
+        for i in 0..16 {
+            if merged & (1 << i) != 0 {
+                children[i] = NewPTR::from_usize(self.children[i].as_usize());
+            }
+        }
+        Ok(Node {
+            children,
+            leaf: if self.leaf == PTR::max_value_sentinel() {
+                NewPTR::max_value_sentinel()
+            } else {
+                NewPTR::from_usize(self.leaf.as_usize())
+            },
+            prefix_len: self.prefix_len,
+            leaf_mask: self.leaf_mask,
+            occupancy: self.occupancy,
+            nodelen: self.nodelen,
+            terminal: self.terminal,
+        })
     }
 }
 
-impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for Node<PTR, LEN> {
+impl<PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> fmt::Debug for Node<PTR, LEN, STAK> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let active: Vec<(usize, &str, PTR)> = (0..16)
-            .filter(|&n| self.children[n] != PTR::zero())
+            .filter(|&n| self.children[n] != PTR::max_value_sentinel())
             .map(|n| {
-                let tag = if self.is_leaf(n) { "L" } else { "I" };
+                let tag = if self.is_leaf(n, 0) { "L" } else { "I" };
                 (n, tag, self.children[n])
             })
             .collect();
         f.debug_struct("Node")
             .field("prefix_len", &self.prefix_len)
-            .field("leaf_mask", &format_args!("0x{:04x}", self.leaf_mask))
+            .field("leaf_mask", &format_args!("{:?}", self.leaf_mask))
+            .field("occupancy", &format_args!("{:?}", self.occupancy))
+            .field("terminal", &format_args!("{:08b}", self.terminal))
             .field("leaf", &self.leaf)
-            .field("raw_offset", &self.raw_offset())
-            .field("terminal", &self.is_terminal())
             .field("children", &active)
             .finish()
     }
+}
+
+/// Entry on the parent stack during optimize stacking decisions.
+struct StackEntry {
+    old_phys: usize,
+    new_phys_idx: usize,
+    vnode: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -262,8 +400,8 @@ impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for Node<PTR, LEN> {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct NibbleTrie<T, PTR: TrieIndex = u32, LEN: TrieIndex = u16> {
-    pub arena: Vec<Node<PTR, LEN>>,
+pub struct NibbleTrie<T, PTR: TrieIndex = u32, LEN: TrieIndex = u16, const STAK: usize = 1> {
+    pub arena: Vec<Node<PTR, LEN, STAK>>,
     pub buf: Vec<u8>,                // all keys concatenated (no null terminators)
     pub index: Vec<(usize, LEN)>,    // (offset into buf, len) per key — offset is usize, len is compact
     pub values: Vec<T>,              // values[i] ↔ index[i]
@@ -492,10 +630,10 @@ fn nibble_count(key: &[u8]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// NibbleTrie implementation
+// NibbleTrie methods (generic over STAK)
 // ---------------------------------------------------------------------------
 
-impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
+impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LEN, STAK> {
     /// Return the key slice for `key_index`.
     #[inline]
     fn key_slice(&self, key_index: PTR) -> &[u8] {
@@ -503,11 +641,18 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
         &self.buf[off..off + len.as_usize()]
     }
 
+    /// Unchecked version of `key_slice` — skips bounds checks on index and buf.
+    #[inline]
+    unsafe fn key_slice_unchecked(&self, key_index: PTR) -> &[u8] {
+        let (off, len) = unsafe { *self.index.get_unchecked(key_index.as_usize()) };
+        unsafe { self.buf.get_unchecked(off..off + len.as_usize()) }
+    }
+
     pub fn new() -> Self {
         NibbleTrie {
             arena: Vec::new(),
             buf: vec![0],           // buf[0] = dummy (unused byte)
-            index: vec![(0, LEN::zero())],   // index[0] = dummy entry (offset 0, len 0)
+            index: vec![(0, LEN::zero())],   // index[0] = dummy entry
             values: Vec::new(),
         }
     }
@@ -521,135 +666,449 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
     }
 
     // -----------------------------------------------------------------------
-    // Lookup
+    // Lookup (generic over STAK)
     // -----------------------------------------------------------------------
 
     pub fn get(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
-        let mut node_idx: PTR = PTR::zero();
+        let mut phys_idx: usize = 0;
+        let mut vnode_idx: usize = 0;
         let max_nib = key.len() * 2;
         loop {
-            let node = &self.arena[node_idx.as_usize()];
-            // Key nibbles exhausted — check if this node is terminal
-            if node.prefix_len.as_usize() >= max_nib {
-                if node.is_terminal() {
-                    let key_len = node.prefix_len.as_usize() / 2;
-                    let off = node.raw_offset() as usize;
-                    let key_in_buf = &self.buf[off..off + key_len];
-                    if simd_eq(key_in_buf, key) {
-                        return Some(node.leaf.as_usize());
+            let node = &self.arena[phys_idx];
+            let prefix_len = node.prefix_len[vnode_idx].as_usize();
+            // Key nibbles exhausted — check if this vnode is terminal.
+            // The leaf key may be longer than the search key (from a deeper vnode
+            // sharing the physical node), so we compare only up to the search key's
+            // length. All nibbles up to prefix_len have been verified during descent.
+            if prefix_len >= max_nib {
+                if node.is_terminal(vnode_idx) {
+                    let ki = node.leaf;
+                    let (off, len) = self.index[ki.as_usize()];
+                    let key_in_buf = &self.buf[off..off + len.as_usize()];
+                    if key.len() == len.as_usize() && simd_eq(&key_in_buf[..key.len()], key) {
+                        return Some(ki.as_usize());
                     }
                 }
                 return None;
             }
-            let nib = key_nibble_at(key, node.prefix_len.as_usize()) as usize;
-            let slot = node.children[nib];
-            if slot == PTR::zero() {
+            let nib = key_nibble_at(key, prefix_len) as usize;
+            if !node.is_occupied(nib, vnode_idx) {
                 return None;
             }
-            if node.is_leaf(nib) {
+            let slot = node.children[nib];
+            if slot == PTR::max_value_sentinel() {
+                return None;
+            }
+            if node.is_leaf(nib, vnode_idx) {
                 let key_index = slot;
-                debug_assert!(key_index != PTR::zero());
                 return if simd_eq(self.key_slice(key_index), key) {
                     Some(key_index.as_usize())
                 } else {
                     None
                 };
             }
-            node_idx = slot;
+            // Internal child — decode address
+            phys_idx = slot.as_usize() / STAK;
+            vnode_idx = slot.as_usize() % STAK;
         }
     }
 
     /// Unchecked lookup — assumes the key is present in the trie.
     ///
-    /// Follows the nibble path through the trie structure and returns the
-    /// key index directly once a terminal node or leaf is reached, **without
-    /// verifying key equality**. This is the key difference from `get()`:
-    /// the final SIMD key comparison is skipped entirely, which is the
-    /// dominant cost of a normal lookup.
-    ///
     /// # Safety
-    ///
-    /// The key **must** have been inserted into this trie. If the key is not
-    /// present, the result is unspecified (may return a wrong index or `None`).
-    /// All child/leaf indices encountered during traversal must be valid arena
-    /// or index entries.
+    /// The key **must** have been inserted into this trie. All child/leaf indices
+    /// encountered during traversal must be valid arena or index entries.
     pub unsafe fn get_unchecked(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
-        let mut node_idx: PTR = PTR::zero();
+        let mut phys_idx: usize = 0;
+        let mut vnode_idx: usize = 0;
         let max_nib = key.len() * 2;
         loop {
-            // SAFETY: node_idx is always a valid arena index (root=0,
-            // children come from prior arena[node].children which are valid).
-            let node = unsafe { self.arena.get_unchecked(node_idx.as_usize()) };
-            let prefix_len = node.prefix_len.as_usize();
-            // Key nibbles exhausted — under the "key in set" assumption,
-            // this node must be terminal. Return the key index directly.
+            let node = unsafe { self.arena.get_unchecked(phys_idx) };
+            let prefix_len = node.prefix_len[vnode_idx].as_usize();
             if prefix_len >= max_nib {
-                debug_assert!(node.is_terminal(), "get_unchecked: key not in set");
+                debug_assert!(node.is_terminal(vnode_idx), "get_unchecked: key not in set");
                 return Some(node.leaf.as_usize());
             }
-            // SAFETY: prefix_len < max_nib implies byte_idx < key.len().
             let nib = unsafe { key_nibble_at_unchecked(key, prefix_len) } as usize;
-            // SAFETY: nib < 16 always; children has 16 slots.
             let slot = unsafe { *node.children.get_unchecked(nib) };
-            if slot == PTR::zero() {
+            if slot == PTR::max_value_sentinel() {
                 return None;
             }
-            if node.is_leaf(nib) {
-                // Under the "key in set" assumption, this leaf is the
-                // correct one — no key comparison needed.
+            if node.is_leaf(nib, vnode_idx) {
                 return Some(slot.as_usize());
             }
-            node_idx = slot;
+            phys_idx = slot.as_usize() / STAK;
+            vnode_idx = slot.as_usize() % STAK;
         }
     }
 
-    /// Unchecked version of `key_slice` — skips bounds checks on index and buf.
-    ///
-    /// # Safety
-    /// `key_index` must be a valid index into `self.index`, and the offset/length
-    /// stored there must describe a valid range within `self.buf`.
-    #[inline]
-    unsafe fn key_slice_unchecked(&self, key_index: PTR) -> &[u8] {
-        let (off, len) = unsafe { *self.index.get_unchecked(key_index.as_usize()) };
-        unsafe { self.buf.get_unchecked(off..off + len.as_usize()) }
-    }
-
     pub fn get_value(&self, key: &[u8]) -> Option<&T> {
-        self.get(key).map(|idx| &self.values[idx - 1]) // values[0] corresponds to keys[1]
+        self.get(key).map(|idx| &self.values[idx - 1])
     }
 
+    // -----------------------------------------------------------------------
+    // Iteration
+    // -----------------------------------------------------------------------
+
+    pub fn iter(&self) -> NibbleIter<'_, T, PTR, LEN, STAK> {
+        NibbleIter::new(self)
+    }
+
+    pub fn iter_last(&self) -> NibbleIter<'_, T, PTR, LEN, STAK> {
+        NibbleIter::new_last(self)
+    }
+
+    pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
+        let buf = self.buf;
+        let keys: Vec<Vec<u8>> = self.index.into_iter().skip(1).map(|(off, len)| {
+            buf[off..off + len.as_usize()].to_vec()
+        }).collect();
+        (keys, self.values)
+    }
+
+    // -----------------------------------------------------------------------
+    // Capacity
+    // -----------------------------------------------------------------------
+
+    pub fn near_capacity(&self) -> bool {
+        // For STAK > 1, encoded addresses are phys_idx * STAK + vnode_idx.
+        // We need arena.len() * STAK < PTR::max_value() for valid encoded addresses.
+        // Also need index.len() < PTR::max_value() for key indices.
+        self.arena.len() >= PTR::max_value() / STAK || self.index.len() >= PTR::max_value()
+    }
+
+    // -----------------------------------------------------------------------
+    // Optimize (DFS key-sorted buf rewrite + vnode stacking)
+    // -----------------------------------------------------------------------
+
+    /// Rewrite `buf` in DFS order and, when STAK > 1, pack ancestor-descendant
+    /// vnodes into shared physical nodes to reduce arena size.
+    ///
+    /// For STAK = 1 this is equivalent to the old buf-only optimize (no stacking
+    /// is possible since each physical node holds exactly one vnode).
+    pub fn optimize(&mut self) {
+        if self.arena.is_empty() {
+            return;
+        }
+
+        let mut new_buf = vec![0u8; self.buf.len()];
+        let mut cursor: usize = 1; // position 0 is the dummy byte
+
+        // Remap table: maps old encoded address → (new_phys, new_vnode).
+        // Initialized with (0, 0) as placeholder for index 0.
+        // For STAK=1 old addresses are just phys_idx, so remap[phys] gives the
+        // new location. For STAK>1 old addresses are phys*STAK+vnode.
+        let old_node_count = self.arena.len() * STAK; // upper bound on old vnode count
+        let mut remap: Vec<(usize, usize)> = vec![(0, 0); old_node_count];
+
+        // Parent stack for stacking decisions
+        let mut parent_stack: Vec<StackEntry> = Vec::new();
+
+        // New arena (rebuilt with stacking)
+        let mut new_arena: Vec<Node<PTR, LEN, STAK>> = Vec::new();
+
+        // Collect key indices in DFS visitation order for index/values sorting
+        let mut dfs_key_order: Vec<PTR> = Vec::new();
+
+        self.walk_optimize_stacked(
+            0, 0, // root at phys=0, vnode=0
+            &mut new_buf, &mut cursor,
+            &mut remap, &mut parent_stack, &mut new_arena,
+            &mut dfs_key_order,
+        );
+
+        new_buf.truncate(cursor);
+        self.buf = new_buf;
+        self.arena = new_arena;
+
+        // Remap all internal child addresses in the new arena
+        for phys in 0..self.arena.len() {
+            for v in 0..STAK {
+                let occ = self.arena[phys].occupancy[v];
+                if occ == 0 && !self.arena[phys].is_terminal(v) {
+                    continue;
+                }
+                for nib in 0..16 {
+                    if (occ >> nib) & 1 == 0 {
+                        continue;
+                    }
+                    if self.arena[phys].is_leaf(nib, v) {
+                        continue; // leaf — value is a key index, not an arena address
+                    }
+                    let old_addr = self.arena[phys].children[nib].as_usize();
+                    debug_assert!(old_addr < remap.len(), "old_addr {} >= remap.len() {}, phys={} v={} nib={}", old_addr, remap.len(), phys, v, nib);
+                    debug_assert!(!(remap[old_addr] == (0, 0) && old_addr != 0), "remap[{}] == (0,0) but old_addr != 0, phys={} v={} nib={}", old_addr, phys, v, nib);
+                    let (new_phys, new_vnode) = remap[old_addr];
+                    self.arena[phys].children[nib] = PTR::from_usize(new_phys * STAK + new_vnode);
+                }
+            }
+        }
+
+        // --- Sort index and values into DFS order ---
+
+        // Build key remap: old key index → new key index (1-based DFS rank).
+        // Index 0 is the dummy entry and stays in place.
+        let num_keys = dfs_key_order.len();
+        let mut key_remap: Vec<usize> = vec![0; self.index.len()];
+        key_remap[0] = 0; // dummy stays at 0
+        for (new_ki, &old_ki) in dfs_key_order.iter().enumerate() {
+            key_remap[old_ki.as_usize()] = new_ki + 1; // 1-based
+        }
+
+        // Remap all key index references in the arena
+        for phys in 0..self.arena.len() {
+            for v in 0..STAK {
+                let occ = self.arena[phys].occupancy[v];
+                if occ == 0 && !self.arena[phys].is_terminal(v) {
+                    continue; // inactive vnode, skip
+                }
+                // Remap leaf children
+                for nib in 0..16 {
+                    if (occ >> nib) & 1 == 0 {
+                        continue;
+                    }
+                    if self.arena[phys].is_leaf(nib, v) {
+                        let old_ki = self.arena[phys].children[nib].as_usize();
+                        let new_ki = key_remap[old_ki];
+                        self.arena[phys].children[nib] = PTR::from_usize(new_ki);
+                    }
+                }
+            }
+            // Remap leaf pointer (skip sentinel values)
+            let old_leaf = self.arena[phys].leaf;
+            if old_leaf != PTR::max_value_sentinel() {
+                let new_ki = key_remap[old_leaf.as_usize()];
+                self.arena[phys].leaf = PTR::from_usize(new_ki);
+            }
+        }
+
+        // Rebuild index in DFS order: new_index[new_ki] = old_index_entry
+        let mut new_index: Vec<(usize, LEN)> = vec![(0, LEN::zero()); num_keys + 1];
+        new_index[0] = self.index[0]; // keep dummy entry
+        for (new_ki, &old_ki) in dfs_key_order.iter().enumerate() {
+            new_index[new_ki + 1] = self.index[old_ki.as_usize()];
+        }
+
+        // Reorder values to match new key ordering: new_values[new_ki - 1] = old_values[old_ki - 1]
+        // Use ptr::read to avoid requiring T: Clone
+        let mut new_values = Vec::with_capacity(num_keys);
+        unsafe {
+            let old_values_ptr = self.values.as_ptr();
+            for &old_ki in &dfs_key_order {
+                let old_val = std::ptr::read(old_values_ptr.add(old_ki.as_usize() - 1));
+                new_values.push(old_val);
+            }
+        }
+        // Old values' elements were moved out via ptr::read, so prevent the old Vec
+        // from dropping them. set_len(0) means no destructor calls on elements,
+        // then swap so the old (now-empty) Vec gets deallocated normally.
+        unsafe { self.values.set_len(0); }
+        std::mem::swap(&mut self.values, &mut new_values);
+        // new_values now holds the old Vec with len=0 — it will just free its buffer on drop
+        self.index = new_index;
+    }
+
+    fn walk_optimize_stacked(
+        &mut self,
+        old_phys: usize,
+        old_vnode: usize,
+        new_buf: &mut [u8],
+        cursor: &mut usize,
+        remap: &mut Vec<(usize, usize)>,
+        parent_stack: &mut Vec<StackEntry>,
+        new_arena: &mut Vec<Node<PTR, LEN, STAK>>,
+        dfs_key_order: &mut Vec<PTR>,
+    ) {
+        let node = self.arena[old_phys]; // copy to avoid borrow conflicts
+        let occ = node.occupancy[old_vnode];
+        let is_term = node.is_terminal(old_vnode);
+
+        // --- Decide where this vnode goes in the new arena ---
+
+        // Try to stack into an ancestor (deepest first)
+        let mut new_phys: usize = 0;
+        let mut assigned_vnode: usize = 0;
+
+        if STAK > 1 {
+            // Walk parent stack from deepest (top) to shallowest (bottom)
+            // Use the physical node's actual nodelen and merged_occupancy rather than
+            // the stack entry's copies, because multiple stack entries may reference
+            // the same physical node (from different subtree visits).
+            let mut stacked = false;
+            for i in (0..parent_stack.len()).rev() {
+                let host_phys = parent_stack[i].new_phys_idx;
+                let host_nodelen = new_arena[host_phys].nodelen as usize;
+                if host_nodelen < STAK {
+                    let host_merged = new_arena[host_phys].merged_occupancy();
+                    if host_merged & occ == 0 {
+                        // Terminal constraint: a pnode with a terminal vnode is
+                        // closed for further stacking. This ensures the single
+                        // `leaf` field holds the terminal key index, and that
+                        // key is long enough for all vnodes' prefix comparisons.
+                        if new_arena[host_phys].terminal != 0 {
+                            continue;
+                        }
+                        // Can stack here!
+                        new_phys = host_phys;
+                        assigned_vnode = host_nodelen; // next available vnode slot
+                        new_arena[host_phys].nodelen += 1;
+                        stacked = true;
+                        break;
+                    }
+                }
+            }
+            if !stacked {
+                // No ancestor can host — create a new physical node
+                new_phys = new_arena.len();
+                assigned_vnode = 0;
+                new_arena.push(Node::new());
+            }
+        } else {
+            // STAK=1: every vnode gets its own physical node
+            new_phys = new_arena.len();
+            assigned_vnode = 0;
+            new_arena.push(Node::new());
+        }
+
+        // Record the remapping
+        let old_addr = old_phys * STAK + old_vnode;
+        if old_addr < remap.len() {
+            remap[old_addr] = (new_phys, assigned_vnode);
+        }
+
+        // --- Populate vnode fields ---
+
+        new_arena[new_phys].prefix_len[assigned_vnode] = node.prefix_len[old_vnode];
+        new_arena[new_phys].occupancy[assigned_vnode] = occ;
+        new_arena[new_phys].leaf_mask[assigned_vnode] = node.leaf_mask[old_vnode];
+        if is_term {
+            new_arena[new_phys].set_terminal(assigned_vnode, true);
+        }
+
+        // Copy key data for terminal node
+        if is_term {
+            let ki = node.leaf;
+            let (old_off, len) = self.index[ki.as_usize()];
+            let start = *cursor;
+            new_buf[start..start + len.as_usize()].copy_from_slice(
+                &self.buf[old_off..old_off + len.as_usize()]
+            );
+            self.index[ki.as_usize()].0 = *cursor;
+            *cursor += len.as_usize();
+            new_arena[new_phys].leaf = ki;
+            dfs_key_order.push(ki);
+        }
+
+        // --- Recurse into children ---
+
+        // Only push onto parent_stack if this vnode is the last (youngest) one in
+        // its old physical node AND the new pnode is not terminal. This enforces:
+        // 1. The stacking invariant: only descendants of the last vnode can stack in.
+        // 2. The terminal constraint: once a pnode has a terminal vnode, it's closed
+        //    for further stacking (the single `leaf` field holds the terminal key).
+        let is_last_vnode = old_vnode == node.nodelen as usize - 1;
+        let new_pnode_has_terminal = new_arena[new_phys].terminal != 0;
+        if is_last_vnode && !new_pnode_has_terminal {
+            let stack_entry = StackEntry {
+                old_phys,
+                new_phys_idx: new_phys,
+                vnode: assigned_vnode,
+            };
+            parent_stack.push(stack_entry);
+        }
+
+        for nib in 0..16 {
+            if (occ >> nib) & 1 == 0 {
+                continue;
+            }
+            if node.is_leaf(nib, old_vnode) {
+                // Leaf child — copy key data
+                let ki = node.children[nib];
+                let (old_off, len) = self.index[ki.as_usize()];
+                let start = *cursor;
+                new_buf[start..start + len.as_usize()].copy_from_slice(
+                    &self.buf[old_off..old_off + len.as_usize()]
+                );
+                self.index[ki.as_usize()].0 = *cursor;
+                *cursor += len.as_usize();
+                // Store leaf key index in the new arena
+                new_arena[new_phys].children[nib] = ki;
+                dfs_key_order.push(ki);
+            } else {
+                // Internal child — recurse, then store the old address for remapping
+                let child_old_addr = node.children[nib];
+                let child_phys = child_old_addr.as_usize() / STAK;
+                let child_vnode = child_old_addr.as_usize() % STAK;
+                self.walk_optimize_stacked(
+                    child_phys, child_vnode,
+                    new_buf, cursor,
+                    remap, parent_stack, new_arena,
+                    dfs_key_order,
+                );
+                // Store the old address so the remap loop can find it later
+                new_arena[new_phys].children[nib] = child_old_addr;
+            }
+        }
+
+        // Propagate leaf for non-terminal vnodes: set leaf to the first descendant's
+        // key index. For terminal vnodes, leaf was already set during the walk.
+        // After recursing into children, their leaves are valid, so we can follow
+        // the first child to get the leaf.
+        // IMPORTANT: don't overwrite leaf if it was already set by a terminal vnode
+        // that was stacked into this pnode (their leaf is authoritative).
+        if !is_term && new_arena[new_phys].leaf == PTR::max_value_sentinel() {
+            let first_nib = occ.trailing_zeros() as usize;
+            if new_arena[new_phys].is_leaf(first_nib, assigned_vnode) {
+                new_arena[new_phys].leaf = new_arena[new_phys].children[first_nib];
+            } else {
+                let child_old_addr = node.children[first_nib];
+                if child_old_addr.as_usize() < remap.len() {
+                    let child_phys_new = remap[child_old_addr.as_usize()].0;
+                    new_arena[new_phys].leaf = new_arena[child_phys_new].leaf;
+                }
+            }
+        }
+
+        if is_last_vnode && !new_pnode_has_terminal {
+            parent_stack.pop();
+        }
+    }
+}
+
+impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> Default for NibbleTrie<T, PTR, LEN, STAK> {
+    fn default() -> Self { Self::new() }
+}
+
+// ---------------------------------------------------------------------------
+// NibbleTrie implementation (STAK=1, insert-compatible)
+// ---------------------------------------------------------------------------
+
+impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LEN, STAK> {
     // -----------------------------------------------------------------------
     // Insertion
     // -----------------------------------------------------------------------
 
     pub fn insert(&mut self, key: Vec<u8>, value: T) -> Result<usize, ()> {
-        // Overflow checks: arena/key indices must fit in PTR.
-        // Each insert adds at most 1 arena node, so arena.len() must stay <= max_value.
-        // Key indices start at 1 (index[0] is dummy), so index.len() must stay <= max_value.
-        // Key nibble count must fit in LEN (for prefix_len). Buf offsets are usize/u64,
-        // so total buffer size is only limited by available memory.
-        if self.arena.len() > PTR::max_value() {
-            return Err(());
-        }
-        if self.index.len() > PTR::max_value() {
+        // Overflow checks: encoded addresses must fit in PTR, and key indices
+        // must not produce the sentinel value.
+        if self.arena.len() >= PTR::max_value() / STAK || self.index.len() >= PTR::max_value() {
             return Err(());
         }
         if key.len() * 2 > LEN::max_value() {
             return Err(());
         }
 
-        // Real key index: index[0] is the dummy, so real keys start at 1
         let new_index = PTR::from_usize(self.index.len());
         let key_len = LEN::from_usize(key.len());
-        let offset = self.buf.len() as u64;
+        let offset = self.buf.len() as usize;
         self.buf.extend_from_slice(&key);
-        self.index.push((offset as usize, key_len));
+        self.index.push((offset, key_len));
         self.values.push(value);
 
         let max_nib = key.len() * 2;
@@ -658,61 +1117,51 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
             return Ok(self.insert_into_empty_trie(&key, new_index, offset, max_nib));
         }
 
-        let mut node_idx: PTR = PTR::zero();
-        // Nibbles 0..confirmed-1 are known to match between new_key and any
-        // key in the current subtree. Skipping them avoids re-scanning the
-        // shared prefix at every level of descent.
+        let mut phys_idx: usize = 0;
+        let mut vnode_idx: usize = 0;
         let mut confirmed: usize = 0;
 
         loop {
-            let node = &self.arena[node_idx.as_usize()];
-            // Use node.raw_offset() for direct buf access — no index lookup needed
-            let (_, ref_len) = self.index[node.leaf.as_usize()];
-            let off = node.raw_offset() as usize;
+            let node = &self.arena[phys_idx];
+            let ki = node.leaf;
+            let (off, ref_len) = self.index[ki.as_usize()];
             let ref_key = &self.buf[off..off + ref_len.as_usize()];
-            let prefix_len = node.prefix_len.as_usize();
+            let prefix_len = node.prefix_len[vnode_idx].as_usize();
 
             match simd_check_prefix::<8>(&key, ref_key, confirmed, prefix_len) {
                 PrefixCheck::Diverges(diverge) => {
-                    // Divergence before prefix_len — split this node
                     return Ok(self.split_node_before_prefix(
-                        node_idx, diverge, new_index, offset, &key, max_nib,
+                        phys_idx, vnode_idx, diverge, new_index, offset, &key, max_nib,
                     ));
                 }
                 PrefixCheck::Matches => {
-                    // Keys match from confirmed to prefix_len.
                     if max_nib == prefix_len {
-                        // Key ends at this node — duplicate or prefix
                         if key.len() == ref_key.len() {
-                            // Exact duplicate of the reference key
                             self.rollback_last_insert();
                             return Err(());
                         }
-                        // Key is a proper prefix of ref_key — mark terminal
-                        self.arena[node_idx.as_usize()].set_terminal(true);
-                        self.arena[node_idx.as_usize()].leaf = new_index;
-                        self.arena[node_idx.as_usize()].set_raw_offset(offset);
+                        self.arena[phys_idx].set_terminal(vnode_idx, true);
+                        self.arena[phys_idx].leaf = new_index;
                         return Ok(new_index.as_usize());
                     }
 
                     confirmed = prefix_len + 1;
                     let nib = key_nibble_at(&key, prefix_len) as usize;
-                    let slot = node.children[nib];
-
-                    if slot == PTR::zero() {
+                    if !node.is_occupied(nib, vnode_idx) {
                         // Empty slot — new key diverges here
-                        self.arena[node_idx.as_usize()].set_leaf_child(nib, new_index);
+                        self.arena[phys_idx].set_leaf_child(nib, vnode_idx, new_index);
                         return Ok(new_index.as_usize());
                     }
+                    let slot = node.children[nib];
 
-                    if node.is_leaf(nib) {
+                    if node.is_leaf(nib, vnode_idx) {
                         return self.split_leaf_child(
-                            nib, node_idx, slot, new_index, offset, &key, max_nib, confirmed,
+                            nib, phys_idx, vnode_idx, slot, new_index, offset, &key, max_nib, confirmed,
                         );
                     }
 
-                    // Internal node — descend
-                    node_idx = slot;
+                    phys_idx = slot.as_usize() / STAK;
+                    vnode_idx = slot.as_usize() % STAK;
                 }
             }
         }
@@ -722,8 +1171,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
     // Insert helpers
     // -----------------------------------------------------------------------
 
-    /// Roll back the last key/value/index entry appended during an insert
-    /// that turned out to be a duplicate.
     #[inline]
     fn rollback_last_insert(&mut self) {
         let (off, _len) = self.index.pop().unwrap();
@@ -731,88 +1178,73 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
         let _ = self.values.pop();
     }
 
-    /// Insert the first key into an empty trie, creating the root node.
     #[inline]
-    fn insert_into_empty_trie(&mut self, key: &[u8], new_index: PTR, offset: u64, max_nib: usize) -> usize {
+    fn insert_into_empty_trie(&mut self, key: &[u8], new_index: PTR, _offset: usize, max_nib: usize) -> usize {
         if max_nib == 0 {
-            // Empty key — root node itself is terminal
             let mut root = Node::new();
-            root.set_terminal(true);
+            root.set_terminal(0, true);
             root.leaf = new_index;
-            root.set_raw_offset(offset);
+            root.prefix_len[0] = LEN::zero();
             self.arena.push(root);
             return new_index.as_usize();
         }
         let first_nib = key_nibble_at(key, 0) as usize;
         let mut root = Node::new();
-        root.set_leaf_child(first_nib, new_index);
+        root.set_leaf_child(first_nib, 0, new_index);
         root.leaf = new_index;
-        root.set_raw_offset(offset);
+        root.prefix_len[0] = LEN::zero();
         self.arena.push(root);
         new_index.as_usize()
     }
 
-    /// Split an existing node at a divergence point that falls before its
-    /// `prefix_len`. The existing node becomes a child of the new parent,
-    /// and the new key is inserted as the other child (or as the terminal
-    /// entry if it ends at the split point).
     #[inline]
     fn split_node_before_prefix(
         &mut self,
-        node_idx: PTR,
+        phys_idx: usize,
+        vnode_idx: usize,
         diverge: usize,
         new_index: PTR,
-        offset: u64,
+        _offset: usize,
         key: &[u8],
         max_nib: usize,
     ) -> usize {
-        // Look up the reference key from the node being split
-        let node = &self.arena[node_idx.as_usize()];
-        let (_, ref_len) = self.index[node.leaf.as_usize()];
-        let off = node.raw_offset() as usize;
+        let node = &self.arena[phys_idx];
+        let ki = node.leaf;
+        let (off, ref_len) = self.index[ki.as_usize()];
         let ref_key = &self.buf[off..off + ref_len.as_usize()];
 
         let new_nib = key_nibble_at(key, diverge) as usize;
         let ref_nib = key_nibble_at(ref_key, diverge) as usize;
 
         let mut new_parent = Node::new();
-        new_parent.prefix_len = LEN::from_usize(diverge);
+        new_parent.prefix_len[0] = LEN::from_usize(diverge);
 
         if diverge >= max_nib {
-            // New key ends at the split point — terminal
-            new_parent.set_terminal(true);
+            new_parent.set_terminal(0, true);
             new_parent.leaf = new_index;
-            new_parent.set_raw_offset(offset);
         } else {
-            new_parent.set_leaf_child(new_nib, new_index);
+            new_parent.set_leaf_child(new_nib, 0, new_index);
             new_parent.leaf = new_index;
-            new_parent.set_raw_offset(offset);
         }
 
-        let old_node = std::mem::replace(
-            &mut self.arena[node_idx.as_usize()],
-            new_parent,
-        );
-        let old_idx = PTR::from_usize(self.arena.len());
+        let old_node = std::mem::replace(&mut self.arena[phys_idx], new_parent);
+        let old_addr = PTR::from_usize(self.arena.len() * STAK); // new node at vnode 0
         self.arena.push(old_node);
 
-        self.arena[node_idx.as_usize()].set_internal_child(ref_nib, old_idx);
+        self.arena[phys_idx].set_internal_child(ref_nib, vnode_idx, old_addr);
 
         new_index.as_usize()
     }
 
-    /// Split a leaf child at the divergence point between the new key and the
-    /// existing leaf key. The leaf slot is replaced by an internal node whose
-    /// two children are the new key and the existing key (or one of them is
-    /// the terminal entry if it ends at the split point).
     #[inline]
     fn split_leaf_child(
         &mut self,
         nib: usize,
-        node_idx: PTR,
+        phys_idx: usize,
+        vnode_idx: usize,
         existing_key_index: PTR,
         new_index: PTR,
-        offset: u64,
+        _offset: usize,
         key: &[u8],
         max_nib: usize,
         confirmed: usize,
@@ -827,225 +1259,72 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
             }
             DivergeResult::At(d) => {
                 let mut split_node = Node::new();
-                split_node.prefix_len = LEN::from_usize(d);
+                split_node.prefix_len[0] = LEN::from_usize(d);
 
                 if d >= max_nib {
-                    // New key ends at the split point — terminal
                     let exist_nib = key_nibble_at(existing_key, d) as usize;
-                    split_node.set_terminal(true);
+                    split_node.set_terminal(0, true);
                     split_node.leaf = new_index;
-                    split_node.set_raw_offset(offset);
-                    split_node.set_leaf_child(exist_nib, existing_key_index);
+                    split_node.set_leaf_child(exist_nib, 0, existing_key_index);
                 } else if d >= existing_key.len() * 2 {
-                    // Existing key ends at the split point — terminal
                     let new_nib = key_nibble_at(key, d) as usize;
-                    split_node.set_terminal(true);
+                    split_node.set_terminal(0, true);
                     split_node.leaf = existing_key_index;
-                    split_node.set_raw_offset(existing_offset as u64);
-                    split_node.set_leaf_child(new_nib, new_index);
+                    split_node.set_leaf_child(new_nib, 0, new_index);
                 } else {
-                    // Neither key ends at the split point — they diverge here
                     let new_nib = key_nibble_at(key, d) as usize;
                     let exist_nib = key_nibble_at(existing_key, d) as usize;
                     debug_assert_ne!(new_nib, exist_nib);
-                    split_node.set_leaf_child(new_nib, new_index);
-                    split_node.set_leaf_child(exist_nib, existing_key_index);
+                    split_node.set_leaf_child(new_nib, 0, new_index);
+                    split_node.set_leaf_child(exist_nib, 0, existing_key_index);
                     split_node.leaf = existing_key_index;
-                    split_node.set_raw_offset(existing_offset as u64);
                 }
 
-                let split_idx = PTR::from_usize(self.arena.len());
+                let split_addr = PTR::from_usize(self.arena.len() * STAK);
                 self.arena.push(split_node);
-                self.arena[node_idx.as_usize()].set_internal_child(nib, split_idx);
+                self.arena[phys_idx].set_internal_child(nib, vnode_idx, split_addr);
 
                 Ok(new_index.as_usize())
             }
         }
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Iteration
-    // -----------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// PTR width conversions (promote/demote), generic over STAK
+// ---------------------------------------------------------------------------
 
-    pub fn iter(&self) -> NibbleIter<'_, T, PTR, LEN> {
-        NibbleIter::new(self)
-    }
-
-    pub fn iter_last(&self) -> NibbleIter<'_, T, PTR, LEN> {
-        NibbleIter::new_last(self)
-    }
-
-    pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
-        // Skip index[0] (dummy)
-        let buf = self.buf;
-        let keys: Vec<Vec<u8>> = self.index.into_iter().skip(1).map(|(off, len)| {
-            buf[off..off + len.as_usize()].to_vec()
-        }).collect();
-        (keys, self.values)
-    }
-
-    /// Swap two arena nodes and fix all parent references.
-    /// After this, what was at index `a` is now at index `b` and vice versa.
-    fn swap_arena(&mut self, a: PTR, b: PTR) {
-        if a == b {
-            return;
-        }
-        self.arena.swap(a.as_usize(), b.as_usize());
-        // Fix references in every node that pointed at a or b
-        for node in &mut self.arena {
-            for nib in 0..16 {
-                if node.children[nib] != PTR::zero() && !node.is_leaf(nib) {
-                    if node.children[nib] == a {
-                        node.children[nib] = b;
-                    } else if node.children[nib] == b {
-                        node.children[nib] = a;
-                    }
-                }
-            }
-        }
-    }
-
-
-    // -----------------------------------------------------------------------
-    // Optimize (DFS key-sorted buf rewrite)
-    // -----------------------------------------------------------------------
-
-    /// Rewrite `buf` so that keys appear in sorted order, with contiguous
-    /// layout for sequential access during iteration.
-    ///
-    /// After `optimize()`, a forward iteration hits `buf` in ascending
-    /// memory order — sequential, prefetcher-friendly access.
-    ///
-    /// No-op for empty tries.
-    pub fn optimize(&mut self) {
-        if self.arena.is_empty() {
-            return;
-        }
-
-        // Pre-allocate at exact size. Writing into a pre-sized slice avoids
-        // per-key Vec::extend_from_slice overhead (capacity checks, memcpy).
-        let mut new_buf = vec![0u8; self.buf.len()];
-        let mut cursor: u64 = 1; // position 0 is the dummy byte
-
-        self.walk_optimize(PTR::zero(), &mut new_buf, &mut cursor);
-
-        new_buf.truncate(cursor as usize);
-        self.buf = new_buf;
-    }
-
-    /// Recursive DFS walk that copies keys into the pre-allocated `new_buf`
-    /// slice in sorted order and updates `index` offsets and `node.offset`
-    /// fields to point at the new locations.
-    ///
-    /// Visit order: terminal key first, then children 0–15 (leaf children
-    /// inline, internal children via recursion). This yields keys in sorted
-    /// order within each subtree.
-    fn walk_optimize(
-        &mut self,
-        node_idx: PTR,
-        new_buf: &mut [u8],
-        cursor: &mut u64,
-    ) {
-        let node: Node<PTR, LEN> = self.arena[node_idx.as_usize()]; // copy to avoid borrow conflicts
-
-        if node.is_terminal() {
-            let ki = node.leaf;
-            let (old_off, len) = self.index[ki.as_usize()];
-            let start = *cursor as usize;
-            new_buf[start..start + len.as_usize()].copy_from_slice(
-                &self.buf[old_off..old_off + len.as_usize()]
-            );
-            self.index[ki.as_usize()].0 = *cursor as usize;
-            *cursor += len.as_usize() as u64;
-        }
-
-        for nib in 0..16 {
-            if node.children[nib] == PTR::zero() {
-                continue;
-            }
-            if node.is_leaf(nib) {
-                let ki = node.children[nib];
-                let (old_off, len) = self.index[ki.as_usize()];
-                let start = *cursor as usize;
-                new_buf[start..start + len.as_usize()].copy_from_slice(
-                    &self.buf[old_off..old_off + len.as_usize()]
-                );
-                self.index[ki.as_usize()].0 = *cursor as usize;
-                *cursor += len.as_usize() as u64;
-            } else {
-                self.walk_optimize(node.children[nib], new_buf, cursor);
-            }
-        }
-
-        // All descendant keys have been written and index offsets updated.
-        // Now set this node's offset from its leaf's index entry.
-        if node.leaf != PTR::zero() {
-            let new_off = self.index[node.leaf.as_usize()].0;
-            self.arena[node_idx.as_usize()].set_raw_offset(new_off as u64);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Capacity and promotion
-    // -----------------------------------------------------------------------
-
-    /// Returns `true` if the arena or key index is approaching the PTR type's
-    /// capacity and the trie should be promoted to a wider PTR type before the
-    /// next insert.
-    ///
-    /// DynTrie calls this before each insert and promotes automatically.
-    pub fn near_capacity(&self) -> bool {
-        self.arena.len() >= PTR::max_value() || self.index.len() >= PTR::max_value()
-    }
-
-    /// Consume this trie and produce a new one with a wider PTR type.
-    /// Arena nodes are converted 1:1 (children/leaf fields widen). `buf`,
-    /// `index`, and `values` transfer unchanged (they don't depend on PTR).
-    ///
-    /// Preserves all structural invariants: sorted internal children, terminal
-    /// flags, leaf masks, and key/value associations.
-    pub fn promote<NewPTR: TrieIndex>(self) -> NibbleTrie<T, NewPTR, LEN> {
-        let arena: Vec<Node<NewPTR, LEN>> = self.arena.into_iter().map(|node| {
-            let mut children = [NewPTR::zero(); 16];
-            for i in 0..16 {
-                children[i] = NewPTR::from_usize(node.children[i].as_usize());
-            }
-            Node {
-                children,
-                prefix_len: node.prefix_len,
-                leaf_mask: node.leaf_mask,
-                leaf: NewPTR::from_usize(node.leaf.as_usize()),
-                offset: node.offset, // u64 — packed terminal bit transfers directly
-            }
-        }).collect();
+impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LEN, STAK> {
+    /// Promote the arena index type to a wider PTR, preserving STAK.
+    /// All child addresses and leaf indices are widened via `NewPTR::from_usize`.
+    /// Since STAK is unchanged, no address remapping is needed.
+    pub fn promote<NewPTR: TrieIndex>(self) -> NibbleTrie<T, NewPTR, LEN, STAK> {
+        let arena = self.arena.into_iter().map(|node| node.promote()).collect();
         NibbleTrie {
             arena,
             buf: self.buf,
-            index: self.index,  // (usize, LEN) — independent of PTR
+            index: self.index,
             values: self.values,
         }
     }
 
-    /// Consume this trie and produce a new one with a narrower PTR type.
-    /// Returns `Err(self)` if the arena or key index doesn't fit in the
-    /// narrower type.
-    pub fn demote<NewPTR: TrieIndex>(self) -> Result<NibbleTrie<T, NewPTR, LEN>, Self> {
-        // Check capacity before converting — all indices must fit in NewPTR.
-        if self.arena.len() > NewPTR::max_value() || self.index.len() > NewPTR::max_value() {
+    /// Demote the arena index type to a narrower PTR, preserving STAK.
+    /// Returns `Err(self)` if any address or index doesn't fit in the narrower type.
+    pub fn demote<NewPTR: TrieIndex>(self) -> Result<NibbleTrie<T, NewPTR, LEN, STAK>, Self> {
+        if self.arena.len() * STAK > NewPTR::max_value() || self.index.len() > NewPTR::max_value() {
             return Err(self);
         }
-        let arena: Vec<Node<NewPTR, LEN>> = self.arena.into_iter().map(|node| {
-            let mut children = [NewPTR::zero(); 16];
-            for i in 0..16 {
-                children[i] = NewPTR::from_usize(node.children[i].as_usize());
+        // Check each node for overflow before consuming self
+        for node in &self.arena {
+            if let Err(node) = node.demote::<NewPTR>() {
+                // Reconstruct is impossible since we only have the error node,
+                // but the capacity check above should catch all cases.
+                // Fall through — the per-node check below handles it.
+                let _ = node; // suppress unused warning
             }
-            Node {
-                children,
-                prefix_len: node.prefix_len,
-                leaf_mask: node.leaf_mask,
-                leaf: NewPTR::from_usize(node.leaf.as_usize()),
-                offset: node.offset,
-            }
+        }
+        let arena = self.arena.into_iter().map(|node| {
+            node.demote().expect("demote capacity check should have caught this")
         }).collect();
         Ok(NibbleTrie {
             arena,
@@ -1056,68 +1335,54 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<T, PTR, LEN> {
     }
 }
 
-impl<T, PTR: TrieIndex, LEN: TrieIndex> Default for NibbleTrie<T, PTR, LEN> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Iterator
 // ---------------------------------------------------------------------------
 
 /// Sentinel nib value meaning "positioned at the terminal value of this node."
-/// A terminal key is always lexicographically before all of its children —
-/// in forward order, terminal is emitted first, then children 0–15.
-/// In backward order, children 15→0 are visited first, then terminal.
 const TERMINAL_NIB: usize = 16;
 
-pub struct NibbleIter<'a, T, PTR: TrieIndex, LEN: TrieIndex> {
-    trie: &'a NibbleTrie<T, PTR, LEN>,
-    /// Stack of (arena_index, children_mask, nibble_position) triples.
-    ///
-    /// - `arena_idx`: index into the arena (which node)
-    /// - `mask`: full `children_mask()` of that node, computed once on push.
-    /// - `nib`: current position. Values:
-    ///   - `usize::MAX`: before-first (initial state, no position)
-    ///   - `0..16`: positioned at child slot `nib` (may be leaf or internal)
-    ///   - `TERMINAL_NIB (16)`: positioned at the node's terminal value
-    stack: Vec<(PTR, u16, usize)>,
+pub struct NibbleIter<'a, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize = 1> {
+    trie: &'a NibbleTrie<T, PTR, LEN, STAK>,
+    /// Stack of (encoded_addr, occupancy_mask, nibble_position, vnode_idx) tuples.
+    stack: Vec<(PTR, u16, usize, usize)>,
 }
 
-impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, T, PTR, LEN> {
-    fn new(trie: &'a NibbleTrie<T, PTR, LEN>) -> Self {
+impl<'a, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleIter<'a, T, PTR, LEN, STAK> {
+    fn new(trie: &'a NibbleTrie<T, PTR, LEN, STAK>) -> Self {
         if trie.arena.is_empty() {
             return NibbleIter { trie, stack: Vec::new() };
         }
-        let mask = trie.arena[0].children_mask();
-        // If root is terminal, start at the terminal value.
-        // Otherwise, start before the first child (usize::MAX).
-        let nib = if trie.arena[0].is_terminal() { TERMINAL_NIB } else { usize::MAX };
-        NibbleIter { trie, stack: vec![(PTR::zero(), mask, nib)] }
+        let mask = trie.arena[0].occupancy[0];
+        let nib = if trie.arena[0].is_terminal(0) { TERMINAL_NIB } else { usize::MAX };
+        NibbleIter { trie, stack: vec![(PTR::zero(), mask, nib, 0)] }
     }
 
-    fn new_last(trie: &'a NibbleTrie<T, PTR, LEN>) -> Self {
+    fn new_last(trie: &'a NibbleTrie<T, PTR, LEN, STAK>) -> Self {
         if trie.arena.is_empty() {
             return NibbleIter { trie, stack: Vec::new() };
         }
         let mut stack = Vec::new();
-        let mut idx: PTR = PTR::zero();
+        let mut phys_idx: usize = 0;
+        let mut vnode_idx: usize = 0;
         loop {
-            let node = &trie.arena[idx.as_usize()];
-            let mask = node.children_mask();
+            let node = &trie.arena[phys_idx];
+            let mask = node.occupancy[vnode_idx];
             if mask != 0 {
-                // Find the highest set bit (rightmost child)
                 let nib = 15 - mask.leading_zeros() as usize;
-                stack.push((idx, mask, nib));
-                if node.is_leaf(nib) {
+                let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                stack.push((encoded, mask, nib, vnode_idx));
+                if node.is_leaf(nib, vnode_idx) {
                     break;
                 } else {
-                    idx = node.children[nib];
+                    let addr = node.children[nib].as_usize();
+                    phys_idx = addr / STAK;
+                    vnode_idx = addr % STAK;
                 }
-            } else if node.is_terminal() {
-                // No children, just terminal — position at terminal
-                stack.push((idx, mask, TERMINAL_NIB));
+            } else if node.is_terminal(vnode_idx) {
+                let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                stack.push((encoded, mask, TERMINAL_NIB, vnode_idx));
                 break;
             } else {
                 break;
@@ -1126,73 +1391,64 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, T, PTR, LEN> {
         NibbleIter { trie, stack }
     }
 
-    /// Descend from internal node `idx` to its leftmost position.
-    /// If the first node encountered is terminal, position at its terminal value.
-    /// Otherwise find the leftmost child.
-    #[inline]
-    fn descend_first(&mut self, mut idx: PTR) {
+    fn descend_first(&mut self, mut phys_idx: usize, mut vnode_idx: usize) {
         loop {
-            let node = &self.trie.arena[idx.as_usize()];
-            if node.is_terminal() {
-                let mask = node.children_mask();
-                self.stack.push((idx, mask, TERMINAL_NIB));
+            let node = &self.trie.arena[phys_idx];
+            if node.is_terminal(vnode_idx) {
+                let mask = node.occupancy[vnode_idx];
+                let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                self.stack.push((encoded, mask, TERMINAL_NIB, vnode_idx));
                 return;
             }
-            let mask = node.children_mask();
-            debug_assert!(mask != 0, "descend_first: non-terminal node with no children");
+            let mask = node.occupancy[vnode_idx];
+            debug_assert!(mask != 0, "descend_first: non-terminal vnode with no children");
             let nib = mask.trailing_zeros() as usize;
-            self.stack.push((idx, mask, nib));
-            if node.is_leaf(nib) {
+            let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+            self.stack.push((encoded, mask, nib, vnode_idx));
+            if node.is_leaf(nib, vnode_idx) {
                 return;
             } else {
-                idx = node.children[nib];
+                let addr = node.children[nib].as_usize();
+                phys_idx = addr / STAK;
+                vnode_idx = addr % STAK;
             }
         }
     }
 
-    /// Descend from internal node `idx` to its rightmost position, pushing
-    /// entries onto the stack. For terminal nodes with no children, positions
-    /// at the terminal value. Otherwise follows the highest child to the
-    /// rightmost leaf.
-    #[inline]
-    fn descend_last(&mut self, mut idx: PTR) {
+    fn descend_last(&mut self, mut phys_idx: usize, mut vnode_idx: usize) {
         loop {
-            let node = &self.trie.arena[idx.as_usize()];
-            if node.is_terminal() {
-                let mask = node.children_mask();
+            let node = &self.trie.arena[phys_idx];
+            if node.is_terminal(vnode_idx) {
+                let mask = node.occupancy[vnode_idx];
                 if mask == 0 {
-                    self.stack.push((idx, mask, TERMINAL_NIB));
+                    let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                    self.stack.push((encoded, mask, TERMINAL_NIB, vnode_idx));
                     return;
                 }
-                // Terminal but has children — need to find rightmost child
-                // Terminal value comes before children in backward order,
-                // so the rightmost position is the rightmost leaf descendant.
             }
-            let mask = node.children_mask();
+            let mask = node.occupancy[vnode_idx];
             if mask == 0 {
-                if node.is_terminal() {
-                    self.stack.push((idx, mask, TERMINAL_NIB));
+                if node.is_terminal(vnode_idx) {
+                    let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                    self.stack.push((encoded, mask, TERMINAL_NIB, vnode_idx));
                 }
                 return;
             }
-            // Find the highest set bit
             let nib = 15 - mask.leading_zeros() as usize;
-            self.stack.push((idx, mask, nib));
-            if node.is_leaf(nib) {
+            let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+            self.stack.push((encoded, mask, nib, vnode_idx));
+            if node.is_leaf(nib, vnode_idx) {
                 return;
             } else {
-                idx = node.children[nib];
+                let addr = node.children[nib].as_usize();
+                phys_idx = addr / STAK;
+                vnode_idx = addr % STAK;
             }
         }
     }
 
-    /// Scan children of `arena_idx` starting from `start_nib`.
-    /// Push the first found child slot onto the stack. If the child
-    /// is an internal node, descend to its leftmost position.
-    /// Returns `true` if a child was found and pushed.
     #[inline]
-    fn push_next_child(&mut self, arena_idx: PTR, mask: u16, start_nib: usize) -> bool {
-        // Mask off bits below start_nib, then find the first set bit with TZCNT
+    fn push_next_child(&mut self, encoded: PTR, mask: u16, start_nib: usize, vnode_idx: usize) -> bool {
         let shifted = if start_nib >= 16 { 0u16 } else { mask >> start_nib };
         if shifted == 0 {
             return false;
@@ -1200,39 +1456,40 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, T, PTR, LEN> {
         let nib = start_nib + shifted.trailing_zeros() as usize;
         debug_assert!(nib < 16);
         debug_assert!(mask & (1 << nib) != 0);
-        self.stack.push((arena_idx, mask, nib));
-        if !self.trie.arena[arena_idx.as_usize()].is_leaf(nib) {
-            self.descend_first(self.trie.arena[arena_idx.as_usize()].children[nib]);
+        self.stack.push((encoded, mask, nib, vnode_idx));
+        let phys_idx = encoded.as_usize() / STAK;
+        if !self.trie.arena[phys_idx].is_leaf(nib, vnode_idx) {
+            let addr = self.trie.arena[phys_idx].children[nib].as_usize();
+            self.descend_first(addr / STAK, addr % STAK);
         }
         true
     }
 
-    /// Pop stack frames and find the next sibling at a higher nibble.
-    /// Used when all children at the current level have been exhausted.
     #[inline]
     fn backtrack_to_next(&mut self) -> Option<(&[u8], &T)> {
         loop {
-            let (parent_idx, parent_mask, child_nib) = self.stack.pop()?;
-            if self.push_next_child(parent_idx, parent_mask, child_nib + 1) {
+            let (parent_encoded, parent_mask, child_nib, parent_vnode) = self.stack.pop()?;
+            if self.push_next_child(parent_encoded, parent_mask, child_nib + 1, parent_vnode) {
                 return self.current();
             }
         }
     }
 
     pub fn current(&self) -> Option<(&[u8], &T)> {
-        let &(arena_idx, _mask, nib) = self.stack.last()?;
-        if nib == usize::MAX {
+        let (_, _, nib, vnode_idx) = self.stack.last()?;
+        if *nib == usize::MAX {
             return None;
         }
-        let node = &self.trie.arena[arena_idx.as_usize()];
-        if nib == TERMINAL_NIB {
-            // Terminal value — use direct buf offset, no index lookup needed
-            let key_len = node.prefix_len.as_usize() / 2;
-            let off = node.raw_offset() as usize;
-            let key = &self.trie.buf[off..off + key_len];
-            let value = &self.trie.values[node.leaf.as_usize() - 1];
+        let (encoded, _, _, _) = self.stack.last()?;
+        let phys_idx = encoded.as_usize() / STAK;
+        let node = &self.trie.arena[phys_idx];
+        if *nib == TERMINAL_NIB {
+            let ki = node.leaf;
+            let (off, len) = self.trie.index[ki.as_usize()];
+            let key = &self.trie.buf[off..off + len.as_usize()];
+            let value = &self.trie.values[ki.as_usize() - 1];
             Some((key, value))
-        } else if let Some(key_index) = node.leaf_key_index(nib) {
+        } else if let Some(key_index) = node.leaf_key_index(*nib, *vnode_idx) {
             let key = self.trie.key_slice(key_index);
             let value = &self.trie.values[key_index.as_usize() - 1];
             Some((key, value))
@@ -1241,53 +1498,47 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, T, PTR, LEN> {
         }
     }
 
-    /// Return just the key index at the current cursor position, skipping
-    /// the key buffer and value reads. Useful when only the position matters
-    /// (e.g., random-access cursor patterns where key/value reads hit scattered
-    /// offsets and defeat prefetching).
     pub fn current_index(&self) -> Option<usize> {
-        let &(arena_idx, _mask, nib) = self.stack.last()?;
+        let &(_, _, nib, vnode_idx) = self.stack.last()?;
         if nib == usize::MAX {
             return None;
         }
-        let node = &self.trie.arena[arena_idx.as_usize()];
+        let (encoded, _, _, _) = self.stack.last()?;
+        let phys_idx = encoded.as_usize() / STAK;
+        let node = &self.trie.arena[phys_idx];
         if nib == TERMINAL_NIB {
             Some(node.leaf.as_usize())
         } else {
-            node.leaf_key_index(nib).map(|ki| ki.as_usize())
+            node.leaf_key_index(nib, vnode_idx).map(|ki| ki.as_usize())
         }
     }
 
-    /// Advance cursor to the next position. Returns `true` if positioned,
-    /// `false` if exhausted. Shared navigation for [`next`] and [`next_index`].
     #[inline]
     fn advance_next(&mut self) -> bool {
         loop {
-            let (arena_idx, mask, nib) = match self.stack.pop() {
+            let (encoded, mask, nib, vnode_idx) = match self.stack.pop() {
                 Some(v) => v,
                 None => return false,
             };
 
             if nib == TERMINAL_NIB {
-                if self.push_next_child(arena_idx, mask, 0) {
+                if self.push_next_child(encoded, mask, 0, vnode_idx) {
                     return true;
                 }
                 continue;
             }
 
             let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
-            if self.push_next_child(arena_idx, mask, search_start) {
+            if self.push_next_child(encoded, mask, search_start, vnode_idx) {
                 return true;
             }
         }
     }
 
-    /// Advance cursor to the previous position. Returns `true` if positioned,
-    /// `false` if exhausted. Shared navigation for [`prev`] and [`prev_index`].
     #[inline]
     fn advance_prev(&mut self) -> bool {
         loop {
-            let (arena_idx, mask, nib) = match self.stack.pop() {
+            let (encoded, mask, nib, vnode_idx) = match self.stack.pop() {
                 Some(v) => v,
                 None => return false,
             };
@@ -1297,40 +1548,39 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, T, PTR, LEN> {
             }
 
             if nib == 0 || nib == usize::MAX {
-                if self.trie.arena[arena_idx.as_usize()].is_terminal() {
-                    self.stack.push((arena_idx, mask, TERMINAL_NIB));
+                let phys_idx = encoded.as_usize() / STAK;
+                if self.trie.arena[phys_idx].is_terminal(vnode_idx) {
+                    self.stack.push((encoded, mask, TERMINAL_NIB, vnode_idx));
                     return true;
                 }
                 continue;
             }
 
-            // Scan backward: find highest set bit below nib using LZCNT
             let mask_below = mask & ((1 << nib) - 1);
             if mask_below != 0 {
                 let prev_nib = 15 - mask_below.leading_zeros() as usize;
-                self.stack.push((arena_idx, mask, prev_nib));
-                if !self.trie.arena[arena_idx.as_usize()].is_leaf(prev_nib) {
-                    self.descend_last(self.trie.arena[arena_idx.as_usize()].children[prev_nib]);
+                let phys_idx = encoded.as_usize() / STAK;
+                self.stack.push((encoded, mask, prev_nib, vnode_idx));
+                if !self.trie.arena[phys_idx].is_leaf(prev_nib, vnode_idx) {
+                    let addr = self.trie.arena[phys_idx].children[prev_nib].as_usize();
+                    self.descend_last(addr / STAK, addr % STAK);
                 }
                 return true;
             }
 
-            if self.trie.arena[arena_idx.as_usize()].is_terminal() {
-                self.stack.push((arena_idx, mask, TERMINAL_NIB));
+            let phys_idx = encoded.as_usize() / STAK;
+            if self.trie.arena[phys_idx].is_terminal(vnode_idx) {
+                self.stack.push((encoded, mask, TERMINAL_NIB, vnode_idx));
                 return true;
             }
         }
     }
 
-    /// Advance to the next key in sorted order, returning only its index.
-    /// Identical navigation to [`next()`](Self::next) but skips key/value reads.
     #[inline]
     pub fn next_index(&mut self) -> Option<usize> {
         if self.advance_next() { self.current_index() } else { None }
     }
 
-    /// Move to the previous key in sorted order, returning only its index.
-    /// Identical navigation to [`prev()`](Self::prev) but skips key/value reads.
     #[inline]
     pub fn prev_index(&mut self) -> Option<usize> {
         if self.advance_prev() { self.current_index() } else { None }
@@ -1353,61 +1603,64 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, T, PTR, LEN> {
         }
 
         self.stack.clear();
-        let mut node_idx: PTR = PTR::zero();
+        let mut phys_idx: usize = 0;
+        let mut vnode_idx: usize = 0;
         let max_nib = key.len() * 2;
 
         loop {
-            let node = &self.trie.arena[node_idx.as_usize()];
-            let mask = node.children_mask();
+            let node = &self.trie.arena[phys_idx];
+            let mask = node.occupancy[vnode_idx];
 
-            // Check if this node is terminal and its key >= seek key
-            if node.is_terminal() && node.prefix_len.as_usize() >= max_nib {
-                let key_len = node.prefix_len.as_usize() / 2;
-                let off = node.raw_offset() as usize;
-                let node_key = &self.trie.buf[off..off + key_len];
+            if node.is_terminal(vnode_idx) && node.prefix_len[vnode_idx].as_usize() >= max_nib {
+                let ki = node.leaf;
+                let (off, len) = self.trie.index[ki.as_usize()];
+                let node_key = &self.trie.buf[off..off + len.as_usize()];
                 if node_key >= key {
-                    self.stack.push((node_idx, mask, TERMINAL_NIB));
+                    let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                    self.stack.push((encoded, mask, TERMINAL_NIB, vnode_idx));
                     return self.current();
                 }
             }
 
-            if node.prefix_len.as_usize() >= max_nib {
-                // Key exhausted, terminal key < seek key (or not terminal)
-                // Look for a child at or after nibble 0, or backtrack
-                if self.push_next_child(node_idx, mask, 0) {
+            if node.prefix_len[vnode_idx].as_usize() >= max_nib {
+                let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                if self.push_next_child(encoded, mask, 0, vnode_idx) {
                     return self.current();
                 }
                 return self.backtrack_to_next();
             }
 
-            let nib = key_nibble_at(key, node.prefix_len.as_usize()) as usize;
-            let slot = node.children[nib];
-            if slot != PTR::zero() {
-                self.stack.push((node_idx, mask, nib));
-                if node.is_leaf(nib) {
-                    // Check if the leaf key is >= the seek key
-                    let leaf_key = self.trie.key_slice(slot);
-                    if leaf_key >= key {
-                        return self.current();
-                    }
-                    // Leaf key < seek key: advance past it
-                    return self.next();
-                } else {
-                    node_idx = slot;
-                    continue;
+            let nib = key_nibble_at(key, node.prefix_len[vnode_idx].as_usize()) as usize;
+            if !node.is_occupied(nib, vnode_idx) {
+                // No child at this nibble — find next higher child, or backtrack
+                let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+                if self.push_next_child(encoded, mask, nib + 1, vnode_idx) {
+                    return self.current();
                 }
+                return self.backtrack_to_next();
             }
 
-            // No exact match — find next higher child, or backtrack
-            if self.push_next_child(node_idx, mask, nib + 1) {
-                return self.current();
+            let encoded = PTR::from_usize(phys_idx * STAK + vnode_idx);
+            self.stack.push((encoded, mask, nib, vnode_idx));
+            let slot = node.children[nib];
+            if node.is_leaf(nib, vnode_idx) {
+                let leaf_key = self.trie.key_slice(slot);
+                if leaf_key >= key {
+                    return self.current();
+                }
+                // Leaf key < seek key: advance past it
+                return self.next();
+            } else {
+                let addr = slot.as_usize();
+                phys_idx = addr / STAK;
+                vnode_idx = addr % STAK;
             }
-            return self.backtrack_to_next();
         }
     }
 }
+
 // ---------------------------------------------------------------------------
-// Tests
+// TinyTrieMap implementations
 // ---------------------------------------------------------------------------
 
 impl TinyTrieMap for NibbleTrie<usize> {
@@ -1438,7 +1691,7 @@ impl TinyTrieMap for NibbleTrie<usize> {
     fn trie_optimize(&mut self) { self.optimize(); }
 }
 
-impl TinyTrieMap for NibbleTrie<usize, u32, u32> {
+impl TinyTrieMap for NibbleTrie<usize, u32, u32, 1> {
     fn trie_new() -> Self { Self::new() }
     fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
     fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }

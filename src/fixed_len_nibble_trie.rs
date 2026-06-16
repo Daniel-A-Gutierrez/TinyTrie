@@ -62,7 +62,7 @@ pub struct FixedLenNode<PTR: TrieIndex> {
     // compiler pads to align(PTR)
 }
 
-impl<PTR: TrieIndex + FixedLenSentinel> FixedLenNode<PTR> {
+impl<PTR: TrieIndex> FixedLenNode<PTR> {
     fn new() -> Self {
         FixedLenNode {
             children: [PTR::max_value_sentinel(); 16],
@@ -152,7 +152,7 @@ impl<PTR: TrieIndex + FixedLenSentinel> FixedLenNode<PTR> {
     }
 }
 
-impl<PTR: TrieIndex + FixedLenSentinel> std::fmt::Debug for FixedLenNode<PTR> {
+impl<PTR: TrieIndex> std::fmt::Debug for FixedLenNode<PTR> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let active: Vec<(usize, &str, PTR)> = (0..16)
             .filter(|&n| self.children[n] != PTR::max_value_sentinel())
@@ -175,31 +175,8 @@ impl<PTR: TrieIndex + FixedLenSentinel> std::fmt::Debug for FixedLenNode<PTR> {
 // TrieIndex extension
 // ---------------------------------------------------------------------------
 
-/// Extension of the TrieIndex trait for the sentinel value.
-/// The NibbleTrie uses 0 as sentinel; FixedLenNibbleTrie uses max_value.
-/// We add `max_value_sentinel()` to avoid changing the existing trait.
+/// TrieIndex now provides `max_value_sentinel()` directly.
 use crate::nibble_trie::TrieIndex;
-
-/// Trait extension for fixed-length trie sentinel operations.
-/// Implemented for all TrieIndex types using max_value as the sentinel.
-trait FixedLenSentinel: TrieIndex {
-    /// The sentinel value for empty child slots and "no key" markers.
-    /// This is max_value for the type, since 0 is a valid key index.
-    fn max_value_sentinel() -> Self;
-}
-
-impl FixedLenSentinel for u8 {
-    #[inline] fn max_value_sentinel() -> Self { u8::MAX }
-}
-impl FixedLenSentinel for u16 {
-    #[inline] fn max_value_sentinel() -> Self { u16::MAX }
-}
-impl FixedLenSentinel for u32 {
-    #[inline] fn max_value_sentinel() -> Self { u32::MAX }
-}
-impl FixedLenSentinel for u64 {
-    #[inline] fn max_value_sentinel() -> Self { u64::MAX }
-}
 
 // ---------------------------------------------------------------------------
 // Nibble helpers (reuse from nibble_trie)
@@ -325,7 +302,7 @@ pub struct FixedLenNibbleTrie<T, PTR: TrieIndex = u32> {
     pub max_len: usize,
 }
 
-impl<T, PTR: TrieIndex + FixedLenSentinel> FixedLenNibbleTrie<T, PTR> {
+impl<T, PTR: TrieIndex> FixedLenNibbleTrie<T, PTR> {
     // -------------------------------------------------------------------
     // Construction & basic accessors
     // -------------------------------------------------------------------
@@ -813,7 +790,7 @@ impl<T, PTR: TrieIndex + FixedLenSentinel> FixedLenNibbleTrie<T, PTR> {
     }
 }
 
-impl<T, PTR: TrieIndex + FixedLenSentinel> Default for FixedLenNibbleTrie<T, PTR> {
+impl<T, PTR: TrieIndex> Default for FixedLenNibbleTrie<T, PTR> {
     fn default() -> Self {
         // Default max_len of 256 — reasonable for most string keys.
         // Users should call new() with an appropriate max_len.
@@ -832,7 +809,7 @@ pub struct FixedLenIter<'a, T, PTR: TrieIndex> {
     stack: Vec<(PTR, u16, usize)>,
 }
 
-impl<'a, T, PTR: TrieIndex + FixedLenSentinel> FixedLenIter<'a, T, PTR> {
+impl<'a, T, PTR: TrieIndex> FixedLenIter<'a, T, PTR> {
     fn new(trie: &'a FixedLenNibbleTrie<T, PTR>) -> Self {
         if trie.arena.is_empty() {
             return FixedLenIter { trie, stack: Vec::new() };

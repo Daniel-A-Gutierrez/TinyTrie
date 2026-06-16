@@ -85,7 +85,7 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<usize, PTR, L
             let node = &arena[idx];
             for nib in 0..16 {
                 let child = node.children[nib].as_usize();
-                if child == 0 || node.is_leaf(nib) {
+                if !node.is_occupied(nib, 0) || node.is_leaf(nib, 0) {
                     continue;
                 }
                 if !visited[child] {
@@ -120,14 +120,14 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<usize, PTR, L
     for node in arena.iter() {
         let cmask = node.children_mask();
         let total_fanout = cmask.count_ones() as usize;
-        let leaf_fanout = node.leaf_mask.count_ones() as usize;
+        let leaf_fanout = node.leaf_mask[0].count_ones() as usize;
         let internal_fanout = total_fanout - leaf_fanout;
 
         fanout_histogram[total_fanout] += 1;
         internal_fanout_histogram[internal_fanout] += 1;
         leaf_fanout_histogram[leaf_fanout] += 1;
 
-        if node.is_terminal() {
+        if node.is_terminal(0) {
             terminal_count += 1;
         }
         if cmask == 0 {
@@ -142,7 +142,7 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<usize, PTR, L
         let node = &arena[idx];
         for nib in 0..16 {
             let child = node.children[nib].as_usize();
-            if child == 0 || node.is_leaf(nib) {
+            if !node.is_occupied(nib, 0) || node.is_leaf(nib, 0) {
                 continue;
             }
             parent_of[child] = idx;
@@ -163,7 +163,7 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<usize, PTR, L
     for idx in 0..total_nodes {
         let node = &arena[idx];
         let internal_children: Vec<usize> = (0..16)
-            .filter(|&nib| node.children[nib].as_usize() != 0 && !node.is_leaf(nib))
+            .filter(|&nib| node.is_occupied(nib, 0) && !node.is_leaf(nib, 0))
             .map(|nib| node.children[nib].as_usize())
             .collect();
         if internal_children.len() < 2 {
@@ -193,7 +193,7 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<usize, PTR, L
             let mut internal_children: Vec<usize> = Vec::new();
             for nib in 0..16 {
                 let c = node.children[nib].as_usize();
-                if c != 0 && !node.is_leaf(nib) {
+                if c != 0 && !node.is_leaf(nib, 0) {
                     internal_children.push(c);
                 }
             }
