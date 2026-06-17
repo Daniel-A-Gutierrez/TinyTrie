@@ -1,7 +1,7 @@
 #![feature(iter_array_chunks)]
 #![feature(generic_const_exprs)]
 #![feature(portable_simd)]
-
+#![feature(nonzero_internals)]
 //! Compact DFA String Index
 //!
 //! A prefix-compressed radix trie with existence guarantee, viewed as a
@@ -42,6 +42,7 @@
 //! "abc" during prefix comparison.
 
 mod simd;
+mod tiny_btree;
 
 mod key_store;
 pub use key_store::{BufKeyStore, KeyStore, TrieKey, U64Key, VecKeyStore};
