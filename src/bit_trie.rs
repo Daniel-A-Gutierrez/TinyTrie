@@ -32,7 +32,7 @@
 //! "empty" in `children[]` slots.
 
 use crate::{KeyStore, TinyTrieMap, TrieKey};
-use std::simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq};
+use std::simd::{Simd, cmp::SimdPartialEq};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -273,8 +273,6 @@ fn diverging_bit(xor: u8, byte_idx: usize) -> usize {
 }
 
 fn simd_find_divergence<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult
-where
-    LaneCount<N>: SupportedLaneCount,
 {
     let minlen = key_a.len().min(key_b.len());
     let mut i = from / 8; // byte containing bit `from`

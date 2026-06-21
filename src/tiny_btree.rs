@@ -7,12 +7,10 @@ pub trait TrieIndex: Copy + Clone + Default + PartialEq + Eq + std::fmt::Debug +
     fn as_usize(self) -> usize;
     /// Maximum representable value (e.g. `u16::MAX` for u16).
     fn max_value() -> usize;
-    /// Maximum value used as sentinel for empty slots in `children[]`.
     /// With stacking, encoded addresses use 0 as a valid address (root = phys 0, vnode 0),
     /// so `PTR::MAX` is the sentinel instead of 0.
     fn from_usize(n: usize) -> Self;
 }
-
 
 trait TreeKey : PartialOrd + PartialEq + Eq + Ord + Sized {
     //find index where this element would be inserted in a sorted array, were it inserted.
@@ -25,21 +23,22 @@ struct KeyNode<K, PTR : TrieIndex, const N : usize> where K : TreeKey, [();N+1]:
     ptrs : [Option<NonZero<PTR>>;N+1],
 }
 
-struct ValueNode<V, const N : usize> where V : Sized, [();N]: {
+struct LeafNode<K, V, const N : usize> where K : TreeKey, V : Sized {
     len : u8,
-    vals : [MaybeUninit<V>;N]
+    keys : [MaybeUninit<K>;N],
+    values : [MaybeUninit<V>;N]
 }
 
 ///keys are stored internally. the value corresponding to each key is 
 ///at an identical arena+node index to its key, in values.
-struct DualTree<K,V,PTR,const N : usize> 
+struct CTree<K,V,PTR,const N : usize> 
 where  K : TreeKey, 
     [();N]:, 
     [();N+1]:,
     V : Sized, 
     PTR : TrieIndex {
-    arena : Vec<KeyNode<K,PTR,N>>,
-    values : Vec<ValueNode<V,N>>,
+    inodes : Vec<KeyNode<K,PTR,N>>,
+    leaves : Vec<LeafNode<K,V,N>>,
     len : usize
 }
 
@@ -49,7 +48,7 @@ where  K : TreeKey,
     [();N+1]:,
     V : Sized, 
     PTR : TrieIndex {
-    tree : &'a DualTree<K,V,PTR,N>,
+    tree : &'a CTree<K,V,PTR,N>,
     stack : Vec<usize>,
     position : usize,
     phantom : PhantomData<V>
@@ -61,7 +60,7 @@ where  K : TreeKey,
     [();N+1]:,
     V : Sized, 
     PTR : TrieIndex {
-    tree : &'a mut DualTree<K,V,PTR,N>,
+    tree : &'a mut CTree<K,V,PTR,N>,
     stack : Vec<usize>,
     position : usize,
     phantom : PhantomData<V>
@@ -91,15 +90,15 @@ impl<K, PTR : TrieIndex, const N : usize> KeyNode<K,PTR,N>
         #[inline] fn truncate(&mut self, newlen : u8) {self.len = newlen}
 }
 
-impl<V, const N : usize> ValueNode<V,N> 
-    where V : Sized, [();N]: {
+impl<K, V, const N : usize> LeafNode<K,V,N> 
+    where  K : TreeKey, V : Sized, [();N]: {
     fn insert(&mut self,  pos : u8, val : V) -> u8 {todo!();}
     fn remove(&mut self, pos: u8) -> V {todo!();}
     fn from_slice(src:&[V]) -> Self {todo!();}
     fn truncate(&mut self, newlen: u8) { self.len = newlen }
 }
 
-impl<K,V,PTR,const N : usize> DualTree<K,V,PTR,N> 
+impl<K,V,PTR,const N : usize> CTree<K,V,PTR,N> 
 where  K : TreeKey, 
     [();N]:, 
     [();N+1]:,
@@ -112,6 +111,8 @@ where  K : TreeKey,
     pub fn get_cursor_mut(&self) -> Cursor<K,V,PTR,N> {todo!();}
     pub fn insert(&self, key : K, value : V) -> Result<(), (K,V)> {todo!();}
     fn get_idx(&self, key : &K) -> Option<(usize,u8)> {todo!();}
+    //fn split_node
+    //fn merge nodes
 }
 
 impl <'a,K,V,PTR,const N : usize>  Cursor<'a,K,V,PTR,N> 

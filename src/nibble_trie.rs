@@ -34,7 +34,7 @@
 //! owned by vnode v, regardless of the value in `children[nib]`.
 
 use crate::TinyTrieMap;
-use std::{fmt, simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq}};
+use std::{fmt, simd::{Simd, cmp::SimdPartialEq}};
 
 // ---------------------------------------------------------------------------
 // TrieIndex trait
@@ -519,8 +519,6 @@ unsafe fn simd_eq_unchecked(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn simd_find_divergence<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult
-where
-    LaneCount<N>: SupportedLaneCount,
 {
     let minlen = key_a.len().min(key_b.len());
     let mut i = from / 2; // byte containing nibble `from`
@@ -558,8 +556,6 @@ fn check_prefix(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixChe
 /// at the first divergence within that range. Returns `Matches` if the keys
 /// agree throughout, or `Diverges(pos)` at the first differing nibble.
 fn simd_check_prefix<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixCheck
-where
-    LaneCount<N>: SupportedLaneCount,
 {
     if from >= to {
         return PrefixCheck::Matches;

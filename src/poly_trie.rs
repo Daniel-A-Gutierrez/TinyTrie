@@ -303,8 +303,6 @@ fn simd_find_divergence<const N: usize>(
     key_b: &[u8],
     from: usize,
 ) -> DivergeResult
-where
-    LaneCount<N>: SupportedLaneCount,
 {
     use std::simd::{Simd, cmp::SimdPartialEq};
 
@@ -346,8 +344,6 @@ pub struct PolyTrie<T> {
     ref_keys: Vec<u32>,
     len: usize,
 }
-
-use std::simd::{LaneCount, SupportedLaneCount};
 
 impl<T> PolyTrie<T> {
     pub fn new() -> Self {

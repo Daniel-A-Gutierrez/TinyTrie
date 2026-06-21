@@ -31,7 +31,7 @@
 //! of two (amortized O(1) per insert).
 
 use crate::TinyTrieMap;
-use std::simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq};
+use std::simd::{Simd, cmp::SimdPartialEq};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -235,8 +235,6 @@ fn find_divergence(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult {
 }
 
 fn simd_find_divergence<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult
-where
-    LaneCount<N>: SupportedLaneCount,
 {
     let minlen = key_a.len().min(key_b.len());
     let mut i = from / 2;

@@ -9,7 +9,6 @@
 //! instructions on the target platform automatically — no intrinsics needed.
 
 use core::simd::cmp::{SimdPartialEq, SimdPartialOrd};
-use core::simd::{Simd, LaneCount, SupportedLaneCount};
 use core::simd::u16x16;
 use core::simd::u32x16;
 use core::simd::u8x16;
@@ -311,6 +310,7 @@ pub fn children_mask_u16(children: &[u16; 16]) -> u16 {
 /// AVX-512 at runtime on some platforms.
 #[inline]
 pub fn children_mask_u64(children: &[u64; 16]) -> u16 {
+    use std::simd::Simd;
     // Two 128-bit chunks: slots 0–7 and 8–15
     let lo = Simd::<u64, 8>::from_slice(&children[0..8]);
     let hi = Simd::<u64, 8>::from_slice(&children[8..16]);
