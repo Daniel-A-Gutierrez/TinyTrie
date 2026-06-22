@@ -42,6 +42,7 @@
 //! "abc" during prefix comparison.
 
 mod simd;
+mod tiny_array;
 mod tiny_btree;
 
 mod key_store;
