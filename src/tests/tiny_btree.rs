@@ -867,3 +867,171 @@ fn test_optimize_var_len_keys() {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// EXPERIMENT / DIAGNOSTIC: log the leaf arena layout after optimize + grow and
+// trace the forward-iteration visit pattern. With the gap-arena design
+// (`spread`/`claim_slot`), splits place new leaves in the gap adjacent to their
+// parent, so the natural layout is stride-2 (live at even slots, gaps at odd)
+// — a clean, bounded sweep rather than the old front↔end bounce from
+// append-at-end splitting. The one residual quirk: pure-sequential inserts
+// exhaust the end gaps and `claim_slot` wraps to a front gap, producing a few
+// arena-spanning jumps (visible in the CONTROL seq trace below). This is
+// development instrumentation for the iteration-perf work, not a correctness test.
+//
+// `#[ignore]` so it is SKIPPED by `cargo test` (it still compiles every build,
+// so it cannot bit-rot) and runs only on demand:
+//
+//   cargo test --lib tiny_btree::tests::experiment_optimize_layout -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore = "diagnostic only: arena-layout + iteration-visit trace"]
+fn experiment_optimize_layout() {
+    type T = CTree<u64, u64, u16, 8, 9>; // N=8
+    let mut tree = T::new();
+
+    // Deterministic PRNG (xorshift32) so the run is reproducible.
+    let mut state: u32 = 0x1234_5678;
+    let mut next_key = || -> u64 {
+        let mut x = state;
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        state = x;
+        x as u64
+    };
+
+    // Concrete dump for u64 keys.
+    fn dump_u64(label: &str, tree: &CTree<u64, u64, u16, 8, 9>, opt_len: usize) {
+        let n = tree.leaves.len();
+        eprintln!("\n=== {label} (n={n}, height={}, opt_len={opt_len}) ===", tree.height);
+        // Replicate optimize's linked-list walk to get order + new_pos (read-only).
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut idx = tree.first_leaf();
+        order.push(idx);
+        while let Some(nx) = tree.leaves[idx].get_next() {
+            order.push(nx);
+            idx = nx;
+        }
+        let mut new_pos = vec![usize::MAX; n];
+        for (i, &o) in order.iter().enumerate() {
+            new_pos[o] = i;
+        }
+        let displaced = (0..n).filter(|&i| new_pos[i] != i).count();
+        let prefix_inplace = (0..opt_len).filter(|&i| new_pos[i] == i).count();
+        let prefix_shifted = opt_len - prefix_inplace;
+        let suffix = n - opt_len;
+        eprintln!(
+            "order(arena idx): {order:?}\n\
+             displaced={displaced}/{n}  prefix_inplace={prefix_inplace}/{opt_len} \
+             prefix_shifted={prefix_shifted}/{opt_len}  suffix={suffix}"
+        );
+        eprintln!("  idx | nkeys | keyrange     | prev  next  | new_pos | region");
+        for i in 0..n {
+            let l = &tree.leaves[i];
+            let klen = l.keys.len();
+            let (lo, hi) = if klen > 0 {
+                (*l.keys.get(0), *l.keys.get(klen - 1))
+            } else {
+                (0, 0)
+            };
+            let region = if i < opt_len { "PREFIX" } else { "sfx" };
+            eprintln!(
+                "  [{i:>2}] k{klen} {lo:>5}..{hi:<5} | {:?} {:?} | new={:>2} | {}",
+                l.get_prev(),
+                l.get_next(),
+                new_pos[i],
+                region
+            );
+        }
+    }
+
+    // Phase 1: build ~80 distinct keys, then optimize. (Scaled up from N=4's
+    // 40 because N=8 leaves hold ~2x the keys, to keep the arena a comparable
+    // size so the bounce pattern is a fair comparison.)
+    let mut seen = std::collections::HashSet::new();
+    while seen.len() < 80 {
+        let k = next_key() % 800;
+        if seen.insert(k) {
+            tree.insert(k, k * 10).unwrap();
+        }
+    }
+    dump_u64("BEFORE optimize (initial build)", &tree, 0);
+    tree.optimize();
+    let opt_len = tree.leaves.len();
+    dump_u64("AFTER optimize", &tree, opt_len);
+
+    // Phase 2: grow with ~160 more distinct keys (triggers splits), do NOT optimize.
+    while seen.len() < 240 {
+        let k = next_key() % 2400;
+        if seen.insert(k) {
+            tree.insert(k, k * 10).unwrap();
+        }
+    }
+    dump_u64("AFTER growing more (no optimize since)", &tree, opt_len);
+
+    // Trace the FORWARD iteration visit order (arena indices the cursor touches,
+    // in order) and the per-step jump distance |next - cur|. This is the cache
+    // access pattern forward iteration actually pays. Append-at-end splitting
+    // makes the cursor bounce between the low-index prefix and high-index
+    // appended suffix leaves.
+    trace_visit("RANDOM post-grow, NO re-optimize (forward iteration)", &tree);
+    tree.optimize();
+    trace_visit("RANDOM post-grow, AFTER re-optimize (forward iteration)", &tree);
+
+    // Phase 3: also show a "sequential-insert" control (prefix should stay put).
+    let mut tree2 = T::new();
+    let mut seen2 = std::collections::HashSet::new();
+    for i in 0..80u64 {
+        tree2.insert(i, i * 10).unwrap();
+        seen2.insert(i);
+    }
+    tree2.optimize();
+    let opt_len2 = tree2.leaves.len();
+    for i in 80..240u64 {
+        tree2.insert(i, i * 10).unwrap();
+        seen2.insert(i);
+    }
+    eprintln!("\n\n##### CONTROL: sequential inserts (splits only at the end) #####");
+    dump_u64("CONTROL seq AFTER growing (no optimize since)", &tree2, opt_len2);
+    trace_visit("CONTROL seq post-grow, NO re-optimize", &tree2);
+}
+
+/// Walk the leaf linked list from the first leaf (the exact path a forward
+/// cursor takes) and print the arena index visited at each step plus the jump
+/// distance from the previous leaf. Non-contiguous jumps (|d|>1) are the cache
+/// misses that kill forward-iteration throughput.
+fn trace_visit(label: &str, tree: &CTree<u64, u64, u16, 8, 9>) {
+    let mut visit: Vec<usize> = Vec::with_capacity(tree.leaves.len());
+    let mut idx = tree.first_leaf();
+    visit.push(idx);
+    while let Some(nx) = tree.leaves[idx].get_next() {
+        visit.push(nx);
+        idx = nx;
+    }
+    let n = visit.len();
+    eprintln!("\n--- {label} (visiting {n} leaves) ---");
+    let mut line = String::new();
+    let mut max_jump = 0usize;
+    let mut sum_jump = 0u64;
+    let mut noncontig = 0usize;
+    for w in visit.windows(2) {
+        let d = w[1].abs_diff(w[0]);
+        if d > 1 {
+            noncontig += 1;
+        }
+        sum_jump += d as u64;
+        if d > max_jump {
+            max_jump = d;
+        }
+        line.push_str(&format!("{} --({})--> ", w[0], d));
+    }
+    if let Some(&last) = visit.last() {
+        line.push_str(&last.to_string());
+    }
+    eprintln!("{line}");
+    let steps = n.saturating_sub(1);
+    let mean = if steps > 0 { sum_jump as f64 / steps as f64 } else { 0.0 };
+    eprintln!(
+        "summary: steps={steps}, noncontiguous(>1)={noncontig}/{steps}, mean_jump={mean:.1}, max_jump={max_jump}, arena_size={}",
+        tree.leaves.len()
+    );
+}
