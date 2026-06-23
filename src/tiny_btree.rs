@@ -617,6 +617,29 @@ macro_rules! impl_trie_index {
 impl_trie_index!(u8, u16, u32, u64);
 
 // ---------------------------------------------------------------------------
+// two_mut — two simultaneous mutable borrows of distinct indices in a slice
+// ---------------------------------------------------------------------------
+
+/// Borrow two distinct indices of a slice mutably at once.
+///
+/// The arena trees store nodes in `Vec<KeyNode>`/`Vec<LeafNode>` and rebalance
+/// needs to mutate two sibling nodes simultaneously (e.g. drain from one into
+/// the other). `split_at_mut` gives one clean cut; this helper picks the cut so
+/// the lower index lands in the left sub-slice and the higher in the right,
+/// returning `(a_ref, b_ref)` regardless of which index is larger.
+#[inline]
+fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
+    debug_assert_ne!(a, b, "two_mut: indices must differ");
+    if a < b {
+        let (left, right) = slice.split_at_mut(b);
+        (&mut left[a], &mut right[0])
+    } else {
+        let (left, right) = slice.split_at_mut(a);
+        (&mut right[0], &mut left[b])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CTree impl
 // ---------------------------------------------------------------------------
 
@@ -674,22 +697,53 @@ where
     /// need to propagate a split back up the tree can do so. `insert` uses this.
     /// Uses `height` to know when we've reached the leaf level — after
     /// `height` hops through inodes, the final pointer is a leaf index.
-    fn walk_to_leaf(&self, needle: &SK::Needle) -> (usize, Vec<(usize, usize)>) {
+    ///
+    /// **Rebalances on the way down.** Every full inode we pass through, and the
+    /// target leaf if it is full, is redistributed with an emptier sibling *now*
+    /// — before we descend further. This guarantees every node on the path has
+    /// room by the time `insert` runs, so a leaf split's separator insertion
+    /// into the bottom inode does not cascade, and the leaf usually has room for
+    /// the new key without splitting at all. Splits still occur (via the
+    /// unchanged `split_*` fallback) when a node and all its siblings are full.
+    ///
+    /// After an inode rebalance the node's key range shifts, so the needle may
+    /// now belong to the sibling we rebalanced with; we re-run `find_child` on
+    /// the grandparent (its separator was just updated) to re-route. The same
+    /// re-route after the leaf rebalance ensures a pre-existing key that the
+    /// rebalance moved to a sibling is still found (so the duplicate check in
+    /// `insert` lands on the right leaf).
+    fn walk_to_leaf(&mut self, needle: &SK::Needle) -> (usize, Vec<(usize, usize)>) {
         if self.height == 0 {
             return (0, Vec::new());
         }
         let mut path = Vec::new();
         let mut node_idx: usize = self.root_inode;
         for _ in 0..self.height - 1 {
-            let node = &self.inodes[node_idx];
-            let child = node.find_child(needle);
+            let child = self.inodes[node_idx].find_child(needle);
+            let child_idx = self.inodes[node_idx].get_ptr(child).unwrap();
+            // Preemptive rebalance: if the child inode is full, redistribute it
+            // with an emptier sibling before descending into it.
+            if self.inodes[child_idx].would_split() {
+                self.try_rebalance_inode(node_idx, child);
+            }
+            // Re-route: the rebalance may have shifted the needle into the
+            // sibling's range (the grandparent separator changed).
+            let child = self.inodes[node_idx].find_child(needle);
+            let child_idx = self.inodes[node_idx].get_ptr(child).unwrap();
             path.push((node_idx, child));
-            node_idx = node.get_ptr(child).unwrap();
+            node_idx = child_idx;
         }
         // Last hop: the pointer from the bottom inode is a leaf index.
-        let bottom = &self.inodes[node_idx];
-        let child = bottom.find_child(needle);
-        let leaf_idx = bottom.get_ptr(child).unwrap();
+        let child = self.inodes[node_idx].find_child(needle);
+        let leaf_idx = self.inodes[node_idx].get_ptr(child).unwrap();
+        // Same preemptive rebalance for the leaf.
+        if self.leaves[leaf_idx].keys.len() >= N {
+            self.try_rebalance_leaf(node_idx, child);
+        }
+        // Re-route after the leaf rebalance (the needle may now belong to the
+        // sibling leaf).
+        let child = self.inodes[node_idx].find_child(needle);
+        let leaf_idx = self.inodes[node_idx].get_ptr(child).unwrap();
         path.push((node_idx, child));
         (leaf_idx, path)
     }
@@ -710,6 +764,244 @@ where
         let bottom = &self.inodes[node_idx];
         let child = bottom.find_child(needle);
         bottom.get_ptr(child).unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // Preemptive rebalance (rotate before split) — see `walk_to_leaf`.
+    //
+    // Each `try_rebalance_*` picks the emptier adjacent sibling of a full node
+    // and, if redistributing leaves both nodes with room, moves entries to
+    // balance them. `redistribute_*_{left,right}` do the in-place move and fix
+    // the parent separator. The full node always receives the smaller half, so
+    // it ends with `<= N-1` entries (room). The guard `s + 2 <= N` (sibling has
+    // >= 2 free slots) ensures BOTH nodes end `<= N-1`: since the incoming
+    // insert may route to either node after re-route, both must have room. When
+    // the sibling has exactly one free slot (`s == N-1`), redistribution would
+    // fill the sibling and risk an overflow insert into it, so we skip and let
+    // the split fallback handle it.
+    // -----------------------------------------------------------------
+
+    /// Pick the emptier sibling leaf of the full leaf at `parent.ptrs[child_pos]`
+    /// and rebalance with it if both leaves can end with room. No-op otherwise.
+    fn try_rebalance_leaf(&mut self, parent_idx: usize, child_pos: usize) {
+        let (left_sib, right_sib, leaf_idx) = {
+            let p = &self.inodes[parent_idx];
+            let leaf_idx = p.get_ptr(child_pos).unwrap();
+            let left = if child_pos > 0 {
+                p.get_ptr(child_pos - 1)
+            } else {
+                None
+            };
+            let right = if child_pos < p.keys.len() {
+                p.get_ptr(child_pos + 1)
+            } else {
+                None
+            };
+            (left, right, leaf_idx)
+        };
+        // Pick the emptier adjacent sibling (tie → right). A missing sibling is
+        // treated as full, so a present one always wins.
+        let pick_right = match (left_sib, right_sib) {
+            (Some(l), Some(r)) => self.leaves[r].keys.len() <= self.leaves[l].keys.len(),
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => return,
+        };
+        let sib_idx = if pick_right { right_sib } else { left_sib };
+        let Some(sib) = sib_idx else {
+            return;
+        };
+        // Guard: both leaves must end with room after rebalance, so the sibling
+        // needs >= 2 free slots (`s + 2 <= N`). With only one free slot the
+        // sibling would fill and the re-routed insert could overflow it; skip
+        // and let the split fallback handle it.
+        if self.leaves[sib].keys.len() + 2 > N {
+            return;
+        }
+        if pick_right {
+            self.redistribute_leaf_right(parent_idx, child_pos, leaf_idx, sib);
+        } else {
+            self.redistribute_leaf_left(parent_idx, child_pos, leaf_idx, sib);
+        }
+    }
+
+    /// Rebalance full leaf `leaf_idx` (at `child_pos`) with its RIGHT sibling
+    /// `sib_idx`: move the leaf's largest `m` keys/values to the sibling's front.
+    /// `parent.keys[child_pos]` becomes the sibling's new first key.
+    fn redistribute_leaf_right(
+        &mut self,
+        parent_idx: usize,
+        child_pos: usize,
+        leaf_idx: usize,
+        sib_idx: usize,
+    ) {
+        let s = self.leaves[sib_idx].keys.len();
+        let l_target = (N + s) / 2; // keys the full leaf keeps (the smaller half)
+        {
+            let (leaf, sib) = two_mut(&mut self.leaves, leaf_idx, sib_idx);
+            leaf.keys.drain_into_front(l_target, &mut sib.keys);
+            leaf.values.drain_into_front(l_target, &mut sib.values);
+        }
+        // Leaf separator = right child's first key (B+ tree invariant).
+        let new_sep = self.leaves[sib_idx].keys.get(0).clone();
+        *self.inodes[parent_idx].keys.get_mut(child_pos) = new_sep;
+    }
+
+    /// Rebalance full leaf `leaf_idx` (at `child_pos`) with its LEFT sibling
+    /// `sib_idx`: move the leaf's smallest `m` keys/values to the sibling's end.
+    /// `parent.keys[child_pos - 1]` becomes the leaf's new first key.
+    fn redistribute_leaf_left(
+        &mut self,
+        parent_idx: usize,
+        child_pos: usize,
+        leaf_idx: usize,
+        sib_idx: usize,
+    ) {
+        let s = self.leaves[sib_idx].keys.len();
+        let l_target = (N + s) / 2;
+        let m = N - l_target; // keys moved from the full leaf's front to the sibling
+        {
+            let (leaf, sib) = two_mut(&mut self.leaves, leaf_idx, sib_idx);
+            leaf.keys.drain_front_into(m, &mut sib.keys);
+            leaf.values.drain_front_into(m, &mut sib.values);
+        }
+        let new_sep = self.leaves[leaf_idx].keys.get(0).clone();
+        *self.inodes[parent_idx].keys.get_mut(child_pos - 1) = new_sep;
+    }
+
+    /// Pick the emptier sibling inode of the full inode at
+    /// `gparent.ptrs[child_pos]` and rebalance with it if both can end with
+    /// room. No-op otherwise.
+    fn try_rebalance_inode(&mut self, gparent_idx: usize, child_pos: usize) {
+        let (left_sib, right_sib, l_idx) = {
+            let g = &self.inodes[gparent_idx];
+            let l_idx = g.get_ptr(child_pos).unwrap();
+            let left = if child_pos > 0 {
+                g.get_ptr(child_pos - 1)
+            } else {
+                None
+            };
+            let right = if child_pos < g.keys.len() {
+                g.get_ptr(child_pos + 1)
+            } else {
+                None
+            };
+            (left, right, l_idx)
+        };
+        let pick_right = match (left_sib, right_sib) {
+            (Some(l), Some(r)) => self.inodes[r].keys.len() <= self.inodes[l].keys.len(),
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (None, None) => return,
+        };
+        let sib_idx = if pick_right { right_sib } else { left_sib };
+        let Some(sib) = sib_idx else {
+            return;
+        };
+        // Guard: both inodes must end with room after rebalance (sibling needs
+        // >= 2 free slots). See `try_rebalance_leaf` for the rationale.
+        if self.inodes[sib].keys.len() + 2 > N {
+            return;
+        }
+        if pick_right {
+            self.redistribute_inode_right(gparent_idx, child_pos, l_idx, sib);
+        } else {
+            self.redistribute_inode_left(gparent_idx, child_pos, l_idx, sib);
+        }
+    }
+
+    /// Rebalance full inode `l_idx` (at `child_pos`) with its RIGHT sibling
+    /// `r_idx`, threading the grandparent separator `sep0 = gparent.keys[pos]`
+    /// down into the sibling and lifting `L.keys[l_target]` up as the new sep.
+    ///
+    /// After: `L.keys = L[0..l_target]`, `L.ptrs = L[0..=l_target]`;
+    /// `R.keys = [L[l_target+1..N], sep0, R[0..s]]`, `R.ptrs = [L[l_target+1..=N],
+    /// R[0..=s]]`; `gparent.keys[pos] = L.keys[l_target]`.
+    fn redistribute_inode_right(
+        &mut self,
+        gparent_idx: usize,
+        child_pos: usize,
+        l_idx: usize,
+        r_idx: usize,
+    ) {
+        // Read the sibling fill and the current separator before any mutation.
+        let (s, sep0) = {
+            let g = &self.inodes[gparent_idx];
+            (self.inodes[r_idx].keys.len(), g.keys.get(child_pos).clone())
+        };
+        let l_target = (N + s) / 2; // keys the full inode keeps (smaller half)
+        let m = N - l_target; // keys prepended to R (== ptrs prepended to R)
+
+        let new_sep = {
+            let (l, r) = two_mut(&mut self.inodes, l_idx, r_idx);
+            // Prepend m ptrs to R: shift R's live ptrs [0..=s] right by m, then
+            // take L's tail ptrs [l_target+1..=N] into R's front.
+            for i in (0..=s).rev() {
+                r.ptrs[i + m] = r.ptrs[i];
+            }
+            for i in 0..m {
+                r.ptrs[i] = l.ptrs[l_target + 1 + i].take();
+            }
+            // Prepend m keys to R: move L's keys [l_target+1..N] (m-1 of them,
+            // when m > 1) to R's front, then insert sep0 at R[m-1].
+            if m > 1 {
+                l.keys.drain_into_front(l_target + 1, &mut r.keys);
+            }
+            r.keys.insert_at(m - 1, sep0);
+            // Lift the new separator off L's tail (now its last key).
+            l.keys.remove_at(l_target)
+        };
+        // L's ptrs [l_target+1..=N] were taken (None) above; live ptrs are now
+        // [0..=l_target], matching L.keys.len() == l_target. Nothing to clear.
+        *self.inodes[gparent_idx].keys.get_mut(child_pos) = new_sep;
+    }
+
+    /// Rebalance full inode `l_idx` (at `child_pos`) with its LEFT sibling
+    /// `sib_idx`, threading `sep0 = gparent.keys[child_pos - 1]` down into the
+    /// sibling and lifting `L.keys[m-1]` up as the new sep.
+    ///
+    /// After: `L.keys = L[m..N]`, `L.ptrs = L[m..=N]`;
+    /// `S.keys = [S[0..s], sep0, L[0..m-1]]`, `S.ptrs = [S[0..=s], L[0..m]]`;
+    /// `gparent.keys[child_pos - 1] = L.keys[m-1]`.
+    fn redistribute_inode_left(
+        &mut self,
+        gparent_idx: usize,
+        child_pos: usize,
+        l_idx: usize,
+        sib_idx: usize,
+    ) {
+        let (s, sep0) = {
+            let g = &self.inodes[gparent_idx];
+            (self.inodes[sib_idx].keys.len(), g.keys.get(child_pos - 1).clone())
+        };
+        let l_target = (N + s) / 2;
+        let m = N - l_target; // keys appended to S (== ptrs appended to S)
+
+        let new_sep = {
+            let (l, sib) = two_mut(&mut self.inodes, l_idx, sib_idx);
+            // Append m ptrs to S: take L's front ptrs [0..m] into S's tail.
+            for i in 0..m {
+                sib.ptrs[(s + 1) + i] = l.ptrs[i].take();
+            }
+            // Append m keys to S: sep0 first, then L's front keys [0..m-1].
+            sib.keys.push(sep0);
+            if m > 1 {
+                l.keys.drain_front_into(m - 1, &mut sib.keys);
+            }
+            // Lift the new separator = L's current first key (original L[m-1]).
+            l.keys.remove_at(0)
+        };
+        // Shift L's remaining ptrs [m..=N] down to [0..=N-m]; clear the tail.
+        {
+            let l = &mut self.inodes[l_idx];
+            for i in 0..=(N - m) {
+                l.ptrs[i] = l.ptrs[m + i];
+            }
+            for i in (N - m + 1)..=N {
+                l.ptrs[i] = None;
+            }
+        }
+        *self.inodes[gparent_idx].keys.get_mut(child_pos - 1) = new_sep;
     }
 
     /// Search for `key` and return a reference to the value if found.

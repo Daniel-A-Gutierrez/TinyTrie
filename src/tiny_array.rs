@@ -199,6 +199,83 @@ where
         dst.len += count as u8;
         self.len = from as u8;
     }
+
+    /// Move `self[from..len)` to **dst's front** (prepend), shifting dst's
+    /// existing elements right. After this call:
+    /// - `dst` has `dst.len + (self.len - from)` elements, with the moved range
+    ///   at indices `[0 .. self.len - from)` and the old dst elements after it.
+    /// - `self` is truncated to `from` (without dropping the moved elements).
+    ///
+    /// Symmetric to [`drain_into`](Self::drain_into), which appends to dst's
+    /// *end*. Used by B+ tree leaf rebalance to move a full leaf's tail to its
+    /// right sibling's front (all moved keys are smaller than the sibling's).
+    ///
+    /// Caller must ensure `from < self.len` and dst has capacity for the moved
+    /// elements.
+    pub fn drain_into_front(&mut self, from: usize, dst: &mut Self) {
+        let count = self.len as usize - from;
+        debug_assert!(from < self.len as usize, "TinyArray::drain_into_front: empty drain");
+        debug_assert!(
+            dst.len as usize + count <= N,
+            "TinyArray::drain_into_front: dst overflow"
+        );
+        unsafe {
+            // Shift dst's initialized elements [0..dst.len) right by `count`.
+            if dst.len as usize != 0 {
+                std::ptr::copy(
+                    dst.slots[0].as_ptr(),
+                    dst.slots[count].as_mut_ptr(),
+                    dst.len as usize,
+                );
+            }
+            // Copy self's tail into the freed front of dst.
+            std::ptr::copy_nonoverlapping(
+                self.slots[from].as_ptr(),
+                dst.slots[0].as_mut_ptr(),
+                count,
+            );
+        }
+        dst.len += count as u8;
+        self.len = from as u8;
+    }
+
+    /// Move `self[0..count)` to **dst's end** (append), then shift self's
+    /// remaining elements `[count..len)` left to the front. After this call:
+    /// - `dst` has `dst.len + count` elements, with the moved range appended.
+    /// - `self` has `self.len - count` elements (its old `[count..len)` range
+    ///   now at the front), and is not dropped.
+    ///
+    /// Symmetric to [`drain_into`](Self::drain_into), which drains the *tail*.
+    /// Used by B+ tree leaf rebalance to move a full leaf's front to its left
+    /// sibling's end (all moved keys are larger than the sibling's).
+    ///
+    /// Caller must ensure `count <= self.len` and dst has capacity.
+    pub fn drain_front_into(&mut self, count: usize, dst: &mut Self) {
+        debug_assert!(count <= self.len as usize, "TinyArray::drain_front_into: count out of bounds");
+        debug_assert!(
+            dst.len as usize + count <= N,
+            "TinyArray::drain_front_into: dst overflow"
+        );
+        let l = self.len as usize;
+        unsafe {
+            // Append self's front to dst's end.
+            std::ptr::copy_nonoverlapping(
+                self.slots[0].as_ptr(),
+                dst.slots[dst.len as usize].as_mut_ptr(),
+                count,
+            );
+            // Shift self's [count..len) left to [0..len-count).
+            if count < l {
+                std::ptr::copy(
+                    self.slots[count].as_ptr(),
+                    self.slots[0].as_mut_ptr(),
+                    l - count,
+                );
+            }
+        }
+        dst.len += count as u8;
+        self.len -= count as u8;
+    }
 }
 
 impl<T, const N: usize> Drop for TinyArray<T, N>

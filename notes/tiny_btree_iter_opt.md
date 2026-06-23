@@ -10,3 +10,4 @@ inodes :                    [new root]                         [root3]
 leaves : [leaf root] -> [l child 1] [r child 1] -> [l1] [new l]       [r1]   [new r]
 
 so with some care in how we split a node up the tree, we can keep the leaves ordered completely i think. 
+
