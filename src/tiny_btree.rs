@@ -715,6 +715,126 @@ where
         self.inodes.shrink_to_fit();
     }
 
+    /// Physically reorder the leaf arena so the leaf linked list is a linear
+    /// scan: after `optimize`, `leaves[i].next` points to `leaves[i+1]` and
+    /// `leaves[i].prev` to `leaves[i-1]`.
+    ///
+    /// Splits allocate new leaves at the *end* of the arena, so the linked
+    /// list's sorted order diverges from arena-index order — the more inserts
+    /// (and splits) the tree has seen, the more the cursor's `next`-pointer
+    /// walk jumps around the arena. Iteration at large sizes pays for that in
+    /// cache misses. `optimize` permutes `leaves` into linked-list order so
+    /// forward iteration becomes a contiguous sweep, then rewires `prev`/`next`
+    /// to match.
+    ///
+    /// Bottom-level inode child pointers (the ones that index into `leaves`)
+    /// are remapped to the new positions; inode contents, separator keys, and
+    /// `height` are unchanged. Existing cursors are invalidated — their
+    /// `leaf_idx` may now name a different leaf — so re-acquire them after
+    /// `optimize`. Idempotent: a second call is a no-op.
+    pub fn optimize(&mut self) {
+        let n = self.leaves.len();
+        if n <= 1 {
+            // 0 or 1 leaves: the list is already trivially linear. Just ensure
+            // the links are clear so the single-leaf case is consistent.
+            if n == 1 {
+                self.leaves[0].clear_prev();
+                self.leaves[0].clear_next();
+            }
+            return;
+        }
+
+        // 1. Walk the leaf linked list from the first leaf to collect the
+        //    sorted arena-index order.
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut idx = self.first_leaf();
+        order.push(idx);
+        while let Some(next) = self.leaves[idx].get_next() {
+            order.push(next);
+            idx = next;
+        }
+        // Malformed linked list (cycle or dangling) — leave the tree untouched
+        // rather than risk moving leaves into an incomplete layout. The
+        // debug_assert below catches the same condition in tests.
+        if order.len() != n {
+            debug_assert_eq!(order.len(), n, "optimize: leaf linked list is incomplete");
+            return;
+        }
+        // Already linear — nothing to do (prev/next are already correct).
+        if order.iter().enumerate().all(|(i, &o)| o == i) {
+            return;
+        }
+
+        // 2. Inverse permutation: new_pos[old_idx] = new index in the reordered
+        //    arena. Used to fix up the bottom-level inode child pointers.
+        let mut new_pos = vec![0usize; n];
+        for (i, &old) in order.iter().enumerate() {
+            new_pos[old] = i;
+        }
+
+        // 3. Remap the bottom-level inodes' child pointers. Descend `height-1`
+        //    times from the root, expanding every child, to collect exactly the
+        //    inodes whose children are leaves; each of their ptrs indexes into
+        //    `leaves` and must follow the permutation.
+        if self.height >= 1 {
+            let mut level: Vec<usize> = vec![self.root_inode];
+            for _ in 0..self.height - 1 {
+                let mut next = Vec::new();
+                for &ni in &level {
+                    let node = &self.inodes[ni];
+                    for ci in 0..=node.keys.len() {
+                        if let Some(c) = node.get_ptr(ci) {
+                            next.push(c);
+                        }
+                    }
+                }
+                level = next;
+            }
+            for &ni in &level {
+                let node = &mut self.inodes[ni];
+                let klen = node.keys.len();
+                for ci in 0..=klen {
+                    if let Some(c) = node.get_ptr(ci) {
+                        node.set_ptr(ci, new_pos[c]);
+                    }
+                }
+            }
+        }
+
+        // 4. Physically reorder the leaves vec into linked-list order. Each old
+        //    leaf is moved exactly once via `ptr::read` — `order` is a
+        //    permutation — so the old buffer is drained without double-frees:
+        //    we drop its length to 0 before replacing it, so the old `Vec`
+        //    deallocates its buffer without running element destructors.
+        let mut new_leaves: Vec<LeafNode<SK, V, PTR, N>> = Vec::with_capacity(n);
+        let ptr = self.leaves.as_mut_ptr();
+        for &old in &order {
+            // SAFETY: `old < n`; `order` is a permutation (verified to have
+            // length `n` with distinct linked-list indices), so each slot is
+            // read exactly once and no element is left duplicated or dropped.
+            let node = unsafe { std::ptr::read(ptr.add(old)) };
+            new_leaves.push(node);
+        }
+        // SAFETY: every element has been moved out via `ptr::read`; setting
+        // length to 0 prevents the old `Vec` from dropping them on replace.
+        unsafe { self.leaves.set_len(0); }
+        self.leaves = new_leaves;
+
+        // 5. Rewire prev/next to be linear by new position.
+        for i in 0..n {
+            if i > 0 {
+                self.leaves[i].set_prev(i - 1);
+            } else {
+                self.leaves[i].clear_prev();
+            }
+            if i + 1 < n {
+                self.leaves[i].set_next(i + 1);
+            } else {
+                self.leaves[i].clear_next();
+            }
+        }
+    }
+
     /// Walk internal nodes to find the leaf index for `needle`, allocating the
     /// descent `path` (`[(inode_idx, pos)]` from root to parent) so callers that
     /// need to propagate a split back up the tree can do so. `insert` uses this.
@@ -1128,7 +1248,7 @@ where
         let mid_key = self.leaves[child_idx].keys.get(mid).clone();
 
         // Save linked-list state before modifying
-        let old_next = self.leaves[child_idx].next.map(|nz| nz.get().as_usize() - 1);
+        let old_next = self.leaves[child_idx].get_next();
 
         // Create new leaf with upper half, then truncate the old leaf
         let mut new_leaf = LeafNode::<SK, V, PTR, N>::new();

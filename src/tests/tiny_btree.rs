@@ -700,3 +700,170 @@ fn test_rebalance_preserves_leaf_links() {
         assert_eq!(*v, i as u64 * 2, "value broken at {i}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// optimize — reorder the leaf arena into linked-list order
+// ---------------------------------------------------------------------------
+
+/// `optimize` on a single-leaf tree (height 0) is a no-op that still clears
+/// the (already clear) links and keeps lookups working.
+#[test]
+fn test_optimize_single_leaf() {
+    let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
+    for i in 0..3 {
+        tree.insert(i, i * 10).unwrap();
+    }
+    tree.optimize();
+    assert_eq!(tree.leaves.len(), 1);
+    assert_eq!(tree.height, 0);
+    for i in 0..3 {
+        assert_eq!(tree.get(&i), Some(&(i * 10)));
+    }
+}
+
+/// `optimize` on an empty tree is a no-op.
+#[test]
+fn test_optimize_empty() {
+    let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
+    tree.optimize();
+    assert_eq!(tree.len(), 0);
+    assert_eq!(tree.leaves.len(), 1);
+}
+
+/// After `optimize`, the leaf arena is in linked-list order: `leaves[i].next`
+/// points to `i+1` and `leaves[i].prev` to `i-1`, and every lookup still
+/// resolves. Insert in reverse so splits scatter leaves out of sorted order
+/// before the call.
+#[test]
+fn test_optimize_linearizes_leaves() {
+    let mut tree: CTree<u64, u64, u16, 3, 4> = CTree::new();
+    let count = 60u64;
+    for i in (0..count).rev() {
+        tree.insert(i, i * 10).unwrap();
+    }
+    // A multi-leaf tree is required for the reorder to be meaningful.
+    assert!(tree.leaves.len() > 1, "precondition: need multiple leaves");
+    assert!(tree.height >= 1);
+
+    tree.optimize();
+
+    let n = tree.leaves.len();
+    for i in 0..n {
+        assert_eq!(
+            tree.leaves[i].get_next(),
+            if i + 1 < n { Some(i + 1) } else { None },
+            "next broken at leaf {i}"
+        );
+        assert_eq!(
+            tree.leaves[i].get_prev(),
+            if i > 0 { Some(i - 1) } else { None },
+            "prev broken at leaf {i}"
+        );
+    }
+    // first_leaf must now be arena index 0.
+    assert_eq!(tree.first_leaf(), 0);
+
+    for i in 0..count {
+        assert_eq!(tree.get(&i), Some(&(i * 10)), "lookup broken for key {i}");
+    }
+    assert_eq!(tree.len(), count as usize);
+}
+
+/// `optimize` preserves full forward and backward iteration order.
+#[test]
+fn test_optimize_preserves_iteration() {
+    let mut tree: CTree<u64, u64, u16, 3, 4> = CTree::new();
+    let order: [u64; 40] = [
+        15, 3, 27, 8, 21, 0, 12, 6, 18, 24, 9, 1, 39, 14, 5, 22, 11, 7, 19, 2, 25, 13, 38, 10,
+        4, 16, 23, 17, 36, 20, 33, 31, 29, 28, 30, 32, 34, 35, 37, 26,
+    ];
+    for &i in &order {
+        tree.insert(i, i * 10).unwrap();
+    }
+    tree.optimize();
+
+    // Forward
+    let mut cursor = tree.get_cursor();
+    let mut fwd = Vec::new();
+    while let Some((k, v)) = cursor.current() {
+        fwd.push((*k, *v));
+        if cursor.next().is_none() {
+            break;
+        }
+    }
+    assert_eq!(fwd.len(), 40);
+    for (i, (k, v)) in fwd.iter().enumerate() {
+        assert_eq!(*k, i as u64);
+        assert_eq!(*v, i as u64 * 10);
+    }
+
+    // Backward from the largest key
+    let mut cursor = tree.cursor_at(&39u64);
+    let mut rev = Vec::new();
+    while let Some((k, v)) = cursor.current() {
+        rev.push((*k, *v));
+        if cursor.prev().is_none() {
+            break;
+        }
+    }
+    assert_eq!(rev.len(), 40);
+    for (i, (k, v)) in rev.iter().enumerate() {
+        assert_eq!(*k, 39 - i as u64);
+        assert_eq!(*v, (39 - i as u64) * 10);
+    }
+}
+
+/// `optimize` is idempotent: a second call changes nothing and keeps the tree
+/// valid. Also verifies inserts still work after optimize (the remapped inode
+/// ptrs route new keys correctly).
+#[test]
+fn test_optimize_idempotent_and_insert_after() {
+    let mut tree: CTree<u64, u64, u16, 3, 4> = CTree::new();
+    for i in 0..40 {
+        tree.insert(i, i).unwrap();
+    }
+    tree.optimize();
+    let leaves_after = tree.leaves.len();
+
+    tree.optimize();
+    assert_eq!(tree.leaves.len(), leaves_after, "second optimize should not move leaves");
+    for i in 0..leaves_after {
+        assert_eq!(tree.leaves[i].get_next(), if i + 1 < leaves_after { Some(i + 1) } else { None });
+    }
+
+    // Insert a new key larger than all existing ones — it routes to the last
+    // leaf and must be findable.
+    tree.insert(100, 1000).unwrap();
+    assert_eq!(tree.get(&100), Some(&1000));
+    for i in 0..40 {
+        assert_eq!(tree.get(&i), Some(&i));
+    }
+    assert_eq!(tree.len(), 41);
+}
+
+/// `optimize` works on the variable-length key form too (`Box<[u8]>`), the
+/// instantiation the bench uses.
+#[test]
+fn test_optimize_var_len_keys() {
+    let mut tree: CTree<Box<[u8]>, usize, u32, 4, 5> = CTree::new();
+    // Insert byte keys in reverse lexicographic order to scatter leaves.
+    let count = 50;
+    for i in (0..count).rev() {
+        let key = format!("key-{i:03}");
+        tree.insert(Box::from(key.as_bytes()), i).unwrap();
+    }
+    assert!(tree.leaves.len() > 1);
+    tree.optimize();
+
+    let n = tree.leaves.len();
+    for i in 0..n {
+        assert_eq!(tree.leaves[i].get_next(), if i + 1 < n { Some(i + 1) } else { None });
+        assert_eq!(tree.leaves[i].get_prev(), if i > 0 { Some(i - 1) } else { None });
+    }
+    for i in 0..count {
+        let key = format!("key-{i:03}");
+        assert_eq!(tree.get(key.as_bytes()), Some(&i));
+    }
+}
+
+

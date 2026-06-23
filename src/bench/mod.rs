@@ -248,7 +248,7 @@ use nibble_trie::{NibbleOptBench, NibbleOptUncheckedBench, NibbleTrieBench, Nibb
 use poly_trie::{PolyOptBench, PolyTrieBench};
 use stacked_trie::{StackedTrie2Bench, StackedTrie4Bench};
 use std_contestants::{BTreeMapBench, HashMapBench, LinkedListBench, SortedVecBench};
-use tiny_btree::CTreeBench;
+use tiny_btree::{CTreeBench, CTreeOptBench};
 
 // ── Type aliases ─────────────────────────────────────────────────────
 
@@ -439,6 +439,7 @@ fn all_contestants() -> Vec<Contestant> {
         Contestant { name: "StackedTrie2",        max_size: None, bench: Box::new(StackedTrie2Bench::new()) },
         Contestant { name: "StackedTrie4",        max_size: None, bench: Box::new(StackedTrie4Bench::new()) },
         Contestant { name: "CTree",               max_size: None, bench: Box::new(CTreeBench::new()) },
+        Contestant { name: "CTreeOpt",            max_size: None, bench: Box::new(CTreeOptBench::new()) },
     ]
 }
 

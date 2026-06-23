@@ -110,3 +110,92 @@ impl Benchable for CTreeBench {
         Some(bytes as f64 / keys.len() as f64)
     }
 }
+
+// ── CTreeOpt ─────────────────────────────────────────────────────────
+
+/// `CTreeBench` variant that calls `optimize` after building.
+///
+/// `optimize` permutes the leaf arena into linked-list order so forward
+/// iteration becomes a contiguous sweep. This contestant isolates the
+/// iteration/lookup payoff from the one-time reorder cost: `build` pays it
+/// once, then `bench_fwd_iter`/`bench_rev_iter`/`bench_lookup` measure the
+/// optimized layout. `bench_optimize` measures the reorder cost itself.
+pub(crate) struct CTreeOptBench {
+    tree: Tree,
+    max_key: Vec<u8>,
+}
+
+impl CTreeOptBench {
+    pub(crate) fn new() -> Self {
+        Self { tree: Tree::new(), max_key: Vec::new() }
+    }
+}
+
+impl Benchable for CTreeOptBench {
+    fn key_domain(&self) -> KeyDomain {
+        KeyDomain::Any
+    }
+
+    fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
+        let (mut tree, max_key) = CTreeBench::build_tree(keys);
+        tree.compact();
+        tree.optimize();
+        self.tree = tree;
+        self.max_key = max_key;
+    }
+
+    fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
+        let (tree, _) = CTreeBench::build_tree(keys);
+        black_box(&tree);
+        Some(())
+    }
+
+    fn bench_optimize(&self, keys: &[Vec<u8>]) -> Option<()> {
+        let (mut tree, _) = CTreeBench::build_tree(keys);
+        tree.compact();
+        tree.optimize();
+        black_box(&tree);
+        Some(())
+    }
+
+    fn bench_lookup(&self, ctx: &BenchContext) -> Option<()> {
+        for k in &ctx.lookup_keys {
+            black_box(self.tree.get(k.as_slice()));
+        }
+        Some(())
+    }
+
+    fn bench_fwd_iter(&self) -> Option<()> {
+        let mut it = self.tree.get_cursor();
+        while let Some((k, v)) = it.current() {
+            black_box(k);
+            black_box(v);
+            if it.next().is_none() {
+                break;
+            }
+        }
+        Some(())
+    }
+
+    fn bench_rev_iter(&self) -> Option<()> {
+        let mut it = self.tree.cursor_at(self.max_key.as_slice());
+        while let Some((k, v)) = it.current() {
+            black_box(k);
+            black_box(v);
+            if it.prev().is_none() {
+                break;
+            }
+        }
+        Some(())
+    }
+
+    fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
+        let before = read_allocated();
+        let (mut tree, _) = CTreeBench::build_tree(keys);
+        tree.compact();
+        tree.optimize();
+        let bytes = read_allocated() - before;
+        drop(tree);
+        Some(bytes as f64 / keys.len() as f64)
+    }
+}
