@@ -9,7 +9,8 @@
       "Bash(rtk read *)",
       "Bash(rtk cargo build *)",
       "Bash(rtk cargo test *)",
-      "Bash(cargo run --release --bin bencher *)"
+      "Bash(cargo run --release --bin bencher *)",
+      "Bash(rtk wc *)"
     ]
   }
 }

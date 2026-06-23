@@ -1,5 +1,5 @@
+use std::borrow::Borrow;
 use std::cmp::Ordering;
-use std::marker::PhantomData;
 use std::num::{NonZero, ZeroablePrimitive};
 use std::simd::cmp::SimdPartialOrd;
 use std::simd::Simd;
@@ -26,16 +26,8 @@ pub trait TrieIndex:
 pub trait FixedLenKey: Copy + Eq + Ord + Sized {
     /// Find the first index `i` in `haystack` where `haystack[i] >= needle`.
     /// Returns `haystack.len()` if all elements are less than `needle`.
-    ///
-    /// Default: scalar linear scan. Overridden by SIMD impls.
-    fn find_position(needle: &Self, haystack: &[Self]) -> usize {
-        for i in 0..haystack.len() {
-            if haystack[i] >= *needle {
-                return i;
-            }
-        }
-        haystack.len()
-    }
+    fn find_position(needle: &Self, haystack: &[Self]) -> usize ;
+    fn find_upper_bound(needle: &Self, haystack: &[Self]) -> usize;
 }
 
 /// Variable-length key: a sequence of `K: FixedLenKey` chunks.
@@ -82,6 +74,31 @@ macro_rules! impl_fixed_len_key_simd {
                 }
                 len
             }
+            #[inline]
+            fn find_upper_bound(needle: &Self, haystack: &[Self]) -> usize {
+                let len = haystack.len();
+                if len == 0 {
+                    return 0;
+                }
+                let broadcast = Simd::<$ty, $lanes>::splat(*needle);
+                let mut i = 0;
+                while i + $lanes <= len {
+                    let chunk = Simd::<$ty, $lanes>::from_slice(&haystack[i..i + $lanes]);
+                    let gt = chunk.simd_gt(broadcast);
+                    let mask = gt.to_bitmask() as u32;
+                    if mask != 0 {
+                        return i + mask.trailing_zeros() as usize;
+                    }
+                    i += $lanes;
+                }
+                while i < len {
+                    if haystack[i] > *needle {
+                        return i;
+                    }
+                    i += 1;
+                }
+                len
+            }
         }
     };
 }
@@ -117,162 +134,262 @@ impl VarLenKey<u8> for Box<[u8]> {
 }
 
 // ---------------------------------------------------------------------------
-// Fixed-len node types
+// StoredKey — sealed internal search trait for the two canonical key forms
 // ---------------------------------------------------------------------------
+//
+// The B+ tree stores keys in one of two canonical representations:
+//   * a fixed-size `K: FixedLenKey`          — searched via SIMD broadcast
+//   * a variable-length `Box<[K]>`           — searched via binary search
+//
+// This trait is the single point of variation between the two: `find_position`
+// and `find_upper_bound` dispatch to the form's own search. It is sealed because it
+// is the custodian of the SIMD-haystack invariant — the stored key array must
+// be a contiguous `&[Self]` for `Simd::from_slice` to be sound-by-convention.
+// Only the two forms above may implement it. Consumers never name this trait;
+// they reach the tree through the stdlib `Borrow`/`Into` conversion seam.
+//
+// The lookup needle type is an associated type, not a method generic: `K` for
+// the fixed form, `[K]` for the variable form. Each impl performs its own
+// concrete comparison, so no `PartialOrd` bound leaks into the trait surface.
 
-struct KeyNode<K, PTR: TrieIndex, const N: usize>
-where
-    K: FixedLenKey,
-    [(); N + 1]:
-{
-    keys: TinyArray<K, N>,
-    ptrs: [Option<NonZero<PTR>>; N + 1],
+mod private {
+    /// Marker sealing [`super::StoredKey`] to the two canonical key forms.
+    pub trait Sealed {}
 }
 
-struct LeafNode<K, V, const N: usize>
+pub trait StoredKey: Ord + Clone + private::Sealed
 where
-    K: FixedLenKey,
+    Self: Borrow<Self::Needle>,
+{
+    /// Borrowed lookup needle: `K` for fixed, `[K]` for variable.
+    type Needle: ?Sized;
+
+    /// First index `i` where `haystack[i] >= needle` (lower bound).
+    /// Returns `haystack.len()` if all elements are less than `needle`.
+    fn find_position(needle: &Self::Needle, haystack: &[Self]) -> usize;
+
+    /// First index `i` where `haystack[i] > needle` (upper bound).
+    /// Returns `haystack.len()` if no element is greater than `needle`.
+    fn find_upper_bound(needle: &Self::Needle, haystack: &[Self]) -> usize;
+
+    /// Is `stored` equal to `needle`? Form-specific: `PartialEq` between a
+    /// stored key and its needle is not uniformly in scope across both forms
+    /// (e.g. `Box<[K]>: PartialEq<[K]>` is not a stdlib impl), so the trait
+    /// owns the comparison. Used to confirm an exact hit after `find_position`.
+    fn eq_key(stored: &Self, needle: &Self::Needle) -> bool;
+}
+
+// --- Fixed form: K: FixedLenKey — SIMD lower + upper bounds -----------------
+
+impl<K: FixedLenKey> private::Sealed for K {}
+
+impl<K: FixedLenKey> StoredKey for K {
+    type Needle = K;
+
+    #[inline]
+    fn find_position(needle: &Self::Needle, haystack: &[Self]) -> usize {
+        // Delegate to the SIMD-accelerated `FixedLenKey::find_position`.
+        K::find_position(needle, haystack)
+    }
+
+    #[inline]
+    fn find_upper_bound(needle: &Self::Needle, haystack: &[Self]) -> usize {
+        K::find_upper_bound(needle, haystack)
+    }
+
+    #[inline]
+    fn eq_key(stored: &Self, needle: &Self::Needle) -> bool {
+        stored == needle
+    }
+}
+
+// --- Variable form: Box<[K]> — binary search both directions ---------------
+
+impl<K: FixedLenKey> private::Sealed for Box<[K]> {}
+
+impl<K: FixedLenKey> StoredKey for Box<[K]> {
+    type Needle = [K];
+
+    #[inline]
+    fn find_position(needle: &Self::Needle, haystack: &[Self]) -> usize {
+        let mut lo = 0usize;
+        let mut hi = haystack.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            // SAFETY: items 0..len are guaranteed initialized in a live node.
+            let node_key = unsafe { haystack.get_unchecked(mid) };
+            match cmp_slice_scalar(node_key.as_ref(), needle) {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Equal => return mid,
+                Ordering::Greater => hi = mid,
+            }
+        }
+        lo
+    }
+
+    #[inline]
+    fn find_upper_bound(needle: &Self::Needle, haystack: &[Self]) -> usize {
+        let mut lo = 0usize;
+        let mut hi = haystack.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            // SAFETY: items 0..len are guaranteed initialized in a live node.
+            let node_key = unsafe { haystack.get_unchecked(mid) };
+            if cmp_slice_scalar(node_key.as_ref(), needle) == Ordering::Greater {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
+
+    #[inline]
+    fn eq_key(stored: &Self, needle: &Self::Needle) -> bool {
+        eq_slice_scalar(stored.as_ref(), needle)
+    }
+}
+
+// Scalar comparison helpers for the varlen (`Box<[K]>`) binary search. These
+// are plain element-wise `Ord`/`PartialEq` loops — no SIMD. Benchmarks showed
+// the SIMD `cmp_slice`/`eq_slice` variant made no measurable difference here, so
+// it was removed.
+#[inline]
+fn cmp_slice_scalar<K: Ord>(a: &[K], b: &[K]) -> Ordering {
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        match a[i].cmp(&b[i]) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+#[inline]
+fn eq_slice_scalar<K: PartialEq>(a: &[K], b: &[K]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Node types — unified over SK: StoredKey
+// ---------------------------------------------------------------------------
+
+/// Internal (separator) node: `keys` plus `ptrs` to children.
+struct KeyNode<SK, PTR, const N: usize, const NP1: usize>
+where
+    SK: StoredKey,
+    PTR: TrieIndex,
+    [(); N]:
+    ,
+    [(); NP1]:
+{
+    keys: TinyArray<SK, N>,
+    ptrs: [Option<NonZero<PTR>>; NP1],
+}
+
+/// Leaf node. Carries the leaf linked list (`prev`/`next`) for O(1) cursor
+/// navigation in both the fixed and variable instantiations.
+///
+/// `prev`/`next` use the same `Option<NonZero<PTR>>` encoding as `KeyNode`'s
+/// child ptrs: stored as 1-based `NonZero`, decoded to a 0-based arena index.
+struct LeafNode<SK, V, PTR, const N: usize>
+where
+    SK: StoredKey,
+    PTR: TrieIndex,
     V: Sized,
     [(); N]:
 {
-    keys: TinyArray<K, N>,
+    keys: TinyArray<SK, N>,
     values: TinyArray<V, N>,
+    prev: Option<NonZero<PTR>>,
+    next: Option<NonZero<PTR>>,
 }
 
 // ---------------------------------------------------------------------------
-// Variable-len node types
+// CTree — generic B+ tree over SK: StoredKey
 // ---------------------------------------------------------------------------
 
-struct VarKeyNode<K, PTR: TrieIndex, const N: usize>
+/// B+ tree. The key representation is chosen by `SK: StoredKey`:
+///   * `CTree<K, V, ...>`        — fixed-size keys, SIMD search (`FixedCTree`)
+///   * `CTree<Box<[K]>, V, ...>` — variable-length keys, binary search (`VarCTree`)
+///
+/// All tree operations are implemented once, generically; `find_position` and
+/// `find_upper_bound` dispatch to `SK`. Consumers reach the tree through the
+/// stdlib `Borrow`/`Into` conversion seam — they never implement search.
+pub struct CTree<SK, V, PTR, const N: usize, const NP1: usize>
 where
-    K: FixedLenKey,
-    [(); N + 1]:
-{
-    keys: TinyArray<Box<[K]>, N>,
-    ptrs: [Option<NonZero<PTR>>; N + 1],
-}
-
-struct VarLeafNode<K, V, const N: usize>
-where
-    K: FixedLenKey,
-    V: Sized,
-    [(); N]:
-{
-    keys: TinyArray<Box<[K]>, N>,
-    values: TinyArray<V, N>,
-}
-
-// ---------------------------------------------------------------------------
-// Fixed-len CTree (B+ tree for Copy keys — SIMD search)
-// ---------------------------------------------------------------------------
-
-/// B+ tree for fixed-size keys with SIMD-accelerated search.
-struct CTree<K, V, PTR, const N: usize>
-where
-    K: FixedLenKey,
+    SK: StoredKey,
     PTR: TrieIndex,
     V: Sized,
     [(); N]:
     ,
-    [(); N + 1]:
+    [(); NP1]:
 {
-    inodes: Vec<KeyNode<K, PTR, N>>,
-    leaves: Vec<LeafNode<K, V, N>>,
+    inodes: Vec<KeyNode<SK, PTR, N, NP1>>,
+    leaves: Vec<LeafNode<SK, V, PTR, N>>,
     len: usize,
+    /// Number of inode levels. 0 = root is a leaf, 1 = root inode above leaves, etc.
+    height: usize,
+    /// Index of the root inode in `self.inodes`. Only valid when height >= 1.
+    root_inode: usize,
 }
 
-struct Cursor<'a, K, V, PTR, const N: usize>
+pub struct Cursor<'a, SK, V, PTR, const N: usize, const NP1: usize>
 where
-    K: FixedLenKey,
+    SK: StoredKey,
     PTR: TrieIndex,
     V: Sized,
     [(); N]:
     ,
-    [(); N + 1]:
+    [(); NP1]:
 {
-    tree: &'a CTree<K, V, PTR, N>,
-    stack: Vec<usize>,
+    tree: &'a CTree<SK, V, PTR, N, NP1>,
+    leaf_idx: usize,
     position: usize,
-    phantom: PhantomData<V>,
 }
 
-struct CursorMut<'a, K, V, PTR, const N: usize>
+pub struct CursorMut<'a, SK, V, PTR, const N: usize, const NP1: usize>
 where
-    K: FixedLenKey,
+    SK: StoredKey,
     PTR: TrieIndex,
     V: Sized,
     [(); N]:
     ,
-    [(); N + 1]:
+    [(); NP1]:
 {
-    tree: &'a mut CTree<K, V, PTR, N>,
-    stack: Vec<usize>,
+    tree: &'a mut CTree<SK, V, PTR, N, NP1>,
+    leaf_idx: usize,
     position: usize,
-    phantom: PhantomData<V>,
-}
-
-// ---------------------------------------------------------------------------
-// Variable-len VarCTree (B+ tree for VarLenKey — binary search)
-// ---------------------------------------------------------------------------
-
-/// B+ tree for variable-length keys with binary-search comparison.
-struct VarCTree<K, V, PTR, const N: usize>
-where
-    K: FixedLenKey,
-    PTR: TrieIndex,
-    V: Sized,
-    [(); N]:
-    ,
-    [(); N + 1]:
-{
-    inodes: Vec<VarKeyNode<K, PTR, N>>,
-    leaves: Vec<VarLeafNode<K, V, N>>,
-    len: usize,
-}
-
-struct VarCursor<'a, K, V, PTR, const N: usize>
-where
-    K: FixedLenKey,
-    PTR: TrieIndex,
-    V: Sized,
-    [(); N]:
-    ,
-    [(); N + 1]:
-{
-    tree: &'a VarCTree<K, V, PTR, N>,
-    stack: Vec<usize>,
-    position: usize,
-    phantom: PhantomData<V>,
-}
-
-struct VarCursorMut<'a, K, V, PTR, const N: usize>
-where
-    K: FixedLenKey,
-    PTR: TrieIndex,
-    V: Sized,
-    [(); N]:
-    ,
-    [(); N + 1]:
-{
-    tree: &'a mut VarCTree<K, V, PTR, N>,
-    stack: Vec<usize>,
-    position: usize,
-    phantom: PhantomData<V>,
 }
 
 // ---------------------------------------------------------------------------
 // KeyNode impl
 // ---------------------------------------------------------------------------
 
-impl<K, PTR: TrieIndex, const N: usize> KeyNode<K, PTR, N>
+impl<SK, PTR, const N: usize, const NP1: usize> KeyNode<SK, PTR, N, NP1>
 where
-    K: FixedLenKey,
-    [(); N + 1]:
+    SK: StoredKey,
+    PTR: TrieIndex,
+    [(); N]:
+    ,
+    [(); NP1]:
 {
+    // NP1 must be exactly N + 1 (one pointer per key, plus the rightmost child).
+    const ASSERT_NP1: () = assert!(NP1 == N + 1, "NP1 must equal N + 1");
+
     fn new() -> Self {
         Self {
             keys: TinyArray::new(),
-            ptrs: [None; N + 1],
+            ptrs: [None; NP1],
         }
     }
 
@@ -290,32 +407,57 @@ where
 
     /// Get key at index `i`. Bounds-checks against `len`.
     #[inline]
-    fn get(&self, i: usize) -> &K {
+    fn get(&self, i: usize) -> &SK {
         self.keys.get(i)
     }
 
     /// Get key at index `i` without bounds check.
     #[inline]
-    unsafe fn get_unchecked(&self, i: usize) -> &K {
-        self.keys.get_unchecked(i)
+    unsafe fn get_unchecked(&self, i: usize) -> &SK {
+        unsafe {
+            self.keys.get_unchecked(i)
+        }
     }
 
-    /// Get child pointer at index `i`. Returns `None` for empty slots.
+    /// Get child pointer at index `i` as a usize index. Returns `None` for empty slots.
+    /// Internally stored as 1-based NonZero; decoded to 0-based index.
     #[inline]
-    fn get_ptr(&self, i: usize) -> Option<PTR> {
+    fn get_ptr(&self, i: usize) -> Option<usize> {
         debug_assert!(i <= self.keys.len());
-        self.ptrs[i].map(|nz| nz.get())
+        self.ptrs[i].map(|nz| nz.get().as_usize() - 1)
     }
 
     /// Get child pointer at index `i` without bounds check.
     #[inline]
-    unsafe fn get_ptr_unchecked(&self, i: usize) -> Option<PTR> {
-        self.ptrs[i].map(|nz| nz.get())
+    unsafe fn get_ptr_unchecked(&self, i: usize) -> Option<usize> {
+        self.ptrs[i].map(|nz| nz.get().as_usize() - 1)
     }
 
+    /// Set child pointer at index `i` to the given 0-based arena index.
+    /// Encoded as 1-based NonZero internally.
     #[inline]
-    fn find_position(&self, k: &K) -> usize {
-        K::find_position(k, self.keys.as_slice())
+    fn set_ptr(&mut self, i: usize, idx: usize) {
+        self.ptrs[i] = NonZero::new(PTR::from_usize(idx + 1));
+    }
+
+    /// Clear child pointer at index `i`.
+    #[inline]
+    fn clear_ptr(&mut self, i: usize) {
+        self.ptrs[i] = None;
+    }
+
+    /// First index where `keys[i] >= needle` (lower bound).
+    #[inline]
+    fn find_position(&self, needle: &SK::Needle) -> usize {
+        SK::find_position(needle, self.keys.as_slice())
+    }
+
+    /// Find the child pointer index for `needle` in a B+ tree internal node.
+    /// Returns the index `i` such that `ptrs[i]` points to the subtree for
+    /// `needle`. Upper-bound semantics: finds the first separator `> needle`.
+    #[inline]
+    fn find_child(&self, needle: &SK::Needle) -> usize {
+        SK::find_upper_bound(needle, self.keys.as_slice())
     }
 
     /// Would inserting one more key overflow this node?
@@ -330,12 +472,11 @@ where
         self.keys.len() == N / 2
     }
 
-    /// Insert `k` into this internal node in sorted order.
-    /// Also shifts ptrs. Caller guarantees `!would_split()`.
-    /// Returns the position where the key was inserted.
-    fn insert_leaf(&mut self, k: K) -> usize {
+    /// Insert `k` at the known sorted position `pos`, shifting the ptrs above
+    /// it right by one. Caller guarantees `pos` is the correct insertion index
+    /// and the node has room (`!would_split()`).
+    fn insert_key_at(&mut self, pos: usize, k: SK) {
         debug_assert!(!self.would_split());
-        let pos = self.find_position(&k);
         let l = self.keys.len();
         if pos < l {
             for i in (pos + 1..=l).rev() {
@@ -343,12 +484,20 @@ where
             }
         }
         self.keys.insert_at(pos, k);
+    }
+
+    /// Insert `k` into this internal node in sorted order.
+    /// Also shifts ptrs. Caller guarantees `!would_split()`.
+    /// Returns the position where the key was inserted.
+    fn insert_leaf(&mut self, k: SK) -> usize {
+        let pos = self.find_position(k.borrow());
+        self.insert_key_at(pos, k);
         pos
     }
 
     /// Remove key at `pos` and its right child pointer.
     /// Returns the removed key.
-    fn remove(&mut self, pos: usize) -> K {
+    fn remove(&mut self, pos: usize) -> SK {
         let l = self.keys.len();
         let k = self.keys.remove_at(pos);
         if pos + 1 < l {
@@ -369,9 +518,10 @@ where
 // LeafNode impl
 // ---------------------------------------------------------------------------
 
-impl<K, V, const N: usize> LeafNode<K, V, N>
+impl<SK, V, PTR, const N: usize> LeafNode<SK, V, PTR, N>
 where
-    K: FixedLenKey,
+    SK: StoredKey,
+    PTR: TrieIndex,
     V: Sized,
     [(); N]:
 {
@@ -379,165 +529,61 @@ where
         Self {
             keys: TinyArray::new(),
             values: TinyArray::new(),
+            prev: None,
+            next: None,
         }
     }
 
-    fn find_position(&self, k: &K) -> usize {
-        K::find_position(k, self.keys.as_slice())
+    /// Previous-leaf index, decoded to 0-based. `None` if this is the first leaf.
+    /// Internally stored as 1-based NonZero, mirroring `KeyNode`'s child ptrs.
+    #[inline]
+    fn get_prev(&self) -> Option<usize> {
+        self.prev.map(|nz| nz.get().as_usize() - 1)
+    }
+
+    /// Next-leaf index, decoded to 0-based. `None` if this is the last leaf.
+    #[inline]
+    fn get_next(&self) -> Option<usize> {
+        self.next.map(|nz| nz.get().as_usize() - 1)
+    }
+
+    /// Set previous-leaf link to the given 0-based arena index. Encoded 1-based.
+    #[inline]
+    fn set_prev(&mut self, idx: usize) {
+        self.prev = NonZero::new(PTR::from_usize(idx + 1));
+    }
+
+    /// Set next-leaf link to the given 0-based arena index. Encoded 1-based.
+    #[inline]
+    fn set_next(&mut self, idx: usize) {
+        self.next = NonZero::new(PTR::from_usize(idx + 1));
+    }
+
+    /// Clear the previous-leaf link.
+    #[inline]
+    fn clear_prev(&mut self) {
+        self.prev = None;
+    }
+
+    /// Clear the next-leaf link.
+    #[inline]
+    fn clear_next(&mut self) {
+        self.next = None;
+    }
+
+    #[inline]
+    fn find_position(&self, needle: &SK::Needle) -> usize {
+        SK::find_position(needle, self.keys.as_slice())
     }
 
     /// Insert key-value at position `pos`. Caller must ensure pos is correct
     /// (from `find_position`) and node is not full.
-    fn insert(&mut self, pos: usize, k: K, v: V) {
+    fn insert(&mut self, pos: usize, k: SK, v: V) {
         self.keys.insert_at(pos, k);
         self.values.insert_at(pos, v);
     }
 
-    fn remove(&mut self, pos: usize) -> (K, V) {
-        let k = self.keys.remove_at(pos);
-        let v = self.values.remove_at(pos);
-        (k, v)
-    }
-
-    fn truncate(&mut self, newlen: u8) {
-        self.keys.truncate(newlen);
-        self.values.truncate(newlen);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// VarKeyNode impl
-// ---------------------------------------------------------------------------
-
-impl<K, PTR: TrieIndex, const N: usize> VarKeyNode<K, PTR, N>
-where
-    K: FixedLenKey,
-    [(); N + 1]:
-{
-    fn new() -> Self {
-        Self {
-            keys: TinyArray::new(),
-            ptrs: [None; N + 1],
-        }
-    }
-
-    #[inline]
-    fn get(&self, i: usize) -> &Box<[K]> {
-        self.keys.get(i)
-    }
-
-    #[inline]
-    unsafe fn get_unchecked(&self, i: usize) -> &Box<[K]> {
-        self.keys.get_unchecked(i)
-    }
-
-    #[inline]
-    fn get_ptr(&self, i: usize) -> Option<PTR> {
-        debug_assert!(i <= self.keys.len());
-        self.ptrs[i].map(|nz| nz.get())
-    }
-
-    #[inline]
-    unsafe fn get_ptr_unchecked(&self, i: usize) -> Option<PTR> {
-        self.ptrs[i].map(|nz| nz.get())
-    }
-
-    #[inline]
-    fn find_position(&self, k: &[K]) -> usize {
-        let n = self.keys.len();
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let node_key = self.keys.get(mid);
-            match node_key.as_ref().cmp(k) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Equal => return mid,
-                Ordering::Greater => hi = mid,
-            }
-        }
-        lo
-    }
-
-    #[inline]
-    fn would_split(&self) -> bool {
-        self.keys.is_full()
-    }
-
-    #[inline]
-    fn would_merge(&self) -> bool {
-        self.keys.len() == N / 2
-    }
-
-    fn insert_leaf(&mut self, k: Box<[K]>) -> usize {
-        debug_assert!(!self.would_split());
-        let pos = self.find_position(&k);
-        let l = self.keys.len();
-        if pos < l {
-            for i in (pos + 1..=l).rev() {
-                self.ptrs[i + 1] = self.ptrs[i];
-            }
-        }
-        self.keys.insert_at(pos, k);
-        pos
-    }
-
-    fn remove(&mut self, pos: usize) -> Box<[K]> {
-        let l = self.keys.len();
-        let k = self.keys.remove_at(pos);
-        if pos + 1 < l {
-            for i in pos + 1..l {
-                self.ptrs[i] = self.ptrs[i + 1];
-            }
-        }
-        k
-    }
-
-    #[inline]
-    fn truncate(&mut self, newlen: u8) {
-        self.keys.truncate(newlen);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// VarLeafNode impl
-// ---------------------------------------------------------------------------
-
-impl<K, V, const N: usize> VarLeafNode<K, V, N>
-where
-    K: FixedLenKey,
-    V: Sized,
-    [(); N]:
-{
-    fn new() -> Self {
-        Self {
-            keys: TinyArray::new(),
-            values: TinyArray::new(),
-        }
-    }
-
-    fn find_position(&self, k: &[K]) -> usize {
-        let n = self.keys.len();
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let node_key = self.keys.get(mid);
-            match node_key.as_ref().cmp(k) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Equal => return mid,
-                Ordering::Greater => hi = mid,
-            }
-        }
-        lo
-    }
-
-    fn insert(&mut self, pos: usize, k: Box<[K]>, v: V) {
-        self.keys.insert_at(pos, k);
-        self.values.insert_at(pos, v);
-    }
-
-    fn remove(&mut self, pos: usize) -> (Box<[K]>, V) {
+    fn remove(&mut self, pos: usize) -> (SK, V) {
         let k = self.keys.remove_at(pos);
         let v = self.values.remove_at(pos);
         (k, v)
@@ -571,27 +617,35 @@ macro_rules! impl_trie_index {
 impl_trie_index!(u8, u16, u32, u64);
 
 // ---------------------------------------------------------------------------
-// CTree impl (fixed-len B+ tree)
+// CTree impl
 // ---------------------------------------------------------------------------
 
-impl<K, V, PTR, const N: usize> CTree<K, V, PTR, N>
+impl<SK, V, PTR, const N: usize, const NP1: usize> CTree<SK, V, PTR, N, NP1>
 where
-    K: FixedLenKey,
+    SK: StoredKey,
     PTR: TrieIndex,
     V: Sized,
     [(); N]:
     ,
-    [(); N + 1]:
+    [(); NP1]:
 {
     const ASSERT_N_FITS: () = assert!(N <= 255, "N must be at most 255");
+    // NP1 must be exactly N + 1 (one pointer per key, plus the rightmost child).
+    const ASSERT_NP1: () = assert!(NP1 == N + 1, "NP1 must equal N + 1");
 
     pub fn new() -> Self {
-        // Start with one empty leaf node (the root).
-        let root = LeafNode::new();
+        // Force evaluation of the static asserts (a const is only checked when
+        // referenced). Catches `NP1 != N + 1` at the call site.
+        let () = Self::ASSERT_NP1;
+        let () = Self::ASSERT_N_FITS;
+        // Start with one empty leaf node (the root). height = 0.
+        let root = LeafNode::<SK, V, PTR, N>::new();
         Self {
             inodes: Vec::new(),
             leaves: vec![root],
             len: 0,
+            height: 0,
+            root_inode: 0, // unused when height == 0
         }
     }
 
@@ -603,227 +657,370 @@ where
         self.len == 0
     }
 
-    /// Walk internal nodes to find the leaf index for `key`.
-    /// Returns `(leaf_idx, path)` where path is `[(inode_idx, pos)]` from root to parent.
-    fn walk_to_leaf(&self, key: &K) -> (usize, Vec<(usize, usize)>) {
+    /// Reclaim spare capacity in the node arenas.
+    ///
+    /// `leaves` and `inodes` are `Vec`s that grow by doubling during inserts,
+    /// so after a build they typically hold capacity beyond the live node
+    /// count. `compact` shrinks each to exact length — the tree's steady-state
+    /// footprint rather than its transient growth capacity. Useful before
+    /// measuring memory, or to tighten a tree built once and queried often.
+    pub fn compact(&mut self) {
+        self.leaves.shrink_to_fit();
+        self.inodes.shrink_to_fit();
+    }
+
+    /// Walk internal nodes to find the leaf index for `needle`, allocating the
+    /// descent `path` (`[(inode_idx, pos)]` from root to parent) so callers that
+    /// need to propagate a split back up the tree can do so. `insert` uses this.
+    /// Uses `height` to know when we've reached the leaf level — after
+    /// `height` hops through inodes, the final pointer is a leaf index.
+    fn walk_to_leaf(&self, needle: &SK::Needle) -> (usize, Vec<(usize, usize)>) {
+        if self.height == 0 {
+            return (0, Vec::new());
+        }
         let mut path = Vec::new();
-        if self.inodes.is_empty() {
-            return (0, path);
-        }
-        let mut node_idx: usize = 0;
-        loop {
+        let mut node_idx: usize = self.root_inode;
+        for _ in 0..self.height - 1 {
             let node = &self.inodes[node_idx];
-            let pos = node.find_position(key);
-            let Some(ptr) = node.get_ptr(pos) else {
-                return (0, path);
-            };
-            let next = ptr.as_usize();
-            path.push((node_idx, pos));
-            if next < self.inodes.len() {
-                node_idx = next;
-            } else {
-                return (next - self.inodes.len(), path);
-            }
+            let child = node.find_child(needle);
+            path.push((node_idx, child));
+            node_idx = node.get_ptr(child).unwrap();
         }
+        // Last hop: the pointer from the bottom inode is a leaf index.
+        let bottom = &self.inodes[node_idx];
+        let child = bottom.find_child(needle);
+        let leaf_idx = bottom.get_ptr(child).unwrap();
+        path.push((node_idx, child));
+        (leaf_idx, path)
+    }
+
+    /// Read-only leaf lookup for `needle` — the allocation-free counterpart to
+    /// `walk_to_leaf`. Used by `get`/`get_mut`/`cursor_at`, which discard the
+    /// descent path and so must not pay to build one.
+    #[inline]
+    fn find_leaf(&self, needle: &SK::Needle) -> usize {
+        if self.height == 0 {
+            return 0;
+        }
+        let mut node_idx: usize = self.root_inode;
+        for _ in 0..self.height - 1 {
+            let child = self.inodes[node_idx].find_child(needle);
+            node_idx = self.inodes[node_idx].get_ptr(child).unwrap();
+        }
+        let bottom = &self.inodes[node_idx];
+        let child = bottom.find_child(needle);
+        bottom.get_ptr(child).unwrap()
     }
 
     /// Search for `key` and return a reference to the value if found.
-    pub fn get(&self, key: &K) -> Option<&V> {
+    ///
+    /// `key` is anything that can be borrowed as the canonical lookup needle
+    /// (`K` for the fixed tree, `[K]` for the variable tree). This is the
+    /// consumer conversion seam: it carries the `Borrow` equivalence contract
+    /// that makes sorted lookup sound.
+    pub fn get<Q: ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        Q: Borrow<SK::Needle>,
+    {
         if self.leaves.is_empty() {
             return None;
         }
-        let (leaf_idx, _) = self.walk_to_leaf(key);
+        let needle = key.borrow();
+        let leaf_idx = self.find_leaf(needle);
         let leaf = &self.leaves[leaf_idx];
-        let pos = leaf.find_position(key);
-        if pos < leaf.keys.len() {
-            if leaf.keys.get(pos) == key {
-                return Some(leaf.values.get(pos));
-            }
+        let pos = leaf.find_position(needle);
+        if pos < leaf.keys.len() && SK::eq_key(leaf.keys.get(pos), needle) {
+            return Some(leaf.values.get(pos));
         }
         None
     }
 
     /// Search for `key` and return a mutable reference to the value if found.
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+    pub fn get_mut<Q: ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        Q: Borrow<SK::Needle>,
+    {
         if self.leaves.is_empty() {
             return None;
         }
-        let (leaf_idx, _) = self.walk_to_leaf(key);
+        let needle = key.borrow();
+        let leaf_idx = self.find_leaf(needle);
         let leaf = &mut self.leaves[leaf_idx];
-        let pos = leaf.find_position(key);
-        if pos < leaf.keys.len() {
-            if leaf.keys.get(pos) == key {
-                return Some(leaf.values.get_mut(pos));
-            }
+        let pos = leaf.find_position(needle);
+        if pos < leaf.keys.len() && SK::eq_key(leaf.keys.get(pos), needle) {
+            return Some(leaf.values.get_mut(pos));
         }
         None
     }
 
-    /// Insert a key-value pair. Returns `Err((key, value))` if the key already exists.
-    pub fn insert(&mut self, key: K, value: V) -> Result<(), (K, V)> {
+    /// Insert a key-value pair. Returns `Err((key, value))` if the key already
+    /// exists.
+    ///
+    /// The key is taken in the canonical stored form (`K` for the fixed tree,
+    /// `Box<[K]>` for the variable tree). The consumer conversion seam lives on
+    /// the lookup side (`get`/`get_mut`/`cursor_at` via `Borrow`); insertion
+    /// takes the owned canonical form so that fixed-tree literal inference
+    /// (`insert(10, v)`) is preserved and variable-tree callers hand a
+    /// `Box<[K]>` directly.
+    pub fn insert(&mut self, key: SK, value: V) -> Result<(), (SK, V)> {
         let _ = Self::ASSERT_N_FITS;
 
-        let (child_idx, path) = self.walk_to_leaf(&key);
-        let leaf = &mut self.leaves[child_idx];
-        let pos = leaf.find_position(&key);
+        let (child_idx, path) = self.walk_to_leaf(key.borrow());
+        let leaf = &self.leaves[child_idx];
+        let pos = leaf.find_position(key.borrow());
 
         // Key already exists?
-        if pos < leaf.keys.len() {
-            if leaf.keys.get(pos) == &key {
-                return Err((key, value));
-            }
+        if pos < leaf.keys.len() && leaf.keys.get(pos) == &key {
+            return Err((key, value));
         }
 
-        // Insert into leaf
-        leaf.insert(pos, key, value);
-        self.len += 1;
-
-        // Handle leaf split if needed
-        if leaf.keys.len() > N {
+        // If leaf is full, split first then determine which half the key lands in
+        if leaf.keys.len() >= N {
+            let mid = N / 2;
             self.split_leaf(child_idx, path);
+            // After split: left leaf has keys[0..mid], right leaf has keys[mid..N].
+            // Determine which leaf the key belongs to based on its position.
+            if pos <= mid {
+                self.leaves[child_idx].insert(pos, key, value);
+            } else {
+                let new_leaf_idx = self.leaves.len() - 1;
+                self.leaves[new_leaf_idx].insert(pos - mid, key, value);
+            }
+        } else {
+            self.leaves[child_idx].insert(pos, key, value);
         }
 
+        self.len += 1;
         Ok(())
     }
 
     fn split_leaf(&mut self, child_idx: usize, mut path: Vec<(usize, usize)>) {
-        let mid = (N + 1) / 2;
+        // Leaf is full (N keys). Split at mid = N/2.
+        // Left keeps keys[0..mid], right gets keys[mid..N].
+        // Separator key (keys[mid]) goes to parent and also stays in right leaf.
+        let mid = N / 2;
         let mid_key = self.leaves[child_idx].keys.get(mid).clone();
 
-        // Create new leaf with upper half
-        let mut new_leaf = LeafNode::<K, V, N>::new();
-        let leaf = &mut self.leaves[child_idx];
-        let split_len = leaf.keys.len() - mid;
-        for i in 0..split_len {
-            unsafe {
-                new_leaf.keys.insert_at(i, leaf.keys.read_slot(mid + i));
-                new_leaf.values.insert_at(i, leaf.values.read_slot(mid + i));
-            }
-        }
-        leaf.keys.truncate(mid as u8);
-        leaf.values.truncate(mid as u8);
+        // Save linked-list state before modifying
+        let old_next = self.leaves[child_idx].next.map(|nz| nz.get().as_usize() - 1);
 
+        // Create new leaf with upper half, then truncate the old leaf
+        let mut new_leaf = LeafNode::<SK, V, PTR, N>::new();
+        self.leaves[child_idx].keys.drain_into(mid, &mut new_leaf.keys);
+        self.leaves[child_idx].values.drain_into(mid, &mut new_leaf.values);
+
+        // Wire up leaf linked list: old_leaf <-> new_leaf <-> old_next
+        new_leaf.set_prev(child_idx);
+        if let Some(ni) = old_next {
+            new_leaf.set_next(ni);
+        }
         let new_leaf_idx = self.leaves.len();
+        self.leaves[child_idx].set_next(new_leaf_idx);
         self.leaves.push(new_leaf);
+
+        if let Some(next_idx) = old_next {
+            self.leaves[next_idx].set_prev(new_leaf_idx);
+        }
 
         // Insert separator key into parent, or create new root
         self.insert_separator(mid_key, new_leaf_idx, &mut path);
     }
 
-    fn insert_separator(
-        &mut self,
-        key: K,
-        new_child_idx: usize,
-        path: &mut Vec<(usize, usize)>,
-    ) {
-        // Convert leaf index to absolute node index
-        let new_ptr = self.inodes.len() + new_child_idx;
-
+    fn insert_separator(&mut self, key: SK, new_child_idx: usize, path: &mut Vec<(usize, usize)>) {
         if path.is_empty() {
-            // Need a new root inode
-            let mut root = KeyNode::<K, PTR, N>::new();
+            // Need a new root inode. The new root's children are the old root
+            // (which was either a leaf or an inode) and the new child.
+            let old_root_idx = self.root_inode;
+            let mut root = KeyNode::<SK, PTR, N, NP1>::new();
             root.keys.insert_at(0, key);
-
-            let old_inode_count = self.inodes.len();
-            root.ptrs[0] = NonZero::new(PTR::from_usize(old_inode_count));
-            root.ptrs[1] = NonZero::new(PTR::from_usize(old_inode_count + new_child_idx));
-
+            root.set_ptr(0, old_root_idx);
+            root.set_ptr(1, new_child_idx);
+            let root_idx = self.inodes.len();
             self.inodes.push(root);
+            self.root_inode = root_idx;
+            self.height += 1;
             return;
         }
 
         // Pop the parent inode from the path
         let (parent_idx, _) = path.pop().unwrap();
-        let parent = &mut self.inodes[parent_idx];
 
-        if !parent.would_split() {
+        if !self.inodes[parent_idx].would_split() {
             // Room in parent — just insert
-            let pos = parent.find_position(&key);
-            let l = parent.keys.len();
-            if pos < l {
-                for i in (pos + 1..=l).rev() {
-                    parent.ptrs[i + 1] = parent.ptrs[i];
+            let parent = &mut self.inodes[parent_idx];
+            let pos = parent.insert_leaf(key);
+            parent.set_ptr(pos + 1, new_child_idx);
+        } else {
+            // Parent is full — split it
+            self.split_inode(parent_idx, key, new_child_idx, path);
+        }
+    }
+
+    /// Split a full internal node.
+    ///
+    /// A full node (`n == N` keys, `n+1` ptrs) receives a new `(key, child)`
+    /// pair, giving `n+1` keys and `n+2` ptrs — one too many. We split at
+    /// `mid = n/2` and push the median up to the parent:
+    ///
+    ///   left  := keys[0..mid),     ptrs[0..=mid]
+    ///   sep   := the median key   (pushed up, not retained in either child)
+    ///   right := keys[mid+1..n),  ptrs[mid+1..=n]
+    ///
+    /// plus the new pair spliced into whichever half its position `pos` falls
+    /// in. The separator is extracted as the tail of the appropriate range so
+    /// no `remove_at(0)` (front shift) is ever needed:
+    ///
+    /// - `pos == mid`: the new key *is* the median, so it goes straight up.
+    ///   Old `keys[mid..n)` all move to right (drain from `mid`), and the new
+    ///   child becomes right's leftmost ptr.
+    /// - `pos != mid`: old `keys[mid]` is the separator. We drain `keys[mid+1..n)`
+    ///   into right (skipped when that range is empty — e.g. `N == 2`), which
+    ///   leaves `keys[mid]` sitting at left's tail; `pop()` lifts it off with
+    ///   no shifting.
+    fn split_inode(
+        &mut self,
+        parent_idx: usize,
+        new_key: SK,
+        new_child_idx: usize,
+        path: &mut Vec<(usize, usize)>,
+    ) {
+        let pos = self.inodes[parent_idx].find_position(new_key.borrow());
+        let n = self.inodes[parent_idx].keys.len(); // == N (full)
+        let mid = n / 2;
+        let right_half = n - mid; // ptrs moved from left to right
+
+        let mut right = KeyNode::<SK, PTR, N, NP1>::new();
+
+        // Move the upper key half to right, then move the matching upper ptrs
+        // [mid+1..=n] across; left retains ptrs[0..=mid] (the separator's left
+        // subtree and below). For pos==mid the new child claims right's slot 0,
+        // so the moved ptrs land at [1..=right_half] in the same pass.
+        {
+            let left = &mut self.inodes[parent_idx];
+            if pos == mid {
+                left.keys.drain_into(mid, &mut right.keys);
+                right.set_ptr(0, new_child_idx);
+                for i in 0..right_half {
+                    right.ptrs[i + 1] = left.ptrs[mid + 1 + i].take();
+                }
+            } else {
+                // Drain keys above the separator only; when right_half == 1
+                // (e.g. N==2) there are none, so skip the drain entirely.
+                if right_half > 1 {
+                    left.keys.drain_into(mid + 1, &mut right.keys);
+                }
+                for i in 0..right_half {
+                    right.ptrs[i] = left.ptrs[mid + 1 + i].take();
                 }
             }
-            parent.keys.insert_at(pos, key);
-            parent.ptrs[pos + 1] = NonZero::new(PTR::from_usize(new_ptr));
-        } else {
-            // Parent is full — split it too
-            // (recursive split, simplified for now)
-            todo!("recursive inode split not yet implemented");
         }
+
+        // Extract the separator and splice the new pair into its half. For
+        // pos==mid the key is consumed as the separator, so only the child
+        // pointer (already placed above) is needed. Otherwise the separator
+        // is old keys[mid], now at left's tail — pop it, no front shift.
+        let separator = if pos == mid {
+            new_key
+        } else {
+            let sep = self.inodes[parent_idx]
+                .keys
+                .pop()
+                .expect("split_inode: left must retain the separator");
+            if pos < mid {
+                let left = &mut self.inodes[parent_idx];
+                left.insert_key_at(pos, new_key);
+                left.set_ptr(pos + 1, new_child_idx);
+            } else {
+                let rpos = pos - mid - 1;
+                right.insert_key_at(rpos, new_key);
+                right.set_ptr(rpos + 1, new_child_idx);
+            }
+            sep
+        };
+
+        let right_idx = self.inodes.len();
+        self.inodes.push(right);
+        self.insert_separator(separator, right_idx, path);
     }
 
-    pub fn get_cursor(&self) -> Cursor<K, V, PTR, N> {
+    /// Walk down the leftmost path to find the first (smallest-key) leaf.
+    fn first_leaf(&self) -> usize {
+        if self.height == 0 {
+            return 0;
+        }
+        let mut node_idx: usize = self.root_inode;
+        for _ in 0..self.height - 1 {
+            node_idx = self.inodes[node_idx].get_ptr(0).unwrap();
+        }
+        self.inodes[node_idx].get_ptr(0).unwrap()
+    }
+
+    /// Walk down the rightmost path to find the last (largest-key) leaf.
+    fn last_leaf(&self) -> usize {
+        if self.height == 0 {
+            return 0;
+        }
+        let mut node_idx: usize = self.root_inode;
+        for _ in 0..self.height - 1 {
+            let n = self.inodes[node_idx].keys.len();
+            node_idx = self.inodes[node_idx].get_ptr(n).unwrap();
+        }
+        let n = self.inodes[node_idx].keys.len();
+        self.inodes[node_idx].get_ptr(n).unwrap()
+    }
+
+    /// Create a cursor positioned at the first element.
+    pub fn get_cursor(&self) -> Cursor<SK, V, PTR, N, NP1> {
+        let leaf_idx = self.first_leaf();
         Cursor {
             tree: self,
-            stack: Vec::new(),
+            leaf_idx,
             position: 0,
-            phantom: PhantomData,
         }
     }
 
-    pub fn get_cursor_mut(&mut self) -> CursorMut<K, V, PTR, N> {
+    /// Create a mutable cursor positioned at the first element.
+    pub fn get_cursor_mut(&mut self) -> CursorMut<SK, V, PTR, N, NP1> {
+        let leaf_idx = self.first_leaf();
         CursorMut {
             tree: self,
-            stack: Vec::new(),
+            leaf_idx,
             position: 0,
-            phantom: PhantomData,
+        }
+    }
+
+    /// Create a cursor positioned at the key (or the nearest key >= it).
+    pub fn cursor_at<Q: ?Sized>(&self, key: &Q) -> Cursor<SK, V, PTR, N, NP1>
+    where
+        Q: Borrow<SK::Needle>,
+    {
+        let needle = key.borrow();
+        let leaf_idx = self.find_leaf(needle);
+        let pos = self.leaves[leaf_idx].find_position(needle);
+        Cursor {
+            tree: self,
+            leaf_idx,
+            position: pos,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// VarCTree impl (variable-len B+ tree)
+// Cursor impl
 // ---------------------------------------------------------------------------
 
-impl<K, V, PTR, const N: usize> VarCTree<K, V, PTR, N>
+impl<'a, SK, V, PTR, const N: usize, const NP1: usize> Cursor<'a, SK, V, PTR, N, NP1>
 where
-    K: FixedLenKey,
+    SK: StoredKey,
     PTR: TrieIndex,
     V: Sized,
     [(); N]:
     ,
-    [(); N + 1]:
+    [(); NP1]:
 {
-    const ASSERT_N_FITS: () = assert!(N <= 255, "N must be at most 255");
-
-    pub fn new() -> Self {
-        let root = VarLeafNode::new();
-        Self {
-            inodes: Vec::new(),
-            leaves: vec![root],
-            len: 0,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Cursor impl (fixed-len)
-// ---------------------------------------------------------------------------
-
-impl<'a, K, V, PTR, const N: usize> Cursor<'a, K, V, PTR, N>
-where
-    K: FixedLenKey,
-    PTR: TrieIndex,
-    V: Sized,
-    [(); N]:
-    ,
-    [(); N + 1]:
-{
-    pub fn current(&self) -> Option<(&K, &V)> {
-        if self.tree.leaves.is_empty() {
-            return None;
-        }
-        let leaf = &self.tree.leaves[0];
+    /// Return the current key-value pair, or None if the cursor is exhausted.
+    pub fn current(&self) -> Option<(&SK, &V)> {
+        let leaf = &self.tree.leaves[self.leaf_idx];
         if self.position < leaf.keys.len() {
             Some((leaf.keys.get(self.position), leaf.values.get(self.position)))
         } else {
@@ -831,36 +1028,99 @@ where
         }
     }
 
+    /// Advance to the next key-value pair and return the value, or None if exhausted.
     pub fn next(&mut self) -> Option<&V> {
-        todo!("proper cursor traversal")
+        // Try to advance within the current leaf
+        let leaf = &self.tree.leaves[self.leaf_idx];
+        if self.position + 1 < leaf.keys.len() {
+            self.position += 1;
+            return Some(self.tree.leaves[self.leaf_idx].values.get(self.position));
+        }
+        // Move to the next leaf
+        let next_leaf = leaf.get_next()?;
+        self.leaf_idx = next_leaf;
+        self.position = 0;
+        Some(self.tree.leaves[self.leaf_idx].values.get(0))
     }
 
+    /// Move to the previous key-value pair and return the value, or None if at the beginning.
     pub fn prev(&mut self) -> Option<&V> {
-        todo!("proper cursor traversal")
+        // Try to move back within the current leaf
+        if self.position > 0 {
+            self.position -= 1;
+            return Some(self.tree.leaves[self.leaf_idx].values.get(self.position));
+        }
+        // Move to the previous leaf
+        let prev_leaf = self.tree.leaves[self.leaf_idx].get_prev()?;
+        self.leaf_idx = prev_leaf;
+        let last_pos = self.tree.leaves[self.leaf_idx].keys.len() - 1;
+        self.position = last_pos;
+        Some(self.tree.leaves[self.leaf_idx].values.get(last_pos))
     }
 }
 
-impl<'a, K, V, PTR, const N: usize> CursorMut<'a, K, V, PTR, N>
+impl<'a, SK, V, PTR, const N: usize, const NP1: usize> CursorMut<'a, SK, V, PTR, N, NP1>
 where
-    K: FixedLenKey,
+    SK: StoredKey,
     PTR: TrieIndex,
     V: Sized,
     [(); N]:
     ,
-    [(); N + 1]:
+    [(); NP1]:
 {
-    pub fn current(&mut self) -> Option<(&K, &mut V)> {
-        if self.tree.leaves.is_empty() {
-            return None;
-        }
-        let leaf = &mut self.tree.leaves[0];
+    /// Return the current key-value pair (mutable ref on value), or None if exhausted.
+    pub fn current(&mut self) -> Option<(&SK, &mut V)> {
+        let leaf = &mut self.tree.leaves[self.leaf_idx];
         if self.position < leaf.keys.len() {
             Some((leaf.keys.get(self.position), leaf.values.get_mut(self.position)))
         } else {
             None
         }
     }
+
+    /// Advance to the next key-value pair and return a mutable ref to the value,
+    /// or None if exhausted.
+    pub fn next(&mut self) -> Option<&mut V> {
+        // Try to advance within the current leaf
+        let leaf = &self.tree.leaves[self.leaf_idx];
+        if self.position + 1 < leaf.keys.len() {
+            self.position += 1;
+        } else {
+            // Move to the next leaf
+            let next_leaf = leaf.get_next();
+            if let Some(nl) = next_leaf {
+                self.leaf_idx = nl;
+                self.position = 0;
+            } else {
+                // No more leaves — exhausted
+                return None;
+            }
+        }
+        Some(self.tree.leaves[self.leaf_idx].values.get_mut(self.position))
+    }
+
+    /// Move to the previous key-value pair and return a mutable ref to the value.
+    pub fn prev(&mut self) -> Option<&mut V> {
+        if self.position > 0 {
+            self.position -= 1;
+        } else {
+            let prev_leaf = self.tree.leaves[self.leaf_idx].get_prev()?;
+            self.leaf_idx = prev_leaf;
+            self.position = self.tree.leaves[self.leaf_idx].keys.len() - 1;
+        }
+        Some(self.tree.leaves[self.leaf_idx].values.get_mut(self.position))
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Instantiation aliases
+// ---------------------------------------------------------------------------
+
+/// Fixed-size-key B+ tree (SIMD search). `K: FixedLenKey`.
+pub type FixedCTree<K, V, PTR, const N: usize, const NP1: usize> = CTree<K, V, PTR, N, NP1>;
+
+/// Variable-length-key B+ tree (binary search). Keys are `Box<[K]>`.
+pub type VarCTree<K, V, PTR, const N: usize, const NP1: usize> = CTree<Box<[K]>, V, PTR, N, NP1>;
 
 #[cfg(test)]
 #[path = "tests/tiny_btree.rs"]

@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "bencher"
-path = "src/bin/bench.rs"
+path = "src/bench/mod.rs"
 
 [features]
 archive = []

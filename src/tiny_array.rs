@@ -127,6 +127,15 @@ where
         self.insert_at(self.len as usize, val);
     }
 
+    /// Remove and return the last element, or `None` if empty.
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(unsafe { self.slots[self.len as usize].assume_init_read() })
+    }
+
     /// Set `len` to `new_len` without dropping any elements.
     ///
     /// The caller is responsible for ensuring that truncated elements (if any)
@@ -152,6 +161,43 @@ where
     pub unsafe fn read_slot(&mut self, pos: usize) -> T {
         debug_assert!(pos < self.len as usize, "TinyArray::read_slot: index out of bounds");
         unsafe { self.slots[pos].assume_init_read() }
+    }
+
+    /// Move elements `[from..len)` into `dst`, starting at `dst` index 0.
+    ///
+    /// After this call:
+    /// - `dst` has `self.len - from` elements in slots `[0..self.len - from)`.
+    /// - `self` is truncated to `from` (without dropping the moved elements).
+    ///
+    /// This is the core operation for B+ tree node splits: split the array at
+    /// `from`, move the upper half into a new node's array, and truncate the
+    /// original to the lower half.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from > self.len` or if `dst` doesn't have capacity for the
+    /// moved elements (i.e., `self.len - from > N`).
+    /// Move elements `[from..len)` into `dst`, starting at `dst` index 0.
+    ///
+    /// After this call:
+    /// - `dst` has `self.len - from` elements in slots `[0..self.len - from)`.
+    /// - `self` is truncated to `from` (without dropping the moved elements).
+    ///
+    /// Caller must ensure `from < self.len` so that at least one element is
+    /// moved and the source index is in bounds.
+    pub fn drain_into(&mut self, from: usize, dst: &mut Self) {
+        let count = self.len as usize - from;
+        debug_assert!(from < self.len as usize, "TinyArray::drain_into: empty drain");
+        debug_assert!(dst.len as usize + count <= N, "TinyArray::drain_into: dst overflow");
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.slots[from].as_ptr(),
+                dst.slots[dst.len as usize].as_mut_ptr(),
+                count,
+            );
+        }
+        dst.len += count as u8;
+        self.len = from as u8;
     }
 }
 

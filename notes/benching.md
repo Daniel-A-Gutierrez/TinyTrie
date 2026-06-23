@@ -78,6 +78,22 @@ Comma-separated substring filters (case-insensitive). A contestant matches if it
 | `random`       | Random 4–16 byte keys (unique, via BTreeSet dedup)  |
 | `words`        | Whitespace-delimited tokens from corpus file        |
 | `lines`        | Newline-delimited lines from corpus file            |
+| `seq-u64`      | Sequential u64 keys (as 8-byte big-endian byte keys) |
+| `random-u64`   | Random u64 keys (as 8-byte big-endian byte keys)    |
+
+The `-u64` modes produce fixed-width 8-byte big-endian keys. These are `CTree`'s natural domain (u64 keys). `VarCTree` declares a **variable-length** key domain and is **skipped** on the `-u64` modes — feeding it fixed-width u64 reps would mischaracterize a variable-length-key store. To compare `CTree` vs `VarCTree` head-to-head, use a variable-length mode (`sequential`, `random`, `words`, `lines`); there `CTree` hashes the bytes to u64 and SIMD-searches, while `VarCTree` binary-searches the raw `Box<[u8]>`.
+
+### Key domains
+
+Each contestant declares a `KeyDomain` that the harness uses to skip it on incompatible key modes:
+
+| Domain     | Meaning                                              | Skipped modes                          |
+|------------|------------------------------------------------------|----------------------------------------|
+| `Any`      | Accepts all key modes (default)                     | none                                   |
+| `Strings`  | No embedded null bytes (null-terminator stores)     | `random`, `random-u64`, `seq-u64`      |
+| `Variable`| Variable-length keys only (fixed-width not its use) | `random-u64`, `seq-u64`                |
+
+`CTree` is `Any` (hashes any byte key to u64). `VarCTree` is `Variable`.
 
 `--keys=words` and `--keys=lines` require `--corpus <file>`. Corpus keys are sorted and deduplicated. If the requested size exceeds the corpus, all available keys are used with a warning.
 
@@ -131,6 +147,8 @@ cargo run --release --bin bench -- --tests lookup --sizes 1000 --keys lines --co
 | `NibbleOptUnchecked`| lookup                                            | get_unchecked on optimized trie          |
 | `DynTrie`    | insert, lookup, fwd, rev, memory                 | Auto-promoting PTR u8→u16→u32→u64       |
 | `DynTrieOpt`      | lookup, fwd, rev, optimize, memory               | DynTrie after optimize()           |
+| `CTree`           | insert, lookup, fwd, rev, memory                 | B+ tree, **fixed instantiation** of the unified generic. `CTree<u64,usize,u32,4,5>` (u64 keys, u32 ptrs, fanout 4); byte keys hashed to u64 for the SIMD `find_position` path. Type alias `FixedCTree<K,V,PTR,N,NP1> = CTree<K,...>`. |
+| `VarCTree`        | insert, lookup, fwd, rev, memory                 | B+ tree, **variable instantiation** of the same unified generic. `VarCTree<u8,usize,u32,4,5>` = `CTree<Box<[u8]>,usize,u32,4,5>` (binary-search path over `Box<[K]>` keys). Baseline against `CTree` for the SIMD-vs-binary-search delta. Byte keys stored directly (no hashing). |
 
 ## Structure Analysis
 

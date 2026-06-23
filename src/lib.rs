@@ -43,7 +43,7 @@
 
 mod simd;
 mod tiny_array;
-mod tiny_btree;
+pub mod tiny_btree;
 
 mod key_store;
 pub use key_store::{BufKeyStore, KeyStore, TrieKey, U64Key, VecKeyStore};
