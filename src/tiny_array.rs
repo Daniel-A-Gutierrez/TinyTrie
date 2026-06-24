@@ -147,6 +147,48 @@ where
         self.len = new_len;
     }
 
+    /// Reorder the initialized elements so that slot `i` holds what was
+    /// originally at slot `perm[i]` — i.e. `self[i] = old_self[perm[i]]`.
+    ///
+    /// `perm` must be a permutation of `0..len` (only its first `len` entries
+    /// are read). Used by the fixed-form B+ tree to sort an unsorted leaf/inode
+    /// in place before a split or rebalance: the caller computes a sorted index
+    /// permutation by key and applies it to BOTH the keys array and the parallel
+    /// values/ptrs array so they stay aligned.
+    ///
+    /// Implemented with cycle-following in-place slot swaps (`ptr::swap`), so it
+    /// moves (never copies) elements — no `T: Clone` bound, no double-drop. `T`
+    /// need not be `Copy`.
+    pub fn permute_in_place(&mut self, perm: &[usize]) {
+        let n = self.len as usize;
+        if n <= 1 {
+            return;
+        }
+        // Mutable working copy of the permutation; positions are marked settled
+        // by writing their own index back into them.
+        let mut p: [usize; N] = [0; N];
+        for i in 0..n {
+            p[i] = perm[i];
+            debug_assert!(perm[i] < n, "TinyArray::permute_in_place: perm out of range");
+        }
+        for i in 0..n {
+            let mut j = i;
+            while p[j] != i {
+                // SAFETY: slots j and p[j] are both < n, hence initialized.
+                unsafe {
+                    std::ptr::swap(
+                        self.slots[j].as_mut_ptr(),
+                        self.slots[p[j]].as_mut_ptr(),
+                    );
+                }
+                let next = p[j];
+                p[j] = j; // mark position j settled
+                j = next;
+            }
+            p[j] = j;
+        }
+    }
+
     /// Read element at `pos` without removing it or shifting.
     ///
     /// The slot is left in an uninitialized state. The caller must ensure

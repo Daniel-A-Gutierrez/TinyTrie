@@ -12,7 +12,7 @@ impl NibbleTrieBench {
     pub(crate) fn new() -> Self { Self { trie: NT::new() } }
 }
 
-impl Benchable for NibbleTrieBench {
+impl Benchable<Vec<u8>> for NibbleTrieBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::trie_new();
         for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
@@ -36,6 +36,7 @@ impl Benchable for NibbleTrieBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: trie_get(lookup),
         fwd_iter: trie_callback,
         rev_iter: trie_callback,
@@ -53,7 +54,7 @@ impl NibbleOptBench {
     pub(crate) fn new() -> Self { Self { trie: NT::new() } }
 }
 
-impl Benchable for NibbleOptBench {
+impl Benchable<Vec<u8>> for NibbleOptBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::trie_new();
         for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
@@ -87,6 +88,7 @@ impl Benchable for NibbleOptBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: trie_get(lookup),
         fwd_iter: trie_callback,
         rev_iter: trie_callback,
@@ -104,7 +106,7 @@ impl NibbleUncheckedBench {
     pub(crate) fn new() -> Self { Self { trie: NT::new() } }
 }
 
-impl Benchable for NibbleUncheckedBench {
+impl Benchable<Vec<u8>> for NibbleUncheckedBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::trie_new();
         for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
@@ -112,6 +114,7 @@ impl Benchable for NibbleUncheckedBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get_unchecked(hit),
         fwd_iter: none,
         rev_iter: none,
@@ -129,7 +132,7 @@ impl NibbleOptUncheckedBench {
     pub(crate) fn new() -> Self { Self { trie: NT::new() } }
 }
 
-impl Benchable for NibbleOptUncheckedBench {
+impl Benchable<Vec<u8>> for NibbleOptUncheckedBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::trie_new();
         for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
@@ -138,6 +141,7 @@ impl Benchable for NibbleOptUncheckedBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get_unchecked(hit),
         fwd_iter: none,
         rev_iter: none,

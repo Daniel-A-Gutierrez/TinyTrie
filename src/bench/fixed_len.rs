@@ -13,7 +13,7 @@ impl FixedLenBench {
     pub(crate) fn new() -> Self { Self { trie: FixedLenNibbleTrie::new(1) } }
 }
 
-impl Benchable for FixedLenBench {
+impl Benchable<Vec<u8>> for FixedLenBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         let max_len = max_key_len(keys);
         self.trie = FixedLenNibbleTrie::new(max_len);
@@ -58,6 +58,7 @@ impl Benchable for FixedLenBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get(truncated),
         fwd_iter: iter_kv,
         rev_iter: iter_kv,
@@ -75,7 +76,7 @@ impl FixedLenOptBench {
     pub(crate) fn new() -> Self { Self { trie: FixedLenNibbleTrie::new(1) } }
 }
 
-impl Benchable for FixedLenOptBench {
+impl Benchable<Vec<u8>> for FixedLenOptBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         let max_len = max_key_len(keys);
         self.trie = FixedLenNibbleTrie::new(max_len);
@@ -123,6 +124,7 @@ impl Benchable for FixedLenOptBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get(truncated),
         fwd_iter: iter_kv,
         rev_iter: iter_kv,

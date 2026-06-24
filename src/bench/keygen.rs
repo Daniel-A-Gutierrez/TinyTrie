@@ -2,6 +2,41 @@ use clap::ValueEnum;
 
 pub(crate) const SIZES: &[usize] = &[100, 10_000, 1_000_000];
 
+// ── NonZeroBytes ───────────────────────────────────────────────────────
+//
+/// Bytestring guaranteed to contain no `0x00` bytes — the insert invariant for
+/// null-terminator tries (BitTrie, PolyTrie), which reject embedded nulls and
+/// append their own terminator internally. The harness produces these only in
+/// key modes that never emit `0x00` (Sequential/Lines/Words), so a
+/// `Benchable<NonZeroBytes>` contestant skips null-byte modes by construction
+/// (no keys of this type exist there) — the skip is structural via `Bench::NonZero`,
+/// no runtime check. This also fixes the prior silent-drop: BitTrie was
+/// mis-declared, so it ran in Random/u64 modes and `insert` quietly dropped
+/// every `0x00`-containing key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NonZeroBytes(Vec<u8>);
+
+impl NonZeroBytes {
+    /// Construct from a bytestring, rejecting any containing `0x00`. The
+    /// `Option` keeps the no-`0x00` invariant provable; the bench keygen only
+    /// feeds text modes here, so this succeeds for the real key sets.
+    pub(crate) fn new(v: Vec<u8>) -> Option<Self> {
+        (!v.contains(&0)).then_some(Self(v))
+    }
+    #[inline] pub(crate) fn as_bytes(&self) -> &[u8] { &self.0 }
+    /// Owned bytes for `trie.insert(Vec<u8>, …)` (null-terminator tries store
+    /// `Vec<u8>` and append the terminator themselves).
+    #[inline] pub(crate) fn to_vec(&self) -> Vec<u8> { self.0.clone() }
+}
+
+impl std::ops::Deref for NonZeroBytes {
+    type Target = [u8];
+    #[inline] fn deref(&self) -> &[u8] { &self.0 }
+}
+impl std::borrow::Borrow<[u8]> for NonZeroBytes {
+    #[inline] fn borrow(&self) -> &[u8] { &self.0 }
+}
+
 pub(crate) fn string_keys(n: usize) -> Vec<Vec<u8>> {
     let w = format!("{}", n - 1).len();
     (0..n).map(|i| format!("key_{i:0>w$}").into_bytes()).collect()
@@ -19,11 +54,11 @@ pub(crate) fn random_keys(n: usize) -> Vec<Vec<u8>> {
     keys.into_iter().collect()
 }
 
-fn u64_to_key(v: u64) -> Vec<u8> {
-    v.to_be_bytes().to_vec()
-}
-
-pub(crate) fn random_u64_keys(n: usize) -> Vec<Vec<u8>> {
+/// Random unique `u64` keys, shuffled — the shared core of the fixed-width
+/// `RandomU64` mode, fed natively to `Benchable<u64>` contestants (the
+/// `Bench::U64` std structures + `CTreeFixed`). No byte-string projection: the
+/// byte/trie contestants skip fixed-width modes entirely.
+pub(crate) fn random_u64_keys_core(n: usize) -> Vec<u64> {
     use rand::Rng;
     let mut rng = rand::rng();
     let mut keys = std::collections::BTreeSet::new();
@@ -31,13 +66,45 @@ pub(crate) fn random_u64_keys(n: usize) -> Vec<Vec<u8>> {
         let v: u64 = rng.random();
         keys.insert(v);
     }
-    let mut keys: Vec<Vec<u8>> = keys.into_iter().map(u64_to_key).collect();
+    let mut keys: Vec<u64> = keys.into_iter().collect();
     rand::seq::SliceRandom::shuffle(&mut keys[..], &mut rng);
     keys
 }
 
-pub(crate) fn seq_u64_keys(n: usize) -> Vec<Vec<u8>> {
-    (0..n as u64).rev().map(u64_to_key).collect()
+/// Descending `0..n` as `u64` — the core of the fixed-width `SeqU64` mode.
+pub(crate) fn seq_u64_keys_core(n: usize) -> Vec<u64> {
+    (0..n as u64).rev().collect()
+}
+
+/// Typed `u64` keys for fixed-width modes. Only called when
+/// `KeyMode::is_fixed_width()` is true (the harness guards it); other modes
+/// are byte-string domains that the byte-keyed contestants handle directly.
+pub(crate) fn generate_keys_u64(mode: &KeyMode, n: usize) -> Vec<u64> {
+    match mode {
+        KeyMode::RandomU64 => random_u64_keys_core(n),
+        KeyMode::SeqU64 => seq_u64_keys_core(n),
+        _ => Vec::new(),
+    }
+}
+
+/// Non-zero bytestring keys for `Benchable<NonZeroBytes>` contestants
+/// (null-terminator tries: BitTrie, PolyTrie). Returns empty for null-byte
+/// modes (`Random`/`RandomU64`/`SeqU64`), where no `0x00`-free key set exists —
+/// those contestants skip such modes by construction (no keys to build on).
+/// For text modes (`Sequential`/`Lines`/`Words`) every key is `0x00`-free, so
+/// the `filter_map` keeps them all.
+pub(crate) fn generate_keys_nonzero(
+    mode: &KeyMode,
+    n: usize,
+    corpus: Option<&[Vec<u8>]>,
+) -> Vec<NonZeroBytes> {
+    if mode.may_contain_null_bytes() {
+        return Vec::new();
+    }
+    generate_keys(mode, n, corpus)
+        .into_iter()
+        .filter_map(NonZeroBytes::new)
+        .collect()
 }
 
 pub(crate) fn load_corpus_lines(path: &str) -> Vec<Vec<u8>> {
@@ -46,14 +113,6 @@ pub(crate) fn load_corpus_lines(path: &str) -> Vec<Vec<u8>> {
 
 pub(crate) fn load_corpus_words(path: &str) -> Vec<Vec<u8>> {
     tiny_trie::load_corpus_words(path)
-}
-
-/// Key domain: describes what kind of keys a structure can accept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KeyDomain {
-    Any,      // Compatible with all key modes
-    Strings,  // No embedded null bytes (null terminator only at end)
-    Variable, // Variable-length keys only — skip fixed-width u64 modes
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -121,6 +180,12 @@ pub(crate) fn resolve_sizes(arg: Option<&str>) -> Vec<usize> {
     filtered
 }
 
+/// Byte-string keys for the variable-length modes (`Sequential`/`Random`/
+/// `Lines`/`Words`). The harness only calls this for non-u64 modes — the byte
+/// and trie contestants (`Bench::Bytes`/`Bench::NonZero`) skip fixed-width
+/// (`RandomU64`/`SeqU64`) modes entirely, so no byte-string projection of `u64`
+/// keys is produced. (The `_ => Vec::new()` arms keep it callable from
+/// `generate_keys_nonzero` without panicking if it ever sees a u64 mode.)
 pub(crate) fn generate_keys(mode: &KeyMode, n: usize, corpus: Option<&[Vec<u8>]>) -> Vec<Vec<u8>> {
     match mode {
         KeyMode::Sequential => string_keys(n),
@@ -129,7 +194,6 @@ pub(crate) fn generate_keys(mode: &KeyMode, n: usize, corpus: Option<&[Vec<u8>]>
             let all = corpus.expect("corpus keys required for words/lines mode");
             all[..n].to_vec()
         }
-        KeyMode::RandomU64 => random_u64_keys(n),
-        KeyMode::SeqU64 => seq_u64_keys(n),
+        _ => Vec::new(),
     }
 }

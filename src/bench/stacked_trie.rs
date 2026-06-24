@@ -12,7 +12,7 @@ impl StackedTrie2Bench {
     pub(crate) fn new() -> Self { Self { trie: NT2::new() } }
 }
 
-impl Benchable for StackedTrie2Bench {
+impl Benchable<Vec<u8>> for StackedTrie2Bench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         let mut base = NT::trie_new();
         for (i, k) in keys.iter().enumerate() { base.trie_insert(k.clone(), i); }
@@ -43,6 +43,7 @@ impl Benchable for StackedTrie2Bench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get(lookup),
         fwd_iter: iter_kv_no_current,
         rev_iter: iter_kv_no_current,
@@ -58,7 +59,7 @@ impl StackedTrie4Bench {
     pub(crate) fn new() -> Self { Self { trie: NT4::new() } }
 }
 
-impl Benchable for StackedTrie4Bench {
+impl Benchable<Vec<u8>> for StackedTrie4Bench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         let mut base = NT::trie_new();
         for (i, k) in keys.iter().enumerate() { base.trie_insert(k.clone(), i); }
@@ -89,6 +90,7 @@ impl Benchable for StackedTrie4Bench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get(lookup),
         fwd_iter: iter_kv_no_current,
         rev_iter: iter_kv_no_current,

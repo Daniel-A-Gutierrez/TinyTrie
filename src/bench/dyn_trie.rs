@@ -12,7 +12,7 @@ impl DynTrieBench {
     pub(crate) fn new() -> Self { Self { trie: DynTrie::new() } }
 }
 
-impl Benchable for DynTrieBench {
+impl Benchable<Vec<u8>> for DynTrieBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = DynTrie::new();
         for (i, k) in keys.iter().enumerate() { self.trie.insert(k.clone(), i).unwrap(); }
@@ -36,6 +36,7 @@ impl Benchable for DynTrieBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get(lookup),
         fwd_iter: dyn_callback,
         rev_iter: dyn_callback,
@@ -52,7 +53,7 @@ impl DynTrieOptBench {
     pub(crate) fn new() -> Self { Self { trie: DynTrie::new() } }
 }
 
-impl Benchable for DynTrieOptBench {
+impl Benchable<Vec<u8>> for DynTrieOptBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = DynTrie::new();
         for (i, k) in keys.iter().enumerate() { self.trie.insert(k.clone(), i).unwrap(); }
@@ -79,6 +80,7 @@ impl Benchable for DynTrieOptBench {
 
     bench_query_methods! {
         field: trie,
+        ctx: BenchContext,
         lookup: get(lookup),
         fwd_iter: dyn_callback,
         rev_iter: dyn_callback,

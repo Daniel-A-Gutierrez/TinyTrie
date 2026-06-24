@@ -180,7 +180,6 @@ where
 }
 
 // --- Fixed form: K: FixedLenKey — SIMD lower + upper bounds -----------------
-
 impl<K: FixedLenKey> private::Sealed for K {}
 
 impl<K: FixedLenKey> StoredKey for K {
