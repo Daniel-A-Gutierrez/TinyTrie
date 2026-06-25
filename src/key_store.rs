@@ -7,6 +7,17 @@
 //! - [`BufKeyStore`] — flat buffer storage for `Vec<u8>` keys (cache-friendly,
 //!   single contiguous allocation for all key bytes).
 //! - [`VecKeyStore`] — `Vec<K>` storage for any `TrieKey` type (e.g. `String`).
+//!
+//! [`ByteKey`] is a simpler trait for key types that can be converted to and
+//! from `&[u8]` while preserving ordering. It is used by [`NibbleTrie`] and
+//! other radix-trie structures that manage their own key storage internally.
+//!
+//! [`NonNullKey`] is a marker trait for [`ByteKey`] types whose byte
+//! representation is guaranteed to contain no `0x00` bytes. Tries that use
+//! null-byte sentinels (e.g. [`PolyTrie`]) require `K: NonNullKey`.
+//!
+//! [`NibbleTrie`]: crate::NibbleTrie
+//! [`PolyTrie`]: crate::PolyTrie
 
 // ---------------------------------------------------------------------------
 // TrieKey
@@ -162,6 +173,143 @@ impl<K: TrieKey> KeyStore<K> for VecKeyStore<K> {
 }
 
 // ---------------------------------------------------------------------------
+// ByteKey — byte-representation trait for generic trie keys
+// ---------------------------------------------------------------------------
+
+/// A key type that can be converted to and from a byte slice while preserving
+/// ordering.
+///
+/// Implementations must ensure that byte-order comparison matches the key
+/// type's natural ordering: for all `a`, `b`, `a.as_bytes().cmp(b.as_bytes())`
+/// must equal `a.cmp(b)`.
+///
+/// The [`from_bytes`] reconstruction is only ever called with byte sequences
+/// originally produced by [`as_bytes`], so implementations may assume valid
+/// input.
+///
+/// [`from_bytes`]: ByteKey::from_bytes
+/// [`as_bytes`]: ByteKey::as_bytes
+pub trait ByteKey {
+    /// Return the byte representation of this key.
+    fn as_bytes(&self) -> &[u8];
+
+    /// Reconstruct a key from its byte representation.
+    ///
+    /// `from_bytes(k.as_bytes())` must produce a value equivalent to `k`.
+    fn from_bytes(bytes: &[u8]) -> Self;
+}
+
+impl ByteKey for Vec<u8> {
+    fn as_bytes(&self) -> &[u8] {
+        self
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        bytes.to_vec()
+    }
+}
+
+impl ByteKey for String {
+    fn as_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        // Safe: bytes were originally produced by String::as_bytes (valid UTF-8).
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NonNullKey — marker trait for keys that never contain 0x00 bytes
+// ---------------------------------------------------------------------------
+
+/// Marker trait for [`ByteKey`] types whose byte representation is guaranteed
+/// to contain no `0x00` bytes.
+///
+/// Tries that use a null-byte sentinel internally (e.g. [`PolyTrie`]) require
+/// `K: NonNullKey` so the compiler rejects key types that might contain `0x00`.
+///
+/// [`PolyTrie`]: crate::PolyTrie
+pub trait NonNullKey: ByteKey {}
+
+impl NonNullKey for NonZeroBytes {}
+
+// ---------------------------------------------------------------------------
+// NonZeroBytes — byte string guaranteed to contain no 0x00 bytes
+// ---------------------------------------------------------------------------
+
+/// A byte string guaranteed to contain no `0x00` bytes.
+///
+/// This is the key type for tries that use a null-byte sentinel internally
+/// (e.g. [`PolyTrie`]). The [`NonNullKey`] marker trait is implemented for
+/// this type, enabling compile-time enforcement of the no-embedded-null
+/// invariant.
+///
+/// [`PolyTrie`]: crate::PolyTrie
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NonZeroBytes(Vec<u8>);
+
+impl NonZeroBytes {
+    /// Construct from a byte slice, returning `None` if it contains `0x00`.
+    pub fn new(v: Vec<u8>) -> Option<Self> {
+        (!v.contains(&0)).then_some(Self(v))
+    }
+
+    /// Construct without checking for `0x00`.
+    ///
+    /// # Safety
+    /// The byte string must not contain `0x00`.
+    pub unsafe fn new_unchecked(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+
+    /// Return the byte representation.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Return the owned byte vector.
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Clone the inner byte vector.
+    ///
+    /// Provided for compatibility with code that needs an owned `Vec<u8>`
+    /// from a borrowed `NonZeroBytes` (e.g. tries that append a null
+    /// terminator internally).
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+}
+
+impl ByteKey for NonZeroBytes {
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        // Safe: from_bytes is only called with bytes originally produced by
+        // as_bytes, which for NonZeroBytes contains no 0x00.
+        Self(bytes.to_vec())
+    }
+}
+
+impl std::ops::Deref for NonZeroBytes {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for NonZeroBytes {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TrieKey implementations
 // ---------------------------------------------------------------------------
 
@@ -224,6 +372,16 @@ impl TrieKey for U64Key {
     type Store = VecKeyStore<U64Key>;
     fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl ByteKey for U64Key {
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        let arr: [u8; 8] = bytes.try_into().expect("U64Key requires exactly 8 bytes");
+        U64Key(arr)
     }
 }
 

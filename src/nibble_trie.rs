@@ -33,8 +33,8 @@
 //! of another node). The `occupancy[v]` mask determines whether a slot is
 //! owned by vnode v, regardless of the value in `children[nib]`.
 
-use crate::TinyTrieMap;
-use std::{fmt, simd::{Simd, cmp::SimdPartialEq}};
+use crate::{ByteKey, TinyTrieMap};
+use std::{fmt, marker::PhantomData, simd::{Simd, cmp::SimdPartialEq}};
 
 // ---------------------------------------------------------------------------
 // TrieIndex trait
@@ -224,6 +224,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> Node<PTR, LEN, STAK> {
 
     /// Clear the occupancy bit for nibble slot `nib` in vnode `v`.
     #[inline]
+    #[allow(dead_code)]
     fn clear_occupied(&mut self, nib: usize, v: usize) {
         debug_assert!(nib < 16);
         debug_assert!(v < STAK);
@@ -390,9 +391,9 @@ impl<PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> fmt::Debug for Node<PTR,
 
 /// Entry on the parent stack during optimize stacking decisions.
 struct StackEntry {
-    old_phys: usize,
+    _old_phys: usize,
     new_phys_idx: usize,
-    vnode: usize,
+    _vnode: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -400,11 +401,15 @@ struct StackEntry {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct NibbleTrie<T, PTR: TrieIndex = u32, LEN: TrieIndex = u16, const STAK: usize = 1> {
+pub struct NibbleTrie<K, T, PTR: TrieIndex = u32, LEN: TrieIndex = u16, const STAK: usize = 1>
+where
+    K: ByteKey,
+{
     pub arena: Vec<Node<PTR, LEN, STAK>>,
     pub buf: Vec<u8>,                // all keys concatenated (no null terminators)
     pub index: Vec<(usize, LEN)>,    // (offset into buf, len) per key — offset is usize, len is compact
     pub values: Vec<T>,              // values[i] ↔ index[i]
+    _key: PhantomData<K>,
 }
 
 // ---------------------------------------------------------------------------
@@ -468,36 +473,6 @@ fn simd_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let len = a.len();
-    let mut i = 0;
-    while i + 16 <= len {
-        let va = Simd::<u8, 16>::from_slice(unsafe { a.get_unchecked(i..i + 16) });
-        let vb = Simd::<u8, 16>::from_slice(unsafe { b.get_unchecked(i..i + 16) });
-        if va.simd_ne(vb).any() {
-            return false;
-        }
-        i += 16;
-    }
-    // Scalar tail
-    while i < len {
-        if unsafe { *a.get_unchecked(i) != *b.get_unchecked(i) } {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-/// Unchecked version of `simd_eq` — skips the length check and uses unchecked
-/// indexing throughout. The caller must guarantee that `a` and `b` have the
-/// same length.
-///
-/// # Safety
-/// `a` and `b` must have the same length. All SIMD and scalar accesses must
-/// be in bounds (guaranteed if lengths are equal and non-empty).
-#[inline]
-unsafe fn simd_eq_unchecked(a: &[u8], b: &[u8]) -> bool {
-    debug_assert_eq!(a.len(), b.len());
     let len = a.len();
     let mut i = 0;
     while i + 16 <= len {
@@ -629,7 +604,7 @@ fn nibble_count(key: &[u8]) -> usize {
 // NibbleTrie methods (generic over STAK)
 // ---------------------------------------------------------------------------
 
-impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LEN, STAK> {
+impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<K, T, PTR, LEN, STAK> {
     /// Return the key slice for `key_index`.
     #[inline]
     fn key_slice(&self, key_index: PTR) -> &[u8] {
@@ -639,17 +614,13 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
 
     /// Unchecked version of `key_slice` — skips bounds checks on index and buf.
     #[inline]
-    unsafe fn key_slice_unchecked(&self, key_index: PTR) -> &[u8] {
-        let (off, len) = unsafe { *self.index.get_unchecked(key_index.as_usize()) };
-        unsafe { self.buf.get_unchecked(off..off + len.as_usize()) }
-    }
-
     pub fn new() -> Self {
         NibbleTrie {
             arena: Vec::new(),
             buf: vec![0],           // buf[0] = dummy (unused byte)
             index: vec![(0, LEN::zero())],   // index[0] = dummy entry
             values: Vec::new(),
+            _key: PhantomData,
         }
     }
 
@@ -752,18 +723,18 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
     // Iteration
     // -----------------------------------------------------------------------
 
-    pub fn iter(&self) -> NibbleIter<'_, T, PTR, LEN, STAK> {
+    pub fn iter(&self) -> NibbleIter<'_, K, T, PTR, LEN, STAK> {
         NibbleIter::new(self)
     }
 
-    pub fn iter_last(&self) -> NibbleIter<'_, T, PTR, LEN, STAK> {
+    pub fn iter_last(&self) -> NibbleIter<'_, K, T, PTR, LEN, STAK> {
         NibbleIter::new_last(self)
     }
 
-    pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
+    pub fn into_keys_values(self) -> (Vec<K>, Vec<T>) {
         let buf = self.buf;
-        let keys: Vec<Vec<u8>> = self.index.into_iter().skip(1).map(|(off, len)| {
-            buf[off..off + len.as_usize()].to_vec()
+        let keys: Vec<K> = self.index.into_iter().skip(1).map(|(off, len)| {
+            K::from_bytes(&buf[off..off + len.as_usize()])
         }).collect();
         (keys, self.values)
     }
@@ -1012,9 +983,9 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
         let new_pnode_has_terminal = new_arena[new_phys].terminal != 0;
         if is_last_vnode && !new_pnode_has_terminal {
             let stack_entry = StackEntry {
-                old_phys,
+                _old_phys: old_phys,
                 new_phys_idx: new_phys,
-                vnode: assigned_vnode,
+                _vnode: assigned_vnode,
             };
             parent_stack.push(stack_entry);
         }
@@ -1077,7 +1048,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
     }
 }
 
-impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> Default for NibbleTrie<T, PTR, LEN, STAK> {
+impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> Default for NibbleTrie<K, T, PTR, LEN, STAK> {
     fn default() -> Self { Self::new() }
 }
 
@@ -1085,32 +1056,33 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> Default for NibbleTri
 // NibbleTrie implementation (STAK=1, insert-compatible)
 // ---------------------------------------------------------------------------
 
-impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LEN, STAK> {
+impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<K, T, PTR, LEN, STAK> {
     // -----------------------------------------------------------------------
     // Insertion
     // -----------------------------------------------------------------------
 
-    pub fn insert(&mut self, key: Vec<u8>, value: T) -> Result<usize, ()> {
+    pub fn insert(&mut self, key: K, value: T) -> Result<usize, ()> {
+        let key_bytes = key.as_bytes();
         // Overflow checks: encoded addresses must fit in PTR, and key indices
         // must not produce the sentinel value.
         if self.arena.len() >= PTR::max_value() / STAK || self.index.len() >= PTR::max_value() {
             return Err(());
         }
-        if key.len() * 2 > LEN::max_value() {
+        if key_bytes.len() * 2 > LEN::max_value() {
             return Err(());
         }
 
         let new_index = PTR::from_usize(self.index.len());
-        let key_len = LEN::from_usize(key.len());
+        let key_len = LEN::from_usize(key_bytes.len());
         let offset = self.buf.len() as usize;
-        self.buf.extend_from_slice(&key);
+        self.buf.extend_from_slice(key_bytes);
         self.index.push((offset, key_len));
         self.values.push(value);
 
-        let max_nib = key.len() * 2;
+        let max_nib = key_bytes.len() * 2;
 
         if self.arena.is_empty() {
-            return Ok(self.insert_into_empty_trie(&key, new_index, offset, max_nib));
+            return Ok(self.insert_into_empty_trie(key_bytes, new_index, offset, max_nib));
         }
 
         let mut phys_idx: usize = 0;
@@ -1124,15 +1096,15 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
             let ref_key = &self.buf[off..off + ref_len.as_usize()];
             let prefix_len = node.prefix_len[vnode_idx].as_usize();
 
-            match simd_check_prefix::<8>(&key, ref_key, confirmed, prefix_len) {
+            match simd_check_prefix::<8>(key_bytes, ref_key, confirmed, prefix_len) {
                 PrefixCheck::Diverges(diverge) => {
                     return Ok(self.split_node_before_prefix(
-                        phys_idx, vnode_idx, diverge, new_index, offset, &key, max_nib,
+                        phys_idx, vnode_idx, diverge, new_index, offset, key_bytes, max_nib,
                     ));
                 }
                 PrefixCheck::Matches => {
                     if max_nib == prefix_len {
-                        if key.len() == ref_key.len() {
+                        if key_bytes.len() == ref_key.len() {
                             self.rollback_last_insert();
                             return Err(());
                         }
@@ -1142,7 +1114,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
                     }
 
                     confirmed = prefix_len + 1;
-                    let nib = key_nibble_at(&key, prefix_len) as usize;
+                    let nib = key_nibble_at(key_bytes, prefix_len) as usize;
                     if !node.is_occupied(nib, vnode_idx) {
                         // Empty slot — new key diverges here
                         self.arena[phys_idx].set_leaf_child(nib, vnode_idx, new_index);
@@ -1152,7 +1124,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
 
                     if node.is_leaf(nib, vnode_idx) {
                         return self.split_leaf_child(
-                            nib, phys_idx, vnode_idx, slot, new_index, offset, &key, max_nib, confirmed,
+                            nib, phys_idx, vnode_idx, slot, new_index, offset, key_bytes, max_nib, confirmed,
                         );
                     }
 
@@ -1290,23 +1262,24 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
 // PTR width conversions (promote/demote), generic over STAK
 // ---------------------------------------------------------------------------
 
-impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LEN, STAK> {
+impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<K, T, PTR, LEN, STAK> {
     /// Promote the arena index type to a wider PTR, preserving STAK.
     /// All child addresses and leaf indices are widened via `NewPTR::from_usize`.
     /// Since STAK is unchanged, no address remapping is needed.
-    pub fn promote<NewPTR: TrieIndex>(self) -> NibbleTrie<T, NewPTR, LEN, STAK> {
+    pub fn promote<NewPTR: TrieIndex>(self) -> NibbleTrie<K, T, NewPTR, LEN, STAK> {
         let arena = self.arena.into_iter().map(|node| node.promote()).collect();
         NibbleTrie {
             arena,
             buf: self.buf,
             index: self.index,
             values: self.values,
+            _key: PhantomData,
         }
     }
 
     /// Demote the arena index type to a narrower PTR, preserving STAK.
     /// Returns `Err(self)` if any address or index doesn't fit in the narrower type.
-    pub fn demote<NewPTR: TrieIndex>(self) -> Result<NibbleTrie<T, NewPTR, LEN, STAK>, Self> {
+    pub fn demote<NewPTR: TrieIndex>(self) -> Result<NibbleTrie<K, T, NewPTR, LEN, STAK>, Self> {
         if self.arena.len() * STAK > NewPTR::max_value() || self.index.len() > NewPTR::max_value() {
             return Err(self);
         }
@@ -1327,6 +1300,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
             buf: self.buf,
             index: self.index,
             values: self.values,
+            _key: PhantomData,
         })
     }
 }
@@ -1339,14 +1313,14 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleTrie<T, PTR, LE
 /// Sentinel nib value meaning "positioned at the terminal value of this node."
 const TERMINAL_NIB: usize = 16;
 
-pub struct NibbleIter<'a, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize = 1> {
-    trie: &'a NibbleTrie<T, PTR, LEN, STAK>,
+pub struct NibbleIter<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize = 1> {
+    trie: &'a NibbleTrie<K, T, PTR, LEN, STAK>,
     /// Stack of (encoded_addr, occupancy_mask, nibble_position, vnode_idx) tuples.
     stack: Vec<(PTR, u16, usize, usize)>,
 }
 
-impl<'a, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleIter<'a, T, PTR, LEN, STAK> {
-    fn new(trie: &'a NibbleTrie<T, PTR, LEN, STAK>) -> Self {
+impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleIter<'a, K, T, PTR, LEN, STAK> {
+    fn new(trie: &'a NibbleTrie<K, T, PTR, LEN, STAK>) -> Self {
         if trie.arena.is_empty() {
             return NibbleIter { trie, stack: Vec::new() };
         }
@@ -1355,7 +1329,7 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleIter<'a, T,
         NibbleIter { trie, stack: vec![(PTR::zero(), mask, nib, 0)] }
     }
 
-    fn new_last(trie: &'a NibbleTrie<T, PTR, LEN, STAK>) -> Self {
+    fn new_last(trie: &'a NibbleTrie<K, T, PTR, LEN, STAK>) -> Self {
         if trie.arena.is_empty() {
             return NibbleIter { trie, stack: Vec::new() };
         }
@@ -1659,7 +1633,7 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex, const STAK: usize> NibbleIter<'a, T,
 // TinyTrieMap implementations
 // ---------------------------------------------------------------------------
 
-impl TinyTrieMap for NibbleTrie<usize> {
+impl TinyTrieMap for NibbleTrie<Vec<u8>, usize> {
     fn trie_new() -> Self { Self::new() }
     fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
     fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
@@ -1687,7 +1661,7 @@ impl TinyTrieMap for NibbleTrie<usize> {
     fn trie_optimize(&mut self) { self.optimize(); }
 }
 
-impl TinyTrieMap for NibbleTrie<usize, u32, u32, 1> {
+impl TinyTrieMap for NibbleTrie<Vec<u8>, usize, u32, u32, 1> {
     fn trie_new() -> Self { Self::new() }
     fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
     fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }

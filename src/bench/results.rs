@@ -1,22 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use super::{COL, NAME_COL, KeyMode};
-
-// ── BenchResult ──────────────────────────────────────────────────────
-
-pub(crate) struct BenchResult {
-    pub iters: u64,
-    pub elapsed: Duration,
-}
-
-impl BenchResult {
-    pub fn rate(&self, ops_per_iter: u64) -> f64 {
-        (self.iters * ops_per_iter) as f64 / self.elapsed.as_secs_f64()
-    }
-}
 
 // ── Formatting ──────────────────────────────────────────────────────
 
@@ -132,7 +118,7 @@ pub(crate) fn save_results(data: &ResultsFile, json_path: &str, md_path: &str) {
         md.push('\n');
         for (name, vals) in entries {
             md.push_str(&format!("{:<NAME_COL$}", name));
-            for (i, &sz) in all_sizes.iter().enumerate() {
+            for (_i, &sz) in all_sizes.iter().enumerate() {
                 if let Some(pos) = data.sizes.iter().position(|&s| s == sz) {
                     if pos < vals.len() {
                         md.push_str(&format!("{:>COL$}", fmt(vals[pos])));

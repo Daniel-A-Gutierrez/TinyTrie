@@ -68,7 +68,7 @@ struct StatsReport {
     stak_total_absorbed: usize,
 }
 
-fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<usize, PTR, LEN>) -> StatsReport {
+fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usize, PTR, LEN>) -> StatsReport {
     let arena = &trie.arena;
     let total_nodes = arena.len();
     let key_count = trie.len();
@@ -313,7 +313,7 @@ fn print_report(size: usize, mode: &str, report: &StatsReport) {
     println!();
 }
 
-fn print_memory_breakdown<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<usize, PTR, LEN>, n: usize) {
+fn print_memory_breakdown<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usize, PTR, LEN>, n: usize) {
     let node_size = std::mem::size_of::<Node<PTR, LEN>>();
     let arena_nodes = trie.arena.len();
     let arena_cap = trie.arena.capacity();
@@ -389,7 +389,7 @@ fn main() {
     };
 
     let n = keys.len();
-    let mut trie: NibbleTrie<usize, u32, u32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, usize, u32, u32> = NibbleTrie::new();
     for (i, key) in keys.into_iter().enumerate() {
         trie.insert(key, i).unwrap();
     }

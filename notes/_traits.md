@@ -1,154 +1,184 @@
-# Benchmark Trait Structure
+# Trait Architecture
 
-## Overview
+Two independent trait systems serve different purposes: **ByteKey** for radix-trie
+key genericity, and **CTree's trait chain** for B+ tree SIMD dispatch. The bench
+harness has its own layer on top.
 
-The benchmark harness uses a layered design that keeps contestant operations
-monomorphized per key type while still running heterogeneous structures side-by-
-side.
+---
 
-## Core Types
+## ByteKey System (`key_store.rs`)
+
+For radix tries (NibbleTrie, NibTrie, etc.) that store keys as byte slices internally
+but want type-safe insert/consume at the API boundary.
+
+### Traits
+
+| Trait | Purpose | Methods |
+|-------|---------|---------|
+| `ByteKey` | Convert to/from `&[u8]` preserving ordering | `as_bytes(&self) -> &[u8]`, `from_bytes(&[u8]) -> Self` |
+| `NonNullKey : ByteKey` | Marker: byte representation contains no `0x00` | *(none)* |
+
+### Implementations
+
+| Type | `ByteKey` | `NonNullKey` |
+|------|-----------|---------------|
+| `Vec<u8>` | ✅ identity | — |
+| `String` | ✅ UTF-8 bytes | — |
+| `U64Key` | ✅ big-endian 8 bytes | — |
+| `NonZeroBytes` | ✅ delegate to inner `Vec<u8>` | ✅ guaranteed no `0x00` |
+
+### Usage
+
+- `NibbleTrie<K, T, PTR, LEN, STAK>` where `K: ByteKey` — insert takes `K`,
+  `get` takes `&[u8]`, `into_keys_values` returns `Vec<K>`
+- `NonNullKey` will be required by `PolyTrie<K: NonNullKey>` (not yet applied)
+- Other tries (BitTrie, NibTrie, FixedLenNibbleTrie) still use `Vec<u8>` directly;
+  can adopt `ByteKey` later
+
+### `NonZeroBytes`
+
+Moved from bench-only (`bench/keygen.rs`) to public API (`key_store.rs`). A `Vec<u8>`
+wrapper guaranteed to contain no `0x00`. Constructed via `NonZeroBytes::new(v)` which
+returns `None` if `0x00` is present, or `unsafe new_unchecked(v)`.
+
+---
+
+## CTree Trait System (`tiny_btree.rs`)
+
+For the B+ tree's SIMD-accelerated node search. Two dispatch paths branch on whether
+keys are fixed-width or variable-length.
+
+### Traits
+
+| Trait | Purpose | Key bound |
+|-------|---------|-----------|
+| `FixedLenKey` | SIMD `find_position`/`find_upper_bound` over fixed-width arrays | `Copy + Eq + Ord + Sized` |
+| `TreeKey` | Map user key → stored form + lookup needle | `Ord + Clone` |
+| `Preview<P>` | Extract fixed-width preview from a key for SIMD pre-filter | — |
+| `SearchStrategy<P> : TreeKey` | Static dispatch: fixed path or variable path | inherits `TreeKey` |
+| `StoredKey` (sealed) | Compare stored key vs borrowed needle | `Ord + Clone`, sealed |
+| `NoPreview` | ZST marker for fixed-key trees (no preview array) | struct, not trait |
+| `TrieIndex` | Arena index type (`u8`/`u16`/`u32`/`u64`) | `Copy + Clone + …` |
+
+### Composition graph
+
+```
+FixedLenKey ──┬──→ TreeKey (blanket: T: FixedLenKey)
+               ├──→ Preview<NoPreview> (blanket: T: FixedLenKey)
+               ├──→ StoredKey (fixed: K: FixedLenKey)
+               ├──→ StoredKey (variable: K: FixedLenKey → Box<[K]>)
+               │
+               │   ┌── Fixed path ──────────────────────────────────┐
+               ├──→ SearchStrategy<NoPreview> (K: FixedLenKey)        │ SIMD on key array
+               │   │   P = NoPreview, previews = 0 bytes              │ directly
+               │   └──────────────────────────────────────────────────┘
+               │
+TreeKey ───────┬──→ Preview<P> (specific: Vec<u8>, Box<[u8]>, [u8])
+               │   P ∈ {u8, u16, u32, u64}
+               │
+               └──→ SearchStrategy<P> (K: TreeKey + Preview<P>, P: FixedLenKey,
+                     K::Stored: StoredKey, K::Needle: Preview<P>)
+                   │   ┌── Variable path ──────────────────────────────┐
+                   │   │   P: FixedLenKey, preview array present     │ SIMD preview
+                   │   │   then scalar StoredKey::cmp_key on collision │ then fallback
+                   │   └──────────────────────────────────────────────┘
+```
+
+### Key type → trait satisfaction
+
+| Key type | Fixed path (P=NoPreview) | Variable path (P=u64) |
+|----------|------------------------|------------------------|
+| `u64` | ✅ all blankets | — |
+| `Vec<u8>` | — | ✅ specific impls |
+| `Box<[u8]>` | — | ✅ specific impls |
+
+### CTree bounds
+
+```rust
+CTree<K, V, PTR, N, NP1, P = NoPreview>
+where
+    K: TreeKey + Preview<P> + SearchStrategy<P>,
+    K::Stored: StoredKey,
+    PTR: TrieIndex,
+    V: Sized,
+    P: Copy,
+```
+
+### Type aliases
+
+```rust
+type FixedCTree<K, V, PTR, N, NP1> = CTree<K, V, PTR, N, NP1, NoPreview>;
+type VarCTree<K, V, PTR, N, NP1, P> = CTree<K, V, PTR, N, NP1, P>;
+```
+
+### Bench adapter
+
+```rust
+trait CTreeBenchKey: TreeKey + Clone + Ord + 'static {
+    type Preview: Copy + Eq + Ord;
+    const DEFAULT_PREVIEW: Self::Preview;
+}
+u64      → Preview = NoPreview    // fixed path
+Vec<u8>  → Preview = u64         // variable path
+```
+
+Produces: `CTreeBench` (varlen), `CTreeOptBench`, `CTreeFixedBench` (u64 SIMD),
+`CTreeFixedOptBench`. Registered as two contestants (`CTree` + `CTreeOpt`) that
+carry both bytes and u64 variants; `variant_for(mode)` dispatches by key mode.
+
+---
+
+## Bench Harness Layer (`bench/mod.rs`)
 
 ### `Benchable<K>`
 
-Every contestant implements this trait for its *native* key type `K` (`Vec<u8>`,
-`NonZeroBytes`, or `u64`).  The trait methods each return `Option<()>` (or
-`Option<f64>` for memory) so a contestant can signal “unsupported” for a
-given test.
+Per-contestant trait, generic over native key type `K`. Returns `Option` so
+contestants can skip unsupported test modes.
 
-| Method | Purpose |
-|--------|---------|
-| `build(&mut self, keys: &[K], ctx: &BenchCtx<K>)` | Populate internal state once per size |
-| `bench_insert` | Build a fresh tree from scratch |
-| `bench_lookup` | Query against `ctx.lookup_keys` |
-| `bench_fwd_iter` / `bench_rev_iter` | Range iteration |
-| `bench_fwd_idx` / `bench_rev_idx` | Index-only iteration |
-| `bench_optimize` | Run structure-specific optimize pass |
-| `bench_memory` | Bytes-per-key via `read_allocated()` |
-| `lookup_ops(&self, ctx) -> usize` | Override op count (default = `lookup_keys.len()`) |
+### `Contestant` + `KeyVariant`
+
+```rust
+#[derive(Clone, Copy)]
+enum KeyVariant { Bytes, NonZero, U64 }
+
+struct Contestant {
+    name: &'static str,
+    max_size: Option<usize>,
+    bytes: Option<Box<dyn Benchable<Vec<u8>>>>>,
+    nonzero: Option<Box<dyn Benchable<NonZeroBytes>>>,
+    u64: Option<Box<dyn Benchable<u64>>>,
+}
+```
+
+Each contestant carries up to three `Benchable<K>` variants (one per key type).
+`variant_for(mode)` selects the appropriate one for the current key mode — e.g.
+`CTree` carries both `bytes` (Vec<u8> variable-length path) and `u64` (fixed SIMD
+path). Multi-key contestants like `BTreeMap`, `HashMap`, etc. merge their former
+`*U64` aliases into one entry.
 
 ### `BenchCtx<K>`
 
-Shared lookup sets, built once per size and borrowed by contestants.  Contains
-four key slices:
+Shared lookup sets built once per size: `lookup_keys` (hit+miss), `hit_keys`
+(unchecked), `fl_lookup_keys` (truncated), `lookup_keys_null` (null-terminated).
 
-- `lookup_keys` — hit+miss interleaved (used by most contestants)
-- `lookup_keys_null` — same keys with a trailing `0x00` (for null-terminator tries)
-- `fl_lookup_keys` — truncated to ≤16 bytes (for `FixedLenBench`)
-- `hit_keys` — only keys known to exist (for unchecked lookup benches)
+### `CTreeKey` adapter
 
-Three type aliases exist: `BenchContext = BenchCtx<Vec<u8>>`,
-`BenchContextNz = BenchCtx<NonZeroBytes>`, and the raw `BenchCtx<u64>`.
+Bench-side trait mapping harness key `K` to CTree's stored form. Bridges
+`Benchable<K>` to CTree's `TreeKey`/`StoredKey` system. Now superseded by
+`CTreeBenchKey` which uses the newer `Preview<P>` trait system.
 
-### `Bench` enum
+---
 
-```rust
-enum Bench {
-    Bytes(Box<dyn Benchable<Vec<u8>>>),
-    NonZero(Box<dyn Benchable<NonZeroBytes>>),
-    U64(Box<dyn Benchable<u64>>),
-}
-```
+## Relationship between the two systems
 
-Only the *contestant type* is erased; `K` stays concrete.  This means a
-`CTree<u64>` bench still inlines its SIMD `find_position` — the `dyn` vtable is
-for `CTreeFixedBench`, not for `u64`.
+The **ByteKey** and **CTree trait** systems are **independent**:
 
-`Bench::skip_for(mode)` filters contestants structurally:
-- `Bytes` → skips fixed-width `u64` modes
-- `NonZero` → skips modes that may emit `0x00`
-- `U64` → skips non-`u64` modes
+- `ByteKey` provides `as_bytes()`/`from_bytes()` for radix-trie key abstraction
+  (insert takes `K`, internal comparison is `&[u8]`)
+- CTree's `TreeKey`/`StoredKey`/`Preview`/`SearchStrategy` provides B+ tree
+  node search dispatch (insert takes `K: TreeKey`, internal search uses
+  `FixedLenKey` SIMD or `Preview<P>` + scalar fallback)
 
-### `Contestant` & `Keys`
-
-```rust
-struct Contestant {
-    name: &'static str,
-    max_size: Option<usize>,   // None = no limit
-    bench: Bench,
-}
-
-struct Keys {
-    bytes: Vec<Vec<u8>>,
-    nonzero: Vec<NonZeroBytes>,
-    u64: Vec<u64>,
-    ctx_b: BenchCtx<Vec<u8>>,
-    ctx_nz: BenchCtx<NonZeroBytes>,
-    ctx_u: BenchCtx<u64>,
-}
-```
-
-`Contestant` dispatch methods (`build`, `bench_insert`, `bench_lookup`, …)
-match on the `Bench` variant and forward the correct slice / context from
-`Keys`.
-
-## `bench_query_methods!` macro
-
-Most trie contestants share the same query logic (lookups, iteration).  The macro
-generates these methods so only `build`, `bench_insert`, `bench_optimize`, and
-`bench_memory` need to be handwritten.
-
-```rust
-bench_query_methods! {
-    field: trie,              // struct field holding the tree
-    ctx: BenchContext,        // context type alias (BenchContext | BenchContextNz | BenchCtx<u64>)
-    lookup: get(lookup),      // method(ctx_field)  see table below
-    fwd_iter: trie_callback,  // iteration style      see table below
-    rev_iter: trie_callback,
-    index_iter: true,         // optional, generates bench_fwd_idx / bench_rev_idx
-    unchecked: true,          // optional, overrides lookup_ops to hit_keys.len()
-}
-```
-
-### Lookup arms
-
-| Spec | Generated body |
-|------|----------------|
-| `trie_get(lookup)` | `self.trie.trie_get(k)` over `ctx.lookup_keys` |
-| `trie_get(null)` | `self.trie.trie_get(k)` over `ctx.lookup_keys_null` |
-| `get(lookup)` | `self.trie.get(k)` over `ctx.lookup_keys` |
-| `get(null)` | `self.trie.get(k)` over `ctx.lookup_keys_null` |
-| `get(truncated)` | `self.trie.get(k)` over `ctx.fl_lookup_keys` |
-| `get_unchecked(hit)` | `unsafe { self.trie.get_unchecked(k) }` over `ctx.hit_keys` |
-
-### Iteration arms
-
-| Spec | Behavior |
-|------|----------|
-| `trie_callback` | `trie_iter_fwd(|k,v| { black_box(k); black_box(v); })` — callback-based |
-| `dyn_callback` | `iter_fwd(&mut |k,v| { … })` — dynamic callback |
-| `iter_kv` | Manual `iter()` / `iter_last()` cursor with `current()` + `next()` / `prev()` |
-| `iter_kv_no_current` | Same but skips the initial `current()` call |
-| `none` | No method generated (contestant supports forward but not reverse, etc.) |
-
-## `NonZeroBytes`
-
-A wrapper `Vec<u8>` guaranteed to contain no `0x00`.  Null-terminator tries
-(`BitTrie`, `PolyTrie`) use this as their native key type so they only run in
-modes that never produce nulls.  This fixes an earlier silent-drop bug where
-`BitTrie` was mis-declared and `insert` quietly discarded null-containing keys.
-
-## `CTreeKey` adapter (tiny_btree.rs)
-
-CTree has two internal stored-key forms: `Box<[u8]>` (variable-length) and `u64`
-(fixed-width).  `CTreeKey` is a bench-side trait that maps the harness key `K`
-to CTree’s stored form:
-
-```rust
-trait CTreeKey: Clone + Ord + 'static {
-    type Stored: StoredKey + Default;
-    fn into_stored(&self) -> Self::Stored;
-    fn as_needle(&self) -> &<Self::Stored as StoredKey>::Needle;
-}
-```
-
-`CTreeBenchGen<K, const OPT: bool>` is generic over this adapter, producing four
-type aliases: `CTreeBench` (`Vec<u8>`, no opt), `CTreeOptBench`,
-`CTreeFixedBench` (`u64`, no opt), `CTreeFixedOptBench`.
-
-## Key type → Contestant mapping
-
-| Native key | Contestants | Supported modes |
-|------------|-------------|-----------------|
-| `Vec<u8>` | NibbleTrie, DynTrie, FixedLen, StackedTrie, CTree, std structures | Random, Sequential, Words, Lines |
-| `NonZeroBytes` | BitTrie, PolyTrie | Sequential, Words, Lines (no null bytes) |
-| `u64` | CTreeFixed, BTreeMapU64, HashMapU64, SortedVecU64, LinkedListU64 | RandomU64, SeqU64 |
+Potential future unification: `ByteKey` types could implement `TreeKey` (e.g.,
+`Vec<u8>: TreeKey<Stored = Box<[u8]>>` already exists), but currently the two
+systems serve different purposes and don't interact.

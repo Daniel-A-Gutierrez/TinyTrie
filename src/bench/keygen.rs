@@ -1,41 +1,7 @@
 use clap::ValueEnum;
+pub(crate) use tiny_trie::NonZeroBytes;
 
 pub(crate) const SIZES: &[usize] = &[100, 10_000, 1_000_000];
-
-// ── NonZeroBytes ───────────────────────────────────────────────────────
-//
-/// Bytestring guaranteed to contain no `0x00` bytes — the insert invariant for
-/// null-terminator tries (BitTrie, PolyTrie), which reject embedded nulls and
-/// append their own terminator internally. The harness produces these only in
-/// key modes that never emit `0x00` (Sequential/Lines/Words), so a
-/// `Benchable<NonZeroBytes>` contestant skips null-byte modes by construction
-/// (no keys of this type exist there) — the skip is structural via `Bench::NonZero`,
-/// no runtime check. This also fixes the prior silent-drop: BitTrie was
-/// mis-declared, so it ran in Random/u64 modes and `insert` quietly dropped
-/// every `0x00`-containing key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NonZeroBytes(Vec<u8>);
-
-impl NonZeroBytes {
-    /// Construct from a bytestring, rejecting any containing `0x00`. The
-    /// `Option` keeps the no-`0x00` invariant provable; the bench keygen only
-    /// feeds text modes here, so this succeeds for the real key sets.
-    pub(crate) fn new(v: Vec<u8>) -> Option<Self> {
-        (!v.contains(&0)).then_some(Self(v))
-    }
-    #[inline] pub(crate) fn as_bytes(&self) -> &[u8] { &self.0 }
-    /// Owned bytes for `trie.insert(Vec<u8>, …)` (null-terminator tries store
-    /// `Vec<u8>` and append the terminator themselves).
-    #[inline] pub(crate) fn to_vec(&self) -> Vec<u8> { self.0.clone() }
-}
-
-impl std::ops::Deref for NonZeroBytes {
-    type Target = [u8];
-    #[inline] fn deref(&self) -> &[u8] { &self.0 }
-}
-impl std::borrow::Borrow<[u8]> for NonZeroBytes {
-    #[inline] fn borrow(&self) -> &[u8] { &self.0 }
-}
 
 pub(crate) fn string_keys(n: usize) -> Vec<Vec<u8>> {
     let w = format!("{}", n - 1).len();
@@ -56,7 +22,7 @@ pub(crate) fn random_keys(n: usize) -> Vec<Vec<u8>> {
 
 /// Random unique `u64` keys, shuffled — the shared core of the fixed-width
 /// `RandomU64` mode, fed natively to `Benchable<u64>` contestants (the
-/// `Bench::U64` std structures + `CTreeFixed`). No byte-string projection: the
+/// `u64` std structures + `CTree`'s u64 variant). No byte-string projection: the
 /// byte/trie contestants skip fixed-width modes entirely.
 pub(crate) fn random_u64_keys_core(n: usize) -> Vec<u64> {
     use rand::Rng;
@@ -182,7 +148,7 @@ pub(crate) fn resolve_sizes(arg: Option<&str>) -> Vec<usize> {
 
 /// Byte-string keys for the variable-length modes (`Sequential`/`Random`/
 /// `Lines`/`Words`). The harness only calls this for non-u64 modes — the byte
-/// and trie contestants (`Bench::Bytes`/`Bench::NonZero`) skip fixed-width
+/// and trie contestants (bytes/nonzero variants) skip fixed-width
 /// (`RandomU64`/`SeqU64`) modes entirely, so no byte-string projection of `u64`
 /// keys is produced. (The `_ => Vec::new()` arms keep it callable from
 /// `generate_keys_nonzero` without panicking if it ever sees a u64 mode.)

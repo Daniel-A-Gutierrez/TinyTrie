@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::hint::black_box;
 
-use tiny_trie::{FixedLenNibbleTrie, TinyTrieMap};
+use tiny_trie::FixedLenNibbleTrie;
 
 use super::{Benchable, BenchContext, truncate_key, max_key_len, read_allocated};
 

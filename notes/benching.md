@@ -147,8 +147,8 @@ cargo run --release --bin bench -- --tests lookup --sizes 1000 --keys lines --co
 | `NibbleOptUnchecked`| lookup                                            | get_unchecked on optimized trie          |
 | `DynTrie`    | insert, lookup, fwd, rev, memory                 | Auto-promoting PTR u8→u16→u32→u64       |
 | `DynTrieOpt`      | lookup, fwd, rev, optimize, memory               | DynTrie after optimize()           |
-| `CTree`           | insert, lookup, fwd, rev, memory                 | B+ tree, **fixed instantiation** of the unified generic. `CTree<u64,usize,u32,4,5>` (u64 keys, u32 ptrs, fanout 4); byte keys hashed to u64 for the SIMD `find_position` path. Type alias `FixedCTree<K,V,PTR,N,NP1> = CTree<K,...>`. |
-| `VarCTree`        | insert, lookup, fwd, rev, memory                 | B+ tree, **variable instantiation** of the same unified generic. `VarCTree<u8,usize,u32,4,5>` = `CTree<Box<[u8]>,usize,u32,4,5>` (binary-search path over `Box<[K]>` keys). Baseline against `CTree` for the SIMD-vs-binary-search delta. Byte keys stored directly (no hashing). |
+| `CTree`           | insert, lookup, fwd, rev, memory                 | B+ tree unified generic. In variable-length modes: `CTree<Vec<u8>,…>` with u64 preview + scalar fallback. In u64 modes: `CTree<u64,…>` with direct SIMD `find_position`. One contestant, two dispatch paths via `variant_for`. |
+| `CTreeOpt`        | lookup, fwd, rev, optimize, memory                | CTree after `optimize()`. Same dual-path dispatch. |
 
 ## Structure Analysis
 

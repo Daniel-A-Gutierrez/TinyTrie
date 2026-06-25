@@ -254,30 +254,6 @@ fn simd_find_divergence<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize)
     find_divergence(key_a, key_b, i * 2)
 }
 
-#[inline]
-fn simd_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let len = a.len();
-    let mut i = 0;
-    while i + 16 <= len {
-        let va = Simd::<u8, 16>::from_slice(unsafe { a.get_unchecked(i..i + 16) });
-        let vb = Simd::<u8, 16>::from_slice(unsafe { b.get_unchecked(i..i + 16) });
-        if va.simd_ne(vb).any() {
-            return false;
-        }
-        i += 16;
-    }
-    while i < len {
-        if unsafe { *a.get_unchecked(i) != *b.get_unchecked(i) } {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 // ---------------------------------------------------------------------------
 // FixedLenNibbleTrie
 // ---------------------------------------------------------------------------
@@ -338,13 +314,6 @@ impl<T, PTR: TrieIndex> FixedLenNibbleTrie<T, PTR> {
         let start = idx * self.max_len;
         let len = self.lens[idx] as usize;
         &self.buf[start..start + len]
-    }
-
-    /// Return the full padded slot for key index `ki`.
-    #[inline]
-    fn padded_key(&self, ki: PTR) -> &[u8] {
-        let start = ki.as_usize() * self.max_len;
-        &self.buf[start..start + self.max_len]
     }
 
     /// Check whether the key at index `ki` matches `key`.

@@ -258,15 +258,15 @@ use poly_trie::{PolyOptBench, PolyTrieBench};
 use stacked_trie::{StackedTrie2Bench, StackedTrie4Bench};
 use std_contestants::{
     BTreeMapBench, BTreeMapBenchU64, HashMapBench, HashMapBenchU64,
-    LinkedListBench, LinkedListBenchU64, SortedVecBench, SortedVecBenchU64,
+    SortedVecBench, SortedVecBenchU64,
 };
 use tiny_btree::{CTreeBench, CTreeFixedBench, CTreeFixedOptBench, CTreeOptBench};
 
 // ── Type aliases ─────────────────────────────────────────────────────
 
-type NT = NibbleTrie<usize, u32, u32>;
-type NT2 = NibbleTrie<usize, u32, u32, 2>;
-type NT4 = NibbleTrie<usize, u32, u32, 4>;
+type NT = NibbleTrie<Vec<u8>, usize, u32, u32>;
+type NT2 = NibbleTrie<Vec<u8>, usize, u32, u32, 2>;
+type NT4 = NibbleTrie<Vec<u8>, usize, u32, u32, 4>;
 
 // ── Config ───────────────────────────────────────────────────────────
 
@@ -300,8 +300,8 @@ pub(crate) fn read_allocated() -> u64 {
 
 /// Convert a STAK=1 NibbleTrie to a STAK=N trie (1:1 vnode mapping).
 /// Internal child addresses are remapped: phys → phys * DST_STAK.
-pub(crate) fn convert_stak1_to<const DST_STAK: usize>(src: &NT) -> NibbleTrie<usize, u32, u32, DST_STAK> {
-    let mut dst: NibbleTrie<usize, u32, u32, DST_STAK> = NibbleTrie::new();
+pub(crate) fn convert_stak1_to<const DST_STAK: usize>(src: &NT) -> NibbleTrie<Vec<u8>, usize, u32, u32, DST_STAK> {
+    let mut dst: NibbleTrie<Vec<u8>, usize, u32, u32, DST_STAK> = NibbleTrie::new();
     dst.buf = src.buf.clone();
     dst.index = src.index.clone();
     dst.values = src.values.clone();
@@ -478,10 +478,9 @@ fn build_context_u64(keys: &[u64]) -> BenchCtx<u64> {
 /// only erases the *contestant type* (not `K`) through a `dyn Benchable<K>`
 /// vtable.
 ///
-/// Which `K`s a contestant supports is structural (it impls `Benchable<K>` only
-/// for those `K`s and is registered under the matching `Bench` variant), and
-/// which *modes* it runs in is structural too (`Bench::skip_for`): a contestant
-/// runs only in modes whose native key type it carries — no `u64`-as-byte-string
+/// Which `K`s a contestant supports is structural (it carries `Option<Box<dyn Benchable<K>>>`
+/// for each `K`), and which *modes* it runs in is structural too (`variant_for`): a contestant
+/// runs only in modes where it has a matching key variant — no `u64`-as-byte-string
 /// projection, no runtime domain check.
 pub(crate) trait Benchable<K: Clone + 'static> {
     /// Populate internal state from keys. Called once per size before query benches.
@@ -501,48 +500,35 @@ pub(crate) trait Benchable<K: Clone + 'static> {
 }
 
 
+// ── Key variant dispatch ──────────────────────────────────────────────
+
+/// Which key type a contestant uses for a given key mode. A contestant may
+/// carry multiple variants (e.g. `CTree` has both `Bytes` and `U64`);
+/// `variant_for(mode)` selects the one appropriate for the current mode.
+#[derive(Clone, Copy)]
+enum KeyVariant {
+    Bytes,
+    NonZero,
+    U64,
+}
+
 // ── Contestant ────────────────────────────────────────────────────────
-
-/// One variant per native key type. A contestant is registered under the
-/// variant matching the `K` it impls `Benchable<K>` for. Adding a key type
-/// (e.g. `u32`) is adding a variant here + a `Keys` field. The `dyn` only
-/// erases the contestant type, not `K`, so the contestant's tree operations
-/// stay monomorphized per `K` (SIMD inlines).
-enum Bench {
-    Bytes(Box<dyn Benchable<Vec<u8>>>),
-    NonZero(Box<dyn Benchable<NonZeroBytes>>),
-    U64(Box<dyn Benchable<u64>>),
-}
-
-impl Bench {
-    /// Whether this contestant is incompatible with `mode`. Fully structural:
-    /// a contestant runs only in modes whose native key type it carries.
-    ///   `Bytes`   — variable-length byte strings; skip fixed-width `u64` modes.
-    ///   `NonZero` — `0x00`-free bytestrings (null-terminator tries); skip modes
-    ///               that may emit `0x00` (i.e. `Random` + the `u64` modes).
-    ///   `U64`     — fixed-width `u64`; skip non-`u64` modes.
-    fn skip_for(&self, mode: KeyMode) -> bool {
-        match self {
-            Bench::Bytes(_) => mode.is_fixed_width(),
-            Bench::NonZero(_) => mode.may_contain_null_bytes(),
-            Bench::U64(_) => !mode.is_fixed_width(),
-        }
-    }
-}
 
 struct Contestant {
     name: &'static str,
     /// Skip this contestant for sizes larger than this (None = no limit).
     max_size: Option<usize>,
-    bench: Bench,
+    bytes: Option<Box<dyn Benchable<Vec<u8>>>>,
+    nonzero: Option<Box<dyn Benchable<NonZeroBytes>>>,
+    u64: Option<Box<dyn Benchable<u64>>>,
 }
 
 /// Per-size typed key sets + contexts, one per supported `K`. The harness
 /// builds these up front and hands `&Keys` to each `Contestant` dispatch method,
-/// which selects the slice/ctx matching its `Bench` variant. The `u64` set is
+/// which selects the slice/ctx matching its `KeyVariant`. The `u64` set is
 /// populated only in fixed-width modes (empty otherwise); the `nonzero` set
-/// only in `0x00`-free modes (empty otherwise). `U64`/`NonZero` contestants are
-/// skipped outside their modes, so they never read the empty sets.
+/// only in `0x00`-free modes (empty otherwise). Contestants without a matching
+/// variant are skipped via `variant_for`, so they never read the empty sets.
 struct Keys {
     bytes: Vec<Vec<u8>>,
     nonzero: Vec<NonZeroBytes>,
@@ -553,60 +539,92 @@ struct Keys {
 }
 
 impl Contestant {
-    fn build(&mut self, k: &Keys) {
-        match &mut self.bench {
-            Bench::Bytes(b) => b.build(&k.bytes, &k.ctx_b),
-            Bench::NonZero(b) => b.build(&k.nonzero, &k.ctx_nz),
-            Bench::U64(b) => b.build(&k.u64, &k.ctx_u),
+    /// Select the key variant appropriate for `mode`. Returns `None` if this
+    /// contestant has no variant compatible with the mode (e.g. a bytes-only
+    /// contestant in a u64 mode).
+    fn variant_for(&self, mode: KeyMode) -> Option<KeyVariant> {
+        if mode.is_fixed_width() {
+            self.u64.as_ref().map(|_| KeyVariant::U64)
+        } else if mode.may_contain_null_bytes() {
+            self.bytes.as_ref().map(|_| KeyVariant::Bytes)
+        } else {
+            // Sequential, Words, Lines — bytes preferred, nonzero fallback
+            if self.bytes.is_some() { Some(KeyVariant::Bytes) }
+            else if self.nonzero.is_some() { Some(KeyVariant::NonZero) }
+            else { None }
         }
     }
-    fn bench_insert(&self, k: &Keys) -> Option<()> {
-        match &self.bench {
-            Bench::Bytes(b) => b.bench_insert(&k.bytes),
-            Bench::NonZero(b) => b.bench_insert(&k.nonzero),
-            Bench::U64(b) => b.bench_insert(&k.u64),
+
+    fn build(&mut self, k: &Keys, mode: KeyMode) {
+        match self.variant_for(mode).expect("skipped contestants should not be built") {
+            KeyVariant::Bytes => self.bytes.as_mut().unwrap().build(&k.bytes, &k.ctx_b),
+            KeyVariant::NonZero => self.nonzero.as_mut().unwrap().build(&k.nonzero, &k.ctx_nz),
+            KeyVariant::U64 => self.u64.as_mut().unwrap().build(&k.u64, &k.ctx_u),
         }
     }
-    fn bench_lookup(&self, k: &Keys) -> Option<()> {
-        match &self.bench {
-            Bench::Bytes(b) => b.bench_lookup(&k.ctx_b),
-            Bench::NonZero(b) => b.bench_lookup(&k.ctx_nz),
-            Bench::U64(b) => b.bench_lookup(&k.ctx_u),
+    fn bench_insert(&self, k: &Keys, mode: KeyMode) -> Option<()> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_insert(&k.bytes),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_insert(&k.nonzero),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_insert(&k.u64),
         }
     }
-    fn lookup_ops(&self, k: &Keys) -> usize {
-        match &self.bench {
-            Bench::Bytes(b) => b.lookup_ops(&k.ctx_b),
-            Bench::NonZero(b) => b.lookup_ops(&k.ctx_nz),
-            Bench::U64(b) => b.lookup_ops(&k.ctx_u),
+    fn bench_lookup(&self, k: &Keys, mode: KeyMode) -> Option<()> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_lookup(&k.ctx_b),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_lookup(&k.ctx_nz),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_lookup(&k.ctx_u),
         }
     }
-    fn bench_optimize(&self, k: &Keys) -> Option<()> {
-        match &self.bench {
-            Bench::Bytes(b) => b.bench_optimize(&k.bytes),
-            Bench::NonZero(b) => b.bench_optimize(&k.nonzero),
-            Bench::U64(b) => b.bench_optimize(&k.u64),
+    fn lookup_ops(&self, k: &Keys, mode: KeyMode) -> usize {
+        match self.variant_for(mode).expect("skipped contestants should not call lookup_ops") {
+            KeyVariant::Bytes => self.bytes.as_ref().unwrap().lookup_ops(&k.ctx_b),
+            KeyVariant::NonZero => self.nonzero.as_ref().unwrap().lookup_ops(&k.ctx_nz),
+            KeyVariant::U64 => self.u64.as_ref().unwrap().lookup_ops(&k.ctx_u),
         }
     }
-    fn bench_memory(&self, k: &Keys) -> Option<f64> {
-        match &self.bench {
-            Bench::Bytes(b) => b.bench_memory(&k.bytes),
-            Bench::NonZero(b) => b.bench_memory(&k.nonzero),
-            Bench::U64(b) => b.bench_memory(&k.u64),
+    fn bench_optimize(&self, k: &Keys, mode: KeyMode) -> Option<()> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_optimize(&k.bytes),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_optimize(&k.nonzero),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_optimize(&k.u64),
         }
     }
-    // No-key bench methods: single match, no Keys needed.
-    fn bench_fwd_iter(&self) -> Option<()> {
-        match &self.bench { Bench::Bytes(b) => b.bench_fwd_iter(), Bench::NonZero(b) => b.bench_fwd_iter(), Bench::U64(b) => b.bench_fwd_iter() }
+    fn bench_memory(&self, k: &Keys, mode: KeyMode) -> Option<f64> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_memory(&k.bytes),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_memory(&k.nonzero),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_memory(&k.u64),
+        }
     }
-    fn bench_rev_iter(&self) -> Option<()> {
-        match &self.bench { Bench::Bytes(b) => b.bench_rev_iter(), Bench::NonZero(b) => b.bench_rev_iter(), Bench::U64(b) => b.bench_rev_iter() }
+    // No-key bench methods: dispatch by variant alone.
+    fn bench_fwd_iter(&self, mode: KeyMode) -> Option<()> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_fwd_iter(),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_fwd_iter(),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_fwd_iter(),
+        }
     }
-    fn bench_fwd_idx(&self) -> Option<()> {
-        match &self.bench { Bench::Bytes(b) => b.bench_fwd_idx(), Bench::NonZero(b) => b.bench_fwd_idx(), Bench::U64(b) => b.bench_fwd_idx() }
+    fn bench_rev_iter(&self, mode: KeyMode) -> Option<()> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_rev_iter(),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_rev_iter(),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_rev_iter(),
+        }
     }
-    fn bench_rev_idx(&self) -> Option<()> {
-        match &self.bench { Bench::Bytes(b) => b.bench_rev_idx(), Bench::NonZero(b) => b.bench_rev_idx(), Bench::U64(b) => b.bench_rev_idx() }
+    fn bench_fwd_idx(&self, mode: KeyMode) -> Option<()> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_fwd_idx(),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_fwd_idx(),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_fwd_idx(),
+        }
+    }
+    fn bench_rev_idx(&self, mode: KeyMode) -> Option<()> {
+        match self.variant_for(mode)? {
+            KeyVariant::Bytes => self.bytes.as_ref()?.bench_rev_idx(),
+            KeyVariant::NonZero => self.nonzero.as_ref()?.bench_rev_idx(),
+            KeyVariant::U64 => self.u64.as_ref()?.bench_rev_idx(),
+        }
     }
 }
 
@@ -617,31 +635,24 @@ fn runnable(c: &Contestant, i: usize, active: &[bool], size: usize) -> bool {
 
 fn all_contestants() -> Vec<Contestant> {
     vec![
-        Contestant { name: "NibbleTrie",        max_size: None, bench: Bench::Bytes(Box::new(NibbleTrieBench::new())) },
-        Contestant { name: "BitTrie",            max_size: None, bench: Bench::NonZero(Box::new(BitTrieBench::new())) },
-        Contestant { name: "BTreeMap",           max_size: None, bench: Bench::Bytes(Box::new(BTreeMapBench::new())) },
-        Contestant { name: "BTreeMapU64",        max_size: None, bench: Bench::U64(Box::new(BTreeMapBenchU64::new())) },
-        Contestant { name: "HashMap",            max_size: None, bench: Bench::Bytes(Box::new(HashMapBench::new())) },
-        Contestant { name: "HashMapU64",         max_size: None, bench: Bench::U64(Box::new(HashMapBenchU64::new())) },
-        Contestant { name: "SortedVec",          max_size: None, bench: Bench::Bytes(Box::new(SortedVecBench::new())) },
-        Contestant { name: "SortedVecU64",       max_size: None, bench: Bench::U64(Box::new(SortedVecBenchU64::new())) },
-        Contestant { name: "NibbleOpt",         max_size: None, bench: Bench::Bytes(Box::new(NibbleOptBench::new())) },
-        Contestant { name: "LinkedList",         max_size: None, bench: Bench::Bytes(Box::new(LinkedListBench::new())) },
-        Contestant { name: "LinkedListU64",      max_size: None, bench: Bench::U64(Box::new(LinkedListBenchU64::new())) },
-        Contestant { name: "NibbleUnchecked",    max_size: None, bench: Bench::Bytes(Box::new(NibbleUncheckedBench::new())) },
-        Contestant { name: "NibbleOptUnchecked", max_size: None, bench: Bench::Bytes(Box::new(NibbleOptUncheckedBench::new())) },
-        Contestant { name: "DynTrie",            max_size: None, bench: Bench::Bytes(Box::new(DynTrieBench::new())) },
-        Contestant { name: "DynTrieOpt",         max_size: None, bench: Bench::Bytes(Box::new(DynTrieOptBench::new())) },
-        Contestant { name: "PolyTrie",           max_size: None, bench: Bench::NonZero(Box::new(PolyTrieBench::new())) },
-        Contestant { name: "PolyOpt",            max_size: None, bench: Bench::NonZero(Box::new(PolyOptBench::new())) },
-        Contestant { name: "FixedLen",            max_size: None, bench: Bench::Bytes(Box::new(FixedLenBench::new())) },
-        Contestant { name: "FixedLenOpt",         max_size: None, bench: Bench::Bytes(Box::new(FixedLenOptBench::new())) },
-        Contestant { name: "StackedTrie2",        max_size: None, bench: Bench::Bytes(Box::new(StackedTrie2Bench::new())) },
-        Contestant { name: "StackedTrie4",        max_size: None, bench: Bench::Bytes(Box::new(StackedTrie4Bench::new())) },
-        Contestant { name: "CTree",               max_size: None, bench: Bench::Bytes(Box::new(CTreeBench::new())) },
-        Contestant { name: "CTreeOpt",            max_size: None, bench: Bench::Bytes(Box::new(CTreeOptBench::new())) },
-        Contestant { name: "CTreeFixed",          max_size: None, bench: Bench::U64(Box::new(CTreeFixedBench::new())) },
-        Contestant { name: "CTreeFixedOpt",       max_size: None, bench: Bench::U64(Box::new(CTreeFixedOptBench::new())) },
+        Contestant { name: "NibbleTrie",        max_size: None, bytes: Some(Box::new(NibbleTrieBench::new())),  nonzero: None, u64: None },
+        Contestant { name: "BitTrie",            max_size: None, bytes: None, nonzero: Some(Box::new(BitTrieBench::new())), u64: None },
+        Contestant { name: "BTreeMap",           max_size: None, bytes: Some(Box::new(BTreeMapBench::new())),   nonzero: None, u64: Some(Box::new(BTreeMapBenchU64::new())) },
+        Contestant { name: "HashMap",            max_size: None, bytes: Some(Box::new(HashMapBench::new())),    nonzero: None, u64: Some(Box::new(HashMapBenchU64::new())) },
+        Contestant { name: "SortedVec",          max_size: None, bytes: Some(Box::new(SortedVecBench::new())), nonzero: None, u64: Some(Box::new(SortedVecBenchU64::new())) },
+        Contestant { name: "NibbleOpt",         max_size: None, bytes: Some(Box::new(NibbleOptBench::new())), nonzero: None, u64: None },
+        Contestant { name: "NibbleUnchecked",    max_size: None, bytes: Some(Box::new(NibbleUncheckedBench::new())), nonzero: None, u64: None },
+        Contestant { name: "NibbleOptUnchecked", max_size: None, bytes: Some(Box::new(NibbleOptUncheckedBench::new())), nonzero: None, u64: None },
+        Contestant { name: "DynTrie",            max_size: None, bytes: Some(Box::new(DynTrieBench::new())),    nonzero: None, u64: None },
+        Contestant { name: "DynTrieOpt",         max_size: None, bytes: Some(Box::new(DynTrieOptBench::new())), nonzero: None, u64: None },
+        Contestant { name: "PolyTrie",           max_size: None, bytes: None, nonzero: Some(Box::new(PolyTrieBench::new())), u64: None },
+        Contestant { name: "PolyOpt",            max_size: None, bytes: None, nonzero: Some(Box::new(PolyOptBench::new())), u64: None },
+        Contestant { name: "FixedLen",            max_size: None, bytes: Some(Box::new(FixedLenBench::new())),  nonzero: None, u64: None },
+        Contestant { name: "FixedLenOpt",         max_size: None, bytes: Some(Box::new(FixedLenOptBench::new())), nonzero: None, u64: None },
+        Contestant { name: "StackedTrie2",        max_size: None, bytes: Some(Box::new(StackedTrie2Bench::new())), nonzero: None, u64: None },
+        Contestant { name: "StackedTrie4",        max_size: None, bytes: Some(Box::new(StackedTrie4Bench::new())), nonzero: None, u64: None },
+        Contestant { name: "CTree",               max_size: None, bytes: Some(Box::new(CTreeBench::new())),     nonzero: None, u64: Some(Box::new(CTreeFixedBench::new())) },
+        Contestant { name: "CTreeOpt",            max_size: None, bytes: Some(Box::new(CTreeOptBench::new())),  nonzero: None, u64: Some(Box::new(CTreeFixedOptBench::new())) },
     ]
 }
 
@@ -841,14 +852,13 @@ fn main() {
 
     let needs_structures = run_lookup || run_fwd || run_rev || run_fwd_idx || run_rev_idx;
 
-    // Pre-compute which contestants are incompatible with this key mode. The skip
-    // is fully structural (`Bench::skip_for`): a contestant runs only in modes
-    // whose native key type it carries — variable-length byte tries sit out
-    // fixed-width `u64` modes (no `u64`-as-byte-string projection); null-terminator
-    // tries (`NonZero`) sit out any mode that may emit `0x00`; the `u64` std
-    // containers + `CTreeFixed` (`U64`) sit out non-`u64` modes.
+    // Pre-compute which contestants are incompatible with this key mode. A
+    // contestant runs only if it has a variant whose key type matches the mode
+    // (`variant_for`): bytes-only contestants sit out fixed-width u64 modes;
+    // u64-only contestants sit out variable-length modes; nonzero-only contestants
+    // sit out modes that may emit `0x00`.
     let skip_for_keys: Vec<bool> = contestants.iter()
-        .map(|c| c.bench.skip_for(key_mode))
+        .map(|c| c.variant_for(key_mode).is_none())
         .collect();
 
     for &size in &sizes {
@@ -900,7 +910,7 @@ fn main() {
             eprintln!("  insertion:");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                if let Some(r) = bench(budget, c.name, || c.bench_insert(&keys)) {
+                if let Some(r) = bench(budget, c.name, || c.bench_insert(&keys, key_mode)) {
                     ins.entry(c.name.into()).or_default().push(r.rate(size as u64));
                 }
             }
@@ -912,7 +922,7 @@ fn main() {
             let t0 = Instant::now();
             for (i, c) in contestants.iter_mut().enumerate() {
                 if skip_for_keys[i] || !runnable(c, i, &active, size) { continue; }
-                c.build(&keys);
+                c.build(&keys, key_mode);
             }
             eprintln!("{:.2}s ✓", t0.elapsed().as_secs_f64());
         }
@@ -922,8 +932,8 @@ fn main() {
             eprintln!("  lookup:");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                let ops = c.lookup_ops(&keys);
-                if let Some(r) = bench(budget, c.name, || c.bench_lookup(&keys)) {
+                let ops = c.lookup_ops(&keys, key_mode);
+                if let Some(r) = bench(budget, c.name, || c.bench_lookup(&keys, key_mode)) {
                     look.entry(c.name.into()).or_default().push(r.rate(ops as u64));
                 }
             }
@@ -934,7 +944,7 @@ fn main() {
             eprintln!("  iteration (forward):");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                if let Some(r) = bench(budget, c.name, || c.bench_fwd_iter()) {
+                if let Some(r) = bench(budget, c.name, || c.bench_fwd_iter(key_mode)) {
                     fwd.entry(c.name.into()).or_default().push(r.rate(size as u64));
                 }
             }
@@ -945,7 +955,7 @@ fn main() {
             eprintln!("  iteration (backward):");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                if let Some(r) = bench(budget, c.name, || c.bench_rev_iter()) {
+                if let Some(r) = bench(budget, c.name, || c.bench_rev_iter(key_mode)) {
                     rev.entry(c.name.into()).or_default().push(r.rate(size as u64));
                 }
             }
@@ -956,7 +966,7 @@ fn main() {
             eprintln!("  iteration (forward index):");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                if let Some(r) = bench(budget, c.name, || c.bench_fwd_idx()) {
+                if let Some(r) = bench(budget, c.name, || c.bench_fwd_idx(key_mode)) {
                     fwd_idx.entry(c.name.into()).or_default().push(r.rate(size as u64));
                 }
             }
@@ -967,7 +977,7 @@ fn main() {
             eprintln!("  iteration (backward index):");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                if let Some(r) = bench(budget, c.name, || c.bench_rev_idx()) {
+                if let Some(r) = bench(budget, c.name, || c.bench_rev_idx(key_mode)) {
                     rev_idx.entry(c.name.into()).or_default().push(r.rate(size as u64));
                 }
             }
@@ -978,7 +988,7 @@ fn main() {
             eprintln!("  optimize:");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                if let Some(r) = bench(budget, c.name, || c.bench_optimize(&keys)) {
+                if let Some(r) = bench(budget, c.name, || c.bench_optimize(&keys, key_mode)) {
                     opt.entry(c.name.into()).or_default().push(r.rate(size as u64));
                 }
             }
@@ -989,7 +999,7 @@ fn main() {
             eprintln!("  memory:");
             for (i, c) in contestants.iter().enumerate() {
                 if !runnable(c, i, &active, size) || skip_for_keys[i] { continue; }
-                if let Some(bytes_per_key) = c.bench_memory(&keys) {
+                if let Some(bytes_per_key) = c.bench_memory(&keys, key_mode) {
                     eprintln!("    {}: {:.1}/key", c.name, bytes_per_key);
                     mem.entry(c.name.into()).or_default().push(bytes_per_key);
                 }

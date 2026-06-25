@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! SIMD-accelerated child lookup using portable SIMD.
 //!
 //! Replaces scalar linear scan (INode) and binary search (HNode) with

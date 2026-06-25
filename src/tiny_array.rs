@@ -19,6 +19,7 @@ where
     slots: [MaybeUninit<T>; N],
 }
 
+#[allow(dead_code)]
 impl<T, const N: usize> TinyArray<T, N>
 where
     [(); N]:

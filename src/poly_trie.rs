@@ -857,6 +857,7 @@ impl<T> PolyTrie<T> {
     // -----------------------------------------------------------------------
 
     /// Debug dump of the trie structure to stderr.
+    #[allow(dead_code)]
     #[cfg(debug_assertions)]
     fn dump(&self) {
         fn dump_ref<T>(trie: &PolyTrie<T>, node_ref: NodeRef, depth: usize) {

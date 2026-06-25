@@ -14,7 +14,7 @@ fn node_size_compact() {
 
 #[test]
 fn insert_empty_and_get() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
     assert_eq!(trie.get(b"hello"), Some(idx));
     assert_eq!(trie.get_value(b"hello"), Some(&42));
@@ -23,7 +23,7 @@ fn insert_empty_and_get() {
 
 #[test]
 fn insert_duplicate_returns_error() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"hello".to_vec(), 1).unwrap();
     let result = trie.insert(b"hello".to_vec(), 2);
     assert_eq!(result, Err(()));
@@ -32,7 +32,7 @@ fn insert_duplicate_returns_error() {
 
 #[test]
 fn insert_null_byte_allowed() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     // Null bytes are now valid in keys
     let idx = trie.insert(b"hel\0lo".to_vec(), 1).unwrap();
     assert_eq!(trie.get(b"hel\0lo"), Some(idx));
@@ -40,7 +40,7 @@ fn insert_null_byte_allowed() {
 
 #[test]
 fn insert_two_keys_split_leaf() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
     let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
     assert_eq!(trie.get(b"abc"), Some(i1));
@@ -50,7 +50,7 @@ fn insert_two_keys_split_leaf() {
 
 #[test]
 fn insert_prefix_key() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
     let i2 = trie.insert(b"abcd".to_vec(), 2).unwrap();
     assert_eq!(trie.get(b"abc"), Some(i1));
@@ -59,7 +59,7 @@ fn insert_prefix_key() {
 
 #[test]
 fn insert_reverse_prefix_key() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie.insert(b"abcd".to_vec(), 1).unwrap();
     let i2 = trie.insert(b"abc".to_vec(), 2).unwrap();
     assert_eq!(trie.get(b"abcd"), Some(i1));
@@ -68,7 +68,7 @@ fn insert_reverse_prefix_key() {
 
 #[test]
 fn insert_no_common_prefix() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
     let i2 = trie.insert(b"xyz".to_vec(), 2).unwrap();
     assert_eq!(trie.get(b"abc"), Some(i1));
@@ -77,7 +77,7 @@ fn insert_no_common_prefix() {
 
 #[test]
 fn insert_three_keys() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
     let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
     let i3 = trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -88,7 +88,7 @@ fn insert_three_keys() {
 
 #[test]
 fn insert_single_char_keys() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut indices = Vec::new();
     for c in b'a'..=b'f' {
         let idx = trie.insert(vec![c], c as i32).unwrap();
@@ -102,7 +102,7 @@ fn insert_single_char_keys() {
 
 #[test]
 fn insert_many_keys_same_prefix() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..50 {
         let key = format!("prefix_{:02}", i);
         trie.insert(key.into_bytes(), i).unwrap();
@@ -115,7 +115,7 @@ fn insert_many_keys_same_prefix() {
 
 #[test]
 fn insert_deeply_nested() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut key = Vec::new();
     for i in 0..100 {
         key.push(b'a');
@@ -126,7 +126,7 @@ fn insert_deeply_nested() {
 
 #[test]
 fn len_and_is_empty() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     assert!(trie.is_empty());
     assert_eq!(trie.len(), 0);
     trie.insert(b"hello".to_vec(), 1).unwrap();
@@ -136,7 +136,7 @@ fn len_and_is_empty() {
 
 #[test]
 fn into_keys_values_roundtrip() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"def".to_vec(), 2).unwrap();
     let (keys, values) = trie.into_keys_values();
@@ -146,14 +146,14 @@ fn into_keys_values_roundtrip() {
 
 #[test]
 fn iter_empty() {
-    let trie: NibbleTrie<i32> = NibbleTrie::new();
+    let trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut iter = trie.iter();
     assert!(iter.next().is_none());
 }
 
 #[test]
 fn iter_single_key() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"hello".to_vec(), 42).unwrap();
     let mut iter = trie.iter();
     let (k, v) = iter.next().unwrap();
@@ -164,7 +164,7 @@ fn iter_single_key() {
 
 #[test]
 fn iter_forward() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -179,7 +179,7 @@ fn iter_forward() {
 
 #[test]
 fn iter_backward() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -200,7 +200,7 @@ fn iter_backward() {
 
 #[test]
 fn iter_seek_exact() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -212,7 +212,7 @@ fn iter_seek_exact() {
 
 #[test]
 fn iter_seek_between() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -231,7 +231,7 @@ fn iter_seek_between() {
 
 #[test]
 fn iter_seek_prefix_key() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abcd".to_vec(), 2).unwrap();
 
@@ -242,7 +242,7 @@ fn iter_seek_prefix_key() {
 
 #[test]
 fn get_value_found_and_missing() {
-    let mut trie: NibbleTrie<String> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, String> = NibbleTrie::new();
     trie.insert(b"hello".to_vec(), "world".to_string()).unwrap();
     assert_eq!(trie.get_value(b"hello"), Some(&"world".to_string()));
     assert_eq!(trie.get_value(b"world"), None);
@@ -250,7 +250,7 @@ fn get_value_found_and_missing() {
 
 #[test]
 fn iter_backward_large() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
         trie.insert(key.into_bytes(), i).unwrap();
@@ -274,7 +274,7 @@ fn iter_backward_large() {
 
 #[test]
 fn leaf_and_offset_set_on_creation() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     // Root should have leaf field set (not the sentinel)
     let root = &trie.arena[0];
@@ -289,14 +289,14 @@ fn leaf_and_offset_set_on_creation() {
 
 #[test]
 fn optimize_empty() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.optimize();
     assert!(trie.is_empty());
 }
 
 #[test]
 fn optimize_single_key() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
     trie.optimize();
     assert_eq!(trie.get(b"hello"), Some(idx));
@@ -305,7 +305,7 @@ fn optimize_single_key() {
 
 #[test]
 fn optimize_preserves_lookups() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
@@ -323,7 +323,7 @@ fn optimize_preserves_lookups() {
 
 #[test]
 fn optimize_preserves_iteration() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..100 {
         let key = format!("key_{:05}", i);
         trie.insert(key.into_bytes(), i as i32).unwrap();
@@ -359,7 +359,7 @@ fn optimize_preserves_iteration() {
 
 #[test]
 fn optimize_preserves_seek() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..50u32 {
         let key = format!("key_{:05}", i);
         trie.insert(key.into_bytes(), i as i32).unwrap();
@@ -373,7 +373,7 @@ fn optimize_preserves_seek() {
 
 #[test]
 fn optimize_idempotent() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
         trie.insert(key.into_bytes(), i).unwrap();
@@ -391,7 +391,7 @@ fn optimize_idempotent() {
 
 #[test]
 fn optimize_byte_boundary_keys() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut indices = Vec::new();
     for b in 1u8..=255 {
         let idx = trie.insert(vec![b], b as i32).unwrap();
@@ -407,7 +407,7 @@ fn optimize_byte_boundary_keys() {
 
 #[test]
 fn optimize_stress_1000() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..1000u32 {
         let key = format!("key_{:05}", i);
@@ -424,7 +424,7 @@ fn optimize_stress_1000() {
 
 #[test]
 fn optimize_deeply_nested() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut key = Vec::new();
     let mut indices = Vec::new();
     for i in 0..100 {
@@ -434,7 +434,7 @@ fn optimize_deeply_nested() {
     }
     trie.optimize();
     for i in 0..100 {
-        let mut key = vec![b'a'; i + 1];
+        let key = vec![b'a'; i + 1];
         assert_eq!(trie.get(&key), Some(indices[i]));
     }
 }
@@ -442,7 +442,7 @@ fn optimize_deeply_nested() {
 #[test]
 fn optimize_sorts_buf() {
     // After optimize(), keys in buf should appear in contiguous sorted order.
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in (0..100u32).rev() {
         let key = format!("key_{:05}", i);
         trie.insert(key.into_bytes(), i as i32).unwrap();
@@ -473,7 +473,7 @@ fn optimize_sorts_buf() {
 fn optimize_sorts_index_and_values() {
     // After optimize(), index[i] and values[i-1] should be in DFS (sorted) order.
     // Insert keys in reverse order to ensure the sort actually changes something.
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let n = 100;
     for i in (0..n).rev() {
         let key = format!("key_{:05}", i);
@@ -509,7 +509,7 @@ fn optimize_sorts_index_and_values() {
 #[test]
 fn optimize_into_keys_values_sorted() {
     // into_keys_values() should return keys in sorted order after optimize
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in (0..50u32).rev() {
         let key = format!("key_{:05}", i);
         trie.insert(key.into_bytes(), i as i32).unwrap();
@@ -531,7 +531,7 @@ fn optimize_into_keys_values_sorted() {
 #[test]
 fn iter_forward_prefix_keys() {
     // "ab" < "abc" in forward order
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"ab".to_vec(), 2).unwrap();
     trie.insert(b"abd".to_vec(), 3).unwrap();
@@ -546,7 +546,7 @@ fn iter_forward_prefix_keys() {
 #[test]
 fn iter_backward_prefix_keys() {
     // "abd" > "abc" > "ab" in backward order
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"ab".to_vec(), 2).unwrap();
     trie.insert(b"abd".to_vec(), 3).unwrap();
@@ -565,7 +565,7 @@ fn iter_backward_prefix_keys() {
 
 #[test]
 fn iter_forward_empty_key() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"".to_vec(), 0).unwrap();
     trie.insert(b"abc".to_vec(), 1).unwrap();
 
@@ -578,7 +578,7 @@ fn iter_forward_empty_key() {
 
 #[test]
 fn optimize_preserves_terminal_flags() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"ab".to_vec(), 1).unwrap();
     trie.insert(b"abcd".to_vec(), 2).unwrap();
     trie.optimize();
@@ -587,7 +587,7 @@ fn optimize_preserves_terminal_flags() {
     assert_eq!(trie.len(), 2);
 
     // Also test reverse order
-    let mut trie2: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie2: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie2.insert(b"abcd".to_vec(), 1).unwrap();
     trie2.insert(b"ab".to_vec(), 2).unwrap();
     trie2.optimize();
@@ -597,7 +597,7 @@ fn optimize_preserves_terminal_flags() {
 
 #[test]
 fn null_bytes_in_keys() {
-    let mut trie: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie.insert(b"a\0b".to_vec(), 1).unwrap();
     let i2 = trie.insert(b"a\0c".to_vec(), 2).unwrap();
     let i3 = trie.insert(b"\0".to_vec(), 3).unwrap();
@@ -614,7 +614,7 @@ fn null_bytes_in_keys() {
 
 #[test]
 fn compact_insert_and_get() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
     assert_eq!(trie.get(b"hello"), Some(idx));
     assert_eq!(trie.get(b"world"), None);
@@ -622,7 +622,7 @@ fn compact_insert_and_get() {
 
 #[test]
 fn compact_insert_prefix_keys() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
     let i2 = trie.insert(b"abcd".to_vec(), 2).unwrap();
     assert_eq!(trie.get(b"abc"), Some(i1));
@@ -631,7 +631,7 @@ fn compact_insert_prefix_keys() {
 
 #[test]
 fn compact_iter_forward() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -646,7 +646,7 @@ fn compact_iter_forward() {
 
 #[test]
 fn compact_iter_backward() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -665,7 +665,7 @@ fn compact_iter_backward() {
 
 #[test]
 fn compact_optimize() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
@@ -682,7 +682,7 @@ fn compact_optimize() {
 
 #[test]
 fn compact_seek() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
@@ -694,7 +694,7 @@ fn compact_seek() {
 
 #[test]
 fn compact_empty_key() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"".to_vec(), 0).unwrap();
     trie.insert(b"abc".to_vec(), 1).unwrap();
 
@@ -766,7 +766,7 @@ fn node_size_u8() {
 
 #[test]
 fn u8_insert_and_get() {
-    let mut trie: NibbleTrie<i32, u8, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
     let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
     assert_eq!(trie.get(b"hello"), Some(idx));
     assert_eq!(trie.get(b"world"), None);
@@ -774,7 +774,7 @@ fn u8_insert_and_get() {
 
 #[test]
 fn u8_near_capacity() {
-    let mut trie: NibbleTrie<i32, u8, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
     // u8 max_value_sentinel = 255, near_capacity when arena.len() >= 255 or index.len() >= 255
     assert!(!trie.near_capacity());
     // Insert some keys — should not be near capacity yet
@@ -787,7 +787,7 @@ fn u8_near_capacity() {
 
 #[test]
 fn u8_overflow() {
-    let mut trie: NibbleTrie<i32, u8, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
     // With u8 PTR, PTR::MAX (255) is the sentinel for empty children slots.
     // This means valid key indices are 1..=254 (index 0 is dummy, 255 is sentinel).
     // So at most 254 keys can be inserted.
@@ -804,14 +804,14 @@ fn u8_overflow() {
 
 #[test]
 fn promote_u8_to_u16() {
-    let mut trie: NibbleTrie<i32, u8, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..50u32 {
         let key = format!("key_{:03}", i);
         let idx = trie.insert(key.into_bytes(), i as i32).unwrap();
         indices.push(idx);
     }
-    let promoted: NibbleTrie<i32, u16, u16> = trie.promote::<u16>();
+    let promoted: NibbleTrie<Vec<u8>, i32, u16, u16> = trie.promote::<u16>();
     // All lookups still work after promotion
     for i in 0..50u32 {
         let key = format!("key_{:03}", i);
@@ -823,14 +823,14 @@ fn promote_u8_to_u16() {
 
 #[test]
 fn promote_u16_to_u32() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..100u32 {
         let key = format!("key_{:03}", i);
         let idx = trie.insert(key.into_bytes(), i as i32).unwrap();
         indices.push(idx);
     }
-    let promoted: NibbleTrie<i32, u32, u16> = trie.promote::<u32>();
+    let promoted: NibbleTrie<Vec<u8>, i32, u32, u16> = trie.promote::<u32>();
     for i in 0..100u32 {
         let key = format!("key_{:03}", i);
         assert_eq!(promoted.get(key.as_bytes()), Some(indices[i as usize]));
@@ -839,14 +839,14 @@ fn promote_u16_to_u32() {
 
 #[test]
 fn demote_u16_to_u8() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..10u32 {
         let key = format!("key_{:03}", i);
         let idx = trie.insert(key.into_bytes(), i as i32).unwrap();
         indices.push(idx);
     }
-    let demoted: NibbleTrie<i32, u8, u16> = match trie.demote::<u8>() {
+    let demoted: NibbleTrie<Vec<u8>, i32, u8, u16> = match trie.demote::<u8>() {
         Ok(d) => d,
         Err(_) => panic!("demote should succeed with 10 keys"),
     };
@@ -858,7 +858,7 @@ fn demote_u16_to_u8() {
 
 #[test]
 fn demote_fails_too_large() {
-    let mut trie: NibbleTrie<i32, u16, u16> = NibbleTrie::new();
+    let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     // Insert more than u8::MAX keys — can't demote to u8
     for i in 0..300u32 {
         let key = format!("key_{:05}", i);
@@ -878,8 +878,8 @@ fn demote_fails_too_large() {
 /// Internal child addresses are remapped: STAK=1 addresses are just phys_idx,
 /// STAK=2 addresses are phys_idx*2 + vnode_idx. Leaf child values (key indices)
 /// stay the same since they're indices into the index/buf arrays, not arena refs.
-fn build_stak2_from_stak1<T: Clone>(trie1: &NibbleTrie<T, u32, u16, 1>) -> NibbleTrie<T, u32, u16, 2> {
-    let mut trie2: NibbleTrie<T, u32, u16, 2> = NibbleTrie::new();
+fn build_stak2_from_stak1<K: ByteKey + Clone, T: Clone>(trie1: &NibbleTrie<K, T, u32, u16, 1>) -> NibbleTrie<K, T, u32, u16, 2> {
+    let mut trie2: NibbleTrie<K, T, u32, u16, 2> = NibbleTrie::new();
     trie2.buf = trie1.buf.clone();
     trie2.index = trie1.index.clone();
     trie2.values = trie1.values.clone();
@@ -935,7 +935,7 @@ fn stak2_node_size_compact() {
 
 #[test]
 fn stak2_simple_get() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie1.insert(b"abc".to_vec(), 1).unwrap();
     let i2 = trie1.insert(b"abd".to_vec(), 2).unwrap();
 
@@ -947,7 +947,7 @@ fn stak2_simple_get() {
 
 #[test]
 fn stak2_get_prefix_keys() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie1.insert(b"ab".to_vec(), 1).unwrap();
     let i2 = trie1.insert(b"abcd".to_vec(), 2).unwrap();
 
@@ -958,7 +958,7 @@ fn stak2_get_prefix_keys() {
 
 #[test]
 fn stak2_iter_forward() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie1.insert(b"abc".to_vec(), 1).unwrap();
     trie1.insert(b"abd".to_vec(), 2).unwrap();
     trie1.insert(b"abe".to_vec(), 3).unwrap();
@@ -974,7 +974,7 @@ fn stak2_iter_forward() {
 
 #[test]
 fn stak2_iter_backward() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie1.insert(b"abc".to_vec(), 1).unwrap();
     trie1.insert(b"abd".to_vec(), 2).unwrap();
     trie1.insert(b"abe".to_vec(), 3).unwrap();
@@ -994,7 +994,7 @@ fn stak2_iter_backward() {
 
 #[test]
 fn stak2_iter_seek() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie1.insert(b"abc".to_vec(), 1).unwrap();
     trie1.insert(b"abd".to_vec(), 2).unwrap();
     trie1.insert(b"abe".to_vec(), 3).unwrap();
@@ -1007,7 +1007,7 @@ fn stak2_iter_seek() {
 
 #[test]
 fn stak2_many_keys() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
@@ -1026,7 +1026,7 @@ fn stak2_many_keys() {
 
 #[test]
 fn stak2_iter_forward_large() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
         trie1.insert(key.into_bytes(), i).unwrap();
@@ -1046,7 +1046,7 @@ fn stak2_iter_forward_large() {
 
 #[test]
 fn stak2_iter_backward_large() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
         trie1.insert(key.into_bytes(), i).unwrap();
@@ -1071,7 +1071,7 @@ fn stak2_iter_backward_large() {
 
 #[test]
 fn stak2_null_bytes_in_keys() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie1.insert(b"a\0b".to_vec(), 1).unwrap();
     let i2 = trie1.insert(b"a\0c".to_vec(), 2).unwrap();
     let i3 = trie1.insert(b"\0".to_vec(), 3).unwrap();
@@ -1086,7 +1086,7 @@ fn stak2_null_bytes_in_keys() {
 
 #[test]
 fn stak2_deeply_nested() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut key = Vec::new();
     let mut indices = Vec::new();
     for i in 0..100 {
@@ -1104,7 +1104,7 @@ fn stak2_deeply_nested() {
 
 #[test]
 fn stak2_single_key() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let idx = trie1.insert(b"hello".to_vec(), 42).unwrap();
 
     let trie2 = build_stak2_from_stak1(&trie1);
@@ -1115,7 +1115,7 @@ fn stak2_single_key() {
 
 #[test]
 fn stak2_empty_key() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie1.insert(b"".to_vec(), 0).unwrap();
     let i2 = trie1.insert(b"abc".to_vec(), 1).unwrap();
 
@@ -1126,7 +1126,7 @@ fn stak2_empty_key() {
 
 #[test]
 fn stak2_iter_prefix_keys() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie1.insert(b"abc".to_vec(), 1).unwrap();
     trie1.insert(b"ab".to_vec(), 2).unwrap();
     trie1.insert(b"abd".to_vec(), 3).unwrap();
@@ -1142,7 +1142,7 @@ fn stak2_iter_prefix_keys() {
 
 #[test]
 fn stak2_optimize_preserves_lookups() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut indices = Vec::new();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
@@ -1161,7 +1161,7 @@ fn stak2_optimize_preserves_lookups() {
 
 #[test]
 fn stak2_optimize_preserves_iteration() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..100 {
         let key = format!("key_{:05}", i);
         trie1.insert(key.into_bytes(), i as i32).unwrap();
@@ -1182,7 +1182,7 @@ fn stak2_optimize_preserves_iteration() {
 
 #[test]
 fn stak2_optimize_preserves_seek() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..50u32 {
         let key = format!("key_{:05}", i);
         trie1.insert(key.into_bytes(), i as i32).unwrap();
@@ -1197,7 +1197,7 @@ fn stak2_optimize_preserves_seek() {
 
 #[test]
 fn stak2_optimize_prefix_keys() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie1.insert(b"ab".to_vec(), 1).unwrap();
     let i2 = trie1.insert(b"abcd".to_vec(), 2).unwrap();
     let mut trie2 = build_stak2_from_stak1(&trie1);
@@ -1208,7 +1208,7 @@ fn stak2_optimize_prefix_keys() {
 
 #[test]
 fn stak2_optimize_null_bytes() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie1.insert(b"a\0b".to_vec(), 1).unwrap();
     let i2 = trie1.insert(b"a\0c".to_vec(), 2).unwrap();
     let mut trie2 = build_stak2_from_stak1(&trie1);
@@ -1219,7 +1219,7 @@ fn stak2_optimize_null_bytes() {
 
 #[test]
 fn stak2_optimize_empty_key() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let i1 = trie1.insert(b"".to_vec(), 0).unwrap();
     let i2 = trie1.insert(b"abc".to_vec(), 1).unwrap();
     let mut trie2 = build_stak2_from_stak1(&trie1);
@@ -1230,7 +1230,7 @@ fn stak2_optimize_empty_key() {
 
 #[test]
 fn stak2_optimize_reduces_arena() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for i in 0..50 {
         let key = format!("prefix_{:02}", i);
         trie1.insert(key.into_bytes(), i).unwrap();
@@ -1247,7 +1247,7 @@ fn stak2_optimize_reduces_arena() {
 #[test]
 fn stak2_optimize_debug_diverse_keys() {
     // Build a STAK=1 trie with diverse keys (similar to wikipedia words)
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let words = [
         "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
         "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
@@ -1261,7 +1261,7 @@ fn stak2_optimize_debug_diverse_keys() {
 
     // Verify STAK=1 lookups work
     for (i, w) in words.iter().enumerate() {
-        assert!(trie1.get(w.as_bytes()).is_some(), "STAK=1 get({:?}) failed", w);
+        assert!(trie1.get(w.as_bytes()).is_some_and(|v| v==i), "STAK=1 get({:?}) failed", w);
     }
 
     // Convert to STAK=2
@@ -1321,7 +1321,7 @@ fn stak2_optimize_debug_diverse_keys() {
 
 #[test]
 fn stak4_optimize_debug_diverse_keys() {
-    let mut trie1: NibbleTrie<i32> = NibbleTrie::new();
+    let mut trie1: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let words = [
         "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
         "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
@@ -1338,7 +1338,7 @@ fn stak4_optimize_debug_diverse_keys() {
     // Verify STAK=4 lookups work BEFORE optimize
     for (i, w) in words.iter().enumerate() {
         let result = trie4.get(w.as_bytes());
-        assert!(result.is_some(), "STAK=4 get({:?}) = None before optimize", w);
+        assert!(result.is_some_and(|v|v==i), "STAK=4 get({:?}) = None before optimize", w);
     }
 
     trie4.optimize();
@@ -1347,7 +1347,7 @@ fn stak4_optimize_debug_diverse_keys() {
     // Verify STAK=4 lookups work AFTER optimize
     for (i, w) in words.iter().enumerate() {
         let result = trie4.get(w.as_bytes());
-        assert!(result.is_some(), "STAK=4 get({:?}) = None after optimize", w);
+        assert!(result.is_some_and(|v| v==i), "STAK=4 get({:?}) = None after optimize", w);
     }
 
     // Validate internal addresses after optimize
@@ -1371,8 +1371,8 @@ fn stak4_optimize_debug_diverse_keys() {
 }
 
 /// Helper: build a STAK=4 trie from a STAK=1 trie.
-fn build_stak4_from_stak1<T: Clone>(trie1: &NibbleTrie<T, u32, u16, 1>) -> NibbleTrie<T, u32, u16, 4> {
-    let mut trie4: NibbleTrie<T, u32, u16, 4> = NibbleTrie::new();
+fn build_stak4_from_stak1<K: ByteKey + Clone, T: Clone>(trie1: &NibbleTrie<K, T, u32, u16, 1>) -> NibbleTrie<K, T, u32, u16, 4> {
+    let mut trie4: NibbleTrie<K, T, u32, u16, 4> = NibbleTrie::new();
     trie4.buf = trie1.buf.clone();
     trie4.index = trie1.index.clone();
     trie4.values = trie1.values.clone();
@@ -1397,4 +1397,26 @@ fn build_stak4_from_stak1<T: Clone>(trie1: &NibbleTrie<T, u32, u16, 1>) -> Nibbl
         trie4.arena.push(node4);
     }
     trie4
+}
+
+// ── Generic key type tests ──────────────────────────────────────────
+
+#[test]
+fn string_key_insert_and_get() {
+    let mut trie: NibbleTrie<String, i32> = NibbleTrie::new();
+    trie.insert("hello".to_string(), 1).unwrap();
+    trie.insert("world".to_string(), 2).unwrap();
+    assert_eq!(trie.get(b"hello"), Some(1));
+    assert_eq!(trie.get(b"world"), Some(2));
+    assert_eq!(trie.get(b"hell"), None);
+}
+
+#[test]
+fn string_key_into_keys_values() {
+    let mut trie: NibbleTrie<String, i32> = NibbleTrie::new();
+    trie.insert("abc".to_string(), 1).unwrap();
+    trie.insert("def".to_string(), 2).unwrap();
+    let (keys, values) = trie.into_keys_values();
+    assert_eq!(keys, vec!["abc".to_string(), "def".to_string()]);
+    assert_eq!(values, vec![1, 2]);
 }

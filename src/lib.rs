@@ -1,6 +1,7 @@
-#![feature(iter_array_chunks)]
+#![allow(incomplete_features)]
 #![feature(generic_const_exprs)]
 #![feature(portable_simd)]
+#![allow(internal_features)]
 #![feature(nonzero_internals)]
 //! Compact DFA String Index
 //!
@@ -46,7 +47,7 @@ mod tiny_array;
 pub mod tiny_btree;
 
 mod key_store;
-pub use key_store::{BufKeyStore, KeyStore, TrieKey, U64Key, VecKeyStore};
+pub use key_store::{ByteKey, BufKeyStore, KeyStore, NonNullKey, NonZeroBytes, TrieKey, U64Key, VecKeyStore};
 
 mod arena;
 pub use arena::Arena;
