@@ -5,7 +5,7 @@
       "Bash(cargo check --benches 2>&1)",
       "Bash(cargo bench --no-run 2>&1)",
       "Bash(cargo test)",
-      "Bash(rtk cargo check)",
+      "Bash(rtk cargo check)"
     ],
     "deny": [
       "Edit(Cargo.toml)",

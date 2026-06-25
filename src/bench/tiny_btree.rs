@@ -167,12 +167,12 @@ where
 // Variable-length `Vec<u8>` CTree — preview SIMD + scalar fallback — runs
 // in every non-`u64` mode (`Bench::Bytes` skips `RandomU64`/`SeqU64`, where
 // the native `u64` SIMD CTree below takes over).
-pub(crate) type CTreeBench = CTreeBenchGen<Vec<u8>, usize, u32, 4, 5, false, u64>;
+pub(crate) type CTreeBench = CTreeBenchGen<Vec<u8>, usize, u32, 8, 9, false, u32>;
 /// `CTreeBench` + `optimize` after build (arena contiguity for iteration).
-pub(crate) type CTreeOptBench = CTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true, u64>;
+pub(crate) type CTreeOptBench = CTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true, u32>;
 
 // Fixed-width `u64` CTree — SIMD `find_position`/`find_upper_bound` path —
 // `RandomU64`/`SeqU64` modes only (`Bench::U64` carries the fixed-width skip).
-pub(crate) type CTreeFixedBench = CTreeBenchGen<u64, usize, u32, 4, 5, false, NoPreview>;
+pub(crate) type CTreeFixedBench = CTreeBenchGen<u64, usize, u32, 16, 17, false, NoPreview>;
 /// `CTreeFixedBench` + `optimize` after build.
-pub(crate) type CTreeFixedOptBench = CTreeBenchGen<u64, usize, u32, 4, 5, true, NoPreview>;
+pub(crate) type CTreeFixedOptBench = CTreeBenchGen<u64, usize, u32, 16, 17, true, NoPreview>;
