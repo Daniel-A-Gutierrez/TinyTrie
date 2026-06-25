@@ -54,7 +54,7 @@ where
 impl<K, V, PTR, const N: usize, const NP1: usize, const OPT: bool, P>
     CTreeBenchGen<K, V, PTR, N, NP1, OPT, P>
 where
-    K: CTreeBenchKey<Preview = P> + TreeKey + tiny_trie::tiny_btree::Preview<P> + Clone + Ord + 'static,
+    K: CTreeBenchKey + TreeKey + tiny_trie::tiny_btree::Preview<P> + Clone + Ord + 'static,
     K::Stored: StoredKey,
     P: Copy + Eq + Ord,
     PTR: tiny_trie::tiny_btree::TrieIndex,
@@ -88,7 +88,7 @@ where
 impl<K, PTR, const N: usize, const NP1: usize, const OPT: bool, P>
     Benchable<K> for CTreeBenchGen<K, usize, PTR, N, NP1, OPT, P>
 where
-    K: CTreeBenchKey<Preview = P> + TreeKey + tiny_trie::tiny_btree::Preview<P> + Clone + Ord + 'static,
+    K: CTreeBenchKey + TreeKey + tiny_trie::tiny_btree::Preview<P> + Clone + Ord + 'static,
     K::Stored: StoredKey,
     P: Copy + Eq + Ord,
     PTR: tiny_trie::tiny_btree::TrieIndex,
