@@ -1,0 +1,9 @@
+[package]
+name = "poly-trie"
+version = "0.1.0"
+edition = "2024"
+description = "Graduated radix trie with adaptive node sizes (Node2/Node4/Node16)"
+license = "MIT"
+
+[dependencies]
+tiny-trie-trait = { path = "../tiny-trie-trait" }

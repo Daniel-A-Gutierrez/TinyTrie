@@ -1,0 +1,11 @@
+[package]
+name = "tiny-trie-archive"
+version = "0.1.0"
+edition = "2024"
+description = "Archived/legacy trie implementations (not published)"
+publish = false
+
+[dependencies]
+
+[features]
+archive = []

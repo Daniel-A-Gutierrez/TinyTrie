@@ -53,10 +53,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrayvec"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+name = "bencher"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ctree",
+ "poly-trie",
+ "rand",
+ "serde",
+ "serde_json",
+ "tiny-trie",
+ "tiny-trie-trait",
+]
 
 [[package]]
 name = "cfg-if"
@@ -111,6 +119,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "ctree"
+version = "0.1.0"
+dependencies = [
+ "tiny-trie-trait",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -157,6 +172,13 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "poly-trie"
+version = "0.1.0"
+dependencies = [
+ "tiny-trie-trait",
+]
 
 [[package]]
 name = "ppv-lite86"
@@ -284,12 +306,13 @@ dependencies = [
 name = "tiny-trie"
 version = "0.1.0"
 dependencies = [
- "arrayvec",
- "clap",
- "rand",
  "serde",
- "serde_json",
+ "tiny-trie-trait",
 ]
+
+[[package]]
+name = "tiny-trie-trait"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

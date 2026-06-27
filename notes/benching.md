@@ -3,8 +3,10 @@
 ## Running the Suite
 
 ```bash
-cargo run --release --bin bench
+cargo run --release -p bencher --bin bencher
 ```
+
+The crate is `bencher` and the binary is `bencher`. The `-p` flag selects the workspace member; `--bin bencher` selects the binary (there's also `trie-stats`).
 
 Runs all contestants at all sizes (10, 100, 1K, 10K, 100K, 10M) with 2s per bench, using sequential `"key_N"` keys.
 
@@ -13,7 +15,7 @@ Runs all contestants at all sizes (10, 100, 1K, 10K, 100K, 10M) with 2s per benc
 ## CLI Options
 
 ```
-bench [OPTIONS]
+bencher [OPTIONS]
 
 Options:
   -t, --tests <TESTS>            Comma-separated test names [default: all]
@@ -29,7 +31,7 @@ Options:
 All options go after `--`:
 
 ```bash
-cargo run --release --bin bench -- [OPTIONS]
+cargo run --release -p bencher --bin bencher -- [OPTIONS]
 ```
 
 ### Tests
@@ -41,7 +43,7 @@ Comma-separated list of benchmark types. Defaults to all.
 | `insert`   | Key insertion                  |
 | `lookup`   | Key lookup (hits + misses)     |
 | `fwd`      | Forward iteration              |
-| `rev`      | Backward iteration             |
+| `rev`      | Backward iteration              |
 | `fwd_idx`  | Forward index-only iteration    |
 | `rev_idx`  | Backward index-only iteration   |
 | `optimize` | Optimize (DFS buf rewrite)    |
@@ -85,52 +87,60 @@ The `-u64` modes produce fixed-width 8-byte big-endian keys. These are `CTree`'s
 
 ### Key domains
 
-Each contestant declares a `KeyDomain` that the harness uses to skip it on incompatible key modes:
+Each contestant declares a `KeyVariant` that the harness uses to skip it on incompatible key modes:
 
 | Domain     | Meaning                                              | Skipped modes                          |
 |------------|------------------------------------------------------|----------------------------------------|
 | `Any`      | Accepts all key modes (default)                     | none                                   |
-| `Strings`  | No embedded null bytes (null-terminator stores)     | `random`, `random-u64`, `seq-u64`      |
-| `Variable`| Variable-length keys only (fixed-width not its use) | `random-u64`, `seq-u64`                |
+| `NonZero`  | No embedded null bytes (null-terminator stores)      | `random`, `random-u64`, `seq-u64`      |
+| `U64`      | Fixed-width u64 keys                                | `sequential`, `random`, `words`, `lines` |
 
-`CTree` is `Any` (hashes any byte key to u64). `VarCTree` is `Variable`.
+`CTree` carries both `Bytes` and `U64` variants; `variant_for(mode)` dispatches by key mode.
 
-`--keys=words` and `--keys=lines` require `--corpus <file>`. Corpus keys are sorted and deduplicated. If the requested size exceeds the corpus, all available keys are used with a warning.
+`--keys=words` and `--keys=lines` require `--corpus <file>`. Corpus keys are sorted and deduplicated. If the requested size exceeds the corpus, all available keys are used with a warning. Corpus files (`corpus.txt`, `wikipedia.txt`) live in the workspace root — pass the path relative to the workspace root:
 
-Shared loading (`load_corpus_lines`, `load_corpus_words`) lives in `lib.rs` so `trie-stats` and bench both use the same code.
+```bash
+cargo run --release -p bencher --bin bencher -- --keys words --corpus ../corpus.txt
+```
+
+Or run from the workspace root:
+
+```bash
+cargo run --release -p bencher --bin bencher -- --keys words --corpus corpus.txt
+```
 
 ### Examples
 
 ```bash
 # All tests, all sizes, all structures
-cargo run --release --bin bench
+cargo run --release -p bencher --bin bencher
 
 # Lookup only, sizes 100 through 10000
-cargo run --release --bin bench -- --tests lookup --sizes 100..10000
+cargo run --release -p bencher --bin bencher -- --tests lookup --sizes 100..10000
 
 # Insert + lookup, explicit sizes
-cargo run --release --bin bench -- --tests insert,lookup --sizes 10,100,1000
+cargo run --release -p bencher --bin bencher -- --tests insert,lookup --sizes 10,100,1000
 
 # Lookup, all sizes, only NibbleTrie variants
-cargo run --release --bin bench -- --tests lookup --structures NibbleTrie
+cargo run --release -p bencher --bin bencher -- --tests lookup --structures NibbleTrie
 
 # All tests, all sizes, only unchecked variants
-cargo run --release --bin bench -- --structures Unchecked
+cargo run --release -p bencher --bin bencher -- --structures Unchecked
 
 # Insert + lookup, size 1M, HashMap vs BTreeMap
-cargo run --release --bin bench -- --tests insert,lookup --sizes 1000000 --structures HashMap,BTreeMap
+cargo run --release -p bencher --bin bencher -- --tests insert,lookup --sizes 1000000 --structures HashMap,BTreeMap
 
 # Random keys (tests real-prefix behavior)
-cargo run --release --bin bench -- --tests lookup --sizes 1000 --keys random
+cargo run --release -p bencher --bin bencher -- --tests lookup --sizes 1000 --keys random
 
 # 5-second budget per bench
-cargo run --release --bin bench -- --time 5
+cargo run --release -p bencher --bin bencher -- --time 5
 
 # Real text words from project source
-cargo run --release --bin bench -- --tests lookup --sizes 1000 --keys words --corpus corpus.txt
+cargo run --release -p bencher --bin bencher -- --tests lookup --sizes 1000 --keys words --corpus corpus.txt
 
 # Real text lines from project source
-cargo run --release --bin bench -- --tests lookup --sizes 1000 --keys lines --corpus corpus.txt
+cargo run --release -p bencher --bin bencher -- --tests lookup --sizes 1000 --keys lines --corpus corpus.txt
 ```
 
 ## Contestants
@@ -142,13 +152,12 @@ cargo run --release --bin bench -- --tests lookup --sizes 1000 --keys lines --co
 | `HashMap`           | insert, lookup, memory                           | std::collections baseline                |
 | `SortedVec`        | insert, lookup, fwd, memory                      | Binary search on sorted vec              |
 | `NibbleOpt`         | lookup, fwd, rev, fwd_idx, rev_idx, optimize, memory | NibbleTrie after optimize()              |
-| `LinkedList`        | insert, fwd, rev, memory                         | O(n) lookup, baseline                    |
 | `NibbleUnchecked`   | lookup                                            | get_unchecked (assumes key in set)      |
 | `NibbleOptUnchecked`| lookup                                            | get_unchecked on optimized trie          |
-| `DynTrie`    | insert, lookup, fwd, rev, memory                 | Auto-promoting PTR u8→u16→u32→u64       |
-| `DynTrieOpt`      | lookup, fwd, rev, optimize, memory               | DynTrie after optimize()           |
-| `CTree`           | insert, lookup, fwd, rev, memory                 | B+ tree unified generic. In variable-length modes: `CTree<Vec<u8>,…>` with u64 preview + scalar fallback. In u64 modes: `CTree<u64,…>` with direct SIMD `find_position`. One contestant, two dispatch paths via `variant_for`. |
-| `CTreeOpt`        | lookup, fwd, rev, optimize, memory                | CTree after `optimize()`. Same dual-path dispatch. |
+| `DynTrie`           | insert, lookup, fwd, rev, memory                 | Auto-promoting PTR u8→u16→u32→u64       |
+| `DynTrieOpt`        | lookup, fwd, rev, optimize, memory                | DynTrie after optimize()                 |
+| `CTree`             | insert, lookup, fwd, rev, memory                 | B+ tree unified generic. In variable-length modes: `CTree<Vec<u8>,…>` with u64 preview + scalar fallback. In u64 modes: `CTree<u64,…>` with direct SIMD `find_position`. |
+| `CTreeOpt`          | lookup, fwd, rev, optimize, memory                | CTree after `optimize()`. Same dual-path dispatch. |
 
 ## Structure Analysis
 
@@ -165,16 +174,16 @@ Walks every arena node and reports: fanout histogram, parent-child and sibling n
 
 Examples:
 ```bash
-cargo run --bin trie-stats corpus.txt 1000
-cargo run --bin trie-stats corpus.txt --words
+cargo run -p bencher --bin trie-stats -- corpus.txt 1000
+cargo run -p bencher --bin trie-stats -- corpus.txt --words
 ```
 
 ## Output
 
 Results print to stdout as sorted tables (fastest first for rates, smallest first for memory) and persist to:
 
-- `benches/bench_results.json` — full structured data
-- `benches/bench_results.md` — markdown tables (sorted, merged across runs)
+- `crates/benches/bench_results_<keymode>.json` — full structured data
+- `crates/benches/bench_results_<keymode>.md` — markdown tables (sorted, merged across runs)
 
 Each run merges into the existing results, overwriting only the contestants and sizes that were actually run. Previous results for other sizes/contestants are preserved.
 

@@ -1,0 +1,9 @@
+[package]
+name = "ctree"
+version = "0.1.0"
+edition = "2024"
+description = "Compact B+ tree with SIMD-accelerated node search"
+license = "MIT"
+
+[dependencies]
+tiny-trie-trait = { path = "../tiny-trie-trait" }

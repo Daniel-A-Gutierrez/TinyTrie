@@ -1,12 +1,41 @@
 # Trait Architecture
 
-Two independent trait systems serve different purposes: **ByteKey** for radix-trie
-key genericity, and **CTree's trait chain** for B+ tree SIMD dispatch. The bench
-harness has its own layer on top.
+Three independent trait systems serve different purposes: **TinyTrieMap** for benchmark
+abstraction, **ByteKey** for radix-trie key genericity, and **CTree's trait chain**
+for B+ tree SIMD dispatch.
 
 ---
 
-## ByteKey System (`key_store.rs`)
+## TinyTrieMap (`tiny-trie-trait` crate)
+
+A minimal trait in its own crate, implemented by each tree structure independently.
+Exists so the bench harness can treat all trees uniformly without orphan-rule issues.
+
+```rust
+pub trait TinyTrieMap: Sized {
+    fn trie_new() -> Self;
+    fn trie_insert(&mut self, key: Vec<u8>, value: usize);
+    fn trie_get(&self, key: &[u8]) -> Option<usize>;
+    fn trie_iter_fwd(&self, f: impl FnMut(&[u8], &usize));
+    fn trie_iter_rev(&self, f: impl FnMut(&[u8], &usize));
+    fn trie_len(&self) -> usize;
+    fn trie_optimize(&mut self) { }  // default no-op
+}
+```
+
+Each crate implements it for its own type:
+
+| Crate | Implementation |
+|-------|---------------|
+| `tiny-trie` | `impl TinyTrieMap for NibbleTrie<Vec<u8>, usize>`, `NibTrie<usize>`, `BitTrie<Vec<u8>, usize>`, `FixedLenNibbleTrie<usize, u32>` |
+| `poly-trie` | `impl TinyTrieMap for PolyTrie<usize>` |
+
+The bench harness (`tiny-trie-bench` crate) depends on `tiny-trie-trait` and all three
+tree crates, so it can compare them head-to-head.
+
+---
+
+## ByteKey System (`tiny-trie` crate, `key_store.rs`)
 
 For radix tries (NibbleTrie, NibTrie, etc.) that store keys as byte slices internally
 but want type-safe insert/consume at the API boundary.
@@ -31,19 +60,19 @@ but want type-safe insert/consume at the API boundary.
 
 - `NibbleTrie<K, T, PTR, LEN, STAK>` where `K: ByteKey` — insert takes `K`,
   `get` takes `&[u8]`, `into_keys_values` returns `Vec<K>`
-- `NonNullKey` will be required by `PolyTrie<K: NonNullKey>` (not yet applied)
 - Other tries (BitTrie, NibTrie, FixedLenNibbleTrie) still use `Vec<u8>` directly;
   can adopt `ByteKey` later
 
 ### `NonZeroBytes`
 
-Moved from bench-only (`bench/keygen.rs`) to public API (`key_store.rs`). A `Vec<u8>`
-wrapper guaranteed to contain no `0x00`. Constructed via `NonZeroBytes::new(v)` which
-returns `None` if `0x00` is present, or `unsafe new_unchecked(v)`.
+A `Vec<u8>` wrapper guaranteed to contain no `0x00`. Constructed via
+`NonZeroBytes::new(v)` which returns `None` if `0x00` is present, or
+`unsafe new_unchecked(v)`. Used by the bench for null-terminator tries
+(BitTrie, PolyTrie).
 
 ---
 
-## CTree Trait System (`tiny_btree.rs`)
+## CTree Trait System (`ctree` crate, `tiny_btree.rs`)
 
 For the B+ tree's SIMD-accelerated node search. Two dispatch paths branch on whether
 keys are fixed-width or variable-length.
@@ -60,28 +89,45 @@ keys are fixed-width or variable-length.
 | `NoPreview` | ZST marker for fixed-key trees (no preview array) | struct, not trait |
 | `TrieIndex` | Arena index type (`u8`/`u16`/`u32`/`u64`) | `Copy + Clone + …` |
 
-### Composition graph
+### `FixedLenKey` implementors
 
 ```
-FixedLenKey ──┬──→ TreeKey (blanket: T: FixedLenKey)
-               ├──→ Preview<NoPreview> (blanket: T: FixedLenKey)
-               ├──→ StoredKey (fixed: K: FixedLenKey)
-               ├──→ StoredKey (variable: K: FixedLenKey → Box<[K]>)
-               │
-               │   ┌── Fixed path ──────────────────────────────────┐
-               ├──→ SearchStrategy<NoPreview> (K: FixedLenKey)        │ SIMD on key array
-               │   │   P = NoPreview, previews = 0 bytes              │ directly
-               │   └──────────────────────────────────────────────────┘
-               │
-TreeKey ───────┬──→ Preview<P> (specific: Vec<u8>, Box<[u8]>, [u8])
-               │   P ∈ {u8, u16, u32, u64}
-               │
-               └──→ SearchStrategy<P> (K: TreeKey + Preview<P>, P: FixedLenKey,
-                     K::Stored: StoredKey, K::Needle: Preview<P>)
-                   │   ┌── Variable path ──────────────────────────────┐
-                   │   │   P: FixedLenKey, preview array present     │ SIMD preview
-                   │   │   then scalar StoredKey::cmp_key on collision │ then fallback
-                   │   └──────────────────────────────────────────────┘
+u8, u16, u32, u64, i8, i16, i32, i64
+// char: commented out (line 97)
+```
+
+### Blanket impls (from `FixedLenKey`)
+
+These are the **fixed path**: SIMD scans the key array directly, no preview array.
+
+```
+impl<T>         TreeKey              for T          where T: FixedLenKey
+impl<T>         Preview<NoPreview>   for T          where T: FixedLenKey
+impl<K>         SearchStrategy<NoPreview> for K     where K: FixedLenKey
+impl<K>         StoredKey            for K          where K: FixedLenKey           // stored as-is
+impl<K>         StoredKey            for Box<[K]>   where K: FixedLenKey           // stored as boxed array
+```
+
+### Specific impls (from `TreeKey`)
+
+These are the **variable path**: SIMD filters on a preview array, then scalar
+`StoredKey::cmp_key` resolves collisions.
+
+```
+// TreeKey concrete impls
+impl            TreeKey              for Vec<u8>    (Stored = Box<[u8]>, Needle = [u8])
+impl            TreeKey              for Box<[u8]>  (Stored = Box<[u8]>, Needle = [u8])
+
+// Preview concrete impls (P ∈ {u8, u16, u32, u64})
+impl            Preview<P>           for Vec<u8>    // stored key
+impl            Preview<P>           for Box<[u8]>  // stored key
+impl            Preview<P>           for [u8]       // needle (unsized) — needed by K::Needle: Preview<P>
+
+// SearchStrategy blanket (varlen)
+impl<K>         SearchStrategy<P>    for K          where K: TreeKey + Preview<P>,
+                                                    P: FixedLenKey,
+                                                    K::Stored: StoredKey,
+                                                    K::Needle: Preview<P>
 ```
 
 ### Key type → trait satisfaction
@@ -128,57 +174,33 @@ carry both bytes and u64 variants; `variant_for(mode)` dispatches by key mode.
 
 ---
 
-## Bench Harness Layer (`bench/mod.rs`)
+## Relationship between the three systems
 
-### `Benchable<K>`
+The three trait systems are **independent** and live in separate crates:
 
-Per-contestant trait, generic over native key type `K`. Returns `Option` so
-contestants can skip unsupported test modes.
+- **`tiny-trie-trait`** (`TinyTrieMap`) — bench abstraction, implemented by each tree
+- **`tiny-trie`** (`ByteKey`/`NonNullKey`) — radix-trie key genericity, insert takes
+  `K: ByteKey`, internal comparison is `&[u8]`
+- **`ctree`** (`TreeKey`/`StoredKey`/`Preview`/`SearchStrategy`) — B+ tree node search
+  dispatch, insert takes `K: TreeKey`, internal search uses `FixedLenKey` SIMD or
+  `Preview<P>` + scalar fallback
 
-### `Contestant` + `KeyVariant`
-
-```rust
-#[derive(Clone, Copy)]
-enum KeyVariant { Bytes, NonZero, U64 }
-
-struct Contestant {
-    name: &'static str,
-    max_size: Option<usize>,
-    bytes: Option<Box<dyn Benchable<Vec<u8>>>>>,
-    nonzero: Option<Box<dyn Benchable<NonZeroBytes>>>,
-    u64: Option<Box<dyn Benchable<u64>>>,
-}
-```
-
-Each contestant carries up to three `Benchable<K>` variants (one per key type).
-`variant_for(mode)` selects the appropriate one for the current key mode — e.g.
-`CTree` carries both `bytes` (Vec<u8> variable-length path) and `u64` (fixed SIMD
-path). Multi-key contestants like `BTreeMap`, `HashMap`, etc. merge their former
-`*U64` aliases into one entry.
-
-### `BenchCtx<K>`
-
-Shared lookup sets built once per size: `lookup_keys` (hit+miss), `hit_keys`
-(unchecked), `fl_lookup_keys` (truncated), `lookup_keys_null` (null-terminated).
-
-### `CTreeKey` adapter
-
-Bench-side trait mapping harness key `K` to CTree's stored form. Bridges
-`Benchable<K>` to CTree's `TreeKey`/`StoredKey` system. Now superseded by
-`CTreeBenchKey` which uses the newer `Preview<P>` trait system.
+Potential future unification: `ByteKey` types could implement `TreeKey` (e.g.,
+`Vec<u8>: TreeKey<Stored = Box<[u8]>>` already exists in the ctree crate), but
+currently the two systems serve different purposes and don't interact.
 
 ---
 
-## Relationship between the two systems
+## Crate layout
 
-The **ByteKey** and **CTree trait** systems are **independent**:
-
-- `ByteKey` provides `as_bytes()`/`from_bytes()` for radix-trie key abstraction
-  (insert takes `K`, internal comparison is `&[u8]`)
-- CTree's `TreeKey`/`StoredKey`/`Preview`/`SearchStrategy` provides B+ tree
-  node search dispatch (insert takes `K: TreeKey`, internal search uses
-  `FixedLenKey` SIMD or `Preview<P>` + scalar fallback)
-
-Potential future unification: `ByteKey` types could implement `TreeKey` (e.g.,
-`Vec<u8>: TreeKey<Stored = Box<[u8]>>` already exists), but currently the two
-systems serve different purposes and don't interact.
+```
+tiny-trie-trait/    ← TinyTrieMap trait (no dependencies)
+tiny-trie/          ← NibbleTrie, NibTrie, BitTrie, DynTrie, FixedLenNibbleTrie
+                    ← depends on: tiny-trie-trait
+ctree/              ← CTree B+ tree, TinyArray
+                    ← depends on: tiny-trie-trait
+poly-trie/          ← PolyTrie, Arena
+                    ← depends on: tiny-trie-trait
+tiny-trie-bench/    ← Bench harness + trie-stats binary
+                    ← depends on: tiny-trie, tiny-trie-trait, ctree, poly-trie
+```

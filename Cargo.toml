@@ -1,27 +1,17 @@
-[package]
-name = "tiny-trie"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "crates/tiny-trie-trait",
+    "crates/tiny-trie",
+    "crates/ctree",
+    "crates/poly-trie",
+    "crates/benches",
+]
+resolver = "2"
 
-[dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-rand = "0.9"
-clap = { version = "4.6.1", features = ["derive"] }
-arrayvec = "0.7.6"
-
-[lib]
-path = "src/lib.rs"
-
-[[bin]]
-name = "trie-stats"
-path = "src/main.rs"
-
-[[bin]]
-name = "bencher"
-path = "src/bench/mod.rs"
-
-[features]
-archive = []
-
-
+[workspace.dependencies]
+# Workspace crates — path declared once here
+tiny-trie = { path = "crates/tiny-trie" }
+tiny-trie-trait = { path = "crates/tiny-trie-trait" }
+ctree = { path = "crates/ctree" }
+poly-trie = { path = "crates/poly-trie" }
+bencher = { path = "crates/benches" }

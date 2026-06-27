@@ -11,7 +11,8 @@
       "Bash(rtk cargo test *)",
       "Bash(cargo run --release --bin bencher *)",
       "Bash(rtk wc *)",
-      "Bash(rtk cargo check *)"
+      "Bash(rtk cargo check *)",
+      "Bash(git mv *)"
     ]
   }
 }
