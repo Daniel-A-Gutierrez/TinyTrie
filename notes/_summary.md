@@ -229,3 +229,33 @@ PackedVarCTree                 250.04M
 ─── Memory (bytes/key) ───
                                1000000
 PackedVarCTree                    45.3
+
+Ok next optimization - recursive rebalancing. Right now nodes only overflow into their immediate neighbors - this allows them to
+check more distant relatives recurisvely. 
+
+
+─── Insertion (keys/sec) ───
+                               1000000
+PackedVarCTree                   3.21M
+
+─── Lookup (keys/sec) ───
+                               1000000
+PackedVarCTree                   8.06M
+
+─── Iter forward (keys/sec) ───
+                               1000000
+PackedVarCTree                 257.97M
+
+─── Iter backward (keys/sec) ───
+                               1000000
+PackedVarCTree                 260.95M
+
+─── Memory (bytes/key) ───
+                               1000000
+PackedVarCTree                    45.3
+
+Big win on insertion and lookup, tested with 5s per test to be sure. Interesting that memory didnt change at all, considering the tree seems to be shallower  (im guessing since lookup improved so much). 
+Testing with the recusive limit set to 10 instead of 3 : 
+
+i'll omit the litany of tests, but optimizing the recusive limit it seems like 3 might be best. 2 and 4 are slower, 10 is far slower. 
+

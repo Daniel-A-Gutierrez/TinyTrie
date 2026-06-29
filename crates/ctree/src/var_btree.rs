@@ -480,6 +480,12 @@ where
         unreachable!("claim_slot: no free gap")
     }
 
+    /// Maximum depth for recursive rebalance cascading.
+    /// When a node is full and its immediate sibling is also full,
+    /// we recursively try to make room in the sibling by rebalancing
+    /// it with its own sibling in the same direction, up to this depth.
+    const REBALANCE_DEPTH: usize = 3;
+
     fn walk_to_leaf(&mut self, needle: &[u8]) -> (usize, SmallVec<[(usize, usize); 8]>) {
         if self.height == 0 { return (0, SmallVec::new()); }
         let mut path = SmallVec::new();
@@ -488,7 +494,9 @@ where
             let child = self.inodes[node_idx].find_child(needle);
             let child_idx = self.inodes[node_idx].get_ptr(child).unwrap();
             let mut child = child;
-            if self.inodes[child_idx].would_split() && self.try_rebalance_inode(node_idx, child) {
+            if self.inodes[child_idx].would_split()
+                && self.try_rebalance_inode(node_idx, child, Self::REBALANCE_DEPTH)
+            {
                 child = self.inodes[node_idx].find_child(needle);
             }
             let child_idx = self.inodes[node_idx].get_ptr(child).unwrap();
@@ -498,7 +506,9 @@ where
         let child = self.inodes[node_idx].find_child(needle);
         let leaf_idx = self.inodes[node_idx].get_ptr(child).unwrap();
         let mut child = child;
-        if self.leaves[leaf_idx].would_split() && self.try_rebalance_leaf(node_idx, child) {
+        if self.leaves[leaf_idx].would_split()
+            && self.try_rebalance_leaf(node_idx, child, Self::REBALANCE_DEPTH)
+        {
             child = self.inodes[node_idx].find_child(needle);
         }
         let leaf_idx = self.inodes[node_idx].get_ptr(child).unwrap();
@@ -529,37 +539,119 @@ where
         self.inodes[idx].keys.len() + 2 <= N
     }
 
-    fn pick_rebalance_sibling(
-        &self, parent_idx: usize, child_pos: usize,
-        sib_fill: impl Fn(usize) -> usize,
-        has_room_for_two: impl Fn(usize) -> bool,
-    ) -> Option<(usize, usize, bool)> {
-        let p = &self.inodes[parent_idx];
-        let (left, right) = p.adjacent_sibling_ptrs(child_pos);
-        let node_idx = p.get_ptr(child_pos).unwrap();
-        let pick_right = match (left, right) {
-            (Some(l), Some(r)) => sib_fill(r) <= sib_fill(l),
-            (Some(_), None) => false,
+    /// Try to rebalance a full leaf by redistributing keys to a sibling.
+    /// If the immediate sibling is also full, recursively try to make room
+    /// in it by rebalancing *it* with its own sibling in the same direction,
+    /// up to `depth` levels deep. Left keeps checking left; right keeps
+    /// checking right — never rebalancing back toward the source node.
+    fn try_rebalance_leaf(&mut self, parent_idx: usize, child_pos: usize, depth: usize) -> bool {
+        let leaf_idx = self.inodes[parent_idx].get_ptr(child_pos).unwrap();
+        let parent = &self.inodes[parent_idx];
+        let left_pos = if child_pos > 0 { Some(child_pos - 1) } else { None };
+        let right_pos = if child_pos < parent.keys.len() { Some(child_pos + 1) } else { None };
+        let left_idx = left_pos.and_then(|p| parent.get_ptr(p));
+        let right_idx = right_pos.and_then(|p| parent.get_ptr(p));
+
+        // Decide which direction to try first (prefer the less-full sibling)
+        let try_right_first = match (left_idx, right_idx) {
+            (Some(l), Some(r)) => self.leaves[r].keys.len() <= self.leaves[l].keys.len(),
             (None, Some(_)) => true,
-            (None, None) => return None,
+            (Some(_), None) => false,
+            (None, None) => return false,
         };
-        let sib = if pick_right { right } else { left }.unwrap();
-        if !has_room_for_two(sib) { return None; }
-        Some((node_idx, sib, pick_right))
+
+        // Try directions in priority order
+        let directions: [(Option<usize>, Option<usize>, bool); 2] = if try_right_first {
+            [(right_idx, right_pos, true), (left_idx, left_pos, false)]
+        } else {
+            [(left_idx, left_pos, false), (right_idx, right_pos, true)]
+        };
+
+        for (sib_idx, sib_pos, go_right) in directions {
+            let Some(sib_idx) = sib_idx else { continue };
+            let Some(sib_pos) = sib_pos else { continue };
+
+            if self.leaf_has_room_for_two(sib_idx) {
+                self.redistribute_leaf_dir(parent_idx, child_pos, leaf_idx, sib_idx, go_right);
+                return true;
+            }
+            // Sibling is full — cascade in the same direction
+            if depth > 0 && self.try_rebalance_leaf(parent_idx, sib_pos, depth - 1) {
+                // Sibling may now have room
+                if self.leaf_has_room_for_two(sib_idx) {
+                    self.redistribute_leaf_dir(parent_idx, child_pos, leaf_idx, sib_idx, go_right);
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
-    fn try_rebalance_leaf(&mut self, parent_idx: usize, child_pos: usize) -> bool {
-        let Some((leaf_idx, sib, pick_right)) = self.pick_rebalance_sibling(
-            parent_idx, child_pos,
-            |i| self.leaves[i].keys.len(),
-            |i| self.leaf_has_room_for_two(i),
-        ) else { return false; };
-        if pick_right {
-            self.redistribute_leaf_right(parent_idx, child_pos, leaf_idx, sib);
+    /// Dispatch to redistribute_leaf_left or redistribute_leaf_right.
+    fn redistribute_leaf_dir(
+        &mut self, parent_idx: usize, child_pos: usize,
+        leaf_idx: usize, sib_idx: usize, go_right: bool,
+    ) {
+        if go_right {
+            self.redistribute_leaf_right(parent_idx, child_pos, leaf_idx, sib_idx);
         } else {
-            self.redistribute_leaf_left(parent_idx, child_pos, leaf_idx, sib);
+            self.redistribute_leaf_left(parent_idx, child_pos, leaf_idx, sib_idx);
         }
-        true
+    }
+
+    /// Try to rebalance a full inode by redistributing keys to a sibling.
+    /// Same recursive cascading logic as try_rebalance_leaf.
+    fn try_rebalance_inode(&mut self, gparent_idx: usize, child_pos: usize, depth: usize) -> bool {
+        let l_idx = self.inodes[gparent_idx].get_ptr(child_pos).unwrap();
+        let parent = &self.inodes[gparent_idx];
+        let left_pos = if child_pos > 0 { Some(child_pos - 1) } else { None };
+        let right_pos = if child_pos < parent.keys.len() { Some(child_pos + 1) } else { None };
+        let left_idx = left_pos.and_then(|p| parent.get_ptr(p));
+        let right_idx = right_pos.and_then(|p| parent.get_ptr(p));
+
+        let try_right_first = match (left_idx, right_idx) {
+            (Some(l), Some(r)) => self.inodes[r].keys.len() <= self.inodes[l].keys.len(),
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (None, None) => return false,
+        };
+
+        let directions: [(Option<usize>, Option<usize>, bool); 2] = if try_right_first {
+            [(right_idx, right_pos, true), (left_idx, left_pos, false)]
+        } else {
+            [(left_idx, left_pos, false), (right_idx, right_pos, true)]
+        };
+
+        for (sib_idx, sib_pos, go_right) in directions {
+            let Some(sib_idx) = sib_idx else { continue };
+            let Some(sib_pos) = sib_pos else { continue };
+
+            if self.inode_has_room_for_two(sib_idx) {
+                self.redistribute_inode_dir(gparent_idx, child_pos, l_idx, sib_idx, go_right);
+                return true;
+            }
+            if depth > 0 && self.try_rebalance_inode(gparent_idx, sib_pos, depth - 1) {
+                if self.inode_has_room_for_two(sib_idx) {
+                    self.redistribute_inode_dir(gparent_idx, child_pos, l_idx, sib_idx, go_right);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Dispatch to redistribute_inode_left or redistribute_inode_right.
+    fn redistribute_inode_dir(
+        &mut self, gparent_idx: usize, child_pos: usize,
+        l_idx: usize, sib_idx: usize, go_right: bool,
+    ) {
+        if go_right {
+            self.redistribute_inode_right(gparent_idx, child_pos, l_idx, sib_idx);
+        } else {
+            self.redistribute_inode_left(gparent_idx, child_pos, l_idx, sib_idx);
+        }
     }
 
     /// Move keys from the full node to its right sibling.
@@ -575,7 +667,7 @@ where
         {
             let (leaf, sib) = two_mut(&mut self.leaves, leaf_idx, sib_idx);
             leaf.keys.drain_into_front(l_target, &mut sib.keys);
-            let drain: Vec<V> = leaf.values.drain(..l_target).collect();
+            let drain: Vec<V> = leaf.values.drain(l_target..).collect();
             sib.values.splice(0..0, drain);
         }
         // Safe: leaves and inodes are disjoint fields
@@ -603,20 +695,6 @@ where
         // Safe: leaves and inodes are disjoint fields
         let new_sep = self.leaves[leaf_idx].keys.key_slice(0);
         self.inodes[parent_idx].keys.update_at(child_pos - 1, new_sep);
-    }
-
-    fn try_rebalance_inode(&mut self, gparent_idx: usize, child_pos: usize) -> bool {
-        let Some((l_idx, sib, pick_right)) = self.pick_rebalance_sibling(
-            gparent_idx, child_pos,
-            |i| self.inodes[i].keys.len(),
-            |i| self.inode_has_room_for_two(i),
-        ) else { return false; };
-        if pick_right {
-            self.redistribute_inode_right(gparent_idx, child_pos, l_idx, sib);
-        } else {
-            self.redistribute_inode_left(gparent_idx, child_pos, l_idx, sib);
-        }
-        true
     }
 
     fn redistribute_inode_right(
@@ -839,10 +917,9 @@ where
         }
 
         // Insert the new key/child into the appropriate inode.
-        let goes_right = {
-            let key_at_mid = self.inodes[parent_idx].keys.key_slice(mid.min(self.inodes[parent_idx].keys.len()));
-            new_stored.cmp(key_at_mid) != std::cmp::Ordering::Less
-        };
+        // Compare against the separator key that was removed — if new_stored
+        // is >= the separator, it goes into the right (new) inode.
+        let goes_right = new_stored.cmp(&mid_stored) != std::cmp::Ordering::Less;
         if goes_right {
             let pos = self.find_position_for_stored(&new_stored, &new_inode.keys);
             new_inode.insert_key_at(pos, &new_stored);

@@ -65,3 +65,61 @@ fn test_var_mixed_inline_overflow() {
     assert_eq!(*tree.get(&[2]).unwrap(), 3);
     assert_eq!(*tree.get(&vec![0u8; 50]).unwrap(), 4);
 }
+
+/// Test that redistribute_leaf_right correctly moves values with keys.
+/// With N=4, insert enough keys to force splits, then verify all key-value
+/// pairs are intact. This specifically exercises the right-redistribution
+/// path where keys and values must move together.
+#[test]
+fn test_var_redistribute_right_values() {
+    let mut tree: TestTree = TestTree::new();
+    // Insert enough keys to trigger multiple splits and rebalances.
+    // With N=4, splits happen after every 4th insert into a full leaf.
+    // The rebalance may move keys/values to the right sibling.
+    let n = 50;
+    for i in 0..n {
+        let key = vec![(i % 256) as u8; (i % 7) + 1]; // variable-length keys
+        tree.insert(key, i).unwrap();
+    }
+
+    // Verify all key-value pairs
+    for i in 0..n {
+        let key = vec![(i % 256) as u8; (i % 7) + 1];
+        let val = tree.get(&key).expect(&format!("key {} not found", i));
+        assert_eq!(*val, i, "key {} has wrong value", i);
+    }
+}
+
+/// Test that many sequential inserts produce a valid B+ tree.
+#[test]
+fn test_var_many_inserts_sequential() {
+    let mut tree: TestTree = TestTree::new();
+    let n = 200;
+    for i in 0..n {
+        let key = vec![(i / 256) as u8, (i % 256) as u8];
+        tree.insert(key, i).unwrap();
+    }
+    assert_eq!(tree.len(), n);
+
+    for i in 0..n {
+        let key = vec![(i / 256) as u8, (i % 256) as u8];
+        assert_eq!(*tree.get(&key).unwrap(), i, "mismatch at key {}", i);
+    }
+}
+
+/// Test that reverse-order inserts also work with rebalancing.
+#[test]
+fn test_var_many_inserts_reverse() {
+    let mut tree: TestTree = TestTree::new();
+    let n = 200;
+    for i in (0..n).rev() {
+        let key = vec![(i / 256) as u8, (i % 256) as u8];
+        tree.insert(key, i).unwrap();
+    }
+    assert_eq!(tree.len(), n);
+
+    for i in 0..n {
+        let key = vec![(i / 256) as u8, (i % 256) as u8];
+        assert_eq!(*tree.get(&key).unwrap(), i, "mismatch at key {}", i);
+    }
+}
