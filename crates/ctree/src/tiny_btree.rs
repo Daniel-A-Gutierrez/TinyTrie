@@ -6,15 +6,6 @@ use std::simd::Simd;
 use crate::tiny_array::TinyArray;
 
 // ---------------------------------------------------------------------------
-// NoPreview marker
-// ---------------------------------------------------------------------------
-
-/// Marker type indicating a fixed-length key with no separate preview array.
-/// Used as the default `P` in `CTree<K, V, PTR, N, NP1, P = NoPreview>`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub struct NoPreview;
-
-// ---------------------------------------------------------------------------
 // TrieIndex
 // ---------------------------------------------------------------------------
 
@@ -94,19 +85,32 @@ impl_fixed_len_key_simd!(i8, 16);
 impl_fixed_len_key_simd!(i16, 8);
 impl_fixed_len_key_simd!(i32, 4);
 impl_fixed_len_key_simd!(i64, 4);
-// impl_fixed_len_key_simd!(char, 4);
+
+// ---------------------------------------------------------------------------
+// BufKey — buffer-offset stored key for varlen byte strings
+// ---------------------------------------------------------------------------
+
+/// Compact reference into `CTree::key_buf`. Replaces `Box<[u8]>` to eliminate
+/// per-key heap allocation and pointer chasing during search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BufKey {
+    pub start: u32,
+    pub len: u16,
+}
+
 // ---------------------------------------------------------------------------
 // TreeKey
 // ---------------------------------------------------------------------------
 
 /// Maps a user's key type to the internal stored form and lookup needle.
 pub trait TreeKey: Ord + Clone {
-    /// Internal stored form: identity for fixed keys, `Box<[u8]>` for varlen.
+    /// Internal stored form: identity for fixed keys, `BufKey` for varlen.
     type Stored: StoredKey<Needle = Self::Needle>;
     /// Borrowed needle for lookups.
     type Needle: ?Sized;
-    /// Consume into stored form.
-    fn into_stored(self) -> Self::Stored;
+    /// Consume into stored form. For varlen keys, appends to `buf` and returns a BufKey.
+    /// For fixed keys, `buf` is unused and the key is returned as-is.
+    fn into_stored(self, buf: &mut Vec<u8>) -> Self::Stored;
     /// Borrow self as lookup needle.
     fn as_needle(&self) -> &Self::Needle;
 }
@@ -115,137 +119,85 @@ pub trait TreeKey: Ord + Clone {
 impl<T: FixedLenKey> TreeKey for T {
     type Stored = T;
     type Needle = T;
-    fn into_stored(self) -> T { self }
+    fn into_stored(self, _buf: &mut Vec<u8>) -> T { self }
     fn as_needle(&self) -> &T { self }
 }
 
-// ---------------------------------------------------------------------------
-// Preview
-// ---------------------------------------------------------------------------
-
-/// SIMD-able preview of a key. Separate from `TreeKey` so a single `K` can have
-/// multiple preview sizes (e.g. `Vec<u8>` -> `u8`, `u16`, `u32`, `u64`).
-pub trait Preview<P> {
-    fn preview(&self) -> P;
-}
-
-/// Fixed keys preview to `NoPreview` (the marker default).
-impl<T: FixedLenKey> Preview<NoPreview> for T {
-    fn preview(&self) -> NoPreview { NoPreview }
-}
-
-// NOTE: No blanket `impl<P, T: Preview<P>> Preview<P> for &T` — it conflicts
-// with the `FixedLenKey -> Preview<NoPreview>` blanket when downstream types
-// implement `FixedLenKey` for `&T`.
-
-// ---------------------------------------------------------------------------
-// TreeKey + Preview impls for byte containers
-// ---------------------------------------------------------------------------
-
 impl TreeKey for Vec<u8> {
-    type Stored = Box<[u8]>;
+    type Stored = BufKey;
     type Needle = [u8];
-    fn into_stored(self) -> Box<[u8]> { self.into_boxed_slice() }
+    fn into_stored(self, buf: &mut Vec<u8>) -> BufKey {
+        let start = buf.len() as u32;
+        buf.extend_from_slice(&self);
+        BufKey { start, len: self.len() as u16 }
+    }
     fn as_needle(&self) -> &[u8] { self }
 }
 
 impl TreeKey for Box<[u8]> {
-    type Stored = Box<[u8]>;
+    type Stored = BufKey;
     type Needle = [u8];
-    fn into_stored(self) -> Box<[u8]> { self }
+    fn into_stored(self, buf: &mut Vec<u8>) -> BufKey {
+        let start = buf.len() as u32;
+        buf.extend_from_slice(&self);
+        BufKey { start, len: self.len() as u16 }
+    }
     fn as_needle(&self) -> &[u8] { self }
 }
-
-// Preview helpers: right-pad with zeros to preview width, big-endian.
-#[inline]
-fn preview_u8(src: &[u8]) -> u8 {
-    if src.is_empty() { 0 } else { src[0] }
-}
-
-#[inline]
-fn preview_u16(src: &[u8]) -> u16 {
-    let mut buf = [0u8; 2];
-    let n = src.len().min(2);
-    buf[..n].copy_from_slice(&src[..n]);
-    u16::from_be_bytes(buf)
-}
-
-#[inline]
-fn preview_u32(src: &[u8]) -> u32 {
-    let mut buf = [0u8; 4];
-    let n = src.len().min(4);
-    buf[..n].copy_from_slice(&src[..n]);
-    u32::from_be_bytes(buf)
-}
-
-#[inline]
-fn preview_u64(src: &[u8]) -> u64 {
-    let mut buf = [0u8; 8];
-    let n = src.len().min(8);
-    buf[..n].copy_from_slice(&src[..n]);
-    u64::from_be_bytes(buf)
-}
-
-// Vec<u8> previews
-impl Preview<u8>  for Vec<u8> { fn preview(&self) -> u8  { preview_u8(self) } }
-impl Preview<u16> for Vec<u8> { fn preview(&self) -> u16 { preview_u16(self) } }
-impl Preview<u32> for Vec<u8> { fn preview(&self) -> u32 { preview_u32(self) } }
-impl Preview<u64> for Vec<u8> { fn preview(&self) -> u64 { preview_u64(self) } }
-
-// Box<[u8]> previews
-impl Preview<u8>  for Box<[u8]> { fn preview(&self) -> u8  { preview_u8(self) } }
-impl Preview<u16> for Box<[u8]> { fn preview(&self) -> u16 { preview_u16(self) } }
-impl Preview<u32> for Box<[u8]> { fn preview(&self) -> u32 { preview_u32(self) } }
-impl Preview<u64> for Box<[u8]> { fn preview(&self) -> u64 { preview_u64(self) } }
-
-// [u8] previews (for SearchStrategy varlen path — needle type is [u8])
-impl Preview<u8>  for [u8] { fn preview(&self) -> u8  { preview_u8(self) } }
-impl Preview<u16> for [u8] { fn preview(&self) -> u16 { preview_u16(self) } }
-impl Preview<u32> for [u8] { fn preview(&self) -> u32 { preview_u32(self) } }
-impl Preview<u64> for [u8] { fn preview(&self) -> u64 { preview_u64(self) } }
 
 // ---------------------------------------------------------------------------
 // SearchStrategy — dispatch fixed vs varlen search
 // ---------------------------------------------------------------------------
 
-/// Static dispatch for node search: fixed keys search the key array directly;
-/// variable keys search previews with SIMD then fall back to scalar comparison.
-///
-/// The `Needle` type is the borrowed lookup form: `K` for fixed keys, `[u8]`
-/// for variable-length byte keys. This lets `get`/`cursor_at` accept `&K::Needle`
-/// directly — no owned key needed for lookups.
-pub trait SearchStrategy<P>: TreeKey {
-    fn find_position(needle: &Self::Needle, previews: &[P], keys: &[Self::Stored]) -> usize;
-    fn find_upper_bound(needle: &Self::Needle, previews: &[P], keys: &[Self::Stored]) -> usize;
+/// Static dispatch for node search: fixed keys search the key array directly
+/// via SIMD; variable keys use linear scan through the key buffer.
+pub trait SearchStrategy: TreeKey {
+    fn find_position(needle: &Self::Needle, keys: &[Self::Stored], buf: &[u8]) -> usize;
+    fn find_upper_bound(needle: &Self::Needle, keys: &[Self::Stored], buf: &[u8]) -> usize;
 }
 
-// Fixed keys: P = NoPreview, search keys directly via SIMD (ignore previews).
-impl<K: FixedLenKey> SearchStrategy<NoPreview> for K {
-    fn find_position(needle: &K, _previews: &[NoPreview], keys: &[K]) -> usize {
+// Fixed keys: search keys directly via SIMD (ignore buf).
+impl<K: FixedLenKey> SearchStrategy for K {
+    fn find_position(needle: &K, keys: &[K], _buf: &[u8]) -> usize {
         K::find_position(needle, keys)
     }
-    fn find_upper_bound(needle: &K, _previews: &[NoPreview], keys: &[K]) -> usize {
+    fn find_upper_bound(needle: &K, keys: &[K], _buf: &[u8]) -> usize {
         K::find_upper_bound(needle, keys)
     }
 }
 
-// Variable keys: P: FixedLenKey, search previews then fallback.
-impl<K: TreeKey + Preview<P>, P: FixedLenKey> SearchStrategy<P> for K
-where
-    K::Stored: StoredKey,
-    K::Needle: Preview<P>,
-{
-    fn find_position(needle: &K::Needle, _previews: &[P], keys: &[K::Stored]) -> usize {
+// Variable keys (Stored = BufKey): linear scan through the key buffer.
+impl SearchStrategy for Vec<u8> {
+    fn find_position(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
         for (i, k) in keys.iter().enumerate() {
-            if StoredKey::cmp_key(k, needle) != Ordering::Less {
+            if StoredKey::cmp_key(k, needle, buf) != Ordering::Less {
                 return i;
             }
         }
         keys.len()
     }
-    fn find_upper_bound(needle: &K::Needle, _previews: &[P], keys: &[K::Stored]) -> usize {
+    fn find_upper_bound(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
         for (i, k) in keys.iter().enumerate() {
-            if StoredKey::cmp_key(k, needle) == Ordering::Greater {
+            if StoredKey::cmp_key(k, needle, buf) == Ordering::Greater {
+                return i;
+            }
+        }
+        keys.len()
+    }
+}
+
+impl SearchStrategy for Box<[u8]> {
+    fn find_position(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
+        for (i, k) in keys.iter().enumerate() {
+            if StoredKey::cmp_key(k, needle, buf) != Ordering::Less {
+                return i;
+            }
+        }
+        keys.len()
+    }
+    fn find_upper_bound(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
+        for (i, k) in keys.iter().enumerate() {
+            if StoredKey::cmp_key(k, needle, buf) == Ordering::Greater {
                 return i;
             }
         }
@@ -262,43 +214,49 @@ mod private {
     pub trait Sealed {}
 }
 
-pub trait StoredKey: Ord + Clone + private::Sealed
-where
-    Self: Borrow<Self::Needle>,
+pub trait StoredKey: Clone + private::Sealed
 {
     /// Borrowed lookup needle: `K` for fixed, `[u8]` for variable.
     type Needle: ?Sized;
-    /// Compare stored key against needle.
-    fn cmp_key(stored: &Self, needle: &Self::Needle) -> Ordering;
-    /// Check equality.
-    fn eq_key(stored: &Self, needle: &Self::Needle) -> bool;
+    /// Compare stored key against needle. `buf` is the CTree key buffer (unused for fixed keys).
+    fn cmp_key(stored: &Self, needle: &Self::Needle, buf: &[u8]) -> Ordering;
+    /// Check equality. `buf` is the CTree key buffer (unused for fixed keys).
+    fn eq_key(stored: &Self, needle: &Self::Needle, buf: &[u8]) -> bool;
+    /// Compare two stored keys through the buffer.
+    fn cmp_stored(a: &Self, b: &Self, buf: &[u8]) -> Ordering;
 }
-
-use std::borrow::Borrow;
 
 // Fixed form
 impl<K: FixedLenKey> private::Sealed for K {}
 
 impl<K: FixedLenKey> StoredKey for K {
     type Needle = K;
-    fn cmp_key(stored: &K, needle: &K) -> Ordering { stored.cmp(needle) }
-    fn eq_key(stored: &K, needle: &K) -> bool { stored == needle }
+    fn cmp_key(stored: &K, needle: &K, _buf: &[u8]) -> Ordering { stored.cmp(needle) }
+    fn eq_key(stored: &K, needle: &K, _buf: &[u8]) -> bool { stored == needle }
+    fn cmp_stored(a: &K, b: &K, _buf: &[u8]) -> Ordering { a.cmp(b) }
 }
 
-// Variable form: Box<[K]>
-impl<K: FixedLenKey> private::Sealed for Box<[K]> {}
+// BufKey form: offset into CTree::key_buf
+impl private::Sealed for BufKey {}
 
-impl<K: FixedLenKey> StoredKey for Box<[K]> {
-    type Needle = [K];
-    fn cmp_key(stored: &Self, needle: &[K]) -> Ordering {
-        cmp_slice_scalar(stored.as_ref(), needle)
+impl StoredKey for BufKey {
+    type Needle = [u8];
+    fn cmp_key(stored: &BufKey, needle: &[u8], buf: &[u8]) -> Ordering {
+        let bytes = &buf[stored.start as usize..][..stored.len as usize];
+        cmp_slice_scalar(bytes, needle)
     }
-    fn eq_key(stored: &Self, needle: &[K]) -> bool {
-        eq_slice_scalar(stored.as_ref(), needle)
+    fn eq_key(stored: &BufKey, needle: &[u8], buf: &[u8]) -> bool {
+        let bytes = &buf[stored.start as usize..][..stored.len as usize];
+        eq_slice_scalar(bytes, needle)
+    }
+    fn cmp_stored(a: &BufKey, b: &BufKey, buf: &[u8]) -> Ordering {
+        let a_bytes = &buf[a.start as usize..][..a.len as usize];
+        let b_bytes = &buf[b.start as usize..][..b.len as usize];
+        cmp_slice_scalar(a_bytes, b_bytes)
     }
 }
 
-// Scalar comparison helpers for the varlen (`Box<[K]>`) binary search.
+// Scalar comparison helpers for varlen key comparison.
 #[inline]
 fn cmp_slice_scalar<K: Ord>(a: &[K], b: &[K]) -> Ordering {
     let n = a.len().min(b.len());
@@ -321,36 +279,30 @@ fn eq_slice_scalar<K: PartialEq>(a: &[K], b: &[K]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Node types — unified over K: TreeKey + Preview<P>
+// Node types — unified over K: TreeKey
 // ---------------------------------------------------------------------------
 
-/// Internal (separator) node: `previews` + `keys` plus `ptrs` to children.
-/// For fixed keys (`P = NoPreview`) the `previews` array is a ZST (0 bytes
-/// per element) and the node searches the `keys` array directly via SIMD.
-/// For variable keys (`P = u8/u16/u32/u64`) the node searches `previews` with
-/// SIMD then falls back to `StoredKey::cmp_key` on collisions.
-struct KeyNode<K, P, PTR, const N: usize, const NP1: usize>
+/// Internal (separator) node: keys plus `ptrs` to children.
+struct KeyNode<K, PTR, const N: usize, const NP1: usize>
 where
-    K: TreeKey + Preview<P>,
+    K: TreeKey,
     PTR: TrieIndex,
     [(); N]: ,
     [(); NP1]: ,
 {
-    previews: TinyArray<P, N>,
     keys: TinyArray<K::Stored, N>,
     ptrs: [Option<NonZero<PTR>>; NP1],
 }
 
 /// Leaf node. Carries the leaf linked list (`prev`/`next`) for O(1) cursor
 /// navigation.
-struct LeafNode<K, P, V, PTR, const N: usize>
+struct LeafNode<K, V, PTR, const N: usize>
 where
-    K: TreeKey + Preview<P>,
+    K: TreeKey,
     PTR: TrieIndex,
     V: Sized,
     [(); N]: ,
 {
-    previews: TinyArray<P, N>,
     keys: TinyArray<K::Stored, N>,
     values: TinyArray<V, N>,
     prev: Option<NonZero<PTR>>,
@@ -361,22 +313,23 @@ where
 // CTree
 // ---------------------------------------------------------------------------
 
-/// B+ tree. `K` is the user's key type, `P` is the preview type.
-///   * `CTree<K, V, ..., P = NoPreview>`  — fixed-size keys, SIMD search
-///   * `CTree<K, V, ..., P = u64>`        — variable-length keys, preview+SIMD
+/// B+ tree. `K` is the user's key type.
+///   * `CTree<u64, ...>`  — fixed-size keys, SIMD search
+///   * `CTree<Vec<u8>, ...>` — variable-length keys, linear scan through buffer
 ///
-/// All tree operations are implemented once, generically over `SearchStrategy<P>`.
-pub struct CTree<K, V, PTR, const N: usize, const NP1: usize, P = NoPreview>
+/// All tree operations are implemented once, generically over `SearchStrategy`.
+pub struct CTree<K, V, PTR, const N: usize, const NP1: usize>
 where
-    K: TreeKey + Preview<P>,
+    K: TreeKey,
     PTR: TrieIndex,
     V: Sized,
-    P: Copy,
     [(); N]: ,
     [(); NP1]: ,
 {
-    inodes: Vec<KeyNode<K, P, PTR, N, NP1>>,
-    leaves: Vec<LeafNode<K, P, V, PTR, N>>,
+    inodes: Vec<KeyNode<K, PTR, N, NP1>>,
+    leaves: Vec<LeafNode<K, V, PTR, N>>,
+    /// Contiguous byte buffer for varlen key data. Fixed-key trees leave this empty.
+    key_buf: Vec<u8>,
     len: usize,
     /// Count of LIVE leaves (excludes gap sentinels).
     n_leaves: usize,
@@ -386,30 +339,28 @@ where
     root_inode: usize,
 }
 
-pub struct Cursor<'a, K, V, PTR, const N: usize, const NP1: usize, P = NoPreview>
+pub struct Cursor<'a, K, V, PTR, const N: usize, const NP1: usize>
 where
-    K: TreeKey + Preview<P>,
+    K: TreeKey,
     PTR: TrieIndex,
     V: Sized,
-    P: Copy,
     [(); N]: ,
     [(); NP1]: ,
 {
-    tree: &'a CTree<K, V, PTR, N, NP1, P>,
+    tree: &'a CTree<K, V, PTR, N, NP1>,
     leaf_idx: usize,
     position: usize,
 }
 
-pub struct CursorMut<'a, K, V, PTR, const N: usize, const NP1: usize, P = NoPreview>
+pub struct CursorMut<'a, K, V, PTR, const N: usize, const NP1: usize>
 where
-    K: TreeKey + Preview<P>,
+    K: TreeKey,
     PTR: TrieIndex,
     V: Sized,
-    P: Copy,
     [(); N]: ,
     [(); NP1]: ,
 {
-    tree: &'a mut CTree<K, V, PTR, N, NP1, P>,
+    tree: &'a mut CTree<K, V, PTR, N, NP1>,
     leaf_idx: usize,
     position: usize,
 }
@@ -419,12 +370,11 @@ where
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-impl<K, P, PTR, const N: usize, const NP1: usize> KeyNode<K, P, PTR, N, NP1>
+impl<K, PTR, const N: usize, const NP1: usize> KeyNode<K, PTR, N, NP1>
 where
-    K: TreeKey + Preview<P> + SearchStrategy<P>,
+    K: TreeKey + SearchStrategy,
     K::Stored: StoredKey,
     PTR: TrieIndex,
-    P: Copy,
     [(); N]: ,
     [(); NP1]: ,
 {
@@ -432,7 +382,6 @@ where
 
     fn new() -> Self {
         Self {
-            previews: TinyArray::new(),
             keys: TinyArray::new(),
             ptrs: [None; NP1],
         }
@@ -443,7 +392,6 @@ where
         let mut node = Self::new();
         for i in from..to {
             node.keys.insert_at(i - from, parent.keys.get(i).clone());
-            node.previews.insert_at(i - from, *parent.previews.get(i));
         }
         for i in from..=to {
             node.ptrs[i - from] = parent.ptrs[i];
@@ -484,15 +432,14 @@ where
 
     /// First index where `keys[i] >= needle` (lower bound).
     #[inline]
-    fn find_position(&self, needle: &<K as TreeKey>::Needle) -> usize {
-        <K as SearchStrategy<P>>::find_position(needle, self.previews.as_slice(), self.keys.as_slice())
+    fn find_position(&self, needle: &<K as TreeKey>::Needle, buf: &[u8]) -> usize {
+        <K as SearchStrategy>::find_position(needle, self.keys.as_slice(), buf)
     }
 
     /// Find the child pointer index for `needle` in a B+ tree internal node.
-    /// Returns the index `i` such that `ptrs[i]` points to the subtree for `needle`.
     #[inline]
-    fn find_child(&self, needle: &<K as TreeKey>::Needle) -> usize {
-        <K as SearchStrategy<P>>::find_upper_bound(needle, self.previews.as_slice(), self.keys.as_slice())
+    fn find_child(&self, needle: &<K as TreeKey>::Needle, buf: &[u8]) -> usize {
+        <K as SearchStrategy>::find_upper_bound(needle, self.keys.as_slice(), buf)
     }
 
     #[inline]
@@ -512,8 +459,8 @@ where
         self.keys.len() == N / 2
     }
 
-    /// Insert stored key at position `pos`, with its preview.
-    fn insert_key_at(&mut self, pos: usize, preview: P, stored: <K as TreeKey>::Stored) {
+    /// Insert stored key at position `pos`.
+    fn insert_key_at(&mut self, pos: usize, stored: <K as TreeKey>::Stored) {
         debug_assert!(!self.would_split());
         let l = self.keys.len();
         if pos < l {
@@ -522,13 +469,12 @@ where
             }
         }
         self.keys.insert_at(pos, stored);
-        self.previews.insert_at(pos, preview);
     }
 
     /// Insert stored key into this internal node in sorted order.
-    fn insert_leaf(&mut self, needle: &<K as TreeKey>::Needle, preview: P, stored: <K as TreeKey>::Stored) -> usize {
-        let pos = self.find_position(needle);
-        self.insert_key_at(pos, preview, stored);
+    fn insert_leaf(&mut self, needle: &<K as TreeKey>::Needle, stored: <K as TreeKey>::Stored, buf: &[u8]) -> usize {
+        let pos = self.find_position(needle, buf);
+        self.insert_key_at(pos, stored);
         pos
     }
 
@@ -536,7 +482,6 @@ where
     fn remove(&mut self, pos: usize) -> <K as TreeKey>::Stored {
         let l = self.keys.len();
         let k = self.keys.remove_at(pos);
-        self.previews.remove_at(pos);
         if pos + 1 < l {
             for i in pos + 1..l {
                 self.ptrs[i] = self.ptrs[i + 1];
@@ -548,7 +493,6 @@ where
     #[inline]
     fn truncate(&mut self, newlen: u8) {
         self.keys.truncate(newlen);
-        self.previews.truncate(newlen);
     }
 }
 
@@ -557,18 +501,16 @@ where
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-impl<K, P, V, PTR, const N: usize> LeafNode<K, P, V, PTR, N>
+impl<K, V, PTR, const N: usize> LeafNode<K, V, PTR, N>
 where
-    K: TreeKey + Preview<P> + SearchStrategy<P>,
+    K: TreeKey + SearchStrategy,
     K::Stored: StoredKey,
     PTR: TrieIndex,
     V: Sized,
-    P: Copy,
     [(); N]: ,
 {
     fn new() -> Self {
         Self {
-            previews: TinyArray::new(),
             keys: TinyArray::new(),
             values: TinyArray::new(),
             prev: None,
@@ -607,8 +549,8 @@ where
     }
 
     #[inline]
-    fn find_position(&self, needle: &<K as TreeKey>::Needle) -> usize {
-        <K as SearchStrategy<P>>::find_position(needle, self.previews.as_slice(), self.keys.as_slice())
+    fn find_position(&self, needle: &<K as TreeKey>::Needle, buf: &[u8]) -> usize {
+        <K as SearchStrategy>::find_position(needle, self.keys.as_slice(), buf)
     }
 
     #[inline]
@@ -617,14 +559,12 @@ where
     }
 
     /// Insert key-value at position `pos`.
-    fn insert(&mut self, pos: usize, preview: P, stored: <K as TreeKey>::Stored, value: V) {
-        self.previews.insert_at(pos, preview);
+    fn insert(&mut self, pos: usize, stored: <K as TreeKey>::Stored, value: V) {
         self.keys.insert_at(pos, stored);
         self.values.insert_at(pos, value);
     }
 
     fn remove(&mut self, pos: usize) -> (<K as TreeKey>::Stored, V) {
-        self.previews.remove_at(pos);
         let k = self.keys.remove_at(pos);
         let v = self.values.remove_at(pos);
         (k, v)
@@ -632,7 +572,6 @@ where
 
     fn truncate(&mut self, newlen: u8) {
         self.keys.truncate(newlen);
-        self.previews.truncate(newlen);
         self.values.truncate(newlen);
     }
 }
@@ -679,14 +618,13 @@ fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-impl<K, V, PTR, const N: usize, const NP1: usize, P>
-    CTree<K, V, PTR, N, NP1, P>
+impl<K, V, PTR, const N: usize, const NP1: usize>
+    CTree<K, V, PTR, N, NP1>
 where
-    K: TreeKey + Preview<P> + SearchStrategy<P>,
+    K: TreeKey + SearchStrategy,
     K::Stored: StoredKey,
     PTR: TrieIndex,
     V: Sized,
-    P: Copy,
     [(); N]: ,
     [(); NP1]: ,
 {
@@ -701,10 +639,11 @@ where
     pub fn new() -> Self {
         let () = Self::ASSERT_NP1;
         let () = Self::ASSERT_N_FITS;
-        let root = LeafNode::<K, P, V, PTR, N>::new();
+        let root = LeafNode::<K, V, PTR, N>::new();
         Self {
             inodes: Vec::new(),
             leaves: vec![root],
+            key_buf: Vec::new(),
             len: 0,
             n_leaves: 1,
             height: 0,
@@ -750,7 +689,7 @@ where
         }
 
         let mut old = std::mem::take(&mut self.leaves);
-        let mut buf: Vec<LeafNode<K, P, V, PTR, N>> = Vec::with_capacity(new_slots);
+        let mut buf: Vec<LeafNode<K, V, PTR, N>> = Vec::with_capacity(new_slots);
         for i in 0..new_slots {
             let is_live_slot = !gapful || i % 2 == 0;
             if is_live_slot {
@@ -836,21 +775,21 @@ where
         let mut path = Vec::new();
         let mut node_idx: usize = self.root_inode;
         for _ in 0..self.height - 1 {
-            let child = self.inodes[node_idx].find_child(needle);
+            let child = self.inodes[node_idx].find_child(needle, &self.key_buf);
             let child_idx = self.inodes[node_idx].get_ptr(child).unwrap();
             let mut child = child;
             if self.inodes[child_idx].would_split() && self.try_rebalance_inode(node_idx, child) {
-                child = self.inodes[node_idx].find_child(needle);
+                child = self.inodes[node_idx].find_child(needle, &self.key_buf);
             }
             let child_idx = self.inodes[node_idx].get_ptr(child).unwrap();
             path.push((node_idx, child));
             node_idx = child_idx;
         }
-        let child = self.inodes[node_idx].find_child(needle);
+        let child = self.inodes[node_idx].find_child(needle, &self.key_buf);
         let leaf_idx = self.inodes[node_idx].get_ptr(child).unwrap();
         let mut child = child;
         if self.leaves[leaf_idx].would_split() && self.try_rebalance_leaf(node_idx, child) {
-            child = self.inodes[node_idx].find_child(needle);
+            child = self.inodes[node_idx].find_child(needle, &self.key_buf);
         }
         let leaf_idx = self.inodes[node_idx].get_ptr(child).unwrap();
         path.push((node_idx, child));
@@ -864,11 +803,11 @@ where
         }
         let mut node_idx: usize = self.root_inode;
         for _ in 0..self.height - 1 {
-            let child = self.inodes[node_idx].find_child(needle);
+            let child = self.inodes[node_idx].find_child(needle, &self.key_buf);
             node_idx = self.inodes[node_idx].get_ptr(child).unwrap();
         }
         let bottom = &self.inodes[node_idx];
-        let child = bottom.find_child(needle);
+        let child = bottom.find_child(needle, &self.key_buf);
         bottom.get_ptr(child).unwrap()
     }
 
@@ -933,13 +872,10 @@ where
         {
             let (leaf, sib) = two_mut(&mut self.leaves, leaf_idx, sib_idx);
             leaf.keys.drain_into_front(l_target, &mut sib.keys);
-            leaf.previews.drain_into_front(l_target, &mut sib.previews);
             leaf.values.drain_into_front(l_target, &mut sib.values);
         }
         let new_sep_stored = self.leaves[sib_idx].keys.get(0).clone();
-        let new_sep_preview = *self.leaves[sib_idx].previews.get(0);
         *self.inodes[parent_idx].keys.get_mut(child_pos) = new_sep_stored;
-        *self.inodes[parent_idx].previews.get_mut(child_pos) = new_sep_preview;
     }
 
     fn redistribute_leaf_left(
@@ -955,13 +891,10 @@ where
         {
             let (leaf, sib) = two_mut(&mut self.leaves, leaf_idx, sib_idx);
             leaf.keys.drain_front_into(m, &mut sib.keys);
-            leaf.previews.drain_front_into(m, &mut sib.previews);
             leaf.values.drain_front_into(m, &mut sib.values);
         }
         let new_sep_stored = self.leaves[leaf_idx].keys.get(0).clone();
-        let new_sep_preview = *self.leaves[leaf_idx].previews.get(0);
         *self.inodes[parent_idx].keys.get_mut(child_pos - 1) = new_sep_stored;
-        *self.inodes[parent_idx].previews.get_mut(child_pos - 1) = new_sep_preview;
     }
 
     fn try_rebalance_inode(&mut self, gparent_idx: usize, child_pos: usize) -> bool {
@@ -991,7 +924,6 @@ where
             let g = &self.inodes[gparent_idx];
             (self.inodes[r_idx].keys.len(), g.keys.get(child_pos).clone())
         };
-        let sep0_preview = *self.inodes[gparent_idx].previews.get(child_pos);
         let l_target = Self::rebalance_target(s);
         let m = N - l_target;
 
@@ -1003,16 +935,11 @@ where
             }
             if m > 1 {
                 l.keys.drain_into_front(l_target + 1, &mut r.keys);
-                l.previews.drain_into_front(l_target + 1, &mut r.previews);
             }
             r.keys.insert_at(m - 1, sep0_stored);
-            r.previews.insert_at(m - 1, sep0_preview);
             l.keys.remove_at(l_target)
         };
-        let new_sep_preview = *self.inodes[l_idx].previews.get(l_target);
-        self.inodes[l_idx].previews.remove_at(l_target);
         *self.inodes[gparent_idx].keys.get_mut(child_pos) = new_sep_stored;
-        *self.inodes[gparent_idx].previews.get_mut(child_pos) = new_sep_preview;
     }
 
     fn redistribute_inode_left(
@@ -1026,7 +953,6 @@ where
             let g = &self.inodes[gparent_idx];
             (self.inodes[sib_idx].keys.len(), g.keys.get(child_pos - 1).clone())
         };
-        let sep0_preview = *self.inodes[gparent_idx].previews.get(child_pos - 1);
         let l_target = Self::rebalance_target(s);
         let m = N - l_target;
 
@@ -1036,30 +962,25 @@ where
                 sib.ptrs[(s + 1) + i] = l.ptrs[i].take();
             }
             sib.keys.push(sep0_stored);
-            sib.previews.push(sep0_preview);
             if m > 1 {
                 l.keys.drain_front_into(m - 1, &mut sib.keys);
-                l.previews.drain_front_into(m - 1, &mut sib.previews);
             }
             l.keys.remove_at(0)
         };
-        let new_sep_preview = *self.inodes[l_idx].previews.get(0);
         {
             let l = &mut self.inodes[l_idx];
             l.ptrs.copy_within(m..=N, 0);
             for i in (N - m + 1)..=N {
                 l.ptrs[i] = None;
             }
-            l.previews.remove_at(0);
         }
         *self.inodes[gparent_idx].keys.get_mut(child_pos - 1) = new_sep_stored;
-        *self.inodes[gparent_idx].previews.get_mut(child_pos - 1) = new_sep_preview;
     }
 
     #[inline]
     fn locate(&self, needle: &<K as TreeKey>::Needle) -> (usize, usize) {
         let leaf_idx = self.find_leaf(needle);
-        let pos = self.leaves[leaf_idx].find_position(needle);
+        let pos = self.leaves[leaf_idx].find_position(needle, &self.key_buf);
         (leaf_idx, pos)
     }
 
@@ -1071,7 +992,7 @@ where
         let leaf = &self.leaves[leaf_idx];
         if pos < leaf.keys.len() {
             let stored = leaf.keys.get(pos);
-            if StoredKey::eq_key(stored, key) {
+            if StoredKey::eq_key(stored, key, &self.key_buf) {
                 return Some(leaf.values.get(pos));
             }
         }
@@ -1085,7 +1006,7 @@ where
         let (leaf_idx, pos) = self.locate(key);
         if pos < self.leaves[leaf_idx].keys.len() {
             let stored = self.leaves[leaf_idx].keys.get(pos);
-            if StoredKey::eq_key(stored, key) {
+            if StoredKey::eq_key(stored, key, &self.key_buf) {
                 return Some(self.leaves[leaf_idx].values.get_mut(pos));
             }
         }
@@ -1095,30 +1016,29 @@ where
     pub fn insert(&mut self, key: K, value: V) -> Result<(), (K, V)> {
         let _ = Self::ASSERT_N_FITS;
 
-        let preview = key.preview();
         let needle = key.as_needle();
 
         let (child_idx, path) = self.walk_to_leaf(needle);
         let leaf = &self.leaves[child_idx];
-        let pos = leaf.find_position(needle);
+        let pos = leaf.find_position(needle, &self.key_buf);
 
         // Key already exists?
-        if pos < leaf.keys.len() && StoredKey::eq_key(leaf.keys.get(pos), needle) {
+        if pos < leaf.keys.len() && StoredKey::eq_key(leaf.keys.get(pos), needle, &self.key_buf) {
             return Err((key, value));
         }
 
-        let stored = K::into_stored(key);
+        let stored = K::into_stored(key, &mut self.key_buf);
 
         if leaf.keys.len() >= N {
             let mid = N / 2;
             let (parent_idx, new_leaf_idx) = self.split_leaf(child_idx, path);
             if pos <= mid {
-                self.leaves[parent_idx].insert(pos, preview, stored, value);
+                self.leaves[parent_idx].insert(pos, stored, value);
             } else {
-                self.leaves[new_leaf_idx].insert(pos - mid, preview, stored, value);
+                self.leaves[new_leaf_idx].insert(pos - mid, stored, value);
             }
         } else {
-            self.leaves[child_idx].insert(pos, preview, stored, value);
+            self.leaves[child_idx].insert(pos, stored, value);
         }
 
         self.len += 1;
@@ -1128,7 +1048,6 @@ where
     fn split_leaf(&mut self, child_idx: usize, mut path: Vec<(usize, usize)>) -> (usize, usize) {
         let mid = N / 2;
         let mid_stored = self.leaves[child_idx].keys.get(mid).clone();
-        let mid_preview = *self.leaves[child_idx].previews.get(mid);
 
         let child_idx = if self.n_leaves == self.leaves.len() {
             let map = self.spread();
@@ -1139,9 +1058,8 @@ where
 
         let old_next = self.leaves[child_idx].get_next();
 
-        let mut new_leaf = LeafNode::<K, P, V, PTR, N>::new();
+        let mut new_leaf = LeafNode::<K, V, PTR, N>::new();
         self.leaves[child_idx].keys.drain_into(mid, &mut new_leaf.keys);
-        self.leaves[child_idx].previews.drain_into(mid, &mut new_leaf.previews);
         self.leaves[child_idx].values.drain_into(mid, &mut new_leaf.values);
 
         let new_leaf_idx = self.claim_slot(child_idx);
@@ -1157,16 +1075,15 @@ where
         }
 
         self.n_leaves += 1;
-        self.insert_separator(mid_stored, mid_preview, new_leaf_idx, &mut path);
+        self.insert_separator(mid_stored, new_leaf_idx, &mut path);
         (child_idx, new_leaf_idx)
     }
 
-    fn insert_separator(&mut self, stored: <K as TreeKey>::Stored, preview: P, new_child_idx: usize, path: &mut Vec<(usize, usize)>) {
+    fn insert_separator(&mut self, stored: <K as TreeKey>::Stored, new_child_idx: usize, path: &mut Vec<(usize, usize)>) {
         if path.is_empty() {
             let old_root_idx = self.root_inode;
-            let mut root = KeyNode::<K, P, PTR, N, NP1>::new();
+            let mut root = KeyNode::<K, PTR, N, NP1>::new();
             root.keys.insert_at(0, stored);
-            root.previews.insert_at(0, preview);
             root.set_ptr(0, old_root_idx);
             root.set_ptr(1, new_child_idx);
             let root_idx = self.inodes.len();
@@ -1179,41 +1096,32 @@ where
         let (parent_idx, _) = path.pop().unwrap();
 
         if !self.inodes[parent_idx].would_split() {
-            let needle: &<K as TreeKey>::Needle = stored.borrow();
-            let pos = self.inodes[parent_idx].find_position(needle);
-            self.inodes[parent_idx].insert_key_at(pos, preview, stored);
+            let pos = self.find_position_for_stored_in_inode(parent_idx, &stored);
+            self.inodes[parent_idx].insert_key_at(pos, stored);
             self.inodes[parent_idx].set_ptr(pos + 1, new_child_idx);
         } else {
-            self.split_inode(parent_idx, stored, preview, new_child_idx, path);
+            self.split_inode(parent_idx, stored, new_child_idx, path);
         }
-    }
-
-    fn find_position_in_inode(inode: &KeyNode<K, P, PTR, N, NP1>, needle: &<K as TreeKey>::Needle) -> usize {
-        inode.find_position(needle)
     }
 
     fn split_inode(
         &mut self,
         parent_idx: usize,
         new_stored: <K as TreeKey>::Stored,
-        new_preview: P,
         new_child_idx: usize,
         path: &mut Vec<(usize, usize)>,
     ) {
         let mid = N / 2;
         // Save the mid separator before we start moving things.
         let mid_stored = self.inodes[parent_idx].keys.get(mid).clone();
-        let mid_preview = *self.inodes[parent_idx].previews.get(mid);
 
         // Save ptrs length before drain_into truncates keys.
         let old_len = self.inodes[parent_idx].keys.len();
 
-        let mut new_inode = KeyNode::<K, P, PTR, N, NP1>::new();
-        // Move keys/previews [mid+1..old_len) to new inode.
-        // Only drain if there are keys beyond the separator.
+        let mut new_inode = KeyNode::<K, PTR, N, NP1>::new();
+        // Move keys [mid+1..old_len) to new inode.
         if mid + 1 < old_len {
             self.inodes[parent_idx].keys.drain_into(mid + 1, &mut new_inode.keys);
-            self.inodes[parent_idx].previews.drain_into(mid + 1, &mut new_inode.previews);
         }
 
         // Move ptrs [mid+1..=old_len] to new inode.
@@ -1221,25 +1129,22 @@ where
             new_inode.ptrs[i] = self.inodes[parent_idx].ptrs[mid + 1 + i];
         }
 
-        // Remove the mid separator key/preview.
+        // Remove the mid separator key.
         self.inodes[parent_idx].keys.remove_at(mid);
-        self.inodes[parent_idx].previews.remove_at(mid);
         // Truncate ptrs: keep [0..=mid], clear the rest.
         for i in (mid + 1)..=old_len {
             self.inodes[parent_idx].ptrs[i] = None;
         }
 
         // Insert the new key/child into the appropriate inode.
-        let goes_right = new_stored >= mid_stored;
+        let goes_right = StoredKey::cmp_stored(&new_stored, &mid_stored, &self.key_buf) != Ordering::Less;
         if goes_right {
-            let needle: &<K as TreeKey>::Needle = new_stored.borrow();
-            let pos = new_inode.find_position(needle);
-            new_inode.insert_key_at(pos, new_preview, new_stored);
+            let pos = self.find_position_for_stored_in_keys(&new_stored, &new_inode.keys);
+            new_inode.insert_key_at(pos, new_stored);
             new_inode.set_ptr(pos + 1, new_child_idx);
         } else {
-            let needle: &<K as TreeKey>::Needle = new_stored.borrow();
-            let pos = self.inodes[parent_idx].find_position(needle);
-            self.inodes[parent_idx].insert_key_at(pos, new_preview, new_stored);
+            let pos = self.find_position_for_stored_in_keys(&new_stored, &self.inodes[parent_idx].keys);
+            self.inodes[parent_idx].insert_key_at(pos, new_stored);
             self.inodes[parent_idx].set_ptr(pos + 1, new_child_idx);
         }
 
@@ -1247,7 +1152,31 @@ where
         self.inodes.push(new_inode);
 
         // Recurse: insert the mid separator into the grandparent.
-        self.insert_separator(mid_stored, mid_preview, new_inode_idx, path);
+        self.insert_separator(mid_stored, new_inode_idx, path);
+    }
+
+    /// Find the position where `stored` should be inserted among an inode's keys.
+    fn find_position_for_stored_in_inode(&self, inode_idx: usize, stored: &K::Stored) -> usize {
+        let keys = self.inodes[inode_idx].keys.as_slice();
+        let buf = &self.key_buf;
+        for (i, k) in keys.iter().enumerate() {
+            if StoredKey::cmp_stored(stored, k, buf) != Ordering::Greater {
+                return i;
+            }
+        }
+        keys.len()
+    }
+
+    /// Find the position where `stored` should be inserted among a key array.
+    fn find_position_for_stored_in_keys(&self, stored: &K::Stored, keys: &TinyArray<K::Stored, N>) -> usize {
+        let buf = &self.key_buf;
+        let slice = keys.as_slice();
+        for (i, k) in slice.iter().enumerate() {
+            if StoredKey::cmp_stored(stored, k, buf) != Ordering::Greater {
+                return i;
+            }
+        }
+        slice.len()
     }
 
     fn descend_to_leaf(&self, rightmost: bool) -> usize {
@@ -1263,7 +1192,7 @@ where
         self.inodes[node_idx].get_ptr(ci).unwrap()
     }
 
-fn first_leaf(&self) -> usize {
+    fn first_leaf(&self) -> usize {
         self.descend_to_leaf(false)
     }
 
@@ -1271,7 +1200,7 @@ fn first_leaf(&self) -> usize {
         self.descend_to_leaf(true)
     }
 
-    pub fn get_cursor(&self) -> Cursor<'_, K, V, PTR, N, NP1, P> {
+    pub fn get_cursor(&self) -> Cursor<'_, K, V, PTR, N, NP1> {
         let leaf_idx = self.first_leaf();
         Cursor {
             tree: self,
@@ -1280,7 +1209,7 @@ fn first_leaf(&self) -> usize {
         }
     }
 
-    pub fn get_cursor_mut(&mut self) -> CursorMut<'_, K, V, PTR, N, NP1, P> {
+    pub fn get_cursor_mut(&mut self) -> CursorMut<'_, K, V, PTR, N, NP1> {
         let leaf_idx = self.first_leaf();
         CursorMut {
             tree: self,
@@ -1289,7 +1218,7 @@ fn first_leaf(&self) -> usize {
         }
     }
 
-    pub fn cursor_at(&self, key: &<K as TreeKey>::Needle) -> Cursor<'_, K, V, PTR, N, NP1, P> {
+    pub fn cursor_at(&self, key: &<K as TreeKey>::Needle) -> Cursor<'_, K, V, PTR, N, NP1> {
         let (leaf_idx, pos) = self.locate(key);
         Cursor {
             tree: self,
@@ -1303,14 +1232,13 @@ fn first_leaf(&self) -> usize {
 // Cursor impl
 // ---------------------------------------------------------------------------
 
-impl<'a, K, V, PTR, const N: usize, const NP1: usize, P>
-    Cursor<'a, K, V, PTR, N, NP1, P>
+impl<'a, K, V, PTR, const N: usize, const NP1: usize>
+    Cursor<'a, K, V, PTR, N, NP1>
 where
-    K: TreeKey + Preview<P> + SearchStrategy<P>,
+    K: TreeKey + SearchStrategy,
     K::Stored: StoredKey,
     PTR: TrieIndex,
     V: Sized,
-    P: Copy,
     [(); N]: ,
     [(); NP1]: ,
 {
@@ -1348,14 +1276,13 @@ where
     }
 }
 
-impl<'a, K, V, PTR, const N: usize, const NP1: usize, P>
-    CursorMut<'a, K, V, PTR, N, NP1, P>
+impl<'a, K, V, PTR, const N: usize, const NP1: usize>
+    CursorMut<'a, K, V, PTR, N, NP1>
 where
-    K: TreeKey + Preview<P> + SearchStrategy<P>,
+    K: TreeKey + SearchStrategy,
     K::Stored: StoredKey,
     PTR: TrieIndex,
     V: Sized,
-    P: Copy,
     [(); N]: ,
     [(); NP1]: ,
 {
@@ -1402,12 +1329,12 @@ where
 
 /// Fixed-size-key B+ tree (SIMD search). `K: FixedLenKey`.
 pub type FixedCTree<K, V, PTR, const N: usize, const NP1: usize> =
-    CTree<K, V, PTR, N, NP1, NoPreview>;
+    CTree<K, V, PTR, N, NP1>;
 
-/// Variable-length-key B+ tree (preview SIMD + scalar fallback).
-/// `K: TreeKey + Preview<P>`, e.g. `Vec<u8>` with `P = u64`.
-pub type VarCTree<K, V, PTR, const N: usize, const NP1: usize, P> =
-    CTree<K, V, PTR, N, NP1, P>;
+/// Variable-length-key B+ tree (linear scan through key buffer).
+/// `K: TreeKey` with `K::Stored = BufKey`, e.g. `Vec<u8>`.
+pub type VarCTree<K, V, PTR, const N: usize, const NP1: usize> =
+    CTree<K, V, PTR, N, NP1>;
 
 #[cfg(test)]
 #[path = "tests/tiny_btree.rs"]

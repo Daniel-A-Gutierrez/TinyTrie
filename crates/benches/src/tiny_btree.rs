@@ -1,31 +1,18 @@
 use std::hint::black_box;
 
-use ctree::{CTree, NoPreview, StoredKey, TreeKey};
+use ctree::{CTree, SearchStrategy, StoredKey, TreeKey};
 
 use super::{Benchable, BenchCtx, read_allocated};
 
 // ── CTreeKey adapter ───────────────────────────────────────────────────
 //
-// Unifies the two CTree key forms behind one generic bench struct. The new
-// CTree signature is `CTree<K, V, PTR, N, NP1, P>` where `K: TreeKey + Preview<P>`.
-// For fixed keys (`u64`), `P = NoPreview` (default). For variable keys (`Vec<u8>`),
-// `P = u64` (u64 preview for SIMD search).
-//
-// The bench harness key `K` maps directly to CTree's `K`. For `u64` keys,
-// `K = u64` and `P = NoPreview`. For `Vec<u8>` keys, `K = Vec<u8>` and `P = u64`.
+// Unifies the two CTree key forms behind one generic bench struct.
+// Fixed keys (u64) use SIMD search; variable keys (Vec<u8>) use BufKey
+// with linear scan through a contiguous key buffer.
 
-pub(crate) trait CTreeBenchKey: TreeKey + Clone + Ord + 'static {
-    /// Preview type for CTree's `P` parameter.
-    type Preview: Copy + Eq + Ord;
-}
-
-impl CTreeBenchKey for u64 {
-    type Preview = NoPreview;
-}
-
-impl CTreeBenchKey for Vec<u8> {
-    type Preview = u64;
-}
+pub(crate) trait CTreeBenchKey: TreeKey + SearchStrategy + Clone + Ord + 'static {}
+impl CTreeBenchKey for u64 {}
+impl CTreeBenchKey for Vec<u8> {}
 
 // ── CTreeBenchGen ─────────────────────────────────────────────────────
 //
@@ -40,26 +27,22 @@ impl CTreeBenchKey for Vec<u8> {
 // the SIMD path. The `dyn Benchable<u64>` vtable in the harness only erases the
 // *contestant type*, not `K`.
 
-pub(crate) struct CTreeBenchGen<K: CTreeBenchKey, V, PTR, const N: usize, const NP1: usize, const OPT: bool, P = <K as CTreeBenchKey>::Preview>
+pub(crate) struct CTreeBenchGen<K: CTreeBenchKey, V, PTR, const N: usize, const NP1: usize, const OPT: bool>
 where
-    K: TreeKey + ctree::Preview<P>,
-    P: Copy + Eq + Ord,
+    K: TreeKey,
     PTR: ctree::TrieIndex,
 {
-    tree: CTree<K, V, PTR, N, NP1, P>,
+    tree: CTree<K, V, PTR, N, NP1>,
     max_key: Option<K>,
 }
 
-// Fixed-key bench: CTree<u64, usize, u32, 4, 5, NoPreview>
-impl<K, V, PTR, const N: usize, const NP1: usize, const OPT: bool, P>
-    CTreeBenchGen<K, V, PTR, N, NP1, OPT, P>
+impl<K, V, PTR, const N: usize, const NP1: usize, const OPT: bool>
+    CTreeBenchGen<K, V, PTR, N, NP1, OPT>
 where
-    K: CTreeBenchKey + TreeKey + ctree::Preview<P> + Clone + Ord + 'static,
+    K: CTreeBenchKey + TreeKey + SearchStrategy + Clone + Ord + 'static,
     K::Stored: StoredKey,
-    P: Copy + Eq + Ord,
     PTR: ctree::TrieIndex,
     V: From<usize>,
-    K: ctree::SearchStrategy<P>,
     [(); N]: ,
     [(); NP1]: ,
 {
@@ -68,7 +51,7 @@ where
     }
 
     /// Insert every key into a fresh tree, tracking the largest harness key.
-    fn build_tree(keys: &[K]) -> (CTree<K, V, PTR, N, NP1, P>, Option<K>)
+    fn build_tree(keys: &[K]) -> (CTree<K, V, PTR, N, NP1>, Option<K>)
     where
         K: Clone,
         V: From<usize>,
@@ -85,14 +68,12 @@ where
 }
 
 // Benchable impl for u64 values (the common case)
-impl<K, PTR, const N: usize, const NP1: usize, const OPT: bool, P>
-    Benchable<K> for CTreeBenchGen<K, usize, PTR, N, NP1, OPT, P>
+impl<K, PTR, const N: usize, const NP1: usize, const OPT: bool>
+    Benchable<K> for CTreeBenchGen<K, usize, PTR, N, NP1, OPT>
 where
-    K: CTreeBenchKey + TreeKey + ctree::Preview<P> + Clone + Ord + 'static,
+    K: CTreeBenchKey + TreeKey + SearchStrategy + Clone + Ord + 'static,
     K::Stored: StoredKey,
-    P: Copy + Eq + Ord,
     PTR: ctree::TrieIndex,
-    K: ctree::SearchStrategy<P>,
     [(); N]: ,
     [(); NP1]: ,
 {
@@ -163,16 +144,13 @@ where
 }
 
 // ── Contestant aliases ─────────────────────────────────────────────────
-//
-// Variable-length `Vec<u8>` CTree — preview SIMD + scalar fallback — runs
-// in every non-`u64` mode (`Bench::Bytes` skips `RandomU64`/`SeqU64`, where
-// the native `u64` SIMD CTree below takes over).
-pub(crate) type CTreeBench = CTreeBenchGen<Vec<u8>, usize, u32, 8, 9, false, u32>;
+
+pub(crate) type CTreeBench = CTreeBenchGen<Vec<u8>, usize, u32, 8, 9, false>;
 /// `CTreeBench` + `optimize` after build (arena contiguity for iteration).
-pub(crate) type CTreeOptBench = CTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true, u32>;
+pub(crate) type CTreeOptBench = CTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true>;
 
 // Fixed-width `u64` CTree — SIMD `find_position`/`find_upper_bound` path —
 // `RandomU64`/`SeqU64` modes only (`Bench::U64` carries the fixed-width skip).
-pub(crate) type CTreeFixedBench = CTreeBenchGen<u64, usize, u32, 16, 17, false, NoPreview>;
+pub(crate) type CTreeFixedBench = CTreeBenchGen<u64, usize, u32, 16, 17, false>;
 /// `CTreeFixedBench` + `optimize` after build.
-pub(crate) type CTreeFixedOptBench = CTreeBenchGen<u64, usize, u32, 16, 17, true, NoPreview>;
+pub(crate) type CTreeFixedOptBench = CTreeBenchGen<u64, usize, u32, 16, 17, true>;

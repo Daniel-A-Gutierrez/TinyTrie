@@ -540,7 +540,7 @@ gen_tree_tests!(
 // keep lexicographic key order aligned with numeric index order.
 gen_tree_tests!(
     var_harness_n3,
-    CTree<Box<[u8]>, u64, u16, 3, 4, u64>,
+    CTree<Box<[u8]>, u64, u16, 3, 4>,
     count = 30,
     store = |i: u64| -> Box<[u8]> { Box::from(&i.to_be_bytes()[..]) },
     borrow = |i: u64| i.to_be_bytes(),
@@ -550,7 +550,7 @@ gen_tree_tests!(
 // Variable form at N=2 (smallest order) for deeper splits.
 gen_tree_tests!(
     var_harness_n2,
-    CTree<Box<[u8]>, u64, u16, 2, 3, u64>,
+    CTree<Box<[u8]>, u64, u16, 2, 3>,
     count = 50,
     store = |i: u64| -> Box<[u8]> { Box::from(&i.to_be_bytes()[..]) },
     borrow = |i: u64| i.to_be_bytes(),
@@ -596,7 +596,7 @@ fn test_leaf_rebalance_absorbs_overflow() {
 /// transfers (clone-on-sep, drain helpers) are sound.
 #[test]
 fn test_leaf_rebalance_absorbs_overflow_var() {
-    let mut tree: CTree<Box<[u8]>, u64, u16, 4, 5, u64> = CTree::new();
+    let mut tree: CTree<Box<[u8]>, u64, u16, 4, 5> = CTree::new();
     for i in 0..=5u64 {
         tree.insert(Box::from(&i.to_be_bytes()[..]), i * 10).unwrap();
     }
@@ -845,7 +845,7 @@ fn test_optimize_idempotent_and_insert_after() {
 /// instantiation the bench uses.
 #[test]
 fn test_optimize_var_len_keys() {
-    let mut tree: CTree<Box<[u8]>, usize, u32, 4, 5, u64> = CTree::new();
+    let mut tree: CTree<Box<[u8]>, usize, u32, 4, 5> = CTree::new();
     // Insert byte keys in reverse lexicographic order to scatter leaves.
     let count = 50;
     for i in (0..count).rev() {

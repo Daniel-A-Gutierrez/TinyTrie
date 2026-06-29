@@ -14,7 +14,7 @@ pub mod tiny_array;
 pub mod tiny_btree;
 
 pub use tiny_btree::{
-    CTree, Cursor, CursorMut, FixedCTree, FixedLenKey, NoPreview, Preview, SearchStrategy,
+    BufKey, CTree, Cursor, CursorMut, FixedCTree, FixedLenKey, SearchStrategy,
     StoredKey, TreeKey, TrieIndex, VarCTree,
 };
 pub use tiny_array::TinyArray;
