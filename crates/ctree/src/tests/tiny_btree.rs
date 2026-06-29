@@ -1035,3 +1035,110 @@ fn trace_visit(label: &str, tree: &CTree<u64, u64, u16, 8, 9>) {
         tree.leaves.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// KeyRef inline vs buf path tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_keyref_inline_short_keys() {
+    // Keys ≤ 14 bytes should be inlined (no key_buf usage).
+    let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
+
+    // Short keys (1–14 bytes) → all inline
+    let short_keys: &[&[u8]] = &[
+        b"a",                   // 1 byte
+        b"ab",                  // 2 bytes
+        b"hello",               // 5 bytes
+        b"fourteen!!",          // 10 bytes
+        b"12345678901234",      // 14 bytes (exactly at threshold)
+    ];
+
+    for (i, k) in short_keys.iter().enumerate() {
+        tree.insert(k.to_vec(), i as u64).unwrap();
+    }
+
+    // Verify lookups
+    for (i, k) in short_keys.iter().enumerate() {
+        assert_eq!(
+            tree.get(k),
+            Some(&(i as u64)),
+            "inline lookup failed for key {:?}",
+            String::from_utf8_lossy(k)
+        );
+    }
+
+    // key_buf should be empty since all keys are inlined
+    assert!(
+        tree.key_buf.is_empty(),
+        "key_buf should be empty when all keys are inline, but has {} bytes",
+        tree.key_buf.len()
+    );
+}
+
+#[test]
+fn test_keyref_buf_long_keys() {
+    // Keys > 14 bytes should go to key_buf.
+    let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
+
+    // Long key (> 14 bytes) → goes to key_buf
+    let long_key = b"this_is_a_long_key!".to_vec(); // 19 bytes
+    tree.insert(long_key.clone(), 42).unwrap();
+
+    assert_eq!(tree.get(&long_key), Some(&42));
+    assert!(
+        !tree.key_buf.is_empty(),
+        "key_buf should not be empty for long keys"
+    );
+}
+
+#[test]
+fn test_keyref_mixed_inline_and_buf() {
+    // Mix of inline and buf keys in the same tree.
+    let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
+
+    let short_key = b"short".to_vec();    // 5 bytes → inline
+    let long_key = b"a_very_long_key_here!".to_vec(); // 21 bytes → buf
+
+    tree.insert(short_key.clone(), 1).unwrap();
+    tree.insert(long_key.clone(), 2).unwrap();
+
+    assert_eq!(tree.get(&short_key), Some(&1));
+    assert_eq!(tree.get(&long_key), Some(&2));
+}
+
+#[test]
+fn test_keyref_inline_ordering() {
+    // Verify inline keys maintain correct sort order via cursor.
+    let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
+
+    // Insert in non-sorted order
+    tree.insert(b"delta".to_vec(), 4).unwrap();
+    tree.insert(b"alpha".to_vec(), 1).unwrap();
+    tree.insert(b"echo".to_vec(), 5).unwrap();
+    tree.insert(b"bravo".to_vec(), 2).unwrap();
+    tree.insert(b"charlie".to_vec(), 3).unwrap();
+
+    // Verify sorted order via cursor: alpha(1), bravo(2), charlie(3), delta(4), echo(5)
+    let expected: &[(&[u8], u64)] = &[
+        (b"alpha", 1), (b"bravo", 2), (b"charlie", 3),
+        (b"delta", 4), (b"echo", 5),
+    ];
+    let mut cursor = tree.get_cursor();
+    for (_key_bytes, val) in expected {
+        let (_, v) = cursor.current().unwrap();
+        assert_eq!(*v, *val, "cursor got value {} expected {}", v, val);
+        cursor.next();
+    }
+}
+
+#[test]
+fn test_keyref_sizes() {
+    use std::mem::{size_of, align_of};
+    // KeyRef should be 16 bytes: Inline variant holds TinyArray<u8,14> (15 bytes)
+    // but Rust may pad the enum. Let's just check it's reasonable.
+    assert_eq!(size_of::<KeyRef>(), 16, "KeyRef size should be 16 bytes");
+    assert_eq!(align_of::<KeyRef>(), 8, "KeyRef alignment should be 8");
+    // BufKey remains 8 bytes
+    assert_eq!(size_of::<BufKey>(), 8, "BufKey size should be 8 bytes");
+}

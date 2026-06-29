@@ -87,11 +87,71 @@ impl_fixed_len_key_simd!(i32, 4);
 impl_fixed_len_key_simd!(i64, 4);
 
 // ---------------------------------------------------------------------------
-// BufKey — buffer-offset stored key for varlen byte strings
+// KeyRef — inline or buffer-offset stored key for varlen byte strings
 // ---------------------------------------------------------------------------
 
-/// Compact reference into `CTree::key_buf`. Replaces `Box<[u8]>` to eliminate
-/// per-key heap allocation and pointer chasing during search.
+/// Stored form for variable-length keys. Short keys (≤14 bytes) are inlined
+/// directly; longer keys reference `CTree::key_buf` via offset + length.
+///
+/// The derived `Ord` provides a total order but is **not** semantically
+/// meaningful for `Buf` variants (it compares offset/length, not key content).
+/// All actual key comparison goes through `StoredKey`, which reads from `key_buf`.
+#[derive(Clone, Debug)]
+pub enum KeyRef {
+    /// Key data stored inline — no indirection.
+    Inline(TinyArray<u8, 14>),
+    /// Key data in the shared `key_buf` at byte offset `start` with length `len`.
+    Buf { start: u64, len: u32 },
+}
+
+impl PartialEq for KeyRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (KeyRef::Inline(a), KeyRef::Inline(b)) => a.as_slice() == b.as_slice(),
+            (KeyRef::Buf { start: s1, len: l1 }, KeyRef::Buf { start: s2, len: l2 }) => {
+                s1 == s2 && l1 == l2
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for KeyRef {}
+
+impl PartialOrd for KeyRef {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KeyRef {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            // Inline vs Inline: compare bytes directly.
+            (KeyRef::Inline(a), KeyRef::Inline(b)) => cmp_slice_scalar(a.as_slice(), b.as_slice()),
+            // Inline always orders before Buf (discriminant ordering).
+            (KeyRef::Inline(_), KeyRef::Buf { .. }) => std::cmp::Ordering::Less,
+            (KeyRef::Buf { .. }, KeyRef::Inline(_)) => std::cmp::Ordering::Greater,
+            // Buf vs Buf: offset ordering (not semantically meaningful;
+            // real comparison goes through StoredKey::cmp_stored with buf).
+            (KeyRef::Buf { start: s1, len: l1 }, KeyRef::Buf { start: s2, len: l2 }) => {
+                (s1, l1).cmp(&(s2, l2))
+            }
+        }
+    }
+}
+
+impl KeyRef {
+    /// Length of the key in bytes.
+    pub fn key_len(&self) -> usize {
+        match self {
+            KeyRef::Inline(arr) => arr.len(),
+            KeyRef::Buf { len, .. } => *len as usize,
+        }
+    }
+}
+
+/// Legacy alias — `BufKey` is now `KeyRef::Buf`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BufKey {
     pub start: u32,
@@ -104,11 +164,12 @@ pub struct BufKey {
 
 /// Maps a user's key type to the internal stored form and lookup needle.
 pub trait TreeKey: Ord + Clone {
-    /// Internal stored form: identity for fixed keys, `BufKey` for varlen.
+    /// Internal stored form: identity for fixed keys, `KeyRef` for varlen.
     type Stored: StoredKey<Needle = Self::Needle>;
     /// Borrowed needle for lookups.
     type Needle: ?Sized;
-    /// Consume into stored form. For varlen keys, appends to `buf` and returns a BufKey.
+    /// Consume into stored form. For varlen keys, short keys (≤14 bytes) are inlined
+    /// into `KeyRef::Inline`; longer keys append to `buf` and return `KeyRef::Buf`.
     /// For fixed keys, `buf` is unused and the key is returned as-is.
     fn into_stored(self, buf: &mut Vec<u8>) -> Self::Stored;
     /// Borrow self as lookup needle.
@@ -123,24 +184,43 @@ impl<T: FixedLenKey> TreeKey for T {
     fn as_needle(&self) -> &T { self }
 }
 
+/// Threshold: keys up to this many bytes are stored inline in `KeyRef::Inline`.
+const INLINE_KEY_MAX: usize = 14;
+
 impl TreeKey for Vec<u8> {
-    type Stored = BufKey;
+    type Stored = KeyRef;
     type Needle = [u8];
-    fn into_stored(self, buf: &mut Vec<u8>) -> BufKey {
-        let start = buf.len() as u32;
-        buf.extend_from_slice(&self);
-        BufKey { start, len: self.len() as u16 }
+    fn into_stored(self, buf: &mut Vec<u8>) -> KeyRef {
+        if self.len() <= INLINE_KEY_MAX {
+            let mut arr = TinyArray::new();
+            for &b in &self {
+                arr.push(b);
+            }
+            KeyRef::Inline(arr)
+        } else {
+            let start = buf.len() as u64;
+            buf.extend_from_slice(&self);
+            KeyRef::Buf { start, len: self.len() as u32 }
+        }
     }
     fn as_needle(&self) -> &[u8] { self }
 }
 
 impl TreeKey for Box<[u8]> {
-    type Stored = BufKey;
+    type Stored = KeyRef;
     type Needle = [u8];
-    fn into_stored(self, buf: &mut Vec<u8>) -> BufKey {
-        let start = buf.len() as u32;
-        buf.extend_from_slice(&self);
-        BufKey { start, len: self.len() as u16 }
+    fn into_stored(self, buf: &mut Vec<u8>) -> KeyRef {
+        if self.len() <= INLINE_KEY_MAX {
+            let mut arr = TinyArray::new();
+            for &b in &*self {
+                arr.push(b);
+            }
+            KeyRef::Inline(arr)
+        } else {
+            let start = buf.len() as u64;
+            buf.extend_from_slice(&self);
+            KeyRef::Buf { start, len: self.len() as u32 }
+        }
     }
     fn as_needle(&self) -> &[u8] { self }
 }
@@ -166,9 +246,9 @@ impl<K: FixedLenKey> SearchStrategy for K {
     }
 }
 
-// Variable keys (Stored = BufKey): linear scan through the key buffer.
+// Variable keys (Stored = KeyRef): linear scan through key buffer or inline bytes.
 impl SearchStrategy for Vec<u8> {
-    fn find_position(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
+    fn find_position(needle: &[u8], keys: &[KeyRef], buf: &[u8]) -> usize {
         for (i, k) in keys.iter().enumerate() {
             if StoredKey::cmp_key(k, needle, buf) != Ordering::Less {
                 return i;
@@ -176,7 +256,7 @@ impl SearchStrategy for Vec<u8> {
         }
         keys.len()
     }
-    fn find_upper_bound(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
+    fn find_upper_bound(needle: &[u8], keys: &[KeyRef], buf: &[u8]) -> usize {
         for (i, k) in keys.iter().enumerate() {
             if StoredKey::cmp_key(k, needle, buf) == Ordering::Greater {
                 return i;
@@ -187,7 +267,7 @@ impl SearchStrategy for Vec<u8> {
 }
 
 impl SearchStrategy for Box<[u8]> {
-    fn find_position(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
+    fn find_position(needle: &[u8], keys: &[KeyRef], buf: &[u8]) -> usize {
         for (i, k) in keys.iter().enumerate() {
             if StoredKey::cmp_key(k, needle, buf) != Ordering::Less {
                 return i;
@@ -195,7 +275,7 @@ impl SearchStrategy for Box<[u8]> {
         }
         keys.len()
     }
-    fn find_upper_bound(needle: &[u8], keys: &[BufKey], buf: &[u8]) -> usize {
+    fn find_upper_bound(needle: &[u8], keys: &[KeyRef], buf: &[u8]) -> usize {
         for (i, k) in keys.iter().enumerate() {
             if StoredKey::cmp_key(k, needle, buf) == Ordering::Greater {
                 return i;
@@ -210,7 +290,8 @@ impl SearchStrategy for Box<[u8]> {
 // ---------------------------------------------------------------------------
 
 mod private {
-    /// Marker sealing [`super::StoredKey`] to the two canonical key forms.
+    /// Marker sealing [`super::StoredKey`] to the canonical key forms:
+    /// fixed keys (`K: FixedLenKey`) and variable keys (`KeyRef`).
     pub trait Sealed {}
 }
 
@@ -236,22 +317,38 @@ impl<K: FixedLenKey> StoredKey for K {
     fn cmp_stored(a: &K, b: &K, _buf: &[u8]) -> Ordering { a.cmp(b) }
 }
 
-// BufKey form: offset into CTree::key_buf
-impl private::Sealed for BufKey {}
+// KeyRef form: inline short keys or offset into CTree::key_buf
+impl private::Sealed for KeyRef {}
 
-impl StoredKey for BufKey {
+impl StoredKey for KeyRef {
     type Needle = [u8];
-    fn cmp_key(stored: &BufKey, needle: &[u8], buf: &[u8]) -> Ordering {
-        let bytes = &buf[stored.start as usize..][..stored.len as usize];
-        cmp_slice_scalar(bytes, needle)
+    fn cmp_key(stored: &KeyRef, needle: &[u8], buf: &[u8]) -> Ordering {
+        match stored {
+            KeyRef::Inline(arr) => cmp_slice_scalar(arr.as_slice(), needle),
+            KeyRef::Buf { start, len } => {
+                let bytes = &buf[*start as usize..][..*len as usize];
+                cmp_slice_scalar(bytes, needle)
+            }
+        }
     }
-    fn eq_key(stored: &BufKey, needle: &[u8], buf: &[u8]) -> bool {
-        let bytes = &buf[stored.start as usize..][..stored.len as usize];
-        eq_slice_scalar(bytes, needle)
+    fn eq_key(stored: &KeyRef, needle: &[u8], buf: &[u8]) -> bool {
+        match stored {
+            KeyRef::Inline(arr) => eq_slice_scalar(arr.as_slice(), needle),
+            KeyRef::Buf { start, len } => {
+                let bytes = &buf[*start as usize..][..*len as usize];
+                eq_slice_scalar(bytes, needle)
+            }
+        }
     }
-    fn cmp_stored(a: &BufKey, b: &BufKey, buf: &[u8]) -> Ordering {
-        let a_bytes = &buf[a.start as usize..][..a.len as usize];
-        let b_bytes = &buf[b.start as usize..][..b.len as usize];
+    fn cmp_stored(a: &KeyRef, b: &KeyRef, buf: &[u8]) -> Ordering {
+        let a_bytes: &[u8] = match a {
+            KeyRef::Inline(arr) => arr.as_slice(),
+            KeyRef::Buf { start, len } => &buf[*start as usize..][..*len as usize],
+        };
+        let b_bytes: &[u8] = match b {
+            KeyRef::Inline(arr) => arr.as_slice(),
+            KeyRef::Buf { start, len } => &buf[*start as usize..][..*len as usize],
+        };
         cmp_slice_scalar(a_bytes, b_bytes)
     }
 }
@@ -1332,7 +1429,7 @@ pub type FixedCTree<K, V, PTR, const N: usize, const NP1: usize> =
     CTree<K, V, PTR, N, NP1>;
 
 /// Variable-length-key B+ tree (linear scan through key buffer).
-/// `K: TreeKey` with `K::Stored = BufKey`, e.g. `Vec<u8>`.
+/// `K: TreeKey` with `K::Stored = KeyRef`, e.g. `Vec<u8>`.
 pub type VarCTree<K, V, PTR, const N: usize, const NP1: usize> =
     CTree<K, V, PTR, N, NP1>;
 

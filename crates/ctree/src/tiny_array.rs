@@ -19,6 +19,28 @@ where
     slots: [MaybeUninit<T>; N],
 }
 
+impl<T: Clone, const N: usize> Clone for TinyArray<T, N>
+where
+    [(); N]:
+{
+    fn clone(&self) -> Self {
+        let mut arr = Self::new();
+        for i in 0..self.len as usize {
+            arr.push(unsafe { self.slots[i].assume_init_read() }.clone());
+        }
+        arr
+    }
+}
+
+impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for TinyArray<T, N>
+where
+    [(); N]:
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
 #[allow(dead_code)]
 impl<T, const N: usize> TinyArray<T, N>
 where

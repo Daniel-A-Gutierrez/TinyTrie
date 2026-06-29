@@ -7,8 +7,8 @@ use super::{Benchable, BenchCtx, read_allocated};
 // ── CTreeKey adapter ───────────────────────────────────────────────────
 //
 // Unifies the two CTree key forms behind one generic bench struct.
-// Fixed keys (u64) use SIMD search; variable keys (Vec<u8>) use BufKey
-// with linear scan through a contiguous key buffer.
+// Fixed keys (u64) use SIMD search; variable keys (Vec<u8>) use KeyRef
+// with inline short keys and linear scan through key_buf for longer keys.
 
 pub(crate) trait CTreeBenchKey: TreeKey + SearchStrategy + Clone + Ord + 'static {}
 impl CTreeBenchKey for u64 {}
