@@ -66,7 +66,7 @@ pub struct ResultsFile {
 }
 
 pub fn results_paths(key_mode: &KeyMode) -> (String, String) {
-    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/benches/");
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../benches/");
     let suffix = match key_mode {
         KeyMode::Sequential => "_seq_txt",
         KeyMode::Random => "_random_txt",

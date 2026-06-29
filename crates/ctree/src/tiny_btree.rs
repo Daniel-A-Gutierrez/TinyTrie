@@ -235,27 +235,21 @@ where
     K::Stored: StoredKey,
     K::Needle: Preview<P>,
 {
-    fn find_position(needle: &K::Needle, previews: &[P], keys: &[K::Stored]) -> usize {
-        let p = needle.preview();
-        let mut pos = P::find_position(&p, previews);
-        while pos < keys.len()
-            && previews[pos] == p
-            && StoredKey::cmp_key(&keys[pos], needle) == Ordering::Less
-        {
-            pos += 1;
+    fn find_position(needle: &K::Needle, _previews: &[P], keys: &[K::Stored]) -> usize {
+        for (i, k) in keys.iter().enumerate() {
+            if StoredKey::cmp_key(k, needle) != Ordering::Less {
+                return i;
+            }
         }
-        pos
+        keys.len()
     }
-    fn find_upper_bound(needle: &K::Needle, previews: &[P], keys: &[K::Stored]) -> usize {
-        let p = needle.preview();
-        let mut pos = P::find_position(&p, previews);
-        while pos < keys.len()
-            && previews[pos] == p
-            && StoredKey::cmp_key(&keys[pos], needle) != Ordering::Greater
-        {
-            pos += 1;
+    fn find_upper_bound(needle: &K::Needle, _previews: &[P], keys: &[K::Stored]) -> usize {
+        for (i, k) in keys.iter().enumerate() {
+            if StoredKey::cmp_key(k, needle) == Ordering::Greater {
+                return i;
+            }
         }
-        pos
+        keys.len()
     }
 }
 
@@ -583,12 +577,12 @@ where
     }
 
     #[inline]
-fn get_prev(&self) -> Option<usize> {
+    fn get_prev(&self) -> Option<usize> {
         self.prev.map(|nz| nz.get().as_usize() - 1)
     }
 
     #[inline]
-fn get_next(&self) -> Option<usize> {
+    fn get_next(&self) -> Option<usize> {
         self.next.map(|nz| nz.get().as_usize() - 1)
     }
 

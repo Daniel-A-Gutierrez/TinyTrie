@@ -182,8 +182,8 @@ cargo run -p bencher --bin trie-stats -- corpus.txt --words
 
 Results print to stdout as sorted tables (fastest first for rates, smallest first for memory) and persist to:
 
-- `crates/benches/bench_results_<keymode>.json` — full structured data
-- `crates/benches/bench_results_<keymode>.md` — markdown tables (sorted, merged across runs)
+- `benches/bench_results_<keymode>.json` — full structured data
+- `benches/bench_results_<keymode>.md` — markdown tables (sorted, merged across runs)
 
 Each run merges into the existing results, overwriting only the contestants and sizes that were actually run. Previous results for other sizes/contestants are preserved.
 

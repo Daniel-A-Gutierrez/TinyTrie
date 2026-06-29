@@ -6,17 +6,17 @@ NibbleTrie                      28.58M           8.42M           5.50M
 SortedVec                       19.85M           8.32M           2.97M
 BitTrie                         19.41M           9.29M           5.59M
 HashMap                         12.11M          12.12M           2.17M
-BTreeMap                        10.57M           3.74M           3.24M
-CTreeOpt                         4.78M           3.13M           2.47M
-CTree                            4.41M           2.95M           2.93M
+BTreeMap                         9.92M           4.26M           2.70M
+CTree                            4.07M           2.59M           2.42M
 PolyTrie                         3.91M           1.59M           1.85M
 FixedLen                         3.52M           1.99M           1.18M
+CTreeOpt                         2.94M           1.99M           2.07M
 
 ─── Iter backward (keys/sec) ───
                                    100           10000         1000000
-BTreeMap                       937.34M         708.50M          52.00M
-CTreeOpt                       434.75M         512.83M         459.61M
-CTree                          423.59M         529.69M         471.85M
+BTreeMap                       949.80M         738.13M          27.60M
+CTree                          438.63M         476.86M         303.40M
+CTreeOpt                       398.40M         480.99M         294.45M
 DynTrieOpt                     172.23M         151.61M          66.57M
 DynTrie                        171.21M         151.39M          66.07M
 StackedTrie4                   164.97M         132.37M          57.30M
@@ -31,9 +31,9 @@ FixedLenOpt                     86.25M          51.95M          36.87M
 ─── Iter forward (keys/sec) ───
                                    100           10000         1000000
 SortedVec                        2.60G           4.98G           5.03G
-CTree                            1.04G           1.37G           1.03G
-CTreeOpt                       938.81M           1.36G           1.03G
-BTreeMap                       921.79M         759.28M          63.52M
+CTree                            1.15G           1.51G         475.30M
+BTreeMap                       929.70M         785.76M          30.45M
+CTreeOpt                       880.73M         952.14M         475.17M
 StackedTrie4                   159.49M         143.66M          72.61M
 StackedTrie2                   157.33M         142.73M          72.69M
 BitTrie                        145.21M         154.06M          69.84M
@@ -77,22 +77,22 @@ FixedLen                        63.90M          18.96M          17.89M
 NibbleUnchecked                 60.29M          26.82M          20.97M
 FixedLenOpt                     59.17M          18.35M          17.73M
 BitTrie                         48.21M          16.68M           9.78M
-BTreeMap                        46.52M           6.38M           8.08M
 PolyTrie                        45.49M           9.39M           4.94M
-CTree                           32.95M           6.10M           6.81M
-CTreeOpt                        32.94M           7.30M           6.91M
+BTreeMap                        44.48M           7.45M           5.60M
 SortedVec                       31.82M          12.09M           6.43M
+CTree                           29.78M           3.67M           5.35M
+CTreeOpt                        24.62M           3.39M           4.99M
 
 ─── Memory (bytes/key) ───
                                    100           10000         1000000
 DynTrieOpt                        37.6            72.5            76.7
 SortedVec                         44.1            43.6            40.6
 DynTrie                           46.1            83.8           130.0
-CTree                             46.2            48.3            47.6
-CTreeOpt                          46.2            48.3            47.6
+CTree                             48.3            51.4            50.7
 StackedTrie2                      55.5           105.3            78.8
 StackedTrie4                      60.7           118.4            87.2
 NibbleOpt                         62.1           120.6           126.1
+CTreeOpt                          64.0            72.7            71.9
 NibbleTrie                        64.0           124.5           134.2
 BTreeMap                          68.7            72.8            72.2
 BitTrie                           71.7            78.6            58.7
@@ -108,6 +108,6 @@ DynTrieOpt                      20.01M           7.20M           4.43M
 StackedTrie2                    18.90M           5.07M           3.15M
 StackedTrie4                    17.61M           4.54M           3.62M
 PolyTrie                         3.81M           1.17M          961.2K
-CTreeOpt                         3.80M           2.99M           2.58M
 FixedLenOpt                      3.36M           2.74M          781.5K
+CTreeOpt                         2.81M           1.86M           1.97M
 
