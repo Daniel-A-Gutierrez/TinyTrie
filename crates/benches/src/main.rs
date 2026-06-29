@@ -1,3 +1,4 @@
+#![feature(generic_const_exprs)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -261,7 +262,7 @@ use std_contestants::{
     BTreeMapBench, BTreeMapBenchU64, HashMapBench, HashMapBenchU64,
     SortedVecBench, SortedVecBenchU64,
 };
-use tiny_btree::{CTreeBench, CTreeFixedBench, CTreeFixedOptBench, CTreeOptBench};
+use tiny_btree::{CTreeBench, CTreeFixedBench, CTreeFixedOptBench, CTreeOptBench, PackedVarCTreeBench};
 
 // ── Type aliases ─────────────────────────────────────────────────────
 
@@ -652,6 +653,7 @@ fn all_contestants() -> Vec<Contestant> {
         Contestant { name: "StackedTrie4",        max_size: None, bytes: Some(Box::new(StackedTrie4Bench::new())), nonzero: None, u64: None },
         Contestant { name: "CTree",               max_size: None, bytes: Some(Box::new(CTreeBench::new())),     nonzero: None, u64: Some(Box::new(CTreeFixedBench::new())) },
         Contestant { name: "CTreeOpt",            max_size: None, bytes: Some(Box::new(CTreeOptBench::new())),  nonzero: None, u64: Some(Box::new(CTreeFixedOptBench::new())) },
+        Contestant { name: "PackedVarCTree",      max_size: None, bytes: Some(Box::new(PackedVarCTreeBench::new())), nonzero: None, u64: None },
     ]
 }
 

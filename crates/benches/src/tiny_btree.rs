@@ -154,3 +154,93 @@ pub(crate) type CTreeOptBench = CTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true>;
 pub(crate) type CTreeFixedBench = CTreeBenchGen<u64, usize, u32, 16, 17, false>;
 /// `CTreeFixedBench` + `optimize` after build.
 pub(crate) type CTreeFixedOptBench = CTreeBenchGen<u64, usize, u32, 16, 17, true>;
+
+// ── PackedVarCTree contestant ──────────────────────────────────────────────
+//
+// Variable-length key CTree using PackedKeySlots (packed inline key storage
+// with branch-free sequential scan). Benchmarked against the existing
+// CTreeBench (which uses KeyRef with inline/buf branching).
+
+use ctree::PackedVarCTree;
+
+pub(crate) struct PackedVarCTreeBench {
+    tree: PackedVarCTree<Vec<u8>, usize, u32, 8, 9>,
+    max_key: Option<Vec<u8>>,
+}
+
+impl PackedVarCTreeBench {
+    pub(crate) fn new() -> Self {
+        Self { tree: PackedVarCTree::new(), max_key: None }
+    }
+
+    fn build_tree(keys: &[Vec<u8>]) -> (PackedVarCTree<Vec<u8>, usize, u32, 8, 9>, Option<Vec<u8>>) {
+        let mut tree = PackedVarCTree::new();
+        let mut max_key: Option<Vec<u8>> = None;
+        for (i, k) in keys.iter().enumerate() {
+            if tree.insert(k.clone(), i).is_ok() && max_key.as_ref().map_or(true, |m| k > m) {
+                max_key = Some(k.clone());
+            }
+        }
+        (tree, max_key)
+    }
+}
+
+impl Benchable<Vec<u8>> for PackedVarCTreeBench {
+    fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchCtx<Vec<u8>>) {
+        let (mut tree, max_key) = Self::build_tree(keys);
+        tree.compact();
+        self.tree = tree;
+        self.max_key = max_key;
+    }
+
+    fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
+        let (tree, _) = Self::build_tree(keys);
+        black_box(&tree);
+        Some(())
+    }
+
+    fn bench_lookup(&self, ctx: &BenchCtx<Vec<u8>>) -> Option<()> {
+        for k in &ctx.lookup_keys {
+            black_box(self.tree.get(k));
+        }
+        Some(())
+    }
+
+    fn bench_fwd_iter(&self) -> Option<()> {
+        let mut it = self.tree.get_cursor();
+        while let Some((k, v)) = it.current() {
+            black_box(k);
+            black_box(v);
+            if it.next().is_none() {
+                break;
+            }
+        }
+        Some(())
+    }
+
+    fn bench_rev_iter(&self) -> Option<()> {
+        let max = self.max_key.as_ref()?;
+        let mut it = self.tree.cursor_at(max);
+        while let Some((k, v)) = it.current() {
+            black_box(k);
+            black_box(v);
+            if it.prev().is_none() {
+                break;
+            }
+        }
+        Some(())
+    }
+
+    fn bench_optimize(&self, _keys: &[Vec<u8>]) -> Option<()> {
+        None // PackedVarCTree optimize is a no-op for now
+    }
+
+    fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
+        let before = read_allocated();
+        let (mut tree, _) = Self::build_tree(keys);
+        tree.compact();
+        let bytes = read_allocated() - before;
+        drop(tree);
+        Some(bytes as f64 / keys.len() as f64)
+    }
+}

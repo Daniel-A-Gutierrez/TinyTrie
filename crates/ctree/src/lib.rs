@@ -10,12 +10,15 @@
 //! and SIMD-accelerated lower-bound search. Variable-length keys can use a
 //! fixed-size preview (`P`) for fast node-level routing.
 
+pub mod packed_keys;
 pub mod tiny_array;
 pub mod tiny_btree;
+pub mod var_btree;
 
 pub use tiny_btree::{
     BufKey, CTree, Cursor, CursorMut, FixedCTree, FixedLenKey, KeyRef,
     SearchStrategy, StoredKey, TreeKey, TrieIndex, VarCTree,
 };
 pub use tiny_array::TinyArray;
+pub use var_btree::{VarCTree as PackedVarCTree, VarKey as PackedVarKey, TrieIndex as PackedTrieIndex};
 
