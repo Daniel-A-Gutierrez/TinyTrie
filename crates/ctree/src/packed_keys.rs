@@ -1,7 +1,7 @@
 //! Packed key storage for variable-length B+ tree nodes.
 //!
-//! `PackedKeySlots<N>` stores up to N keys in a dense packed layout:
-//! - `lens[i]`: total key length (0 = empty slot).
+//! `PackedKeySlots<L, N>` stores up to N keys in a dense packed layout:
+//! - `lens[i]`: total key length (0 = empty slot), stored as type `L`.
 //! - `packed`: all key bytes contiguously, no padding. Key `i` starts at
 //!   `sum(lens[0..i])` and spans `lens[i]` bytes. Stored in a SmallVec that
 //!   keeps the first `PACKED_INLINE` bytes on-stack before spilling to heap.
@@ -14,26 +14,71 @@ use smallvec::SmallVec;
 /// Inline capacity for the packed key buffer (bytes kept on-stack before heap).
 pub const PACKED_INLINE: usize = 64;
 
+// ---------------------------------------------------------------------------
+// LengthType trait
+// ---------------------------------------------------------------------------
+
+/// Trait for types that can store key lengths in `PackedKeySlots`.
+///
+/// Implemented for `u8`, `u16`, `u32`, `u64`, and `usize`. The choice of `L`
+/// determines the maximum key length the tree can store — e.g. `u8` limits
+/// keys to 255 bytes, `u16` to 65535 bytes.
+pub trait LengthType: Copy + Clone + Default + Ord + std::fmt::Debug + 'static {
+    /// Convert to `usize`.
+    fn as_usize(self) -> usize;
+    /// Maximum representable value (e.g. 255 for `u8`).
+    fn max() -> usize;
+    /// The zero value (represents an empty slot in `lens`).
+    fn zero() -> Self;
+    /// Convert a `usize` to `Self`. Panics if `n` exceeds `Self::max()`.
+    fn usize_as(n: usize) -> Self;
+}
+
+macro_rules! impl_length_type {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl LengthType for $ty {
+                #[inline] fn as_usize(self) -> usize { self as usize }
+                #[inline] fn max() -> usize { <$ty>::MAX as usize }
+                #[inline] fn zero() -> Self { 0 }
+                #[inline] fn usize_as(n: usize) -> Self {
+                    debug_assert!(n <= <$ty>::MAX as usize, "key length {} exceeds {}::MAX", n, stringify!($ty));
+                    n as $ty
+                }
+            }
+        )*
+    };
+}
+
+impl_length_type!(u8, u16, u32, u64, usize);
+
+// ---------------------------------------------------------------------------
+// PackedKeySlots
+// ---------------------------------------------------------------------------
+
 /// Packed key storage for up to N variable-length keys.
 ///
 /// Keys are stored densely — a 3-byte key takes 3 bytes, a 50-byte key takes
 /// 50 bytes, with no padding. The first `PACKED_INLINE` bytes of packed data
 /// are kept inline in the struct; overflow goes to the heap.
-pub struct PackedKeySlots<const N: usize> {
+///
+/// The type parameter `L` determines how key lengths are stored. `u8` limits
+/// keys to 255 bytes, `u16` to 65535, etc.
+pub struct PackedKeySlots<L: LengthType, const N: usize> {
     /// Number of occupied key slots.
     len: u8,
-    /// Key length per slot. 0 = empty.
-    lens: [u8; N],
+    /// Key length per slot. `L::zero()` = empty.
+    lens: [L; N],
     /// Dense key data. Key `i` starts at `sum(lens[0..i])`.
     packed: SmallVec<[u8; PACKED_INLINE]>,
 }
 
-impl<const N: usize> PackedKeySlots<N> {
+impl<L: LengthType, const N: usize> PackedKeySlots<L, N> {
     /// Create an empty `PackedKeySlots`.
     pub fn new() -> Self {
         Self {
             len: 0,
-            lens: [0u8; N],
+            lens: [L::zero(); N],
             packed: SmallVec::new(),
         }
     }
@@ -65,7 +110,7 @@ impl<const N: usize> PackedKeySlots<N> {
     #[inline]
     pub fn key_len(&self, i: usize) -> usize {
         debug_assert!(i < self.len as usize);
-        self.lens[i] as usize
+        self.lens[i].as_usize()
     }
 
     /// Compute byte offset into `packed` for key `i`.
@@ -74,7 +119,7 @@ impl<const N: usize> PackedKeySlots<N> {
     pub fn packed_offset_up_to(&self, i: usize) -> usize {
         let mut off = 0;
         for j in 0..i {
-            off += self.lens[j] as usize;
+            off += self.lens[j].as_usize();
         }
         off
     }
@@ -84,7 +129,7 @@ impl<const N: usize> PackedKeySlots<N> {
     pub fn key_slice(&self, i: usize) -> &[u8] {
         debug_assert!(i < self.len as usize);
         let start = self.packed_offset_up_to(i);
-        let klen = self.lens[i] as usize;
+        let klen = self.lens[i].as_usize();
         &self.packed[start..start + klen]
     }
 
@@ -93,7 +138,7 @@ impl<const N: usize> PackedKeySlots<N> {
     #[inline]
     pub fn key_slice_with_offset(&self, i: usize, packed_off: usize) -> (&[u8], usize) {
         debug_assert!(i < self.len as usize);
-        let klen = self.lens[i] as usize;
+        let klen = self.lens[i].as_usize();
         (&self.packed[packed_off..packed_off + klen], packed_off + klen)
     }
 
@@ -104,15 +149,22 @@ impl<const N: usize> PackedKeySlots<N> {
 
     /// Insert `key` at position `pos`, shifting later keys right.
     ///
-    /// Panics if the array is full or `pos > len`.
+    /// Panics if the array is full, `pos > len`, or the key length exceeds
+    /// `<L as LengthType>::max()`.
     pub fn insert_at(&mut self, pos: usize, key: &[u8]) {
         debug_assert!(!self.is_full(), "PackedKeySlots::insert_at: array is full");
         debug_assert!(
             pos <= self.len as usize,
             "PackedKeySlots::insert_at: pos out of bounds"
         );
+        assert!(
+            key.len() <= <L as LengthType>::max(),
+            "PackedKeySlots::insert_at: key length {} exceeds maximum {}",
+            key.len(),
+            <L as LengthType>::max()
+        );
         let l = self.len as usize;
-        let klen = key.len().min(255);
+        let klen = key.len();
 
         // Compute byte offset before shifting lens (lens[0..pos] is still correct)
         let packed_off = self.packed_offset_up_to(pos);
@@ -121,7 +173,7 @@ impl<const N: usize> PackedKeySlots<N> {
         if pos < l {
             self.lens.copy_within(pos..l, pos + 1);
         }
-        self.lens[pos] = klen as u8;
+        self.lens[pos] = L::usize_as(klen);
 
         // Shift packed data right by klen bytes
         let old_len = self.packed.len();
@@ -129,7 +181,7 @@ impl<const N: usize> PackedKeySlots<N> {
         if packed_off < old_len {
             self.packed.as_mut_slice().copy_within(packed_off..old_len, packed_off + klen);
         }
-        self.packed[packed_off..packed_off + klen].copy_from_slice(&key[..klen]);
+        self.packed[packed_off..packed_off + klen].copy_from_slice(key);
 
         self.len += 1;
     }
@@ -143,7 +195,7 @@ impl<const N: usize> PackedKeySlots<N> {
             "PackedKeySlots::remove_at: index out of bounds"
         );
         let l = self.len as usize;
-        let klen = self.lens[pos] as usize;
+        let klen = self.lens[pos].as_usize();
 
         // Compute packed offset before modifying lens
         let packed_off = self.packed_offset_up_to(pos);
@@ -162,23 +214,31 @@ impl<const N: usize> PackedKeySlots<N> {
         if pos + 1 < l {
             self.lens.copy_within(pos + 1..l, pos);
         }
-        self.lens[l - 1] = 0;
+        self.lens[l - 1] = L::zero();
 
         self.len -= 1;
         key
     }
 
     /// Replace the key at position `pos` with `key`.
+    ///
+    /// Panics if the key length exceeds `<L as LengthType>::max()`.
     pub fn update_at(&mut self, pos: usize, key: &[u8]) {
         debug_assert!(pos < self.len as usize, "PackedKeySlots::update_at: index out of bounds");
-        let new_klen = key.len().min(255) as usize;
-        let old_klen = self.lens[pos] as usize;
+        assert!(
+            key.len() <= <L as LengthType>::max(),
+            "PackedKeySlots::update_at: key length {} exceeds maximum {}",
+            key.len(),
+            <L as LengthType>::max()
+        );
+        let new_klen = key.len();
+        let old_klen = self.lens[pos].as_usize();
 
         let packed_off = self.packed_offset_up_to(pos);
 
         if new_klen == old_klen {
             // Same size — write in place
-            self.packed[packed_off..packed_off + new_klen].copy_from_slice(&key[..new_klen]);
+            self.packed[packed_off..packed_off + new_klen].copy_from_slice(key);
         } else if new_klen > old_klen {
             // Grew — shift right
             let delta = new_klen - old_klen;
@@ -186,7 +246,7 @@ impl<const N: usize> PackedKeySlots<N> {
             self.packed.resize(old_packed_len + delta, 0);
             self.packed.as_mut_slice()
                 .copy_within(packed_off + old_klen..old_packed_len, packed_off + new_klen);
-            self.packed[packed_off..packed_off + new_klen].copy_from_slice(&key[..new_klen]);
+            self.packed[packed_off..packed_off + new_klen].copy_from_slice(key);
         } else {
             // Shrunk — shift left
             let delta = old_klen - new_klen;
@@ -194,15 +254,15 @@ impl<const N: usize> PackedKeySlots<N> {
             self.packed.as_mut_slice()
                 .copy_within(packed_off + old_klen..packed_end, packed_off + new_klen);
             self.packed.truncate(packed_end - delta);
-            self.packed[packed_off..packed_off + new_klen].copy_from_slice(&key[..new_klen]);
+            self.packed[packed_off..packed_off + new_klen].copy_from_slice(key);
         }
 
-        self.lens[pos] = new_klen as u8;
+        self.lens[pos] = L::usize_as(new_klen);
     }
 
     /// Append `key` to the end of the array.
     ///
-    /// Panics if the array is full.
+    /// Panics if the array is full or the key length exceeds `<L as LengthType>::max()`.
     pub fn push(&mut self, key: &[u8]) {
         self.insert_at(self.len as usize, key);
     }
@@ -251,7 +311,7 @@ impl<const N: usize> PackedKeySlots<N> {
 
         // Clear moved lens in src
         for i in from..self.len as usize {
-            self.lens[i] = 0;
+            self.lens[i] = L::zero();
         }
         // Remove moved packed range from src
         self.packed.drain(src_packed_start..src_packed_end);
@@ -298,7 +358,7 @@ impl<const N: usize> PackedKeySlots<N> {
 
         // Clear moved data in src
         for i in from..self.len as usize {
-            self.lens[i] = 0;
+            self.lens[i] = L::zero();
         }
         self.packed.drain(src_packed_start..src_packed_end);
 
@@ -323,7 +383,7 @@ impl<const N: usize> PackedKeySlots<N> {
         // Compute source packed byte range for keys [0..count)
         let mut src_packed_end = 0usize;
         for i in 0..count {
-            src_packed_end += self.lens[i] as usize;
+            src_packed_end += self.lens[i].as_usize();
         }
 
         // Append self's [0..count) lens to dst's end
@@ -341,7 +401,7 @@ impl<const N: usize> PackedKeySlots<N> {
 
         // Clear vacated lens in src
         for i in (l - count)..l {
-            self.lens[i] = 0;
+            self.lens[i] = L::zero();
         }
 
         // Shift src's remaining packed data left
@@ -378,7 +438,7 @@ impl<const N: usize> PackedKeySlots<N> {
         let l = self.len as usize;
         let mut off = 0usize;
         for i in 0..l {
-            let klen = self.lens[i] as usize;
+            let klen = self.lens[i].as_usize();
             let key = &self.packed[off..off + klen];
             if needle <= key {
                 return (i, off);
@@ -393,7 +453,7 @@ impl<const N: usize> PackedKeySlots<N> {
         let l = self.len as usize;
         let mut off = 0usize;
         for i in 0..l {
-            let klen = self.lens[i] as usize;
+            let klen = self.lens[i].as_usize();
             let key = &self.packed[off..off + klen];
             if needle < key {
                 return i;
@@ -406,7 +466,7 @@ impl<const N: usize> PackedKeySlots<N> {
     /// Check if the key at position `i` is equal to `needle`.
     pub fn eq_key(&self, i: usize, needle: &[u8]) -> bool {
         debug_assert!(i < self.len as usize);
-        let klen = self.lens[i] as usize;
+        let klen = self.lens[i].as_usize();
         if klen != needle.len() {
             return false;
         }
@@ -419,7 +479,7 @@ impl<const N: usize> PackedKeySlots<N> {
     #[inline]
     pub fn eq_key_with_offset(&self, i: usize, off: usize, needle: &[u8]) -> bool {
         debug_assert!(i < self.len as usize);
-        let klen = self.lens[i] as usize;
+        let klen = self.lens[i].as_usize();
         if klen != needle.len() {
             return false;
         }
@@ -427,7 +487,7 @@ impl<const N: usize> PackedKeySlots<N> {
     }
 }
 
-impl<const N: usize> Clone for PackedKeySlots<N> {
+impl<L: LengthType, const N: usize> Clone for PackedKeySlots<L, N> {
     fn clone(&self) -> Self {
         Self {
             len: self.len,
@@ -437,7 +497,7 @@ impl<const N: usize> Clone for PackedKeySlots<N> {
     }
 }
 
-impl<const N: usize> std::fmt::Debug for PackedKeySlots<N> {
+impl<L: LengthType, const N: usize> std::fmt::Debug for PackedKeySlots<L, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut keys = Vec::new();
         for i in 0..self.len as usize {
@@ -456,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_scan() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"hello");
         slots.insert_at(1, b"world");
         slots.insert_at(2, b"abc");
@@ -474,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_sorted_scan() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"abc");
         slots.insert_at(1, b"hello");
         slots.insert_at(2, b"world");
@@ -491,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_insert_long_key() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         let long_key = b"this_is_a_very_long_key_that_overflows";
         slots.insert_at(0, b"abc");
         slots.insert_at(1, long_key);
@@ -510,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_packed_density() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         // 3-byte keys should take exactly 3 bytes each in packed
         slots.insert_at(0, b"aaa");
         slots.insert_at(1, b"bbb");
@@ -520,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"alpha");
         slots.insert_at(1, b"beta");
         slots.insert_at(2, b"gamma");
@@ -534,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_remove_long_key() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         let long_key = b"this_is_a_very_long_key_that_overflows";
         slots.insert_at(0, b"abc");
         slots.insert_at(1, long_key);
@@ -550,8 +610,8 @@ mod tests {
 
     #[test]
     fn test_drain_into() {
-        let mut src: PackedKeySlots<8> = PackedKeySlots::new();
-        let mut dst: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut src: PackedKeySlots<u8, 8> = PackedKeySlots::new();
+        let mut dst: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         let long_key = b"overflow_key_here_for_testing";
         src.insert_at(0, b"aaa");
         src.insert_at(1, long_key);
@@ -570,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_eq_key() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         let long_key = b"this_is_a_long_key_for_overflow";
         slots.insert_at(0, b"abc");
         slots.insert_at(1, long_key);
@@ -583,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_insert_at_front() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"ccc");
         slots.insert_at(0, b"aaa");
         slots.insert_at(1, b"bbb");
@@ -595,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_find_upper_bound() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"aaa");
         slots.insert_at(1, b"ccc");
         slots.insert_at(2, b"eee");
@@ -608,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_all_long_keys() {
-        let mut slots: PackedKeySlots<16> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 16> = PackedKeySlots::new();
         let keys: &[&[u8]] = &[
             b"alpha_bravo_charlie",
             b"alpha_bravo_delta",
@@ -633,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_mixed_key_lengths() {
-        let mut slots: PackedKeySlots<16> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 16> = PackedKeySlots::new();
         slots.insert_at(0, b"another_very_long_key_here");
         slots.insert_at(1, b"mid");
         slots.insert_at(2, b"short");
@@ -650,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_find_position_edge_cases() {
-        let mut slots: PackedKeySlots<16> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 16> = PackedKeySlots::new();
         assert_eq!(slots.find_position(b"anything"), 0);
 
         slots.insert_at(0, b"hello");
@@ -668,7 +728,7 @@ mod tests {
 
     #[test]
     fn test_prefix_matching() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"abc");
         slots.insert_at(1, b"abcd");
 
@@ -680,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_update_at() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"alpha");
         slots.insert_at(1, b"beta");
         slots.insert_at(2, b"gamma");
@@ -705,7 +765,7 @@ mod tests {
 
     #[test]
     fn test_update_at_shrink() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"long_key_here");
         slots.insert_at(1, b"mid");
 
@@ -717,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_update_at_grow() {
-        let mut slots: PackedKeySlots<8> = PackedKeySlots::new();
+        let mut slots: PackedKeySlots<u8, 8> = PackedKeySlots::new();
         slots.insert_at(0, b"a");
         slots.insert_at(1, b"mid");
 

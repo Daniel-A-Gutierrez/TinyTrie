@@ -9,6 +9,7 @@ use std::num::{NonZero, ZeroablePrimitive};
 
 use smallvec::SmallVec;
 
+pub use crate::packed_keys::LengthType;
 use crate::packed_keys::PackedKeySlots;
 
 // ---------------------------------------------------------------------------
@@ -65,23 +66,25 @@ impl VarKey for Box<[u8]> {
 // Node types
 // ---------------------------------------------------------------------------
 
-struct KeyNode<PTR, const N: usize, const NP1: usize>
+struct KeyNode<PTR, L, const N: usize, const NP1: usize>
 where
     PTR: TrieIndex,
+    L: LengthType,
     [(); N]:,
     [(); NP1]:,
 {
-    keys: PackedKeySlots<N>,
+    keys: PackedKeySlots<L, N>,
     ptrs: [Option<NonZero<PTR>>; NP1],
 }
 
-struct LeafNode<V, PTR, const N: usize>
+struct LeafNode<V, PTR, L, const N: usize>
 where
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
 {
-    keys: PackedKeySlots<N>,
+    keys: PackedKeySlots<L, N>,
     values: Vec<V>,
     prev: Option<NonZero<PTR>>,
     next: Option<NonZero<PTR>>,
@@ -92,9 +95,10 @@ where
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-impl<PTR, const N: usize, const NP1: usize> KeyNode<PTR, N, NP1>
+impl<PTR, L, const N: usize, const NP1: usize> KeyNode<PTR, L, N, NP1>
 where
     PTR: TrieIndex,
+    L: LengthType,
     [(); N]:,
     [(); NP1]:,
 {
@@ -206,9 +210,10 @@ where
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-impl<V, PTR, const N: usize> LeafNode<V, PTR, N>
+impl<V, PTR, L, const N: usize> LeafNode<V, PTR, L, N>
 where
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
 {
@@ -333,16 +338,17 @@ fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
 // ---------------------------------------------------------------------------
 
 /// B+ tree for variable-length byte keys using packed key storage.
-pub struct VarCTree<K, V, PTR, const N: usize, const NP1: usize>
+pub struct VarCTree<K, V, PTR, L, const N: usize, const NP1: usize>
 where
     K: VarKey,
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
 {
-    inodes: Vec<KeyNode<PTR, N, NP1>>,
-    leaves: Vec<LeafNode<V, PTR, N>>,
+    inodes: Vec<KeyNode<PTR, L, N, NP1>>,
+    leaves: Vec<LeafNode<V, PTR, L, N>>,
     len: usize,
     n_leaves: usize,
     height: usize,
@@ -351,11 +357,12 @@ where
 }
 
 #[allow(dead_code)]
-impl<K, V, PTR, const N: usize, const NP1: usize>
-    VarCTree<K, V, PTR, N, NP1>
+impl<K, V, PTR, L, const N: usize, const NP1: usize>
+    VarCTree<K, V, PTR, L, N, NP1>
 where
     K: VarKey,
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
@@ -371,7 +378,7 @@ where
     pub fn new() -> Self {
         let () = Self::ASSERT_NP1;
         let () = Self::ASSERT_N_FITS;
-        let root = LeafNode::<V, PTR, N>::new();
+        let root = LeafNode::<V, PTR, L, N>::new();
         Self {
             inodes: Vec::new(),
             leaves: vec![root],
@@ -415,7 +422,7 @@ where
         }
 
         let mut old = std::mem::take(&mut self.leaves);
-        let mut buf: Vec<LeafNode<V, PTR, N>> = Vec::with_capacity(new_slots);
+        let mut buf: Vec<LeafNode<V, PTR, L, N>> = Vec::with_capacity(new_slots);
         for i in 0..new_slots {
             let is_live_slot = !gapful || i % 2 == 0;
             if is_live_slot {
@@ -809,6 +816,10 @@ where
             return Err((key, value));
         }
 
+        if needle_bytes.len() > <L as LengthType>::max() {
+            return Err((key, value));
+        }
+
         let key_bytes = key.into_bytes();
 
         if self.leaves[child_idx].keys.len() >= N {
@@ -841,7 +852,7 @@ where
         let old_next = self.leaves[child_idx].get_next();
         let drain_bytes = self.leaves[child_idx].keys.packed_len()
             - self.leaves[child_idx].keys.packed_offset_up_to(mid);
-        let mut new_leaf = LeafNode::<V, PTR, N>::new();
+        let mut new_leaf = LeafNode::<V, PTR, L, N>::new();
         new_leaf.keys.reserve(drain_bytes * 2);
         self.leaves[child_idx].keys.drain_into(mid, &mut new_leaf.keys);
         let drained_values = self.leaves[child_idx].values.split_off(mid);
@@ -864,7 +875,7 @@ where
     fn insert_separator(&mut self, stored: &[u8], new_child_idx: usize, path: &mut SmallVec<[(usize, usize); 8]>) {
         if path.is_empty() {
             let old_root_idx = self.root_inode;
-            let mut root = KeyNode::<PTR, N, NP1>::new();
+            let mut root = KeyNode::<PTR, L, N, NP1>::new();
             root.keys.insert_at(0, &stored);
             root.set_ptr(0, old_root_idx);
             root.set_ptr(1, new_child_idx);
@@ -897,7 +908,7 @@ where
         let mid_stored = self.inodes[parent_idx].keys.get_key(mid);
         let old_len = self.inodes[parent_idx].keys.len();
 
-        let mut new_inode = KeyNode::<PTR, N, NP1>::new();
+        let mut new_inode = KeyNode::<PTR, L, N, NP1>::new();
         // Move keys [mid+1..old_len) to new inode.
         if mid + 1 < old_len {
             let drain_bytes = self.inodes[parent_idx].keys.packed_len()
@@ -935,7 +946,7 @@ where
         self.insert_separator(&mid_stored, new_inode_idx, path);
     }
 
-    fn find_position_for_stored(&self, stored: &[u8], keys: &PackedKeySlots<N>) -> usize {
+    fn find_position_for_stored(&self, stored: &[u8], keys: &PackedKeySlots<L, N>) -> usize {
         for i in 0..keys.len() {
             let key = keys.key_slice(i);
             if stored.cmp(key) != std::cmp::Ordering::Greater {
@@ -959,17 +970,17 @@ where
     fn first_leaf(&self) -> usize { self.descend_to_leaf(false) }
     fn last_leaf(&self) -> usize { self.descend_to_leaf(true) }
 
-    pub fn get_cursor(&self) -> Cursor<'_, K, V, PTR, N, NP1> {
+    pub fn get_cursor(&self) -> Cursor<'_, K, V, PTR, L, N, NP1> {
         let leaf_idx = self.first_leaf();
         Cursor { tree: self, leaf_idx, position: 0, packed_off: 0 }
     }
 
-    pub fn get_cursor_mut(&mut self) -> CursorMut<'_, K, V, PTR, N, NP1> {
+    pub fn get_cursor_mut(&mut self) -> CursorMut<'_, K, V, PTR, L, N, NP1> {
         let leaf_idx = self.first_leaf();
         CursorMut { tree: self, leaf_idx, position: 0, packed_off: 0 }
     }
 
-    pub fn cursor_at(&self, key: &K::Needle) -> Cursor<'_, K, V, PTR, N, NP1> {
+    pub fn cursor_at(&self, key: &K::Needle) -> Cursor<'_, K, V, PTR, L, N, NP1> {
         let needle = key.as_ref();
         let (leaf_idx, pos, packed_off) = self.locate_with_offset(needle);
         Cursor { tree: self, leaf_idx, position: pos, packed_off }
@@ -980,41 +991,44 @@ where
 // Cursor impl
 // ---------------------------------------------------------------------------
 
-pub struct Cursor<'a, K, V, PTR, const N: usize, const NP1: usize>
+pub struct Cursor<'a, K, V, PTR, L, const N: usize, const NP1: usize>
 where
     K: VarKey,
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
 {
-    tree: &'a VarCTree<K, V, PTR, N, NP1>,
+    tree: &'a VarCTree<K, V, PTR, L, N, NP1>,
     leaf_idx: usize,
     position: usize,
     /// Cached byte offset into the leaf's packed key buffer.
     packed_off: usize,
 }
 
-pub struct CursorMut<'a, K, V, PTR, const N: usize, const NP1: usize>
+pub struct CursorMut<'a, K, V, PTR, L, const N: usize, const NP1: usize>
 where
     K: VarKey,
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
 {
-    tree: &'a mut VarCTree<K, V, PTR, N, NP1>,
+    tree: &'a mut VarCTree<K, V, PTR, L, N, NP1>,
     leaf_idx: usize,
     position: usize,
     packed_off: usize,
 }
 
 #[allow(dead_code)]
-impl<'a, K, V, PTR, const N: usize, const NP1: usize>
-    Cursor<'a, K, V, PTR, N, NP1>
+impl<'a, K, V, PTR, L, const N: usize, const NP1: usize>
+    Cursor<'a, K, V, PTR, L, N, NP1>
 where
     K: VarKey,
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
@@ -1033,11 +1047,12 @@ where
 }
 
 #[allow(dead_code)]
-impl<'a, K, V, PTR, const N: usize, const NP1: usize>
-    CursorMut<'a, K, V, PTR, N, NP1>
+impl<'a, K, V, PTR, L, const N: usize, const NP1: usize>
+    CursorMut<'a, K, V, PTR, L, N, NP1>
 where
     K: VarKey,
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
@@ -1063,8 +1078,8 @@ where
 // ---------------------------------------------------------------------------
 
 /// Variable-length-key B+ tree with packed key storage.
-pub type VarCTreeMap<K, V, PTR, const N: usize, const NP1: usize> =
-    VarCTree<K, V, PTR, N, NP1>;
+pub type VarCTreeMap<K, V, PTR, L, const N: usize, const NP1: usize> =
+    VarCTree<K, V, PTR, L, N, NP1>;
 
 #[cfg(test)]
 #[path = "tests/var_btree.rs"]

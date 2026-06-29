@@ -92,170 +92,32 @@ Previews are a ~24% lookup regression vs linear scan (5.38M→6.65M). Binary sea
 
 KeyRef inlining (Inline+Owned, 24-byte KeyRef, no key_buf):
 
-┌─────────────────────────┬────────────────────────────────────┬────────────┬──────────────┬──────────────┬──────────────┬──────┐
-│ Config                  │ What changed                       │ Insert     │ Fwd          │ Bwd          │ Lookup       │ Mem  │
-├─────────────────────────┼────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
-│ with interning          │ BufKey interning + inline ≤14B     │ 3.28/3.36ᴼ │ 644M/706Mᴼ   │ 87M/438Mᴼ    │ 6.27M/6.89Mᴼ │ 35.6 │
-├─────────────────────────┼────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
-│ no interning            │ Inline ≤22B only, Owned for long   │ 3.14/2.96ᴼ │ 486M/443Mᴼ   │ 290M/196Mᴼ   │ 5.88M/6.77Mᴼ │ 45.2 │
-└─────────────────────────┴────────────────────────────────────┴────────────┴──────────────┴──────────────┴──────────────┴──────┘
+┌───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┬──────┐
+│ Config                │ What changed                                          │ Insert     │ Fwd          │ Bwd          │ Lookup       │ Mem  │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ with interning        │ BufKey interning + inline ≤14B                        │ 3.28/3.36ᴼ │ 644M/706Mᴼ   │ 87M/438Mᴼ    │ 6.27M/6.89Mᴼ │ 35.6 │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ no interning          │ Inline ≤22B only, Owned for long                      │ 3.14/2.96ᴼ │ 486M/443Mᴼ   │ 290M/196Mᴼ   │ 5.88M/6.77Mᴼ │ 45.2 │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ PackedKeySlots (init) │ PackedKeySlots, branch-free prefix scan; iter rebuilds│ 2.80M      │ 117M         │ 96M          │ 6.28M        │ 41.5 │
+│                       │ Vec<u8> per step                                      │            │              │              │              │      │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ vec-per-node keys     │ Vec-per-node keys; iter ↑18×, lookup regresses        │ 2.54M      │ 283M         │ 266M         │ 5.36M        │ 38.4 │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ SmallVec              │ SmallVec for vlen keys; good perf trade, memory ↑     │ 2.32M      │ 245M         │ 236M         │ 5.12M        │ 44.2 │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ + reserve capacity    │ Reserve capacity on node split; lookup ↑ to 7.63M     │ 2.42M      │ 265M         │ 251M         │ 7.63M        │ 45.3 │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ + GLM optimizations   │ 9 easy optimizations (dedup/cache/allocs); lookup ↓   │ 2.57M      │ 250M         │ 250M         │ 4.95M        │ 45.3 │
+├───────────────────────┼───────────────────────────────────────────────────────┼────────────┼──────────────┼──────────────┼──────────────┼──────┤
+│ + recursive rebalance │ Recursive rebalancing (limit=3); big insert+lookup win│ 3.21M      │ 258M         │ 261M         │ 8.06M        │ 45.3 │
+└───────────────────────┴───────────────────────────────────────────────────────┴────────────┴──────────────┴──────────────┴──────────────┴──────┘
+
+Recursive rebalancing limit tuned: 3 is best (2, 4 slower; 10 far slower). Memory unchanged at 45.3...
+
+Looking at the table it may not seem very worth it but i don't think the original 'intern everything' approach was good, it relied heavily on optimization and 
+we had no way of doing our gap arena efficiently with variable length keys.
+Also the initial bonus to lookup from reserve capacity was probably anomalous because the lookup codepath was unchanged. 
 
 
-PackedKeySlots (contiguous inline buf + per-node overflow vec, branch-free prefix scan):
-
-| Config | What changed | Insert | Fwd | Lookup | Notes |
-|--------|-------------|--------|-----|--------|-------|
-| CTree (baseline) | KeyRef Inline+Buf, linear scan | 13.89M | 1.16G | 35.72M | Sequential keys |
-| PackedVarCTree | PackedKeySlots, branch-free scan | 10.23M (-26%) | 62M (-95%) | 36.09M (+1%) | N=8, seq keys |
-
-Lookup is flat (same perf). Insert is -26% at n=100 (insert_at shifting 224-byte inline_buf).
-Fwd iteration is 18x slower because cursor.current() reconstructs key as Vec<u8> per call.
-
-RLE on the keys
-
-
-─── Insertion (keys/sec) ───
-                               1000000
-PackedVarCTree                   2.80M
-
-─── Lookup (keys/sec) ───
-                               1000000
-PackedVarCTree                   6.28M
-
-─── Iter forward (keys/sec) ───
-                               1000000
-PackedVarCTree                 116.88M
-
-─── Iter backward (keys/sec) ───
-                               1000000
-PackedVarCTree                  95.91M
-
-─── Memory (bytes/key) ───
-                               1000000
-PackedVarCTree                    41.5
-
-
-wow iteration sucks 
-optimizing that to get rid of inlining and just do packing in a vec-per-node for the keys
-
-  ─── Insertion (keys/sec) ───
-                                 1000000
-  PackedVarCTree                   2.54M
-
-  ─── Lookup (keys/sec) ───
-                                 1000000
-  PackedVarCTree                   5.36M
-
-  ─── Iter forward (keys/sec) ───
-                                 1000000
-  PackedVarCTree                 283.10M
-
-  ─── Iter backward (keys/sec) ───
-                                 1000000
-  PackedVarCTree                 266.45M
-
-  ─── Memory (bytes/key) ───
-                                 1000000
-  PackedVarCTree                    38.4
-
-significant regression on lookup but massive improvement on iteration. 
-I'm gonna swap in smallvec and see how that does. 
-
-
-
-─── Insertion (keys/sec) ───
-                               1000000
-PackedVarCTree                   2.32M
-
-─── Lookup (keys/sec) ───
-                               1000000
-PackedVarCTree                   5.12M
-
-─── Iter forward (keys/sec) ───
-                               1000000
-PackedVarCTree                 244.94M
-
-─── Iter backward (keys/sec) ───
-                               1000000
-PackedVarCTree                 235.65M
-
-─── Memory (bytes/key) ───
-                               1000000
-PackedVarCTree                    44.2
-
-mostly a big win except on memory, but memory is still quite good. 
-reserve capacity for keys when splitting node : 
-
-─── Insertion (keys/sec) ───
-                               1000000
-PackedVarCTree                   2.42M
-
-─── Lookup (keys/sec) ───
-                               1000000
-PackedVarCTree                   7.63M
-
-─── Iter forward (keys/sec) ───
-                               1000000
-PackedVarCTree                 264.56M
-
-─── Iter backward (keys/sec) ───
-                               1000000
-PackedVarCTree                 250.73M
-
-─── Memory (bytes/key) ───
-                               1000000
-PackedVarCTree                    45.3
-
-Ok, big picture done, asking glm to spot easy optimizations / reduce code duplication / unnecessary allocs / cache instead of recompute
-it found ~9 obvious optimizations it can make, lets see how big of an impact it makes. 
-
-
-─── Insertion (keys/sec) ───
-                               1000000
-PackedVarCTree                   2.57M
-
-─── Lookup (keys/sec) ───
-                               1000000
-PackedVarCTree                   4.95M
-
-─── Iter forward (keys/sec) ───
-                               1000000
-PackedVarCTree                 249.83M
-
-─── Iter backward (keys/sec) ───
-                               1000000
-PackedVarCTree                 250.04M
-
-─── Memory (bytes/key) ───
-                               1000000
-PackedVarCTree                    45.3
-
-Ok next optimization - recursive rebalancing. Right now nodes only overflow into their immediate neighbors - this allows them to
-check more distant relatives recurisvely. 
-
-
-─── Insertion (keys/sec) ───
-                               1000000
-PackedVarCTree                   3.21M
-
-─── Lookup (keys/sec) ───
-                               1000000
-PackedVarCTree                   8.06M
-
-─── Iter forward (keys/sec) ───
-                               1000000
-PackedVarCTree                 257.97M
-
-─── Iter backward (keys/sec) ───
-                               1000000
-PackedVarCTree                 260.95M
-
-─── Memory (bytes/key) ───
-                               1000000
-PackedVarCTree                    45.3
-
-Big win on insertion and lookup, tested with 5s per test to be sure. Interesting that memory didnt change at all, considering the tree seems to be shallower  (im guessing since lookup improved so much). 
-Testing with the recusive limit set to 10 instead of 3 : 
-
-i'll omit the litany of tests, but optimizing the recusive limit it seems like 3 might be best. 2 and 4 are slower, 10 is far slower. 
 

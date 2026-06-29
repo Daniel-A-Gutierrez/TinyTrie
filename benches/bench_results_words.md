@@ -11,7 +11,7 @@ CTree                            4.07M           2.59M           3.28M
 PolyTrie                         3.91M           1.59M           1.85M
 FixedLen                         3.52M           1.99M           1.18M
 CTreeOpt                         2.94M           1.99M           3.36M
-PackedVarCTree                     0.0             0.0           3.23M
+PackedVarCTree                     0.0             0.0           3.11M
 
 ─── Iter backward (keys/sec) ───
                                    100           10000         1000000
@@ -28,7 +28,7 @@ NibbleTrie                     137.27M         118.06M          53.03M
 PolyTrie                       106.31M          98.25M          49.96M
 FixedLen                        86.42M          52.04M          36.94M
 FixedLenOpt                     86.25M          51.95M          36.87M
-PackedVarCTree                     0.0             0.0         261.64M
+PackedVarCTree                     0.0             0.0         218.26M
 
 ─── Iter forward (keys/sec) ───
                                    100           10000         1000000
@@ -46,7 +46,7 @@ NibbleOpt                      117.96M         103.27M          64.78M
 PolyTrie                       101.19M          95.90M          47.32M
 FixedLen                        72.52M          74.86M          36.14M
 FixedLenOpt                     71.94M          75.03M          36.01M
-PackedVarCTree                     0.0             0.0         260.32M
+PackedVarCTree                     0.0             0.0         254.70M
 
 ─── Iter fwd index (keys/sec) ───
                                    100           10000         1000000
@@ -85,7 +85,7 @@ BTreeMap                        44.48M           7.45M           5.60M
 SortedVec                       31.82M          12.09M           6.43M
 CTree                           29.78M           3.67M           6.27M
 CTreeOpt                        24.62M           3.39M           6.89M
-PackedVarCTree                     0.0             0.0           8.18M
+PackedVarCTree                     0.0             0.0           7.78M
 
 ─── Memory (bytes/key) ───
                                    100           10000         1000000

@@ -20,5 +20,5 @@ pub use tiny_btree::{
     SearchStrategy, StoredKey, TreeKey, TrieIndex, VarCTree,
 };
 pub use tiny_array::TinyArray;
-pub use var_btree::{VarCTree as PackedVarCTree, VarKey as PackedVarKey, TrieIndex as PackedTrieIndex};
+pub use var_btree::{VarCTree as PackedVarCTree, VarKey as PackedVarKey, TrieIndex as PackedTrieIndex, LengthType as PackedLengthType};
 

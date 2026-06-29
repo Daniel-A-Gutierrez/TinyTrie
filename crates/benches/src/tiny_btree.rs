@@ -50,7 +50,7 @@ where
         Self { tree: CTree::new(), max_key: None }
     }
 
-    /// Insert every key into a fresh tree, tracking the largest harness key.
+    /// Insert all keys, tracking the largest for reverse iteration.
     fn build_tree(keys: &[K]) -> (CTree<K, V, PTR, N, NP1>, Option<K>)
     where
         K: Clone,
@@ -59,7 +59,8 @@ where
         let mut tree = CTree::new();
         let mut max_key: Option<K> = None;
         for (i, k) in keys.iter().enumerate() {
-            if tree.insert(k.clone(), V::from(i)).is_ok() && max_key.as_ref().map_or(true, |m| k > m) {
+            let _ = tree.insert(k.clone(), V::from(i));
+            if max_key.as_ref().map_or(true, |m| k > m) {
                 max_key = Some(k.clone());
             }
         }
@@ -137,9 +138,10 @@ where
         let (mut tree, _) = Self::build_tree(keys);
         tree.compact();
         if OPT { tree.optimize(); }
+        let n = tree.len();
         let bytes = read_allocated() - before;
         drop(tree);
-        Some(bytes as f64 / keys.len() as f64)
+        Some(bytes as f64 / n as f64)
     }
 }
 
@@ -161,10 +163,11 @@ pub(crate) type CTreeFixedOptBench = CTreeBenchGen<u64, usize, u32, 16, 17, true
 // with branch-free sequential scan). Benchmarked against the existing
 // CTreeBench (which uses KeyRef with inline/buf branching).
 
+use ctree::PackedLengthType;
 use ctree::PackedVarCTree;
 
 pub(crate) struct PackedVarCTreeBench {
-    tree: PackedVarCTree<Vec<u8>, usize, u32, 8, 9>,
+    tree: PackedVarCTree<Vec<u8>, usize, u32, u8, 8, 9>,
     max_key: Option<Vec<u8>>,
 }
 
@@ -173,28 +176,46 @@ impl PackedVarCTreeBench {
         Self { tree: PackedVarCTree::new(), max_key: None }
     }
 
-    fn build_tree(keys: &[Vec<u8>]) -> (PackedVarCTree<Vec<u8>, usize, u32, 8, 9>, Option<Vec<u8>>) {
+    /// Insert keys that fit within the length type's maximum, skipping those
+    /// that are too long. Returns the actual count inserted and warns on stderr
+    /// if any keys were rejected.
+    fn build_tree(keys: &[Vec<u8>]) -> (PackedVarCTree<Vec<u8>, usize, u32, u8, 8, 9>, Option<Vec<u8>>, usize) {
+        let max_len = <u8 as PackedLengthType>::max();
         let mut tree = PackedVarCTree::new();
         let mut max_key: Option<Vec<u8>> = None;
+        let mut rejected = 0usize;
         for (i, k) in keys.iter().enumerate() {
-            if tree.insert(k.clone(), i).is_ok() && max_key.as_ref().map_or(true, |m| k > m) {
-                max_key = Some(k.clone());
+            if k.len() > max_len {
+                rejected += 1;
+                continue;
+            }
+            if tree.insert(k.clone(), i).is_ok() {
+                if max_key.as_ref().map_or(true, |m| k > m) {
+                    max_key = Some(k.clone());
+                }
             }
         }
-        (tree, max_key)
+        if rejected > 0 {
+            eprintln!(
+                "PackedVarCTree: rejected {}/{} keys (exceed max length of {} bytes)",
+                rejected, keys.len(), max_len
+            );
+        }
+        let n = tree.len();
+        (tree, max_key, n)
     }
 }
 
 impl Benchable<Vec<u8>> for PackedVarCTreeBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchCtx<Vec<u8>>) {
-        let (mut tree, max_key) = Self::build_tree(keys);
+        let (mut tree, max_key, _) = Self::build_tree(keys);
         tree.compact();
         self.tree = tree;
         self.max_key = max_key;
     }
 
     fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
-        let (tree, _) = Self::build_tree(keys);
+        let (tree, _, _) = Self::build_tree(keys);
         black_box(&tree);
         Some(())
     }
@@ -237,10 +258,10 @@ impl Benchable<Vec<u8>> for PackedVarCTreeBench {
 
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
         let before = read_allocated();
-        let (mut tree, _) = Self::build_tree(keys);
+        let (mut tree, _, n) = Self::build_tree(keys);
         tree.compact();
         let bytes = read_allocated() - before;
         drop(tree);
-        Some(bytes as f64 / keys.len() as f64)
+        Some(bytes as f64 / n as f64)
     }
 }

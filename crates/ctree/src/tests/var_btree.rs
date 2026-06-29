@@ -1,9 +1,10 @@
 use super::*;
 
-fn make_tree<K, V, PTR, const N: usize, const NP1: usize>() -> VarCTree<K, V, PTR, N, NP1>
+fn make_tree<K, V, PTR, L, const N: usize, const NP1: usize>() -> VarCTree<K, V, PTR, L, N, NP1>
 where
     K: VarKey,
     PTR: TrieIndex,
+    L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
@@ -11,7 +12,7 @@ where
     VarCTree::new()
 }
 
-type TestTree = VarCTree<Vec<u8>, usize, u32, 4, 5>;
+type TestTree = VarCTree<Vec<u8>, usize, u32, u8, 4, 5>;
 
 #[test]
 fn test_var_insert_and_get() {
