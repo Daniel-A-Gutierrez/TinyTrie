@@ -2,7 +2,7 @@
 members = [
     "crates/tiny-trie-trait",
     "crates/tiny-trie",
-    "crates/ctree",
+    "crates/btrees",
     "crates/poly-trie",
     "crates/benches",
 ]
@@ -12,6 +12,6 @@ resolver = "2"
 # Workspace crates — path declared once here
 tiny-trie = { path = "crates/tiny-trie" }
 tiny-trie-trait = { path = "crates/tiny-trie-trait" }
-ctree = { path = "crates/ctree" }
+btrees = { path = "crates/btrees" }
 poly-trie = { path = "crates/poly-trie" }
 bencher = { path = "crates/benches" }

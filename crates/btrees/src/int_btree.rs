@@ -1424,15 +1424,6 @@ where
 // Instantiation aliases
 // ---------------------------------------------------------------------------
 
-/// Fixed-size-key B+ tree (SIMD search). `K: FixedLenKey`.
-pub type FixedCTree<K, V, PTR, const N: usize, const NP1: usize> =
-    CTree<K, V, PTR, N, NP1>;
-
-/// Variable-length-key B+ tree (linear scan through key buffer).
-/// `K: TreeKey` with `K::Stored = KeyRef`, e.g. `Vec<u8>`.
-pub type VarCTree<K, V, PTR, const N: usize, const NP1: usize> =
-    CTree<K, V, PTR, N, NP1>;
-
 #[cfg(test)]
-#[path = "tests/tiny_btree.rs"]
+#[path = "tests/int_btree.rs"]
 mod tests;

@@ -245,7 +245,7 @@ mod nibble_trie;
 mod poly_trie;
 mod stacked_trie;
 mod std_contestants;
-mod tiny_btree;
+mod btree;
 
 // ── Re-exports from modules ──────────────────────────────────────────
 
@@ -262,7 +262,7 @@ use std_contestants::{
     BTreeMapBench, BTreeMapBenchU64, HashMapBench, HashMapBenchU64,
     SortedVecBench, SortedVecBenchU64,
 };
-use tiny_btree::{CTreeBench, CTreeFixedBench, CTreeFixedOptBench, CTreeOptBench, PackedVarCTreeBench};
+use btree::{IntBTreeBench, IntBTreeOptBench, StrBTreeBench};
 
 // ── Type aliases ─────────────────────────────────────────────────────
 
@@ -445,7 +445,7 @@ fn build_context_nonzero(keys: &[NonZeroBytes]) -> BenchContextNz {
 }
 
 /// Fixed-width `u64` context. Mirrors the byte ctx's hit+miss interleaving so
-/// `CTreeFixedBench` performs the same `2n` lookups (half hit, half miss) as
+/// `IntBTreeFixedBench` performs the same `2n` lookups (half hit, half miss) as
 /// the byte CTree — a fair cross-contestant comparison. The miss is the bitwise
 /// complement `!v`, a guaranteed-absent `u64` for both `RandomU64` (collision
 /// with another key is ~n/2^64) and `SeqU64` (complement of a small `i` is
@@ -651,9 +651,9 @@ fn all_contestants() -> Vec<Contestant> {
         Contestant { name: "FixedLenOpt",         max_size: None, bytes: Some(Box::new(FixedLenOptBench::new())), nonzero: None, u64: None },
         Contestant { name: "StackedTrie2",        max_size: None, bytes: Some(Box::new(StackedTrie2Bench::new())), nonzero: None, u64: None },
         Contestant { name: "StackedTrie4",        max_size: None, bytes: Some(Box::new(StackedTrie4Bench::new())), nonzero: None, u64: None },
-        Contestant { name: "CTree",               max_size: None, bytes: Some(Box::new(CTreeBench::new())),     nonzero: None, u64: Some(Box::new(CTreeFixedBench::new())) },
-        Contestant { name: "CTreeOpt",            max_size: None, bytes: Some(Box::new(CTreeOptBench::new())),  nonzero: None, u64: Some(Box::new(CTreeFixedOptBench::new())) },
-        Contestant { name: "PackedVarCTree",      max_size: None, bytes: Some(Box::new(PackedVarCTreeBench::new())), nonzero: None, u64: None },
+        Contestant { name: "IntBTree",      max_size: None, bytes: Some(Box::new(IntBTreeBench::new())),    nonzero: None, u64: None },
+        Contestant { name: "IntBTreeOpt",   max_size: None, bytes: Some(Box::new(IntBTreeOptBench::new())), nonzero: None, u64: None },
+        Contestant { name: "StrBTree",      max_size: None, bytes: Some(Box::new(StrBTreeBench::new())),     nonzero: None, u64: None },
     ]
 }
 

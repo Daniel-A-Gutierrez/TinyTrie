@@ -39,8 +39,6 @@ NibbleOptUnchecked             189.29M             0.0
 BTreeMap                       134.71M          17.81M
 CTree                          129.90M             0.0
 CTreeOpt                       129.72M             0.0
-CTreeFixed                     125.75M             0.0
-CTreeFixedOpt                  125.51M             0.0
 NibbleOpt                      112.80M             0.0
 NibbleTrie                     112.44M             0.0
 DynTrieOpt                     109.00M             0.0

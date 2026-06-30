@@ -1,7 +1,7 @@
 //! Variable-length key B+ tree using packed key storage.
 //!
 //! This module implements a B+ tree optimized for variable-length byte keys.
-//! Keys are stored in `PackedKeySlots<N>` — a dense layout where each key's
+//! Keys are stored in `KeySlots<N>` — a dense layout where each key's
 //! full bytes are stored contiguously with no padding. The sequential scan
 //! walks through packed bytes with a running offset.
 
@@ -9,8 +9,8 @@ use std::num::{NonZero, ZeroablePrimitive};
 
 use smallvec::SmallVec;
 
-pub use crate::packed_keys::LengthType;
-use crate::packed_keys::PackedKeySlots;
+pub use crate::key_slots::LengthType;
+use crate::key_slots::KeySlots;
 
 // ---------------------------------------------------------------------------
 // TrieIndex
@@ -40,23 +40,23 @@ macro_rules! impl_trie_index {
 impl_trie_index!(u8, u16, u32, u64);
 
 // ---------------------------------------------------------------------------
-// VarKey trait
+// StrBTreeKey trait
 // ---------------------------------------------------------------------------
 
-/// Trait for variable-length key types that can be stored in a VarCTree.
-pub trait VarKey: Ord + Clone + 'static {
+/// Trait for variable-length key types that can be stored in a StrBTree.
+pub trait StrBTreeKey: Ord + Clone + 'static {
     type Needle: ?Sized + AsRef<[u8]>;
     fn as_needle(&self) -> &Self::Needle;
     fn into_bytes(self) -> Vec<u8>;
 }
 
-impl VarKey for Vec<u8> {
+impl StrBTreeKey for Vec<u8> {
     type Needle = [u8];
     fn as_needle(&self) -> &[u8] { self }
     fn into_bytes(self) -> Vec<u8> { self }
 }
 
-impl VarKey for Box<[u8]> {
+impl StrBTreeKey for Box<[u8]> {
     type Needle = [u8];
     fn as_needle(&self) -> &[u8] { self }
     fn into_bytes(self) -> Vec<u8> { Vec::from(self) }
@@ -73,7 +73,7 @@ where
     [(); N]:,
     [(); NP1]:,
 {
-    keys: PackedKeySlots<L, N>,
+    keys: KeySlots<L, N>,
     ptrs: [Option<NonZero<PTR>>; NP1],
 }
 
@@ -84,7 +84,7 @@ where
     V: Sized,
     [(); N]:,
 {
-    keys: PackedKeySlots<L, N>,
+    keys: KeySlots<L, N>,
     values: Vec<V>,
     prev: Option<NonZero<PTR>>,
     next: Option<NonZero<PTR>>,
@@ -106,7 +106,7 @@ where
 
     fn new() -> Self {
         Self {
-            keys: PackedKeySlots::new(),
+            keys: KeySlots::new(),
             ptrs: [None; NP1],
         }
     }
@@ -219,7 +219,7 @@ where
 {
     fn new() -> Self {
         Self {
-            keys: PackedKeySlots::new(),
+            keys: KeySlots::new(),
             values: Vec::new(),
             prev: None,
             next: None,
@@ -334,13 +334,13 @@ fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
 }
 
 // ---------------------------------------------------------------------------
-// VarCTree
+// StrBTree
 // ---------------------------------------------------------------------------
 
 /// B+ tree for variable-length byte keys using packed key storage.
-pub struct VarCTree<K, V, PTR, L, const N: usize, const NP1: usize>
+pub struct StrBTree<K, V, PTR, L, const N: usize, const NP1: usize>
 where
-    K: VarKey,
+    K: StrBTreeKey,
     PTR: TrieIndex,
     L: LengthType,
     V: Sized,
@@ -358,9 +358,9 @@ where
 
 #[allow(dead_code)]
 impl<K, V, PTR, L, const N: usize, const NP1: usize>
-    VarCTree<K, V, PTR, L, N, NP1>
+    StrBTree<K, V, PTR, L, N, NP1>
 where
-    K: VarKey,
+    K: StrBTreeKey,
     PTR: TrieIndex,
     L: LengthType,
     V: Sized,
@@ -946,7 +946,7 @@ where
         self.insert_separator(&mid_stored, new_inode_idx, path);
     }
 
-    fn find_position_for_stored(&self, stored: &[u8], keys: &PackedKeySlots<L, N>) -> usize {
+    fn find_position_for_stored(&self, stored: &[u8], keys: &KeySlots<L, N>) -> usize {
         for i in 0..keys.len() {
             let key = keys.key_slice(i);
             if stored.cmp(key) != std::cmp::Ordering::Greater {
@@ -993,14 +993,14 @@ where
 
 pub struct Cursor<'a, K, V, PTR, L, const N: usize, const NP1: usize>
 where
-    K: VarKey,
+    K: StrBTreeKey,
     PTR: TrieIndex,
     L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
 {
-    tree: &'a VarCTree<K, V, PTR, L, N, NP1>,
+    tree: &'a StrBTree<K, V, PTR, L, N, NP1>,
     leaf_idx: usize,
     position: usize,
     /// Cached byte offset into the leaf's packed key buffer.
@@ -1009,14 +1009,14 @@ where
 
 pub struct CursorMut<'a, K, V, PTR, L, const N: usize, const NP1: usize>
 where
-    K: VarKey,
+    K: StrBTreeKey,
     PTR: TrieIndex,
     L: LengthType,
     V: Sized,
     [(); N]:,
     [(); NP1]:,
 {
-    tree: &'a mut VarCTree<K, V, PTR, L, N, NP1>,
+    tree: &'a mut StrBTree<K, V, PTR, L, N, NP1>,
     leaf_idx: usize,
     position: usize,
     packed_off: usize,
@@ -1026,7 +1026,7 @@ where
 impl<'a, K, V, PTR, L, const N: usize, const NP1: usize>
     Cursor<'a, K, V, PTR, L, N, NP1>
 where
-    K: VarKey,
+    K: StrBTreeKey,
     PTR: TrieIndex,
     L: LengthType,
     V: Sized,
@@ -1050,7 +1050,7 @@ where
 impl<'a, K, V, PTR, L, const N: usize, const NP1: usize>
     CursorMut<'a, K, V, PTR, L, N, NP1>
 where
-    K: VarKey,
+    K: StrBTreeKey,
     PTR: TrieIndex,
     L: LengthType,
     V: Sized,
@@ -1078,9 +1078,9 @@ where
 // ---------------------------------------------------------------------------
 
 /// Variable-length-key B+ tree with packed key storage.
-pub type VarCTreeMap<K, V, PTR, L, const N: usize, const NP1: usize> =
-    VarCTree<K, V, PTR, L, N, NP1>;
+pub type StrBTreeMap<K, V, PTR, L, const N: usize, const NP1: usize> =
+    StrBTree<K, V, PTR, L, N, NP1>;
 
 #[cfg(test)]
-#[path = "tests/var_btree.rs"]
+#[path = "tests/str_btree.rs"]
 mod tests;

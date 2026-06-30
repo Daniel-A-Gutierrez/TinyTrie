@@ -1,4 +1,4 @@
-use crate::tiny_btree::*;
+use crate::int_btree::*;
 
 // ---------------------------------------------------------------------------
 // FixedLenKey SIMD `find_position` — direct trait tests
@@ -882,7 +882,7 @@ fn test_optimize_var_len_keys() {
 // `#[ignore]` so it is SKIPPED by `cargo test` (it still compiles every build,
 // so it cannot bit-rot) and runs only on demand:
 //
-//   cargo test --lib tiny_btree::tests::experiment_optimize_layout -- --ignored --nocapture
+//   cargo test --lib int_btree::tests::experiment_optimize_layout -- --ignored --nocapture
 // ---------------------------------------------------------------------------
 #[test]
 #[ignore = "diagnostic only: arena-layout + iteration-visit trace"]

@@ -7,17 +7,17 @@ SortedVec                       19.85M           8.32M           2.97M
 BitTrie                         19.41M           9.29M           5.59M
 HashMap                         12.11M          12.12M           2.17M
 BTreeMap                         9.92M           4.26M           2.70M
-CTree                            4.07M           2.59M           3.28M
+IntBTree                         4.07M           2.59M           3.28M
 PolyTrie                         3.91M           1.59M           1.85M
 FixedLen                         3.52M           1.99M           1.18M
-CTreeOpt                         2.94M           1.99M           3.36M
-PackedVarCTree                     0.0             0.0           3.11M
+IntBTreeOpt                      2.94M           1.99M           3.36M
+StrBTree                           0.0             0.0           3.10M
 
 ─── Iter backward (keys/sec) ───
                                    100           10000         1000000
 BTreeMap                       949.80M         738.13M          27.60M
-CTree                          438.63M         476.86M          86.76M
-CTreeOpt                       398.40M         480.99M         438.24M
+IntBTree                       438.63M         476.86M          86.76M
+IntBTreeOpt                    398.40M         480.99M         438.24M
 DynTrieOpt                     172.23M         151.61M          66.57M
 DynTrie                        171.21M         151.39M          66.07M
 StackedTrie4                   164.97M         132.37M          57.30M
@@ -28,14 +28,14 @@ NibbleTrie                     137.27M         118.06M          53.03M
 PolyTrie                       106.31M          98.25M          49.96M
 FixedLen                        86.42M          52.04M          36.94M
 FixedLenOpt                     86.25M          51.95M          36.87M
-PackedVarCTree                     0.0             0.0         218.26M
+StrBTree                           0.0             0.0         228.12M
 
 ─── Iter forward (keys/sec) ───
                                    100           10000         1000000
 SortedVec                        2.60G           4.98G           5.03G
-CTree                            1.15G           1.51G         643.69M
+IntBTree                         1.15G           1.51G         643.69M
 BTreeMap                       929.70M         785.76M          30.45M
-CTreeOpt                       880.73M         952.14M         705.77M
+IntBTreeOpt                    880.73M         952.14M         705.77M
 StackedTrie4                   159.49M         143.66M          72.61M
 StackedTrie2                   157.33M         142.73M          72.69M
 BitTrie                        145.21M         154.06M          69.84M
@@ -46,7 +46,7 @@ NibbleOpt                      117.96M         103.27M          64.78M
 PolyTrie                       101.19M          95.90M          47.32M
 FixedLen                        72.52M          74.86M          36.14M
 FixedLenOpt                     71.94M          75.03M          36.01M
-PackedVarCTree                     0.0             0.0         254.70M
+StrBTree                           0.0             0.0         260.09M
 
 ─── Iter fwd index (keys/sec) ───
                                    100           10000         1000000
@@ -83,21 +83,21 @@ BitTrie                         48.21M          16.68M           9.78M
 PolyTrie                        45.49M           9.39M           4.94M
 BTreeMap                        44.48M           7.45M           5.60M
 SortedVec                       31.82M          12.09M           6.43M
-CTree                           29.78M           3.67M           6.27M
-CTreeOpt                        24.62M           3.39M           6.89M
-PackedVarCTree                     0.0             0.0           7.78M
+IntBTree                        29.78M           3.67M           6.27M
+IntBTreeOpt                     24.62M           3.39M           6.89M
+StrBTree                           0.0             0.0           7.96M
 
 ─── Memory (bytes/key) ───
                                    100           10000         1000000
-PackedVarCTree                     0.0             0.0            45.3
+StrBTree                           0.0             0.0            45.3
 DynTrieOpt                        37.6            72.5            76.7
 SortedVec                         44.1            43.6            40.6
 DynTrie                           46.1            83.8           130.0
-CTree                             48.3            51.4            35.6
+IntBTree                          48.3            51.4            35.6
 StackedTrie2                      55.5           105.3            78.8
 StackedTrie4                      60.7           118.4            87.2
 NibbleOpt                         62.1           120.6           126.1
-CTreeOpt                          64.0            72.7            51.8
+IntBTreeOpt                       64.0            72.7            51.8
 NibbleTrie                        64.0           124.5           134.2
 BTreeMap                          68.7            72.8            72.2
 BitTrie                           71.7            78.6            58.7
@@ -114,5 +114,5 @@ StackedTrie2                    18.90M           5.07M           3.15M
 StackedTrie4                    17.61M           4.54M           3.62M
 PolyTrie                         3.81M           1.17M          961.2K
 FixedLenOpt                      3.36M           2.74M          781.5K
-CTreeOpt                         2.81M           1.86M           3.00M
+IntBTreeOpt                      2.81M           1.86M           3.00M
 

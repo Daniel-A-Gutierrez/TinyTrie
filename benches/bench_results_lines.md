@@ -8,14 +8,14 @@ BitTrie                         14.15M          18.10M
 HashMap                         14.09M          15.74M
 NibbleTrie                       8.62M           9.46M
 PolyTrie                         5.79M           2.29M
-CTree                            5.75M           4.46M
-CTreeOpt                         5.45M           4.40M
+IntBTree                            5.75M           4.46M
+IntBTreeOpt                         5.45M           4.40M
 
 ─── Iter backward (keys/sec) ───
                                    100           10000
 BTreeMap                       986.16M           1.18G
-CTree                          438.66M         543.11M
-CTreeOpt                       437.08M         540.87M
+IntBTree                          438.66M         543.11M
+IntBTreeOpt                       437.08M         540.87M
 BitTrie                        157.11M         250.87M
 DynTrieOpt                     146.22M         139.91M
 DynTrie                        146.03M         140.27M
@@ -26,8 +26,8 @@ NibbleOpt                          0.0         158.74M
 ─── Iter forward (keys/sec) ───
                                    100           10000
 SortedVec                        2.66G           7.23G
-CTreeOpt                         1.09G           1.37G
-CTree                            1.08G           1.37G
+IntBTreeOpt                         1.09G           1.37G
+IntBTree                            1.08G           1.37G
 BTreeMap                       870.94M           1.29G
 BitTrie                        161.17M         226.11M
 DynTrie                        116.08M         108.35M
@@ -57,8 +57,8 @@ SortedVec                       27.83M          11.80M
 NibbleUnchecked                 26.60M             0.0
 NibbleTrie                      24.39M          13.00M
 BitTrie                         24.20M          12.11M
-CTree                            9.23M           3.37M
-CTreeOpt                         9.22M           3.34M
+IntBTree                            9.23M           3.37M
+IntBTreeOpt                         9.22M           3.34M
 NibbleOpt                          0.0          12.46M
 NibbleOptUnchecked                 0.0          15.55M
 
@@ -70,8 +70,8 @@ SortedVec                        116.7           249.7
 HashMap                          127.1           271.8
 DynTrieOpt                       129.3           281.0
 LinkedList                       132.7           265.7
-CTree                            134.5           271.3
-CTreeOpt                         134.5           271.3
+IntBTree                            134.5           271.3
+IntBTreeOpt                         134.5           271.3
 BTreeMap                         150.1           281.3
 PolyOpt                          154.0           298.6
 PolyTrie                         157.7           310.4
@@ -85,7 +85,7 @@ NibbleTrie                       221.4           462.0
 ─── Optimize (keys/sec) ───
                                    100           10000
 DynTrieOpt                      13.30M           5.87M
-CTreeOpt                         5.88M           4.40M
+IntBTreeOpt                         5.88M           4.40M
 PolyTrie                         5.02M           2.46M
 NibbleOpt                          0.0           8.32M
 

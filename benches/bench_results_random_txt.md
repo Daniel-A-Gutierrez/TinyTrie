@@ -7,15 +7,15 @@ DynTrie                         34.57M          23.94M           5.14M
 SortedVec                       18.52M           9.19M           2.61M
 BTreeMap                        18.19M           9.58M           2.69M
 HashMap                         15.46M          12.24M           1.66M
-CTree                           13.06M           8.40M           3.01M
-CTreeOpt                        12.94M           8.32M           2.99M
+IntBTree                           13.06M           8.40M           3.01M
+IntBTreeOpt                        12.94M           8.32M           2.99M
 FixedLen                        10.90M           6.18M           1.43M
 
 ─── Iter backward (keys/sec) ───
                                    100           10000         1000000
 BTreeMap                       914.96M         960.28M          89.61M
-CTreeOpt                       448.03M         543.97M         488.77M
-CTree                          446.75M         538.96M         488.97M
+IntBTreeOpt                       448.03M         543.97M         488.77M
+IntBTree                          446.75M         538.96M         488.97M
 NibbleTrie                     152.39M         157.66M          84.98M
 DynTrie                        152.31M         157.05M          84.50M
 DynTrieOpt                     152.18M         156.74M          86.25M
@@ -28,8 +28,8 @@ FixedLenOpt                    130.54M         130.84M          75.94M
 ─── Iter forward (keys/sec) ───
                                    100           10000         1000000
 SortedVec                        2.46G           4.67G           4.70G
-CTree                            1.08G           1.35G           1.02G
-CTreeOpt                         1.08G           1.35G           1.08G
+IntBTree                            1.08G           1.35G           1.02G
+IntBTreeOpt                         1.08G           1.35G           1.08G
 BTreeMap                       906.55M         953.25M          82.62M
 NibbleOpt                      166.11M         163.55M          93.58M
 NibbleTrie                     164.80M         163.28M          93.17M
@@ -72,8 +72,8 @@ StackedTrie2                   135.81M          66.98M          22.96M
 StackedTrie4                   132.11M          65.69M          22.76M
 HashMap                         79.09M          48.97M           8.24M
 BTreeMap                        44.71M          16.59M           7.58M
-CTree                           40.95M          14.17M           9.85M
-CTreeOpt                        40.71M          13.68M           9.67M
+IntBTree                           40.95M          14.17M           9.85M
+IntBTreeOpt                        40.71M          13.68M           9.67M
 SortedVec                       28.88M          10.54M           5.40M
 
 ─── Memory (bytes/key) ───
@@ -81,8 +81,8 @@ SortedVec                       28.88M          10.54M           5.40M
 SortedVec                         42.2            41.9            42.0
 DynTrieOpt                        44.6            53.6            78.0
 HashMap                           52.6            64.0            79.2
-CTree                             53.4            49.1            49.0
-CTreeOpt                          53.4            49.1            49.0
+IntBTree                             53.4            49.1            49.0
+IntBTreeOpt                          53.4            49.1            49.0
 DynTrie                           55.0            78.7            68.8
 NibbleOpt                         60.0            66.7            75.9
 StackedTrie2                      62.6            70.0            80.1
@@ -98,6 +98,6 @@ NibbleOpt                       24.45M          13.10M           3.82M
 DynTrieOpt                      22.71M          11.81M           3.76M
 StackedTrie2                    21.42M           8.01M           3.41M
 StackedTrie4                    20.74M           7.86M           3.26M
-CTreeOpt                        12.35M           6.32M           2.64M
+IntBTreeOpt                        12.35M           6.32M           2.64M
 FixedLenOpt                      9.62M           6.44M           1.35M
 

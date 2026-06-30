@@ -1,5 +1,5 @@
 [package]
-name = "ctree"
+name = "btrees"
 version = "0.1.0"
 edition = "2024"
 description = "Compact B+ tree with SIMD-accelerated node search"

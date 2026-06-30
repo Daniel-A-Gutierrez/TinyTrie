@@ -120,4 +120,27 @@ we had no way of doing our gap arena efficiently with variable length keys.
 Also the initial bonus to lookup from reserve capacity was probably anomalous because the lookup codepath was unchanged. 
 
 
+Adding 3 bytes of padding between keys to attempt to lower the cost of rebalancing : 
 
+
+─── Insertion (keys/sec) ───
+                               1000000
+StrBTree                         2.26M
+
+─── Lookup (keys/sec) ───
+                               1000000
+StrBTree                         5.47M
+
+─── Iter forward (keys/sec) ───
+                               1000000
+StrBTree                       239.18M
+
+─── Iter backward (keys/sec) ───
+                               1000000
+StrBTree                       205.93M
+
+─── Memory (bytes/key) ───
+                               1000000
+StrBTree                          42.9
+
+Definitely not good. Insertion way slower. 

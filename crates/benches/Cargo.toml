@@ -20,7 +20,7 @@ path = "trie-stats.rs"
 [dependencies]
 tiny-trie.workspace = true
 tiny-trie-trait.workspace = true
-ctree.workspace=true
+btrees.workspace=true
 poly-trie.workspace=true
 clap = { version = "4.6.1", features = ["derive"] }
 rand = "0.9"

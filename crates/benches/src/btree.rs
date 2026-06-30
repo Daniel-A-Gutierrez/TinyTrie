@@ -1,47 +1,47 @@
 use std::hint::black_box;
 
-use ctree::{CTree, SearchStrategy, StoredKey, TreeKey};
+use btrees::{CTree, SearchStrategy, StoredKey, TreeKey};
 
 use super::{Benchable, BenchCtx, read_allocated};
 
-// ── CTreeKey adapter ───────────────────────────────────────────────────
+// ── IntBTreeKey adapter ───────────────────────────────────────────────────
 //
-// Unifies the two CTree key forms behind one generic bench struct.
+// Unifies the two IntBTree key forms behind one generic bench struct.
 // Fixed keys (u64) use SIMD search; variable keys (Vec<u8>) use KeyRef
 // with inline short keys and linear scan through key_buf for longer keys.
 
-pub(crate) trait CTreeBenchKey: TreeKey + SearchStrategy + Clone + Ord + 'static {}
-impl CTreeBenchKey for u64 {}
-impl CTreeBenchKey for Vec<u8> {}
+pub(crate) trait IntBTreeBenchKey: TreeKey + SearchStrategy + Clone + Ord + 'static {}
+impl IntBTreeBenchKey for u64 {}
+impl IntBTreeBenchKey for Vec<u8> {}
 
-// ── CTreeBenchGen ─────────────────────────────────────────────────────
+// ── IntBTreeBenchGen ─────────────────────────────────────────────────────
 //
-// One generic contestant over both CTree key forms. `OPT` selects the
+// One generic contestant over both IntBTree key forms. `OPT` selects the
 // `optimize`-after-build variant. `max_key: Option<K>` tracks the largest
 // inserted key in *harness-key* form so reverse iteration can seed
 // `cursor_at` via `as_needle`, and an empty tree is handled without
 // panicking (`None` → the rev-iter bench returns early).
 //
-// Monomorphization: `K` is never erased here — `CTreeBenchGen<u64, _>` holds a
+// Monomorphization: `K` is never erased here — `IntBTreeBenchGen<u64, _>` holds a
 // concrete `CTree<u64, …>`, so `get`/`find_position`/`find_upper_bound` inline
 // the SIMD path. The `dyn Benchable<u64>` vtable in the harness only erases the
 // *contestant type*, not `K`.
 
-pub(crate) struct CTreeBenchGen<K: CTreeBenchKey, V, PTR, const N: usize, const NP1: usize, const OPT: bool>
+pub(crate) struct IntBTreeBenchGen<K: IntBTreeBenchKey, V, PTR, const N: usize, const NP1: usize, const OPT: bool>
 where
     K: TreeKey,
-    PTR: ctree::TrieIndex,
+    PTR: btrees::TrieIndex,
 {
     tree: CTree<K, V, PTR, N, NP1>,
     max_key: Option<K>,
 }
 
 impl<K, V, PTR, const N: usize, const NP1: usize, const OPT: bool>
-    CTreeBenchGen<K, V, PTR, N, NP1, OPT>
+    IntBTreeBenchGen<K, V, PTR, N, NP1, OPT>
 where
-    K: CTreeBenchKey + TreeKey + SearchStrategy + Clone + Ord + 'static,
+    K: IntBTreeBenchKey + TreeKey + SearchStrategy + Clone + Ord + 'static,
     K::Stored: StoredKey,
-    PTR: ctree::TrieIndex,
+    PTR: btrees::TrieIndex,
     V: From<usize>,
     [(); N]: ,
     [(); NP1]: ,
@@ -70,11 +70,11 @@ where
 
 // Benchable impl for u64 values (the common case)
 impl<K, PTR, const N: usize, const NP1: usize, const OPT: bool>
-    Benchable<K> for CTreeBenchGen<K, usize, PTR, N, NP1, OPT>
+    Benchable<K> for IntBTreeBenchGen<K, usize, PTR, N, NP1, OPT>
 where
-    K: CTreeBenchKey + TreeKey + SearchStrategy + Clone + Ord + 'static,
+    K: IntBTreeBenchKey + TreeKey + SearchStrategy + Clone + Ord + 'static,
     K::Stored: StoredKey,
-    PTR: ctree::TrieIndex,
+    PTR: btrees::TrieIndex,
     [(); N]: ,
     [(); NP1]: ,
 {
@@ -147,41 +147,35 @@ where
 
 // ── Contestant aliases ─────────────────────────────────────────────────
 
-pub(crate) type CTreeBench = CTreeBenchGen<Vec<u8>, usize, u32, 8, 9, false>;
-/// `CTreeBench` + `optimize` after build (arena contiguity for iteration).
-pub(crate) type CTreeOptBench = CTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true>;
+pub(crate) type IntBTreeBench = IntBTreeBenchGen<Vec<u8>, usize, u32, 8, 9, false>;
+/// `IntBTreeBench` + `optimize` after build (arena contiguity for iteration).
+pub(crate) type IntBTreeOptBench = IntBTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true>;
 
-// Fixed-width `u64` CTree — SIMD `find_position`/`find_upper_bound` path —
-// `RandomU64`/`SeqU64` modes only (`Bench::U64` carries the fixed-width skip).
-pub(crate) type CTreeFixedBench = CTreeBenchGen<u64, usize, u32, 16, 17, false>;
-/// `CTreeFixedBench` + `optimize` after build.
-pub(crate) type CTreeFixedOptBench = CTreeBenchGen<u64, usize, u32, 16, 17, true>;
-
-// ── PackedVarCTree contestant ──────────────────────────────────────────────
+// ── StrBTree contestant ──────────────────────────────────────────────────
 //
-// Variable-length key CTree using PackedKeySlots (packed inline key storage
+// Variable-length key CTree using KeySlots (inline key storage
 // with branch-free sequential scan). Benchmarked against the existing
-// CTreeBench (which uses KeyRef with inline/buf branching).
+// IntBTreeBench (which uses KeyRef with inline/buf branching).
 
-use ctree::PackedLengthType;
-use ctree::PackedVarCTree;
+use btrees::LengthType;
+use btrees::StrBTree;
 
-pub(crate) struct PackedVarCTreeBench {
-    tree: PackedVarCTree<Vec<u8>, usize, u32, u8, 8, 9>,
+pub(crate) struct StrBTreeBench {
+    tree: StrBTree<Vec<u8>, usize, u32, u8, 8, 9>,
     max_key: Option<Vec<u8>>,
 }
 
-impl PackedVarCTreeBench {
+impl StrBTreeBench {
     pub(crate) fn new() -> Self {
-        Self { tree: PackedVarCTree::new(), max_key: None }
+        Self { tree: StrBTree::new(), max_key: None }
     }
 
     /// Insert keys that fit within the length type's maximum, skipping those
     /// that are too long. Returns the actual count inserted and warns on stderr
     /// if any keys were rejected.
-    fn build_tree(keys: &[Vec<u8>]) -> (PackedVarCTree<Vec<u8>, usize, u32, u8, 8, 9>, Option<Vec<u8>>, usize) {
-        let max_len = <u8 as PackedLengthType>::max();
-        let mut tree = PackedVarCTree::new();
+    fn build_tree(keys: &[Vec<u8>]) -> (StrBTree<Vec<u8>, usize, u32, u8, 8, 9>, Option<Vec<u8>>, usize) {
+        let max_len = <u8 as LengthType>::max();
+        let mut tree = StrBTree::new();
         let mut max_key: Option<Vec<u8>> = None;
         let mut rejected = 0usize;
         for (i, k) in keys.iter().enumerate() {
@@ -197,7 +191,7 @@ impl PackedVarCTreeBench {
         }
         if rejected > 0 {
             eprintln!(
-                "PackedVarCTree: rejected {}/{} keys (exceed max length of {} bytes)",
+                "StrBTree: rejected {}/{} keys (exceed max length of {} bytes)",
                 rejected, keys.len(), max_len
             );
         }
@@ -206,7 +200,7 @@ impl PackedVarCTreeBench {
     }
 }
 
-impl Benchable<Vec<u8>> for PackedVarCTreeBench {
+impl Benchable<Vec<u8>> for StrBTreeBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchCtx<Vec<u8>>) {
         let (mut tree, max_key, _) = Self::build_tree(keys);
         tree.compact();
@@ -253,7 +247,7 @@ impl Benchable<Vec<u8>> for PackedVarCTreeBench {
     }
 
     fn bench_optimize(&self, _keys: &[Vec<u8>]) -> Option<()> {
-        None // PackedVarCTree optimize is a no-op for now
+        None // StrBTree optimize is a no-op for now
     }
 
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
