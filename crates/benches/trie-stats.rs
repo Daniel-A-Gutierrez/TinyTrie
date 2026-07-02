@@ -2,8 +2,7 @@
 //!
 //! Builds tries at multiple sizes with random keys, then walks every arena
 //! node to collect metrics: fanout distribution, parent-child nibble overlap
-//! (for node-stacking analysis), STAK coverage, terminal/leaf-only counts,
-//! depth distribution.
+//! (for node-stacking analysis), terminal/leaf-only counts, depth distribution.
 
 use clap::Parser;
 use tiny_trie::{NibbleTrie, Node, TrieIndex};
@@ -64,9 +63,6 @@ struct StatsReport {
     nodes_with_siblings: usize, // nodes that have ≥2 internal children
     terminal_count: usize,
     leaf_only_count: usize,
-    // STAK: how many chain levels absorbed before conflict
-    stak_depth_histogram: [usize; 33],
-    stak_total_absorbed: usize,
 }
 
 fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usize, PTR, LEN>) -> StatsReport {
@@ -85,10 +81,10 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usiz
         for &idx in &queue {
             let node = &arena[idx];
             for nib in 0..16 {
-                let child = node.children[nib].as_usize();
-                if !node.is_occupied(nib, 0) || node.is_leaf(nib, 0) {
+                if !node.is_occupied(nib) || node.is_leaf(nib) {
                     continue;
                 }
+                let child = node.children[nib].get().as_usize();
                 if !visited[child] {
                     visited[child] = true;
                     depth[child] = depth[idx] + 1;
@@ -121,14 +117,14 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usiz
     for node in arena.iter() {
         let cmask = node.children_mask();
         let total_fanout = cmask.count_ones() as usize;
-        let leaf_fanout = node.leaf_mask[0].count_ones() as usize;
+        let leaf_fanout = node.leaf_mask.count_ones() as usize;
         let internal_fanout = total_fanout - leaf_fanout;
 
         fanout_histogram[total_fanout] += 1;
         internal_fanout_histogram[internal_fanout] += 1;
         leaf_fanout_histogram[leaf_fanout] += 1;
 
-        if node.is_terminal(0) {
+        if node.is_terminal() {
             terminal_count += 1;
         }
         if cmask == 0 {
@@ -142,10 +138,10 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usiz
     for idx in 0..total_nodes {
         let node = &arena[idx];
         for nib in 0..16 {
-            let child = node.children[nib].as_usize();
-            if !node.is_occupied(nib, 0) || node.is_leaf(nib, 0) {
+            if !node.is_occupied(nib) || node.is_leaf(nib) {
                 continue;
             }
+            let child = node.children[nib].get().as_usize();
             parent_of[child] = idx;
         }
     }
@@ -164,8 +160,8 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usiz
     for idx in 0..total_nodes {
         let node = &arena[idx];
         let internal_children: Vec<usize> = (0..16)
-            .filter(|&nib| node.is_occupied(nib, 0) && !node.is_leaf(nib, 0))
-            .map(|nib| node.children[nib].as_usize())
+            .filter(|&nib| node.is_occupied(nib) && !node.is_leaf(nib))
+            .map(|nib| node.children[nib].get().as_usize())
             .collect();
         if internal_children.len() < 2 {
             continue;
@@ -181,45 +177,11 @@ fn compute_stats<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<u8>, usiz
         }
     }
 
-    // --- STAK coverage ---
-    let mut stak_depth_histogram = [0usize; 33];
-    let mut total_absorbed = 0usize;
-
-    for idx in 0..total_nodes {
-        let mut merged_mask = arena[idx].children_mask();
-        let mut depth = 0usize;
-        let mut cur = idx;
-        loop {
-            let node = &arena[cur];
-            let mut internal_children: Vec<usize> = Vec::new();
-            for nib in 0..16 {
-                let c = node.children[nib].as_usize();
-                if c != 0 && !node.is_leaf(nib, 0) {
-                    internal_children.push(c);
-                }
-            }
-            if internal_children.len() != 1 {
-                break;
-            }
-            let child_idx = internal_children[0];
-            let child_mask = arena[child_idx].children_mask();
-            if merged_mask & child_mask != 0 {
-                break;
-            }
-            merged_mask |= child_mask;
-            depth += 1;
-            cur = child_idx;
-        }
-        stak_depth_histogram[depth] += 1;
-        total_absorbed += depth;
-    }
-
     StatsReport {
         total_nodes, key_count, avg_depth, max_depth, depth_histogram,
         fanout_histogram, internal_fanout_histogram, leaf_fanout_histogram,
         overlap_histogram, sibling_overlap_histogram, nodes_with_siblings,
-        terminal_count, leaf_only_count, stak_depth_histogram,
-        stak_total_absorbed: total_absorbed,
+        terminal_count, leaf_only_count,
     }
 }
 
@@ -232,7 +194,7 @@ fn print_report(size: usize, mode: &str, report: &StatsReport) {
         total_nodes, key_count, avg_depth, max_depth, depth_histogram,
         fanout_histogram, internal_fanout_histogram, leaf_fanout_histogram,
         overlap_histogram, sibling_overlap_histogram, nodes_with_siblings,
-        terminal_count, leaf_only_count, stak_depth_histogram, stak_total_absorbed,
+        terminal_count, leaf_only_count,
     } = report;
 
     println!("=== NibbleTrie Stats: {size} keys [{mode}] ===");
@@ -298,19 +260,6 @@ fn print_report(size: usize, mode: &str, report: &StatsReport) {
             println!("  {k:2} overlap: {count:6} ({pct:5.1}%){tag}");
         }
     }
-    println!();
-
-    let absorbable = *total_nodes - stak_depth_histogram[0];
-    println!("STAK chain depth (nodes that can absorb their child chain):");
-    for (depth, &count) in stak_depth_histogram.iter().enumerate() {
-        if count > 0 {
-            let pct = count as f64 / *total_nodes as f64 * 100.0;
-            let tag = if depth == 0 { " (can't absorb)" } else { "" };
-            println!("  depth {depth:2}: {count:6} ({pct:5.1}%){tag}");
-        }
-    }
-    println!("  Total absorbable nodes: {absorbable} ({:.1}%)", absorbable as f64 / *total_nodes as f64 * 100.0);
-    println!("  Total nodes absorbed:   {stak_total_absorbed}");
     println!();
 }
 

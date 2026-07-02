@@ -25,7 +25,7 @@ mod key_store;
 
 pub use tiny_trie_trait::TinyTrieMap;
 
-pub use nibble_trie::{NibbleTrie, Node, TrieIndex};
+pub use nibble_trie::{NibbleTrie, Node, OptNz, TrieIndex};
 pub use nib_trie::{NibTrie, NibNode};
 pub use bit_trie::BitTrie;
 pub use dyn_trie::DynTrie;

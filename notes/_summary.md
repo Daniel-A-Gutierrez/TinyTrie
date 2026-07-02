@@ -144,3 +144,62 @@ StrBTree                       205.93M
 StrBTree                          42.9
 
 Definitely not good. Insertion way slower. 
+
+
+## Nibble Trie
+
+### baseline
+─── Insertion (keys/sec) ───
+                                   100           10000         1000000
+NibbleTrie                      28.58M           8.42M           5.50M
+
+─── Iter backward (keys/sec) ───
+NibbleTrie                     137.27M         118.06M          53.03M
+
+─── Iter bwd index (keys/sec) ───
+NibbleTrie                     119.51M         112.24M          62.21M
+
+─── Iter fwd index (keys/sec) ───
+NibbleTrie                     163.16M         145.39M          72.16M
+
+─── Iter rev index (keys/sec) ───
+NibbleTrie                     197.93M         155.21M          63.21M
+
+─── Lookup (keys/sec) ───
+NibbleTrie                      86.57M          12.23M          11.73M
+
+─── Memory (bytes/key) ───
+NibbleTrie                        64.0           124.5           134.2
+
+### undo stacking optimization
+
+─── Insertion (keys/sec) ───
+                               1000000
+NibbleTrie                       7.52M
+
+─── Lookup (keys/sec) ───
+                               1000000
+NibbleTrie                      12.84M
+
+─── Iter forward (keys/sec) ───
+                               1000000
+NibbleTrie                      68.98M
+
+─── Iter backward (keys/sec) ───
+                               1000000
+NibbleTrie                      59.85M
+
+─── Iter fwd index (keys/sec) ───
+                               1000000
+NibbleTrie                      80.87M
+
+─── Iter rev index (keys/sec) ───
+                               1000000
+NibbleTrie                      70.76M
+
+─── Memory (bytes/key) ───
+                               1000000
+NibbleTrie                       121.6
+
+good uplift across the board, especially on insert. 
+

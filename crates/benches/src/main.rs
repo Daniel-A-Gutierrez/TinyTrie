@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use tiny_trie::{NibbleTrie, Node, TrieIndex};
+use tiny_trie::NibbleTrie;
 
 // ── bench_query_methods! macro (must precede mod declarations) ─────────
 //
@@ -243,7 +243,6 @@ mod dyn_trie;
 mod fixed_len;
 mod nibble_trie;
 mod poly_trie;
-mod stacked_trie;
 mod std_contestants;
 mod btree;
 
@@ -257,7 +256,6 @@ use dyn_trie::{DynTrieBench, DynTrieOptBench};
 use fixed_len::{FixedLenBench, FixedLenOptBench};
 use nibble_trie::{NibbleOptBench, NibbleOptUncheckedBench, NibbleTrieBench, NibbleUncheckedBench};
 use poly_trie::{PolyOptBench, PolyTrieBench};
-use stacked_trie::{StackedTrie2Bench, StackedTrie4Bench};
 use std_contestants::{
     BTreeMapBench, BTreeMapBenchU64, HashMapBench, HashMapBenchU64,
     SortedVecBench, SortedVecBenchU64,
@@ -267,8 +265,6 @@ use btree::{IntBTreeBench, IntBTreeOptBench, StrBTreeBench};
 // ── Type aliases ─────────────────────────────────────────────────────
 
 type NT = NibbleTrie<Vec<u8>, usize, u32, u32>;
-type NT2 = NibbleTrie<Vec<u8>, usize, u32, u32, 2>;
-type NT4 = NibbleTrie<Vec<u8>, usize, u32, u32, 4>;
 
 // ── Config ───────────────────────────────────────────────────────────
 
@@ -294,38 +290,6 @@ unsafe impl std::alloc::GlobalAlloc for TrackingAllocator {
 
 pub(crate) fn read_allocated() -> u64 {
     ALLOCATED.load(Ordering::Relaxed)
-}
-
-// ── Stacked-trie conversion ──────────────────────────────────────────
-
-/// Convert a STAK=1 NibbleTrie to a STAK=N trie (1:1 vnode mapping).
-/// Internal child addresses are remapped: phys → phys * DST_STAK.
-pub(crate) fn convert_stak1_to<const DST_STAK: usize>(src: &NT) -> NibbleTrie<Vec<u8>, usize, u32, u32, DST_STAK> {
-    let mut dst: NibbleTrie<Vec<u8>, usize, u32, u32, DST_STAK> = NibbleTrie::new();
-    dst.buf = src.buf.clone();
-    dst.index = src.index.clone();
-    dst.values = src.values.clone();
-    for node1 in &src.arena {
-        let mut node_dst: Node<u32, u32, DST_STAK> = Node::new();
-        for nib in 0..16 {
-            if node1.is_occupied(nib, 0) {
-                if node1.is_leaf(nib, 0) {
-                    node_dst.children[nib] = node1.children[nib];
-                } else {
-                    node_dst.children[nib] = u32::from_usize(node1.children[nib].as_usize() * DST_STAK);
-                }
-                node_dst.occupancy[0] |= 1 << nib;
-                if node1.is_leaf(nib, 0) {
-                    node_dst.leaf_mask[0] |= 1 << nib;
-                }
-            }
-        }
-        node_dst.prefix_len[0] = node1.prefix_len[0];
-        node_dst.leaf = node1.leaf;
-        node_dst.terminal = if node1.is_terminal(0) { 1 } else { 0 };
-        dst.arena.push(node_dst);
-    }
-    dst
 }
 
 // ── FixedLen helpers ────────────────────────────────────────────────
@@ -649,8 +613,6 @@ fn all_contestants() -> Vec<Contestant> {
         Contestant { name: "PolyOpt",            max_size: None, bytes: None, nonzero: Some(Box::new(PolyOptBench::new())), u64: None },
         Contestant { name: "FixedLen",            max_size: None, bytes: Some(Box::new(FixedLenBench::new())),  nonzero: None, u64: None },
         Contestant { name: "FixedLenOpt",         max_size: None, bytes: Some(Box::new(FixedLenOptBench::new())), nonzero: None, u64: None },
-        Contestant { name: "StackedTrie2",        max_size: None, bytes: Some(Box::new(StackedTrie2Bench::new())), nonzero: None, u64: None },
-        Contestant { name: "StackedTrie4",        max_size: None, bytes: Some(Box::new(StackedTrie4Bench::new())), nonzero: None, u64: None },
         Contestant { name: "IntBTree",      max_size: None, bytes: Some(Box::new(IntBTreeBench::new())),    nonzero: None, u64: None },
         Contestant { name: "IntBTreeOpt",   max_size: None, bytes: Some(Box::new(IntBTreeOptBench::new())), nonzero: None, u64: None },
         Contestant { name: "StrBTree",      max_size: None, bytes: Some(Box::new(StrBTreeBench::new())),     nonzero: None, u64: None },

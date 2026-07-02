@@ -1,5 +1,13 @@
 # OKOK big opportunities left for optimization 
 
+> **REVERTED (2026-07-02).** The "node stacking" / "Stacking v2" experiment below was
+> implemented in commit `34b612e` and has since been reversed out of `nibble_trie.rs`.
+> `NibbleTrie` is back to one logical node per physical node; the empty-slot sentinel is
+> now `0` encoded via `OptNz<PTR>` (`#[repr(transparent)]` newtype) instead of the
+> `PTR::max_value` sentinel that stacking required. The `optimize()` DFS key/value sort
+> was kept; only the vnode-packing mechanics were removed. The notes below are retained
+> for historical reference. See `notes/nibble_trie.md` for the current structure.
+
 ## node stacking
 Another fundamental weakness of this structure is its sparse layout. BTree wastes its space on pointers, 
 we waste them on empty slots in our Nodes. If we assume though that each node only has 2-4 children on average
