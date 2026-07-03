@@ -19,19 +19,25 @@ fn dyn_auto_promote_u8_to_u16() {
     let mut trie: DynTrie<i32> = DynTrie::new();
     // u8 capacity: arena.len() >= 255 triggers promotion
     // Insert enough keys to force promotion
-    let mut indices = Vec::new();
     for i in 0..300u32 {
         let key = format!("key_{:05}", i);
-        let idx = trie.insert(key.into_bytes(), i as i32).unwrap();
-        indices.push(idx);
+        trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     assert_eq!(trie.ptr_size(), 2); // promoted to u16
 
-    // Verify all lookups still work after promotion
+    // Indices are not stable across inserts/optimize — verify presence + value
+    // via the forward-iteration callback.
     for i in 0..300u32 {
         let key = format!("key_{:05}", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(indices[i as usize]),
-            "lookup failed for i={}", i);
+        assert!(trie.get(key.as_bytes()).is_some(),
+            "dyn lookup failed after promote for i={}", i);
+    }
+    let mut seen = std::collections::HashMap::<Vec<u8>, i32>::new();
+    trie.iter_fwd(&mut |k, v| { seen.insert(k.to_vec(), *v); });
+    for i in 0..300u32 {
+        let key = format!("key_{:05}", i);
+        assert_eq!(seen.get(key.as_bytes()), Some(&(i as i32)),
+            "dyn value mismatch after promote for i={}", i);
     }
 }
 
@@ -61,16 +67,25 @@ fn dyn_len_and_is_empty() {
 #[test]
 fn dyn_optimize() {
     let mut trie: DynTrie<i32> = DynTrie::new();
-    let mut indices = Vec::new();
     for i in 0..100u32 {
         let key = format!("key_{:03}", i);
-        let idx = trie.insert(key.into_bytes(), i as i32).unwrap();
-        indices.push(idx);
+        trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     trie.optimize();
+    // optimize() re-spreads keys into the sparse 2*i+1 layout, so the index
+    // returned by insert() is not stable across optimize; check presence and
+    // that each key still maps to its value via the iteration callback.
     for i in 0..100u32 {
         let key = format!("key_{:03}", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(indices[i as usize]));
+        assert!(trie.get(key.as_bytes()).is_some(),
+            "dyn lookup failed after optimize for i={}", i);
+    }
+    let mut seen = std::collections::HashMap::<Vec<u8>, i32>::new();
+    trie.iter_fwd(&mut |k, v| { seen.insert(k.to_vec(), *v); });
+    for i in 0..100u32 {
+        let key = format!("key_{:03}", i);
+        assert_eq!(seen.get(key.as_bytes()), Some(&(i as i32)),
+            "dyn value mismatch after optimize for i={}", i);
     }
 }
 

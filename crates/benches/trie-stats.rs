@@ -269,10 +269,11 @@ fn print_memory_breakdown<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<
     let arena_cap = trie.arena.capacity();
     let arena_bytes = arena_cap * node_size;
     let buf_bytes = trie.buf.capacity();
-    let idx_entry = std::mem::size_of::<(usize, LEN)>();
+    // Values are inlined into the sparse index slots now (no separate `values`
+    // vec). A slot is Option<(NonZero<usize>, LEN, T)> with T = usize here.
+    let idx_entry = std::mem::size_of::<Option<(std::num::NonZero<usize>, LEN, usize)>>();
     let idx_bytes = trie.index.capacity() * idx_entry;
-    let val_bytes = trie.values.capacity() * std::mem::size_of::<usize>();
-    let total = arena_bytes + buf_bytes + idx_bytes + val_bytes;
+    let total = arena_bytes + buf_bytes + idx_bytes;
 
     let mut total_slots = 0u64;
     let mut used_slots = 0u64;
@@ -284,6 +285,11 @@ fn print_memory_breakdown<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<
     let empty_slots = total_slots - used_slots;
     let waste_bytes = empty_slots * std::mem::size_of::<PTR>() as u64;
 
+    // Count how many index slots are gaps (None) vs occupied.
+    let idx_len = trie.index.len();
+    let idx_gaps = trie.index.iter().filter(|s| s.is_none()).count() as u64;
+    let idx_occupied = idx_len as u64 - idx_gaps;
+
     println!("Memory breakdown:");
     println!("  Node size:      {node_size} bytes");
     println!("  Arena:         {arena_bytes:8} bytes ({:>5}/key) — {} nodes (cap {}), {:.0}% of total",
@@ -292,10 +298,8 @@ fn print_memory_breakdown<PTR: TrieIndex, LEN: TrieIndex>(trie: &NibbleTrie<Vec<
         waste_bytes as f64 / n as f64, empty_slots as f64 / total_slots as f64 * 100.0, waste_bytes as f64 / arena_bytes as f64 * 100.0);
     println!("  Buf:           {buf_bytes:8} bytes ({:>5}/key) — {:.0}% of total",
         buf_bytes as f64 / n as f64, buf_bytes as f64 / total as f64 * 100.0);
-    println!("  Index:         {idx_bytes:8} bytes ({:>5}/key) — {} entries × {idx_entry}B, {:.0}% of total",
-        idx_bytes as f64 / n as f64, trie.index.len(), idx_bytes as f64 / total as f64 * 100.0);
-    println!("  Values:        {val_bytes:8} bytes ({:>5}/key) — {:.0}% of total",
-        val_bytes as f64 / n as f64, val_bytes as f64 / total as f64 * 100.0);
+    println!("  Index:         {idx_bytes:8} bytes ({:>5}/key) — {idx_len} slots × {idx_entry}B ({idx_occupied} occupied, {idx_gaps} gaps), {:.0}% of total",
+        idx_bytes as f64 / n as f64, idx_bytes as f64 / total as f64 * 100.0);
     println!("  Total:        {total:8} bytes ({:.1}/key)", total as f64 / n as f64);
     println!();
 }

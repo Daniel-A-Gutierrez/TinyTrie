@@ -203,3 +203,38 @@ NibbleTrie                       121.6
 
 good uplift across the board, especially on insert. 
 
+### Implement Gap Arena for Index 
+─── Insertion (keys/sec) ───
+                               1000000
+NibbleTrie                       4.28M
+
+─── Lookup (keys/sec) ───
+                               1000000
+NibbleTrie                      12.63M
+
+─── Iter forward (keys/sec) ───
+                               1000000
+NibbleTrie                     872.35M
+
+─── Iter backward (keys/sec) ───
+                               1000000
+NibbleTrie                     413.71M
+
+─── Iter fwd index (keys/sec) ───
+                               1000000
+NibbleTrie                     461.82M
+
+─── Iter rev index (keys/sec) ───
+                               1000000
+NibbleTrie                     478.21M
+
+─── Memory (bytes/key) ───
+                               1000000
+NibbleTrie                       186.3
+
+iteration now rivals our optimized btree, and lookup crushes it. Memory usage is horrendous though. 
+Unlike in the btree, the ordering of our index is strictly enforced. 
+Thats probably a good optimization route for the btree too. 
+We lost a lot of our insertion speed though. 
+
+### Leaf Nodes
