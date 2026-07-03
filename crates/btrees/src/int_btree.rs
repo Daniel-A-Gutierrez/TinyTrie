@@ -391,8 +391,10 @@ where
     ptrs: [Option<NonZero<PTR>>; NP1],
 }
 
-/// Leaf node. Carries the leaf linked list (`prev`/`next`) for O(1) cursor
-/// navigation.
+/// Leaf node. Lives in the `leaves` arena `Vec`; the arena is kept in strict
+/// sorted physical order (gaps are zeroed `LeafNode`s with `keys.len() == 0`),
+/// so forward/backward cursor navigation scans slot-by-slot skipping gaps — no
+/// per-leaf linked-list pointers are needed.
 struct LeafNode<K, V, PTR, const N: usize>
 where
     K: TreeKey,
@@ -402,8 +404,11 @@ where
 {
     keys: TinyArray<K::Stored, N>,
     values: TinyArray<V, N>,
-    prev: Option<NonZero<PTR>>,
-    next: Option<NonZero<PTR>>,
+    // `PTR` is retained in the type parameters even though no link fields use
+    // it: `relocate`/`split_leaf` construct `LeafNode::<K, V, PTR, N>` and the
+    // arena `Vec` is typed by `PTR`, so keeping it avoids touching every call
+    // site. It costs nothing at runtime here.
+    _ptr: std::marker::PhantomData<PTR>,
 }
 
 // ---------------------------------------------------------------------------
@@ -610,39 +615,8 @@ where
         Self {
             keys: TinyArray::new(),
             values: TinyArray::new(),
-            prev: None,
-            next: None,
+            _ptr: std::marker::PhantomData,
         }
-    }
-
-    #[inline]
-    fn get_prev(&self) -> Option<usize> {
-        self.prev.map(|nz| nz.get().as_usize() - 1)
-    }
-
-    #[inline]
-    fn get_next(&self) -> Option<usize> {
-        self.next.map(|nz| nz.get().as_usize() - 1)
-    }
-
-    #[inline]
-    fn set_prev(&mut self, idx: usize) {
-        self.prev = NonZero::new(PTR::from_usize(idx + 1));
-    }
-
-    #[inline]
-    fn set_next(&mut self, idx: usize) {
-        self.next = NonZero::new(PTR::from_usize(idx + 1));
-    }
-
-    #[inline]
-    fn clear_prev(&mut self) {
-        self.prev = None;
-    }
-
-    #[inline]
-    fn clear_next(&mut self) {
-        self.next = None;
     }
 
     #[inline]
@@ -767,18 +741,37 @@ where
 
     fn relocate(&mut self, gapful: bool) -> Vec<usize> {
         let old_len = self.leaves.len();
+
+        // Dense pack of 0 or 1 live leaf is already optimal — and the empty
+        // root (keys.len()==0, n_leaves==1) would be miscounted as a gap by the
+        // forward scan below, so short-circuit it with the identity map.
+        if !gapful && self.n_leaves <= 1 {
+            return (0..old_len).collect();
+        }
+
+        // The arena is kept in strict sorted physical order, so a forward scan
+        // over non-empty leaves *is* the sorted live-leaf order (no linked list
+        // to walk).
         let mut order: Vec<usize> = Vec::with_capacity(self.n_leaves);
-        let mut idx = self.first_leaf();
-        order.push(idx);
-        while let Some(nx) = self.leaves[idx].get_next() {
-            order.push(nx);
-            idx = nx;
+        for i in 0..old_len {
+            if self.leaves[i].keys.len() > 0 {
+                order.push(i);
+            }
         }
         let live = order.len();
-        debug_assert_eq!(live, self.n_leaves, "relocate: linked-list length {live} != n_leaves {}", self.n_leaves);
+        debug_assert_eq!(live, self.n_leaves, "relocate: live count {live} != n_leaves {}", self.n_leaves);
 
         let slot_of = |rank: usize| if gapful { 2 * rank } else { rank };
-        let new_slots = slot_of(live);
+        // Gapful spread doubles *current* arena capacity (`2 * old_len`), not
+        // `2 * live`. The extra slots `[2*live, 2*old_len)` are trailing gaps.
+        // This is what makes sequential inserts O(n): the last leaf's end-splits
+        // land in the trailing gap at `child_idx+1` (no shift, no spread) until
+        // the trailing gaps exhaust, then one spread doubles capacity again —
+        // geometric, not the every-2-splits spread that `2 * live` causes. The
+        // shift handles clustered split-twice (occupied `child_idx+1`) by
+        // shifting into a forward gap, so doubling here does not cause the
+        // exponential growth that "spread-if-occupied" would.
+        let new_slots = if gapful { 2 * old_len } else { live };
 
         let mut new_pos = vec![usize::MAX; old_len];
         for rank in 0..live {
@@ -788,7 +781,10 @@ where
         let mut old = std::mem::take(&mut self.leaves);
         let mut buf: Vec<LeafNode<K, V, PTR, N>> = Vec::with_capacity(new_slots);
         for i in 0..new_slots {
-            let is_live_slot = !gapful || i % 2 == 0;
+            // Even slots within the live region hold live leaves; odd slots and
+            // even slots beyond `2*live` are gaps (the latter are the trailing
+            // gaps that absorb sequential end-splits).
+            let is_live_slot = !gapful || (i % 2 == 0 && i / 2 < live);
             if is_live_slot {
                 let rank = if gapful { i / 2 } else { i };
                 let old_idx = order[rank];
@@ -800,20 +796,23 @@ where
         }
         drop(old);
 
-        for rank in 0..live {
-            let i = slot_of(rank);
-            if rank > 0 {
-                buf[i].set_prev(slot_of(rank - 1));
-            } else {
-                buf[i].clear_prev();
-            }
-            if rank + 1 < live {
-                buf[i].set_next(slot_of(rank + 1));
-            } else {
-                buf[i].clear_next();
-            }
-        }
+        self.remap_bottom_leaf_ptrs(&new_pos);
 
+        self.leaves = buf;
+        self.n_leaves = live;
+        new_pos
+    }
+
+    fn spread(&mut self) -> Vec<usize> {
+        self.relocate(true)
+    }
+
+    /// Remap every bottom-level inode's leaf child pointer `c` to `new_pos[c]`.
+    /// Descends from the root through `height - 1` inode levels (following
+    /// inode→inode ptrs, which are untouched) to reach the bottom inodes, then
+    /// rewrites their leaf child ptrs. Used by `relocate` (full remap) and by
+    /// `split_leaf`'s shift path (local +1 remap for the moved leaves).
+    fn remap_bottom_leaf_ptrs(&mut self, new_pos: &[usize]) {
         if self.height >= 1 {
             let mut level: Vec<usize> = vec![self.root_inode];
             for _ in 0..self.height - 1 {
@@ -838,31 +837,77 @@ where
                 }
             }
         }
-
-        self.leaves = buf;
-        self.n_leaves = live;
-        new_pos
     }
 
-    fn spread(&mut self) -> Vec<usize> {
-        self.relocate(true)
-    }
+    /// Targeted +1 remap for `split_leaf`'s shift: bump every bottom-inode leaf
+    /// child pointer whose slot lies in `[child_idx+1, g)` (the moved run) by
+    /// +1. The moved run is a contiguous run of `child_idx`'s sorted successors,
+    /// so we walk the bottom-inode layer rightward as a B-tree in-order
+    /// successor walk: scan `child_idx`'s parent from `child_pos+1`, and when a
+    /// node is exhausted ascend a level, step to the right sibling, and descend
+    /// to the leftmost bottom inode — so a run crossing a grandparent (or
+    /// higher) boundary is fully covered. `path` is the descent path from
+    /// `walk_to_leaf`. O(run + ascent), not O(n_leaves) — a full remap per split
+    /// would make insertion O(n²).
+    fn remap_shift_range(&mut self, path: &[(usize, usize)], child_idx: usize, g: usize) {
+        if self.height == 0 || path.is_empty() {
+            return;
+        }
+        let plen = path.len();
+        // Per depth: the current inode and the next child position to scan.
+        let mut cur_inode: Vec<usize> = path.iter().map(|(n, _)| *n).collect();
+        let mut cur_pos: Vec<usize> = path.iter().map(|(_, c)| *c).collect();
+        cur_pos[plen - 1] += 1; // first moved leaf = child_pos+1
+        let mut level = plen - 1;
 
-    fn claim_slot(&self, after: usize) -> usize {
-        let n = self.leaves.len();
-        let mut i = after + 1;
-        while i < n {
-            if self.leaves[i].keys.len() == 0 {
-                return i;
+        loop {
+            let inode_idx = cur_inode[level];
+            let start = cur_pos[level];
+            let klen = self.inodes[inode_idx].keys.len();
+            // Read pass: collect in-range bumps; stop once a pointer reaches `g`.
+            let mut bumps: Vec<(usize, usize)> = Vec::new();
+            let mut at_end = false;
+            for ci in start..=klen {
+                if let Some(c) = self.inodes[inode_idx].get_ptr(ci) {
+                    if c >= child_idx + 1 && c < g {
+                        bumps.push((ci, c + 1));
+                    } else if c >= g {
+                        at_end = true;
+                        break;
+                    }
+                }
             }
-            i += 1;
-        }
-        for i in 0..after {
-            if self.leaves[i].keys.len() == 0 {
-                return i;
+            for (ci, np) in bumps {
+                self.inodes[inode_idx].set_ptr(ci, np);
             }
+            if at_end {
+                return;
+            }
+            // Exhausted this node's children without reaching `g`: ascend until
+            // we find a level with a right sibling, then descend to the leftmost
+            // bottom inode of that sibling.
+            loop {
+                if level == 0 {
+                    return; // past the root's rightmost — run invalid (shouldn't happen)
+                }
+                level -= 1;
+                cur_pos[level] += 1;
+                if cur_pos[level] <= self.inodes[cur_inode[level]].keys.len() {
+                    break; // right sibling exists at this level
+                }
+                // else keep ascending
+            }
+            // Descend from `level` to the bottom via leftmost children.
+            let mut ni = self.inodes[cur_inode[level]].get_ptr(cur_pos[level]).unwrap();
+            for d in (level + 1)..plen {
+                cur_inode[d] = ni;
+                cur_pos[d] = 0;
+                if d < plen - 1 {
+                    ni = self.inodes[ni].get_ptr(0).unwrap();
+                }
+            }
+            level = plen - 1;
         }
-        unreachable!("claim_slot: no free gap (caller must spread when full)")
     }
 
     fn walk_to_leaf(&mut self, needle: &<K as TreeKey>::Needle) -> (usize, Vec<(usize, usize)>) {
@@ -1143,33 +1188,55 @@ where
     }
 
     fn split_leaf(&mut self, child_idx: usize, mut path: Vec<(usize, usize)>) -> (usize, usize) {
+        let mut child_idx = child_idx;
+
+        // Proactive resize: at ~90% arena occupancy, re-disperse live leaves
+        // into even slots with fresh gaps (grows capacity geometrically).
+        if self.n_leaves * 10 >= self.leaves.len() * 9 {
+            let map = self.spread();
+            child_idx = map[child_idx];
+        }
+
+        // The new leaf's exact sorted slot is `child_idx+1`. Find the next free
+        // gap at or after that slot. If the forward region is entirely full of
+        // live leaves (no gap before the arena end), spread to grow + re-disperse
+        // (post-spread `child_idx+1` is a gap, so the shift below collapses to a
+        // direct place).
+        let mut g = child_idx + 1;
+        while g < self.leaves.len() && self.leaves[g].keys.len() != 0 {
+            g += 1;
+        }
+        if g == self.leaves.len() {
+            let map = self.spread();
+            child_idx = map[child_idx];
+            g = child_idx + 1; // guaranteed an in-range gap after a spread
+            debug_assert!(g < self.leaves.len() && self.leaves[g].keys.len() == 0);
+        }
+
+        // Arena stable. Drain the split in place (child_idx's leaf keeps its slot).
         let mid = N / 2;
         let mid_stored = self.leaves[child_idx].keys.get(mid).clone();
-
-        let child_idx = if self.n_leaves == self.leaves.len() {
-            let map = self.spread();
-            map[child_idx]
-        } else {
-            child_idx
-        };
-
-        let old_next = self.leaves[child_idx].get_next();
 
         let mut new_leaf = LeafNode::<K, V, PTR, N>::new();
         self.leaves[child_idx].keys.drain_into(mid, &mut new_leaf.keys);
         self.leaves[child_idx].values.drain_into(mid, &mut new_leaf.values);
 
-        let new_leaf_idx = self.claim_slot(child_idx);
-
-        new_leaf.set_prev(child_idx);
-        if let Some(ni) = old_next {
-            new_leaf.set_next(ni);
+        // If `child_idx+1` wasn't the gap we found, shift the run of live leaves
+        // `[child_idx+1, g)` right by one into the gap at `g` (rotate_right(1) on
+        // the inclusive range is a safe Drop-preserving permutation). That frees
+        // `child_idx+1` for `new_leaf` at its exact sorted position — strict
+        // physical order is maintained. The moved leaves change slot by +1, so
+        // remap their parent-inode child pointers by +1 too.
+        if g > child_idx + 1 {
+            self.leaves[child_idx + 1..=g].rotate_right(1);
+            // The moved run `[child_idx+1, g)` is a contiguous run of `child_idx`'s
+            // sorted successors, so their parent-inode child pointers (starting at
+            // `child_pos+1` in `child_idx`'s parent, then that parent's right
+            // siblings) need +1. Targeted O(run) walk — NOT a full arena remap.
+            self.remap_shift_range(&path, child_idx, g);
         }
-        self.leaves[child_idx].set_next(new_leaf_idx);
-        self.leaves[new_leaf_idx] = new_leaf;
-        if let Some(next_idx) = old_next {
-            self.leaves[next_idx].set_prev(new_leaf_idx);
-        }
+        self.leaves[child_idx + 1] = new_leaf;
+        let new_leaf_idx = child_idx + 1;
 
         self.n_leaves += 1;
         self.insert_separator(mid_stored, new_leaf_idx, &mut path);
@@ -1354,8 +1421,15 @@ where
             self.position += 1;
             return Some(self.tree.leaves[self.leaf_idx].values.get(self.position));
         }
-        let next_leaf = leaf.get_next()?;
-        self.leaf_idx = next_leaf;
+        // Skip forward over gap slots to the next live leaf.
+        let mut i = self.leaf_idx + 1;
+        while i < self.tree.leaves.len() && self.tree.leaves[i].keys.len() == 0 {
+            i += 1;
+        }
+        if i >= self.tree.leaves.len() {
+            return None;
+        }
+        self.leaf_idx = i;
         self.position = 0;
         Some(self.tree.leaves[self.leaf_idx].values.get(0))
     }
@@ -1365,11 +1439,18 @@ where
             self.position -= 1;
             return Some(self.tree.leaves[self.leaf_idx].values.get(self.position));
         }
-        let prev_leaf = self.tree.leaves[self.leaf_idx].get_prev()?;
-        self.leaf_idx = prev_leaf;
-        let last_pos = self.tree.leaves[self.leaf_idx].keys.len() - 1;
-        self.position = last_pos;
-        Some(self.tree.leaves[self.leaf_idx].values.get(last_pos))
+        // Skip backward over gap slots to the previous live leaf.
+        let mut i = self.leaf_idx;
+        while i > 0 {
+            i -= 1;
+            if self.tree.leaves[i].keys.len() > 0 {
+                self.leaf_idx = i;
+                let last_pos = self.tree.leaves[i].keys.len() - 1;
+                self.position = last_pos;
+                return Some(self.tree.leaves[self.leaf_idx].values.get(last_pos));
+            }
+        }
+        None
     }
 }
 
@@ -1397,13 +1478,16 @@ where
         if self.position + 1 < leaf.keys.len() {
             self.position += 1;
         } else {
-            let next_leaf = leaf.get_next();
-            if let Some(nl) = next_leaf {
-                self.leaf_idx = nl;
-                self.position = 0;
-            } else {
+            // Skip forward over gap slots to the next live leaf.
+            let mut i = self.leaf_idx + 1;
+            while i < self.tree.leaves.len() && self.tree.leaves[i].keys.len() == 0 {
+                i += 1;
+            }
+            if i >= self.tree.leaves.len() {
                 return None;
             }
+            self.leaf_idx = i;
+            self.position = 0;
         }
         Some(self.tree.leaves[self.leaf_idx].values.get_mut(self.position))
     }
@@ -1412,9 +1496,17 @@ where
         if self.position > 0 {
             self.position -= 1;
         } else {
-            let prev_leaf = self.tree.leaves[self.leaf_idx].get_prev()?;
-            self.leaf_idx = prev_leaf;
-            self.position = self.tree.leaves[self.leaf_idx].keys.len() - 1;
+            // Skip backward over gap slots to the previous live leaf.
+            let mut i = self.leaf_idx;
+            while i > 0 {
+                i -= 1;
+                if self.tree.leaves[i].keys.len() > 0 {
+                    self.leaf_idx = i;
+                    self.position = self.tree.leaves[i].keys.len() - 1;
+                    return Some(self.tree.leaves[self.leaf_idx].values.get_mut(self.position));
+                }
+            }
+            return None;
         }
         Some(self.tree.leaves[self.leaf_idx].values.get_mut(self.position))
     }

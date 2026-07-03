@@ -22,6 +22,8 @@ pub mod bit_trie;
 pub mod dyn_trie;
 pub mod fixed_len_nibble_trie;
 mod key_store;
+mod tiny_array;
+pub mod flat_node;
 
 pub use tiny_trie_trait::TinyTrieMap;
 

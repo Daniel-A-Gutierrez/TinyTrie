@@ -13,9 +13,9 @@ path = "src/lib.rs"
 name = "bencher"
 path = "src/main.rs"
 
-[[bin]]
-name = "trie-stats"
-path = "trie-stats.rs"
+# [[bin]]
+# name = "trie-stats"
+# path = "trie-stats.rs"
 
 [dependencies]
 tiny-trie.workspace = true

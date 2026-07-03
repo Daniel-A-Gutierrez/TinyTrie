@@ -6,17 +6,17 @@ use super::{Benchable, BenchCtx, read_allocated};
 
 // ── IntBTreeKey adapter ───────────────────────────────────────────────────
 //
-// Unifies the two IntBTree key forms behind one generic bench struct.
-// Fixed keys (u64) use SIMD search; variable keys (Vec<u8>) use KeyRef
-// with inline short keys and linear scan through key_buf for longer keys.
+// `IntBTree` is specialized on integer keys: its `FixedLenKey` path uses SIMD
+// search natively. The bench keeps the struct generic over `K` so further int
+// key types (u32, …) can be added later, but byte-string keys are deliberately
+// *not* included here — that domain belongs to `StrBTree` (see below).
 
 pub(crate) trait IntBTreeBenchKey: TreeKey + SearchStrategy + Clone + Ord + 'static {}
 impl IntBTreeBenchKey for u64 {}
-impl IntBTreeBenchKey for Vec<u8> {}
 
 // ── IntBTreeBenchGen ─────────────────────────────────────────────────────
 //
-// One generic contestant over both IntBTree key forms. `OPT` selects the
+// One generic contestant over IntBTree's integer key forms. `OPT` selects the
 // `optimize`-after-build variant. `max_key: Option<K>` tracks the largest
 // inserted key in *harness-key* form so reverse iteration can seed
 // `cursor_at` via `as_needle`, and an empty tree is handled without
@@ -147,9 +147,9 @@ where
 
 // ── Contestant aliases ─────────────────────────────────────────────────
 
-pub(crate) type IntBTreeBench = IntBTreeBenchGen<Vec<u8>, usize, u32, 8, 9, false>;
+pub(crate) type IntBTreeBench = IntBTreeBenchGen<u64, usize, u32, 8, 9, false>;
 /// `IntBTreeBench` + `optimize` after build (arena contiguity for iteration).
-pub(crate) type IntBTreeOptBench = IntBTreeBenchGen<Vec<u8>, usize, u32, 4, 5, true>;
+pub(crate) type IntBTreeOptBench = IntBTreeBenchGen<u64, usize, u32, 4, 5, true>;
 
 // ── StrBTree contestant ──────────────────────────────────────────────────
 //

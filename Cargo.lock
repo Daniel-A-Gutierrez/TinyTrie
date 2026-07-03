@@ -53,6 +53,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrays"
+version = "0.1.0"
+
+[[package]]
 name = "bencher"
 version = "0.1.0"
 dependencies = [

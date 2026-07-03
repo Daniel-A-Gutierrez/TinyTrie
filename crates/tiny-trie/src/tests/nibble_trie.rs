@@ -14,6 +14,88 @@ fn node_size_compact() {
     assert_eq!(std::mem::size_of::<Node<u16, u16>>(), 40);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 0: FlatNode / ArenaNode size experiment.
+// Run with: cargo test -p tiny-trie flat_node_sizes -- --nocapture --ignored
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn flat_node_sizes() {
+    use crate::flat_node::{ArenaNode, ArenaNodeN32, FlatNode, FlatNodeN32, UntaggedArenaNode, UntaggedArenaNodeN32};
+
+    macro_rules! row {
+        ($cap:expr, $ptr:ty, $len:ty) => {
+            format!(
+                "  CAP={:>2}  ({:>3},{:>3})  Inode={:>3}  Fnode={:>3}  Enum={:>3}  Union={:>3}  (align I/F/E/U = {}/{}/{}/{})",
+                $cap,
+                std::any::type_name::<$ptr>(),
+                std::any::type_name::<$len>(),
+                std::mem::size_of::<Node<$ptr, $len>>(),
+                std::mem::size_of::<FlatNode<$ptr, $len, $cap>>(),
+                std::mem::size_of::<ArenaNode<$ptr, $len, $cap>>(),
+                std::mem::size_of::<UntaggedArenaNode<$ptr, $len, $cap>>(),
+                std::mem::align_of::<Node<$ptr, $len>>(),
+                std::mem::align_of::<FlatNode<$ptr, $len, $cap>>(),
+                std::mem::align_of::<ArenaNode<$ptr, $len, $cap>>(),
+                std::mem::align_of::<UntaggedArenaNode<$ptr, $len, $cap>>(),
+            )
+        };
+    }
+
+    // u32 nibble-pack variant (valid for CAP <= 8): Fnode drops to 4-byte align.
+    macro_rules! row_n32 {
+        ($cap:expr, $ptr:ty, $len:ty) => {
+            format!(
+                "  CAP={:>2}  ({:>3},{:>3})  Inode={:>3}  FnodeN32={:>3}  EnumN32={:>3}  UnionN32={:>3}  (align I/F/E/U = {}/{}/{}/{})",
+                $cap,
+                std::any::type_name::<$ptr>(),
+                std::any::type_name::<$len>(),
+                std::mem::size_of::<Node<$ptr, $len>>(),
+                std::mem::size_of::<FlatNodeN32<$ptr, $len, $cap>>(),
+                std::mem::size_of::<ArenaNodeN32<$ptr, $len, $cap>>(),
+                std::mem::size_of::<UntaggedArenaNodeN32<$ptr, $len, $cap>>(),
+                std::mem::align_of::<Node<$ptr, $len>>(),
+                std::mem::align_of::<FlatNodeN32<$ptr, $len, $cap>>(),
+                std::mem::align_of::<ArenaNodeN32<$ptr, $len, $cap>>(),
+                std::mem::align_of::<UntaggedArenaNodeN32<$ptr, $len, $cap>>(),
+            )
+        };
+    }
+
+    let sections: &[((&str, &str), Vec<String>)] = &[
+        (("PTR=u32 LEN=u32", "(bench: NibbleTrie<Vec<u8>,usize,u32,u32>)"), vec![
+            row!(16, u32, u32), row!(12, u32, u32), row!(8, u32, u32),
+        ]),
+        (("PTR=u32 LEN=u16", "(default NibbleTrie<Vec<u8>,T>)"), vec![
+            row!(16, u32, u16), row!(12, u32, u16), row!(8, u32, u16),
+        ]),
+        (("PTR=u16 LEN=u16", "(compact)"), vec![
+            row!(16, u16, u16), row!(12, u16, u16), row!(8, u16, u16),
+        ]),
+        (("PTR=u8  LEN=u16", "(u8 compact)"), vec![
+            row!(16, u8, u16), row!(12, u8, u16), row!(8, u8, u16),
+        ]),
+        (("u32 nibble-pack (CAP<=8)", "Fnode drops to 4-align; target: no Inode bloat"), vec![
+            row_n32!(8, u32, u32), row_n32!(6, u32, u32), row_n32!(4, u32, u32),
+            row_n32!(8, u16, u16),
+            row_n32!(8, u8, u16),
+        ]),
+    ];
+
+    let mut out = String::from("\n=== FlatNode / ArenaNode sizes (bytes) ===\n");
+    for ((title, sub), rows) in sections {
+        out.push_str(&format!("\n  -- {} {} --\n", title, sub));
+        for r in rows {
+            out.push_str(r);
+            out.push('\n');
+        }
+    }
+    out.push_str("\n  Enum = tagged enum (Inode|Fnode); Union = untagged union (tag in parent PTR high-bit).\n");
+    out.push_str("  Fnode holds up to CAP (prefix_len, nibble, key-ptr) slots; nibbles packed in u64.\n");
+    println!("{}", out);
+}
+
 #[test]
 fn insert_empty_and_get() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -283,7 +365,7 @@ fn leaf_and_offset_set_on_creation() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     // Root should have leaf field set (not the empty sentinel)
-    let root = &trie.arena[0];
+    let root = trie.inode(0);
     assert!(root.leaf.is_some(), "root leaf field should be set");
     // offset should point to the key in buf (stored in index, not node)
     let (off, len, _) = trie.index[root.leaf.get().as_usize()].as_ref().unwrap();
@@ -949,7 +1031,24 @@ fn recompute_leftmost<PTR: TrieIndex, LEN: TrieIndex>(
     trie: &NibbleTrie<Vec<u8>, i32, PTR, LEN>,
     phys: usize,
 ) -> Result<usize, String> {
-    let node = &trie.arena[phys];
+    // An Fnode's leftmost = `base` (the smallest key index in its subtree). Verify
+    // `base` and every terminal slot's key index points at an occupied slot.
+    if let ArenaNode::Fnode(f) = &trie.arena[phys] {
+        let base = f.base.as_usize();
+        if trie.index[base].is_none() {
+            return Err(format!("Fnode {phys}: base -> gap slot {base}"));
+        }
+        for (_plen, offset) in f.slots.as_slice() {
+            if *offset != FNODE_OFFSET_NULL {
+                let ki = base + *offset as usize;
+                if trie.index[ki].is_none() {
+                    return Err(format!("Fnode {phys}: slot offset {offset} -> gap slot {ki}"));
+                }
+            }
+        }
+        return Ok(base);
+    }
+    let node = trie.inode(phys);
     let mut min_ki: Option<usize> = None;
     if node.is_terminal() {
         let ki = node.leaf.get().as_usize();
@@ -1440,6 +1539,12 @@ fn node_stats() {
     let mut total_children = 0usize;
 
     for node in trie.arena.iter() {
+        // Step 2: every arena element is an Inode (no Fnodes produced yet).
+        // Match the Inode out; Fnode stats land in a later step.
+        let node = match node {
+            ArenaNode::Inode(n) => n,
+            ArenaNode::Fnode(_) => continue,
+        };
         let mask = node.children_mask();
         let occ = mask.count_ones() as usize;
         let term = node.is_terminal();
@@ -1491,4 +1596,464 @@ fn node_stats() {
         .open("/tmp/nibble_nodes.txt").expect("open /tmp/nibble_nodes.txt");
     f.write_all(s.as_bytes()).expect("write");
     std::hint::black_box(&trie);
+}
+
+// ── Fnode (FlatNode) read-path tests ──────────────────────────────────
+//
+// Step 4 (revised encoding): read-only Fnodes use `base` + `terminal` +
+// relative `u8` offsets (CAP 16: 1 `base` + 15 array slots). No code path
+// *produces* Fnodes yet (flatten() is step 4's remaining work), so these tests
+// build them by hand: insert keys via the normal Inode path, then *collapse* a
+// chosen non-root Inode subtree into a `FlatNode` and verify `get`/
+// `get_unchecked`/`seek`/forward-iter still match a `BTreeMap` oracle. The
+// step-3 "subtree root can't be terminal" restriction is LIFTED — the root's
+// own terminal key is pulled out of the array into `base`+`terminal: true` and
+// returned by `flat_get`'s fallback path.
+
+/// Flatten the Inode subtree rooted at `phys` into a [`FlatNode`] using the
+/// pre-order DFS layout consumed by [`NibbleTrie::flat_get`].
+///
+/// Encoding (step 4, revised):
+/// - `base` = the leftmost key's `index` position = `root.leaf` (the root's own
+///   key when the root is terminal, else its leftmost descendant). It is the
+///   smallest key in the subtree, hence the smallest `index` position, so every
+///   other subtree key yields a non-negative offset.
+/// - `terminal` = `root.is_terminal()`. When `true`, `base` is the root's own
+///   prefix key: it is pulled OUT of the array (not a slot) and returned by
+///   `flat_get`'s fallback. When `false`, `base` is a leftmost descendant and IS
+///   emitted as an array slot (offset 0) — the fallback never returns it.
+/// - Each array slot is `(prefix_len, offset)`: `prefix_len` = the discriminant
+///   depth (the parent node's `prefix_len`, where this key diverges from a
+///   sibling); `offset = key_index - base`, or [`FNODE_OFFSET_NULL`] for a pure
+///   branch marker (an internal child with no own terminal key; its descendants
+///   follow as deeper slots). A terminal+branch internal child emits its own
+///   key as a non-NULL offset slot, then its descendants.
+///
+/// Returns `None` if the subtree can't be conservatively flattened: it's the
+/// root (`phys == 0`), contains an `Fnode` child (merging Fnodes is flatten()'s
+/// job), exceeds [`FNODE_SLOTS`] array slots, or an offset would collide with
+/// the `0xFF` sentinel (subtree spans ≥ 255 `index` positions — can't happen at
+/// insert-only density, but guarded defensively). `phys` must be an `Inode`.
+fn flatten_subtree_to_fnode<PTR: TrieIndex, LEN: TrieIndex>(
+    trie: &NibbleTrie<Vec<u8>, i32, PTR, LEN>,
+    phys: usize,
+) -> Option<FlatNode<PTR, LEN>> {
+    // The root must stay an Inode; only flatten non-root subtrees. The actual
+    // build is shared with `NibbleTrie::flatten` via `build_fnode_subtree`.
+    if phys == 0 {
+        return None;
+    }
+    trie.build_fnode_subtree(phys)
+}
+
+/// Collapse the `Inode` at `phys` into a `FlatNode` (in place — the parent's
+/// child slot already points at `phys`, now an `Fnode`). Returns `false` if
+/// `phys` is the root (root must stay an `Inode`) or the subtree isn't a
+/// conservative Fnode candidate.
+fn collapse_to_fnode<PTR: TrieIndex, LEN: TrieIndex>(
+    trie: &mut NibbleTrie<Vec<u8>, i32, PTR, LEN>,
+    phys: usize,
+) -> bool {
+    if phys == 0 {
+        return false; // root must stay an Inode
+    }
+    let Some(fnode) = flatten_subtree_to_fnode(&*trie, phys) else {
+        return false;
+    };
+    trie.arena[phys] = ArenaNode::Fnode(fnode);
+    true
+}
+
+/// First non-root `Inode` in the arena that is a conservative Fnode candidate.
+fn first_fnode_candidate<PTR: TrieIndex, LEN: TrieIndex>(
+    trie: &NibbleTrie<Vec<u8>, i32, PTR, LEN>,
+) -> Option<usize> {
+    for phys in 1..trie.arena.len() {
+        if !matches!(trie.arena[phys], ArenaNode::Inode(_)) {
+            continue;
+        }
+        if flatten_subtree_to_fnode(trie, phys).is_some() {
+            return Some(phys);
+        }
+    }
+    None
+}
+
+/// The non-root `Inode` candidate whose flattened Fnode has the *most* slots
+/// (ties broken by lowest arena index). Used to pick a deep/chain subtree that
+/// actually exercises `flat_get`'s descent path.
+fn best_fnode_candidate<PTR: TrieIndex, LEN: TrieIndex>(
+    trie: &NibbleTrie<Vec<u8>, i32, PTR, LEN>,
+) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None; // (phys, slot_count)
+    for phys in 1..trie.arena.len() {
+        if !matches!(trie.arena[phys], ArenaNode::Inode(_)) {
+            continue;
+        }
+        if let Some(f) = flatten_subtree_to_fnode(trie, phys) {
+            let n = f.slots.len();
+            if best.map_or(true, |(_, bn)| n > bn) {
+                best = Some((phys, n));
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Cross-check a (possibly Fnode-containing) trie against a `BTreeMap` oracle:
+/// `get`/`get_value`, `get_unchecked`, forward iteration order, and `seek`
+/// lower-bound semantics for every oracle key plus a spread of non-keys.
+fn cross_check_fnode<PTR: TrieIndex, LEN: TrieIndex>(
+    trie: &NibbleTrie<Vec<u8>, i32, PTR, LEN>,
+    oracle: &BTreeMap<Vec<u8>, i32>,
+) {
+    assert_eq!(trie.len(), oracle.len());
+    for (k, v) in oracle {
+        assert_eq!(trie.get_value(k), Some(v), "get_value mismatch for key {:?}", k);
+        // SAFETY: `k` is in the trie (just confirmed above).
+        let idx = unsafe { trie.get_unchecked(k) }.expect("get_unchecked missed a present key");
+        assert_eq!(&trie.index[idx].as_ref().unwrap().2, v, "get_unchecked value mismatch for {:?}", k);
+    }
+    // No spurious keys.
+    let mut probe = Vec::new();
+    for (k, _) in oracle {
+        // a few near-miss probes
+        probe.push(k.clone());
+        let mut shorter = k.clone();
+        if shorter.len() > 1 { shorter.truncate(shorter.len() - 1); probe.push(shorter); }
+        let mut longer = k.clone(); longer.push(k[0]); probe.push(longer);
+    }
+    for p in &probe {
+        let got = trie.get(p);
+        assert_eq!(got.is_some(), oracle.contains_key(p), "get spurious for {:?}", p);
+    }
+
+    // Forward iteration == oracle order.
+    let mut it = trie.iter();
+    let mut ordered = Vec::new();
+    if let Some((k, v)) = it.current() { ordered.push((k.to_vec(), *v)); }
+    while let Some((k, v)) = it.next() { ordered.push((k.to_vec(), *v)); }
+    let expected: Vec<(Vec<u8>, i32)> = oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    assert_eq!(ordered, expected, "forward iteration order/value mismatch");
+
+    // Seek lower-bound: for every key plus non-keys, seek(k) == first oracle key >= k.
+    let mut seek_probes: Vec<Vec<u8>> = oracle.keys().cloned().collect();
+    // Insert inter-key gaps and beyond-ends.
+    if oracle.len() >= 2 {
+        let mid = oracle.keys().nth(oracle.len() / 2).unwrap();
+        let mut gap = mid.clone(); gap[0] = gap[0].wrapping_add(1); seek_probes.push(gap);
+    }
+    if let Some(last) = oracle.keys().next_back() {
+        let mut past = last.clone(); past[0] = past[0].wrapping_add(1); seek_probes.push(past);
+        let _ = last;
+    }
+    seek_probes.push(Vec::new());
+    for p in &seek_probes {
+        let cursor = trie.iter();
+        let mut c = cursor;
+        let landed = c.seek(p).map(|(k, _)| k.to_vec());
+        let want: Option<Vec<u8>> = oracle.range(p.clone()..).next().map(|(k, _)| k.clone());
+        assert_eq!(landed, want, "seek lower-bound mismatch for {:?}", p);
+    }
+}
+
+#[test]
+fn fnode_read_single_level() {
+    // "a","b","c","d" all share nib0 (0x6_), diverging at nib1 → root child[6]
+    // → one Inode@depth1 with 4 leaf children. Collapsing it yields a 4-entry
+    // Fnode (all leaves, no branches): the flat-scan single-level case.
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle = BTreeMap::new();
+    for (i, k) in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()].iter().enumerate() {
+        trie.insert(k.clone(), i as i32).unwrap();
+        oracle.insert(k.clone(), i as i32);
+    }
+    let phys = first_fnode_candidate(&trie).expect("a flat candidate must exist");
+    assert!(collapse_to_fnode(&mut trie, phys), "collapse failed");
+    assert!(matches!(trie.arena[phys], ArenaNode::Fnode(_)), "arena[phys] is now an Fnode");
+    cross_check_fnode(&trie, &oracle);
+}
+
+#[test]
+fn fnode_read_multi_level_descent() {
+    // The trie path-compresses (each Inode discriminates only at the divergence
+    // nibble), so a real multi-level Fnode needs keys branching at *different*
+    // depths. {"aaaa","aaab","baaa","baab"}: all share nib0 (0x6_); nib1 splits
+    // the a-group (nib1=1) from the b-group (nib1=2); each pair then diverges at
+    // nib7. The subtree under the nib1 Inode flattens to a 2-branch + 4-leaf
+    // (6-slot) Fnode — branch markers followed by deeper leaf entries, which
+    // is the layout that exercises flat_get's `can_descend` descent path.
+    let keys: [Vec<u8>; 4] = [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle = BTreeMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        trie.insert(k.clone(), i as i32).unwrap();
+        oracle.insert(k.clone(), i as i32);
+    }
+    let phys = best_fnode_candidate(&trie).expect("a flat candidate must exist");
+    assert!(collapse_to_fnode(&mut trie, phys), "collapse failed");
+    if let ArenaNode::Fnode(f) = &trie.arena[phys] {
+        let has_branch = f.slots.as_slice().iter().any(|(_, off)| *off == FNODE_OFFSET_NULL);
+        assert!(has_branch, "multi-level Fnode must contain a branch marker (descent path)");
+        assert_eq!(f.slots.len(), 6, "multi-level Fnode must be 6 slots (2 branches + 4 leaves)");
+    } else { panic!("not an Fnode"); }
+    cross_check_fnode(&trie, &oracle);
+}
+
+#[test]
+fn fnode_read_prefix_key() {
+    // "aa" is a prefix of "aaaa"/"aaab" — the node where "aa" ends is terminal
+    // AND has a child (terminal+branch). The flat scan must still find "aa":
+    // it is encoded as a `Some`-ptr edge slot with the deeper leaves following,
+    // and flat_get lands on it when the query is exhausted (L==4) and descends
+    // past it when the query continues (L==8).
+    //
+    // The trie path-compresses, so a prefix key lands at the *root* of its local
+    // subtree (the divergence node) — and a terminal root can't be collapsed. To
+    // get a *non-root* terminal+branch, "b" forces a nib1 split: the nib1 node
+    // (non-terminal) has child[1] -> the "aa" subtree (terminal+branch a-node)
+    // and child[2] -> leaf "b". Collapsing the nib1 subtree captures the "aa"
+    // terminal+branch node as an internal (Some-ptr edge) slot.
+    let keys: [Vec<u8>; 4] = [b"aa".to_vec(), b"aaaa".to_vec(), b"aaab".to_vec(), b"b".to_vec()];
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle = BTreeMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        trie.insert(k.clone(), i as i32).unwrap();
+        oracle.insert(k.clone(), i as i32);
+    }
+    let phys = best_fnode_candidate(&trie).expect("a flat candidate must exist");
+    assert!(collapse_to_fnode(&mut trie, phys), "collapse failed");
+    // Sanity: the collapsed Fnode contains the prefix key as a terminal+branch
+    // slot — a non-NULL offset (terminal) immediately followed by a deeper slot.
+    if let ArenaNode::Fnode(f) = &trie.arena[phys] {
+        let s = f.slots.as_slice();
+        let found_prefix = (0..s.len()).any(|i| {
+            s[i].1 != FNODE_OFFSET_NULL && i + 1 < s.len() && s[i + 1].0.as_usize() > s[i].0.as_usize()
+        });
+        assert!(found_prefix, "expected a terminal+branch (non-NULL offset followed by a deeper) slot");
+    } else { panic!("not an Fnode"); }
+    cross_check_fnode(&trie, &oracle);
+}
+
+#[test]
+fn fnode_read_branch_then_leaves() {
+    // Keys forming a 2-branch subtree: at some depth two internal children each
+    // lead to a small leaf group, so the flattened Fnode has branch markers
+    // followed by deeper leaf entries (the motivating 2-level layout).
+    // "ax","ay","bx","by": nib0 = 6 for all ('a'/'b' are 0x6_, 'x'/'y' share too);
+    // root child[6] → Inode@depth1. nib1: a→1, b→2 → two internal children.
+    // Each group {"ax","ay"} / {"bx","by"} diverges at nib2 (x→? y→?):
+    //   'x'=0x78 nib0... wait these are byte-indexed: "ax"=[0x61,0x78],
+    //   nib0=6,nib1=1; "ay"=[0x61,0x79] nib0=6,nib1=9 → diverge at nib1? No:
+    //   "ax" nib1 = 0x78&0xF = 8; "ay" nib1 = 0x79&0xF = 9. So {"ax","ay"} share
+    //   nib0=6 only, diverge at nib1 — they're not under a common depth-1 node.
+    // Use 3-byte keys instead so each pair shares 2 nibbles then diverges:
+    //   "aax"/"aay" share nib0..nib3 (a,a), diverge at nib4 (x/y low nibble).
+    let pairs: &[(Vec<u8>, i32)] = &[
+        (b"aax".to_vec(), 0), (b"aay".to_vec(), 1),
+        (b"bbx".to_vec(), 2), (b"bby".to_vec(), 3),
+    ];
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle = BTreeMap::new();
+    for (k, v) in pairs {
+        trie.insert(k.clone(), *v).unwrap();
+        oracle.insert(k.clone(), *v);
+    }
+    // Find a candidate that actually contains a branch marker (multi-level).
+    let phys = first_fnode_candidate(&trie).expect("a flat candidate must exist");
+    assert!(collapse_to_fnode(&mut trie, phys), "collapse failed");
+    let has_branch = matches!(&trie.arena[phys], ArenaNode::Fnode(f) if f.slots.as_slice().iter().any(|(_, off)| *off == FNODE_OFFSET_NULL));
+    assert!(has_branch, "expected the collapsed Fnode to contain a branch marker");
+    cross_check_fnode(&trie, &oracle);
+}
+
+#[test]
+fn fnode_read_stress() {
+    // Random keys, collapse every available candidate one at a time, and
+    // cross-check after each collapse. A candidate may disappear or appear as
+    // the arena changes; we just keep collapsing until none remain.
+    let mut state: u64 = 0x9e3779b97f4a7c15;
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
+    for _ in 0..200 {
+        let k = rand_key(&mut state, 6);
+        if oracle.contains_key(&k) {
+            continue;
+        }
+        trie.insert(k.clone(), oracle.len() as i32).unwrap();
+        oracle.insert(k, oracle.len() as i32);
+    }
+    cross_check_fnode(&trie, &oracle); // baseline (all-Inode)
+    let mut collapses = 0;
+    while let Some(phys) = first_fnode_candidate(&trie) {
+        assert!(collapse_to_fnode(&mut trie, phys), "collapse failed at phys {phys}");
+        collapses += 1;
+        cross_check_fnode(&trie, &oracle);
+    }
+    assert!(collapses > 0, "stress never collapsed any subtree");
+}
+
+#[test]
+fn fnode_read_terminal_root() {
+    // A subtree whose ROOT is itself terminal (a prefix key with children below)
+    // is now flattenable: the root's own key is pulled out into `base`+`terminal:
+    // true` and returned by `flat_get`'s FALLBACK (no array slot). "ba" is a
+    // prefix of "baaa"/"baab"; "c" forces a nib1 split so the "ba"-rooted subtree
+    // is non-root (collapsable). Collapsing it yields a `terminal=true` Fnode
+    // whose array holds only the two longer keys (offsets >= 1) — exercising the
+    // fallback path that the step-3 root-not-terminal restriction forbade.
+    let keys: [Vec<u8>; 4] = [b"baaa".to_vec(), b"baab".to_vec(), b"ba".to_vec(), b"c".to_vec()];
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle = BTreeMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        trie.insert(k.clone(), i as i32).unwrap();
+        oracle.insert(k.clone(), i as i32);
+    }
+    // Find the terminal-rooted candidate (its flattened Fnode has terminal==true).
+    let phys = (1..trie.arena.len())
+        .find(|&p| flatten_subtree_to_fnode(&trie, p).map_or(false, |f| f.terminal))
+        .expect("a terminal-rooted candidate must exist");
+    assert!(collapse_to_fnode(&mut trie, phys), "collapse failed");
+    match &trie.arena[phys] {
+        ArenaNode::Fnode(f) => {
+            assert!(f.terminal, "expected the root's own key pulled out as terminal base");
+            assert!(!f.slots.as_slice().is_empty(), "expected descendant array slots");
+            // `base` is pulled out of the array (returned by the fallback), so no
+            // array slot may carry offset 0 — every slot is either a branch marker
+            // (0xFF) or a descendant with offset 1..=254.
+            assert!(f.slots.as_slice().iter().all(|(_, off)| *off != 0),
+                "terminal-rooted Fnode must not duplicate `base` as an offset-0 slot");
+            assert!(f.slots.as_slice().iter().any(|(_, off)| *off != FNODE_OFFSET_NULL),
+                "terminal-rooted Fnode must have at least one descendant terminal");
+        }
+        _ => panic!("not an Fnode"),
+    }
+    cross_check_fnode(&trie, &oracle);
+}
+
+// ── flatten() — the trie produces Fnodes itself ──────────────────────
+//
+// `flatten()` rebuilds the arena, collapsing qualifying non-root subtrees
+// (≤ FNODE_CAP keys, ≥ 2 Inodes) into Fnodes in place of their root. The root
+// stays an Inode; key indices are unchanged (arena-only rebuild). These tests
+// exercise the real production path (vs the hand-built `collapse_to_fnode`
+// read-path tests above) and check idempotence + structural invariants.
+
+#[test]
+fn flatten_basic() {
+    // {aaaa,aaab,baaa,baab}: the trie path-compresses into a ≥3-Inode subtree
+    // (the layout `fnode_read_multi_level_descent` flattens to 6 slots), so
+    // `flatten` must emit at least one Fnode, keep the root an Inode, shrink the
+    // arena (the subtree's child Inodes are consumed), and stay correct.
+    let keys: [Vec<u8>; 4] = [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle = BTreeMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        trie.insert(k.clone(), i as i32).unwrap();
+        oracle.insert(k.clone(), i as i32);
+    }
+    trie.optimize();
+    let arena_after_opt = trie.arena.len();
+    trie.flatten();
+    assert!(trie.arena.iter().any(|n| matches!(n, ArenaNode::Fnode(_))),
+        "flatten produced no Fnodes");
+    assert!(matches!(trie.arena[0], ArenaNode::Inode(_)), "root must stay an Inode");
+    assert!(trie.arena.len() < arena_after_opt,
+        "arena did not shrink after flatten: {} vs {}", trie.arena.len(), arena_after_opt);
+    verify_invariants(&trie).expect("invariants hold after flatten");
+    cross_check_fnode(&trie, &oracle);
+}
+
+#[test]
+fn flatten_idempotent() {
+    // Re-flattening an already-flat trie is a no-op topology copy: no new Fnodes
+    // appear (existing Fnode children block re-flatten), and correctness holds.
+    let keys: [Vec<u8>; 4] = [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle = BTreeMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        trie.insert(k.clone(), i as i32).unwrap();
+        oracle.insert(k.clone(), i as i32);
+    }
+    trie.optimize();
+    trie.flatten();
+    let (fnodes1, len1) = (
+        trie.arena.iter().filter(|n| matches!(n, ArenaNode::Fnode(_))).count(),
+        trie.arena.len(),
+    );
+    trie.flatten(); // second pass
+    let (fnodes2, len2) = (
+        trie.arena.iter().filter(|n| matches!(n, ArenaNode::Fnode(_))).count(),
+        trie.arena.len(),
+    );
+    assert_eq!((fnodes2, len2), (fnodes1, len1), "re-flatten changed the arena");
+    verify_invariants(&trie).expect("invariants hold after re-flatten");
+    cross_check_fnode(&trie, &oracle);
+}
+
+#[test]
+fn flatten_stress() {
+    // 200 random variable-length keys → optimize → flatten → cross-check. Then
+    // re-optimize+flatten (idempotent convergence) and cross-check again.
+    let mut state: u64 = 0x123456789abcdef0;
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
+    for _ in 0..200 {
+        let k = rand_key(&mut state, 6);
+        if oracle.contains_key(&k) { continue; }
+        trie.insert(k.clone(), oracle.len() as i32).unwrap();
+        oracle.insert(k, oracle.len() as i32);
+    }
+    trie.optimize();
+    let arena_after_opt = trie.arena.len();
+    trie.flatten();
+    assert!(trie.arena.iter().any(|n| matches!(n, ArenaNode::Fnode(_))),
+        "stress flatten produced no Fnodes");
+    assert!(trie.arena.len() < arena_after_opt, "stress arena did not shrink");
+    verify_invariants(&trie).expect("invariants hold after stress flatten");
+    cross_check_fnode(&trie, &oracle);
+
+    // Re-optimize over the Fnode-containing arena, then re-flatten. `walk_optimize`
+    // remaps Fnode `base`+offsets to fresh `2i+1` slots, so this converges and
+    // stays correct. (Wiring `flatten` into `optimize` itself is deferred until
+    // step-5 insert handles Fnodes; this exercises the remap path directly.)
+    trie.optimize();
+    trie.flatten();
+    verify_invariants(&trie).expect("invariants hold after re-optimize+flatten");
+    cross_check_fnode(&trie, &oracle);
+}
+
+#[test]
+#[ignore = "memory-footprint sanity; run directly (cargo stdout is filtered)"]
+fn flatten_memory_footprint() {
+    // Insert 2000 random variable-length keys, optimize, then flatten. Measure
+    // the arena's byte footprint (arena.len() * size_of::<ArenaNode>()) before
+    // and after flatten to confirm Fnode compaction actually saves memory.
+    let mut state: u64 = 0xfeed1234abcd5678;
+    let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
+    let mut oracle: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
+    for _ in 0..2000 {
+        let k = rand_key(&mut state, 6);
+        if oracle.contains_key(&k) { continue; }
+        trie.insert(k.clone(), oracle.len() as i32).unwrap();
+        oracle.insert(k, oracle.len() as i32);
+    }
+    trie.optimize();
+    let before_nodes = trie.arena.len();
+    let before_bytes = before_nodes * std::mem::size_of::<ArenaNode<u32, u16>>();
+    let fnodes_before = trie.arena.iter().filter(|n| matches!(n, ArenaNode::Fnode(_))).count();
+    trie.flatten();
+    let after_nodes = trie.arena.len();
+    let after_bytes = after_nodes * std::mem::size_of::<ArenaNode<u32, u16>>();
+    let fnodes = trie.arena.iter().filter(|n| matches!(n, ArenaNode::Fnode(_))).count();
+    let leaves = trie.arena.iter().filter(|n| matches!(n, ArenaNode::Inode(n) if n.children_mask() == 0)).count();
+    eprintln!(
+        "flatten_memory_footprint: keys={} arena {}->{} nodes ({}B->{}B, {:.1}%), Fnodes {}->{}, leaf-Inodes={}",
+        oracle.len(), before_nodes, after_nodes, before_bytes, after_bytes,
+        100.0 * after_bytes as f64 / before_bytes as f64, fnodes_before, fnodes, leaves
+    );
+    assert!(fnodes > 0, "flatten produced no Fnodes");
+    assert!(after_bytes < before_bytes, "arena bytes did not drop: {} -> {}", before_bytes, after_bytes);
+    verify_invariants(&trie).expect("invariants hold");
+    cross_check_fnode(&trie, &oracle);
 }

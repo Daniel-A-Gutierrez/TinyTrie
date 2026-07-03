@@ -627,12 +627,14 @@ fn test_rebalance_packs_tighter() {
         tree.insert(i, i).unwrap();
     }
     // 48 keys, N=4. Split-only (split at mid=2) leaves leaves ~half-full
-    // (~20 leaves). Rebalance keeps them fuller; assert a bound well below the
-    // split-only count to confirm rebalancing is doing work.
+    // (~20 live leaves). Rebalance keeps them fuller; assert a bound well below
+    // the split-only count to confirm rebalancing is doing work. Check
+    // `n_leaves` (LIVE leaves) — with the gap arena, `leaves.len()` counts
+    // slots (live + gaps), which the ~90% spread intentionally keeps ~2× live.
     assert!(
-        tree.leaves.len() <= 18,
-        "expected compact leaves (<=18, split-only ~20), got {}",
-        tree.leaves.len()
+        tree.n_leaves <= 18,
+        "expected compact leaves (<=18 live, split-only ~20), got {}",
+        tree.n_leaves
     );
     for i in 0..count {
         assert_eq!(tree.get(&i), Some(&i));
@@ -747,21 +749,25 @@ fn test_optimize_linearizes_leaves() {
 
     tree.optimize();
 
+    // With the linked list gone, `optimize` must leave the arena *dense and
+    // strictly sorted*: no gaps, every slot live, each leaf's max key below the
+    // next leaf's min key — the property that makes gap-skip iteration correct.
     let n = tree.leaves.len();
+    assert_eq!(n, tree.n_leaves, "optimize should leave no gaps (dense)");
     for i in 0..n {
-        assert_eq!(
-            tree.leaves[i].get_next(),
-            if i + 1 < n { Some(i + 1) } else { None },
-            "next broken at leaf {i}"
-        );
-        assert_eq!(
-            tree.leaves[i].get_prev(),
-            if i > 0 { Some(i - 1) } else { None },
-            "prev broken at leaf {i}"
+        assert!(tree.leaves[i].keys.len() > 0, "slot {i} empty after optimize");
+    }
+    assert_eq!(tree.first_leaf(), 0);
+    for i in 1..n {
+        let prev = &tree.leaves[i - 1];
+        let cur = &tree.leaves[i];
+        let prev_max = *prev.keys.get(prev.keys.len() - 1);
+        let cur_min = *cur.keys.get(0);
+        assert!(
+            prev_max < cur_min,
+            "leaves out of order at {i}: {prev_max} >= {cur_min}"
         );
     }
-    // first_leaf must now be arena index 0.
-    assert_eq!(tree.first_leaf(), 0);
 
     for i in 0..count {
         assert_eq!(tree.get(&i), Some(&(i * 10)), "lookup broken for key {i}");
@@ -827,8 +833,10 @@ fn test_optimize_idempotent_and_insert_after() {
 
     tree.optimize();
     assert_eq!(tree.leaves.len(), leaves_after, "second optimize should not move leaves");
+    // Dense + every slot live (no linked list to check; assert the arena state).
+    assert_eq!(tree.leaves.len(), tree.n_leaves);
     for i in 0..leaves_after {
-        assert_eq!(tree.leaves[i].get_next(), if i + 1 < leaves_after { Some(i + 1) } else { None });
+        assert!(tree.leaves[i].keys.len() > 0, "slot {i} empty after second optimize");
     }
 
     // Insert a new key larger than all existing ones — it routes to the last
@@ -855,10 +863,12 @@ fn test_optimize_var_len_keys() {
     assert!(tree.leaves.len() > 1);
     tree.optimize();
 
+    // Dense + every slot live (varlen form). Sortedness is covered by the
+    // lookup loop below + the generic cursor suites.
     let n = tree.leaves.len();
+    assert_eq!(n, tree.n_leaves, "optimize should leave no gaps (dense)");
     for i in 0..n {
-        assert_eq!(tree.leaves[i].get_next(), if i + 1 < n { Some(i + 1) } else { None });
-        assert_eq!(tree.leaves[i].get_prev(), if i > 0 { Some(i - 1) } else { None });
+        assert!(tree.leaves[i].keys.len() > 0, "slot {i} empty after optimize");
     }
     for i in 0..count {
         let key = format!("key-{i:03}");
@@ -870,14 +880,13 @@ fn test_optimize_var_len_keys() {
 
 // ---------------------------------------------------------------------------
 // EXPERIMENT / DIAGNOSTIC: log the leaf arena layout after optimize + grow and
-// trace the forward-iteration visit pattern. With the gap-arena design
-// (`spread`/`claim_slot`), splits place new leaves in the gap adjacent to their
-// parent, so the natural layout is stride-2 (live at even slots, gaps at odd)
-// — a clean, bounded sweep rather than the old front↔end bounce from
-// append-at-end splitting. The one residual quirk: pure-sequential inserts
-// exhaust the end gaps and `claim_slot` wraps to a front gap, producing a few
-// arena-spanning jumps (visible in the CONTROL seq trace below). This is
-// development instrumentation for the iteration-perf work, not a correctness test.
+// trace the forward-iteration visit pattern. The arena is kept in strict sorted
+// physical order: splits `rotate_right` the run after the split point into the
+// adjacent gap so the new leaf lands at its exact sorted slot, and `spread`
+// (triggered at ~90% occupancy, doubling capacity) re-disperses live leaves
+// into even slots with gaps at odd + trailing. There is no per-leaf linked
+// list — iteration scans forward skipping gaps. This is development
+// instrumentation for the iteration-perf work, not a correctness test.
 //
 // `#[ignore]` so it is SKIPPED by `cargo test` (it still compiles every build,
 // so it cannot bit-rot) and runs only on demand:
@@ -903,28 +912,31 @@ fn experiment_optimize_layout() {
     fn dump_u64(label: &str, tree: &CTree<u64, u64, u16, 8, 9>, opt_len: usize) {
         let n = tree.leaves.len();
         eprintln!("\n=== {label} (n={n}, height={}, opt_len={opt_len}) ===", tree.height);
-        // Replicate optimize's linked-list walk to get order + new_pos (read-only).
+        // Forward gap-skip walk: the arena is kept in strict sorted physical
+        // order, so a forward scan over non-empty leaves *is* the sorted order
+        // (no linked list to walk).
         let mut order: Vec<usize> = Vec::with_capacity(n);
-        let mut idx = tree.first_leaf();
-        order.push(idx);
-        while let Some(nx) = tree.leaves[idx].get_next() {
-            order.push(nx);
-            idx = nx;
+        for i in 0..n {
+            if tree.leaves[i].keys.len() > 0 {
+                order.push(i);
+            }
         }
         let mut new_pos = vec![usize::MAX; n];
         for (i, &o) in order.iter().enumerate() {
             new_pos[o] = i;
         }
+        let live = order.len();
+        let gaps = n - live;
         let displaced = (0..n).filter(|&i| new_pos[i] != i).count();
         let prefix_inplace = (0..opt_len).filter(|&i| new_pos[i] == i).count();
         let prefix_shifted = opt_len - prefix_inplace;
         let suffix = n - opt_len;
         eprintln!(
             "order(arena idx): {order:?}\n\
-             displaced={displaced}/{n}  prefix_inplace={prefix_inplace}/{opt_len} \
-             prefix_shifted={prefix_shifted}/{opt_len}  suffix={suffix}"
+             live={live} gaps={gaps}  displaced={displaced}/{n}  \
+             prefix_inplace={prefix_inplace}/{opt_len}  prefix_shifted={prefix_shifted}/{opt_len}  suffix={suffix}"
         );
-        eprintln!("  idx | nkeys | keyrange     | prev  next  | new_pos | region");
+        eprintln!("  idx | nkeys | keyrange     | new_pos | region");
         for i in 0..n {
             let l = &tree.leaves[i];
             let klen = l.keys.len();
@@ -935,9 +947,7 @@ fn experiment_optimize_layout() {
             };
             let region = if i < opt_len { "PREFIX" } else { "sfx" };
             eprintln!(
-                "  [{i:>2}] k{klen} {lo:>5}..{hi:<5} | {:?} {:?} | new={:>2} | {}",
-                l.get_prev(),
-                l.get_next(),
+                "  [{i:>2}] k{klen} {lo:>5}..{hi:<5} | new={:>2} | {}",
                 new_pos[i],
                 region
             );
@@ -995,17 +1005,19 @@ fn experiment_optimize_layout() {
     trace_visit("CONTROL seq post-grow, NO re-optimize", &tree2);
 }
 
-/// Walk the leaf linked list from the first leaf (the exact path a forward
-/// cursor takes) and print the arena index visited at each step plus the jump
-/// distance from the previous leaf. Non-contiguous jumps (|d|>1) are the cache
-/// misses that kill forward-iteration throughput.
+/// Walk the live leaves in forward arena order (the exact path a forward
+/// cursor takes via gap-skip) and print the arena index visited at each step
+/// plus the jump distance from the previous leaf. Non-contiguous jumps (|d|>1)
+/// are the cache misses that kill forward-iteration throughput.
 fn trace_visit(label: &str, tree: &CTree<u64, u64, u16, 8, 9>) {
     let mut visit: Vec<usize> = Vec::with_capacity(tree.leaves.len());
-    let mut idx = tree.first_leaf();
-    visit.push(idx);
-    while let Some(nx) = tree.leaves[idx].get_next() {
-        visit.push(nx);
-        idx = nx;
+    let n = tree.leaves.len();
+    let mut i = 0;
+    while i < n {
+        if tree.leaves[i].keys.len() > 0 {
+            visit.push(i);
+        }
+        i += 1;
     }
     let n = visit.len();
     eprintln!("\n--- {label} (visiting {n} leaves) ---");
@@ -1034,6 +1046,108 @@ fn trace_visit(label: &str, tree: &CTree<u64, u64, u16, 8, 9>) {
         "summary: steps={steps}, noncontiguous(>1)={noncontig}/{steps}, mean_jump={mean:.1}, max_jump={max_jump}, arena_size={}",
         tree.leaves.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// EXPERIMENT: does `Option<LeafNode>` get a *free* discriminant (niche opt)?
+//
+// `LeafNode` carries two `Option<NonZero<PTR>>` fields (`prev`/`next`) and two
+// `TinyArray<_, N>` fields. Each `TinyArray` stores `len: u8` valid over
+// `0..=N`, so when `N < 255` the values `N+1..=255` are an invalid bitpattern —
+// a niche the outer `Option` can reuse as its `None` tag.
+//
+// The `Option<NonZero<PTR>>` fields do NOT obviously help `Option<LeafNode>`:
+// their zero bitpattern is already a *valid* state (the inner `None`), so it
+// is not available as the outer `None`. The question this experiment answers:
+// is the free discriminant real, and where does it come from — the PTR niche
+// or the TinyArray `len` niche? The `N = 255` row (no `len` niche) is the
+// deciding datapoint: if `Option<LeafNode>` still fits in `LeafNode` there,
+// the PTR niche is doing the work; if it grows, the niche was `len` only.
+//
+//   cargo test --lib int_btree::tests::experiment_option_leafnode_niche -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore = "diagnostic only: measures Option<LeafNode> niche optimization"]
+fn experiment_option_leafnode_niche() {
+    use std::mem::{align_of, size_of};
+
+    // Print one row: LeafNode size, Option<LeafNode> size, alignment, whether free.
+    macro_rules! row {
+        ($label:expr, $lt:ty) => {
+            let leaf = size_of::<$lt>();
+            let opt = size_of::<Option<$lt>>();
+            let al = align_of::<$lt>();
+            let free = leaf == opt;
+            eprintln!(
+                "  {:<28} leaf={:>4}  Option<leaf>={:>4}  align={:>2}  {}  (delta={})",
+                $label,
+                leaf,
+                opt,
+                al,
+                if free { "FREE  " } else { "paid  " },
+                opt as isize - leaf as isize,
+            );
+        };
+    }
+
+    // K = u64 (fixed SIMD path), V = u64. Sweep N across small values and the
+    // N = 255 edge (where TinyArray's `len` niche vanishes), and PTR across the
+    // TrieIndex types. NP1 = N + 1 for LeafNode's sibling KeyNode, but LeafNode
+    // itself only takes N.
+    eprintln!("=== Option<LeafNode> niche experiment (K=u64, V=u64) ===");
+    eprintln!("-- N = 4 (typical) --");
+    row!("LeafNode<_,_,u8, 4>", LeafNode<u64, u64, u8, 4>);
+    row!("LeafNode<_,_,u16,4>", LeafNode<u64, u64, u16, 4>);
+    row!("LeafNode<_,_,u32,4>", LeafNode<u64, u64, u32, 4>);
+    row!("LeafNode<_,_,u64,4>", LeafNode<u64, u64, u64, 4>);
+
+    eprintln!("-- N = 8 --");
+    row!("LeafNode<_,_,u16,8>", LeafNode<u64, u64, u16, 8>);
+    row!("LeafNode<_,_,u32,8>", LeafNode<u64, u64, u32, 8>);
+
+    eprintln!("-- N = 16 --");
+    row!("LeafNode<_,_,u16,16>", LeafNode<u64, u64, u16, 16>);
+    row!("LeafNode<_,_,u32,16>", LeafNode<u64, u64, u32, 16>);
+
+    eprintln!("-- N = 32 --");
+    row!("LeafNode<_,_,u32,32>", LeafNode<u64, u64, u32, 32>);
+
+    // The deciding row: N = 255 ⇒ TinyArray `len` has no niche (0..=255 all
+    // valid). If Option<LeafNode> is still == LeafNode here, the PTR niche is
+    // exploited; if it grows, the niche was `len`-only.
+    eprintln!("-- N = 255 (no len niche) --");
+    row!("LeafNode<_,_,u8, 255>", LeafNode<u64, u64, u8, 255>);
+    row!("LeafNode<_,_,u16,255>", LeafNode<u64, u64, u16, 255>);
+    row!("LeafNode<_,_,u32,255>", LeafNode<u64, u64, u32, 255>);
+    row!("LeafNode<_,_,u64,255>", LeafNode<u64, u64, u64, 255>);
+
+    // Sanity: the inner Option<NonZero<PTR>> is itself niche-optimized (free).
+    eprintln!("-- inner Option<NonZero<PTR>> (should be FREE) --");
+    row!("Option<NonZero<u16>>", Option<std::num::NonZero<u16>>);
+    row!("Option<NonZero<u32>>", Option<std::num::NonZero<u32>>);
+
+    // Bare TinyArray niche check: confirms the `len` field is the niche source
+    // for N < 255 and vanishes at N = 255.
+    eprintln!("-- bare TinyArray<u64, N> (len niche source) --");
+    row!("TinyArray<u64, 4>",   crate::tiny_array::TinyArray<u64, 4>);
+    row!("TinyArray<u64, 255>", crate::tiny_array::TinyArray<u64, 255>);
+
+    // Isolation controls: why is Option<TinyArray> NOT free despite the `len`
+    // niche? Three hand-rolled structs, all 40 bytes, all with a `len: u8`
+    // field valid over 0..=4 (so 5..=255 is a niche). The difference is what
+    // sits in the payload: a plain array, a MaybeUninit array, or nothing.
+    // Whichever stays 40 as an Option tells us which payload kills the niche.
+    use std::mem::MaybeUninit;
+    #[repr(C)]
+    struct LenPlain    { len: u8,        slots: [u64; 4] }
+    #[repr(C)]
+    struct LenMaybe    { len: u8,        slots: [MaybeUninit<u64>; 4] }
+    #[repr(C)]
+    struct LenOnly    { len: u8,        _pad: [u8; 31] }
+    eprintln!("-- controls: does MaybeUninit kill the len niche? --");
+    row!("LenPlain  (len + [u64;4])",      LenPlain);
+    row!("LenMaybe  (len + [MU<u64;4])",   LenMaybe);
+    row!("LenOnly   (len + pad)",          LenOnly);
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,4 +1255,30 @@ fn test_keyref_sizes() {
     assert_eq!(align_of::<KeyRef>(), 8, "KeyRef alignment should be 8");
     // BufKey remains 8 bytes
     assert_eq!(size_of::<BufKey>(), 8, "BufKey size should be 8 bytes");
+}
+
+
+
+#[test]
+#[ignore = "asc vs desc insert timing"]
+fn experiment_asc_vs_desc() {
+    use std::time::Instant;
+    let n: u64 = 1_000_000;
+    let v = |k: u64| k;
+
+    let t = Instant::now();
+    let mut asc: CTree<u64, u64, u32, 8, 9> = CTree::new();
+    for k in 0..n { asc.insert(k, v(k)).unwrap(); }
+    let asc_us = t.elapsed().as_micros();
+
+    let t = Instant::now();
+    let mut desc: CTree<u64, u64, u32, 8, 9> = CTree::new();
+    for k in (0..n).rev() { desc.insert(k, v(k)).unwrap(); }
+    let desc_us = t.elapsed().as_micros();
+
+    eprintln!("ascending  0..{n}: {asc_us} us ({:.0} keys/sec)", (n as f64)*1e6/(asc_us as f64).max(1.0));
+    eprintln!("descending {n}..0: {desc_us} us ({:.0} keys/sec)", (n as f64)*1e6/(desc_us as f64).max(1.0));
+    // sanity: both trees hold all keys
+    assert_eq!(asc.len() as u64, n);
+    assert_eq!(desc.len() as u64, n);
 }

@@ -29,6 +29,7 @@
 //! `ki` maps to `values[ki - 1]`).
 
 use crate::ByteKey;
+use crate::tiny_array::TinyArray;
 use tiny_trie_trait::TinyTrieMap;
 use std::{fmt, marker::PhantomData, num::NonZero, simd::{Simd, cmp::SimdPartialEq}};
 
@@ -360,6 +361,224 @@ impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for Node<PTR, LEN> {
 }
 
 // ---------------------------------------------------------------------------
+// FlatNode (Fnode) — dense leaf-pack node (step 4: base + terminal + offset)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of keys a [`FlatNode`] can hold: 1 reference key (`base`) +
+/// `FNODE_SLOTS` array slots.
+pub const FNODE_CAP: usize = 16;
+
+/// Number of array slots in a [`FlatNode`] (one less than [`FNODE_CAP`] — the
+/// leftmost/reference key is pulled out of the array into `base`).
+pub const FNODE_SLOTS: usize = 15;
+
+/// `offset` value meaning "branch marker" (no terminal key at this slot; its
+/// children follow as deeper array slots). Real offsets are `>= 1` because
+/// `base` is the smallest key index in the subtree.
+pub const FNODE_OFFSET_NULL: u8 = 0xFF;
+
+/// A dense leaf-pack node: collapses a small/deep subtree (≤ [`FNODE_CAP`]
+/// keys) into one node holding a flattened pre-order micro-trie.
+///
+/// **Encoding (step 4, revised):** `index` is kept in sorted key order (insert
+/// places each key at its sorted position), so a subtree's keys appear in
+/// `index` in increasing position order. The leftmost (reference) key's absolute
+/// `index` position is stored once as `base`; every other key is stored as a
+/// `u8` **offset** from `base` (`key_index = base + offset`). This collapses the
+/// 4 B ptr to 1 B and pays for the larger CAP. Keys still live in `buf`, pointed
+/// to by `index` — no change to key storage.
+///
+/// - `base` — the leftmost key's `index` position. Doubles as the reference key
+///   (same role as `Inode.leaf`) for `simd_check_prefix`. Its discriminating
+///   depth is `parent.prefix_len` (the parent already matched the edge nibble
+///   there), so it is **not stored** and **not an array slot**.
+/// - `terminal` — whether `base` (the subtree root) is itself terminal. `true` +
+///   deeper slots = terminal+branch root; `true` + no deeper slots = pure-leaf
+///   root; `false` = pure-branch root (`base` is reference-only). This lifts the
+///   step-3 "subtree root can't be terminal" restriction — the root gets its own
+///   representation outside the slot array.
+/// - `slots` — the non-leftmost keys, each `(prefix_len, offset)`: `prefix_len`
+///   is the discriminating depth (absolute nibble position where this key
+///   diverges from a sibling); `offset` is `key_index - base`. `offset ==
+///   [`FNODE_OFFSET_NULL`]` → pure branch marker (its children follow as deeper
+///   slots); otherwise a terminal key at `base + offset`. Because `base` is the
+///   smallest index in the subtree, real offsets are `>= 1`.
+///
+/// A `Some`-offset (≠ NULL) slot with deeper slots following is a
+/// **terminal+branch** node (a prefix key); `flat_get` descends past it when the
+/// query continues (`can_descend`) and lands on it (returning the terminal,
+/// verified by `simd_eq`) when the query is exhausted. A NULL-offset slot is a
+/// pure (non-terminal) branch. An Fnode is a DAG leaf — slots hold only key
+/// indices, never arena refs; multi-level structure is encoded via pre-order
+/// `prefix_len` (the flat scan algorithm).
+///
+/// `u8` offsets are safe because NibbleTrie is **insert-only** (no `remove`):
+/// `index` density stays 50–90% (`optimize`'s `2i+1` respread + the `>90%`
+/// trigger), so a ≤16-key subtree spans ≤~32 `index` slots → offsets ≤~32 ≪
+/// `0xFF`. No flatten guard needed now (if deletion is ever added: a `span ≤ 254`
+/// flatten-guard + split-on-overflow trigger).
+///
+/// `FlatNode` is `Copy`: every field (and every `TinyArray` element) is `Copy`,
+/// and `TinyArray` itself is `Copy` (no heap allocation, no `Drop`). So
+/// [`ArenaNode`] is `Copy` too — no borrow-not-copy constraint on the arena.
+#[derive(Copy, Clone, Debug)]
+pub struct FlatNode<PTR: TrieIndex, LEN: TrieIndex> {
+    pub nibbles: u64,                       // 15 nibbles × 4 bits (array slots 0..FNODE_SLOTS)
+    pub base: PTR,                          // index into `index` of the leftmost (reference) key
+    pub terminal: bool,                     // whether `base` (the subtree root) is itself terminal
+    pub slots: TinyArray<(LEN, u8), FNODE_SLOTS>, // (prefix_len, offset); offset 0xFF = branch marker
+}
+
+impl<PTR: TrieIndex, LEN: TrieIndex> FlatNode<PTR, LEN> {
+    pub fn new() -> Self {
+        FlatNode {
+            nibbles: 0,
+            base: PTR::zero(),
+            terminal: false,
+            slots: TinyArray::new(),
+        }
+    }
+
+    /// The `index` position of the key at array slot `i` (`base + offset`), or
+    /// `None` if slot `i` is a branch marker (offset == [`FNODE_OFFSET_NULL`]).
+    #[inline]
+    pub fn slot_key_index(&self, i: usize) -> Option<PTR> {
+        let (_plen, offset) = self.slots.as_slice()[i];
+        if offset == FNODE_OFFSET_NULL {
+            None
+        } else {
+            Some(PTR::from_usize(self.base.as_usize() + offset as usize))
+        }
+    }
+
+    /// The nibble stored at array slot `i`.
+    #[inline]
+    pub fn slot_nibble(&self, i: usize) -> u8 {
+        ((self.nibbles >> (4 * i)) & 0xF) as u8
+    }
+
+    /// The key index at [`Frame::Fnode`] position `pos`: `0` = `base`, `i+1` =
+    /// array slot `i`. Returns `None` if `pos` is not a terminal — `base` when
+    /// `!terminal`, or an array branch-marker slot (the latter never occurs: the
+    /// iterator only ever positions on terminals). Pre-order (base, then array
+    /// slots in nibble order) is sorted key order, so `pos` enumerates terminals
+    /// in ascending key order.
+    #[inline]
+    pub fn pos_key_index(&self, pos: usize) -> Option<PTR> {
+        if pos == 0 {
+            if self.terminal { Some(self.base) } else { None }
+        } else {
+            let i = pos - 1;
+            let (_plen, offset) = self.slots.as_slice()[i];
+            if offset == FNODE_OFFSET_NULL {
+                None
+            } else {
+                Some(PTR::from_usize(self.base.as_usize() + offset as usize))
+            }
+        }
+    }
+
+    /// First terminal position: `0` if `terminal`, else the first array slot
+    /// with a non-NULL offset (encoded as `slot+1`). `None` if no terminals.
+    #[inline]
+    pub fn first_terminal_pos(&self) -> Option<usize> {
+        if self.terminal {
+            Some(0)
+        } else {
+            self.next_terminal_pos(0)
+        }
+    }
+
+    /// Next terminal position strictly after `pos`: scans array slots from
+    /// `pos` for the next non-NULL offset (returned as `slot+1`). `pos==0`
+    /// (after `base`) starts at array slot 0; `pos==i+1` (after array slot `i`)
+    /// starts at array slot `i+1`. `None` if exhausted (caller pops the frame).
+    #[inline]
+    pub fn next_terminal_pos(&self, pos: usize) -> Option<usize> {
+        let slots = self.slots.as_slice();
+        for i in pos..slots.len() {
+            let (_plen, offset) = slots[i];
+            if offset != FNODE_OFFSET_NULL {
+                return Some(i + 1);
+            }
+        }
+        None
+    }
+
+    /// Number of terminal keys this Fnode represents: `base` (if `terminal`) plus
+    /// every array slot with a non-NULL offset. When `terminal=false`, `base` is
+    /// itself an array slot (offset 0), so it is counted by the loop; when `true`,
+    /// `base` is pulled out of the array and counted here.
+    pub fn key_count(&self) -> usize {
+        let mut n = if self.terminal { 1 } else { 0 };
+        for (_, offset) in self.slots.as_slice() {
+            if *offset != FNODE_OFFSET_NULL {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Promote the reference key index type to a wider `PTR` (only `base`
+    /// carries a `PTR`; the array slots are `(LEN, u8)` offsets).
+    fn promote<NewPTR: TrieIndex>(self) -> FlatNode<NewPTR, LEN> {
+        FlatNode {
+            nibbles: self.nibbles,
+            base: NewPTR::from_usize(self.base.as_usize()),
+            terminal: self.terminal,
+            slots: self.slots,
+        }
+    }
+
+    /// Demote the reference key index type to a narrower `PTR`. Returns
+    /// `Err(self)` if `base` doesn't fit in the narrower type. (Array-slot
+    /// offsets are `u8`, so they always fit.)
+    fn demote<NewPTR: TrieIndex>(self) -> Result<FlatNode<NewPTR, LEN>, Self> {
+        if self.base.as_usize() > NewPTR::max_value() {
+            return Err(self);
+        }
+        Ok(FlatNode {
+            nibbles: self.nibbles,
+            base: NewPTR::from_usize(self.base.as_usize()),
+            terminal: self.terminal,
+            slots: self.slots,
+        })
+    }
+}
+
+impl<PTR: TrieIndex, LEN: TrieIndex> Default for FlatNode<PTR, LEN> {
+    fn default() -> Self { Self::new() }
+}
+
+/// Tagged arena element: `Inode` (the existing 16-slot direct-addressed
+/// [`Node`]) or `Fnode` (a [`FlatNode`]). `Copy` — both variants are `Copy`
+/// (`FlatNode` is `Copy` since `TinyArray` is), so arena reads may copy freely.
+#[derive(Copy, Clone, Debug)]
+pub enum ArenaNode<PTR: TrieIndex, LEN: TrieIndex> {
+    Inode(Node<PTR, LEN>),
+    Fnode(FlatNode<PTR, LEN>),
+}
+
+impl<PTR: TrieIndex, LEN: TrieIndex> ArenaNode<PTR, LEN> {
+    /// Promote the arena index type to a wider `PTR` (dispatches by variant).
+    fn promote<NewPTR: TrieIndex>(self) -> ArenaNode<NewPTR, LEN> {
+        match self {
+            ArenaNode::Inode(n) => ArenaNode::Inode(n.promote()),
+            ArenaNode::Fnode(f) => ArenaNode::Fnode(f.promote()),
+        }
+    }
+
+    /// Demote the arena index type to a narrower `PTR` (dispatches by variant).
+    /// Returns `Err(self)` if any index doesn't fit.
+    fn demote<NewPTR: TrieIndex>(self) -> Result<ArenaNode<NewPTR, LEN>, Self> {
+        match self {
+            ArenaNode::Inode(n) => n.demote().map(ArenaNode::Inode).map_err(ArenaNode::Inode),
+            ArenaNode::Fnode(f) => f.demote().map(ArenaNode::Fnode).map_err(ArenaNode::Fnode),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NibbleTrie
 // ---------------------------------------------------------------------------
 
@@ -368,7 +587,7 @@ pub struct NibbleTrie<K, T, PTR: TrieIndex = u32, LEN: TrieIndex = u16>
 where
     K: ByteKey,
 {
-    pub arena: Vec<Node<PTR, LEN>>,
+    pub arena: Vec<ArenaNode<PTR, LEN>>,
     pub buf: Vec<u8>,                // all keys concatenated (no null terminators)
     pub index: Vec<Option<Slot<LEN, T>>>, // sparse: position == key index; None = gap; [0] = dummy
     pub n_keys: usize,               // live key count (replaces index.len()-1)
@@ -575,6 +794,31 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         &self.buf[off.get()..off.get() + len.as_usize()]
     }
 
+    /// Borrow the `Inode` at arena index `i`.
+    ///
+    /// This is the single chokepoint for the **Inode-only** code paths (insert,
+    /// bump_walk, optimize, the invariant oracle) that do not yet handle Fnodes.
+    /// The read path (`get`/`get_unchecked`) and `NibbleIter` dispatch Fnodes
+    /// separately (`flat_get` / `Frame::Fnode`) and never call this on an Fnode.
+    /// Panics if `arena[i]` is an `Fnode` — a sign an Inode-only path reached one
+    /// (step 4/5 wire those paths).
+    #[inline]
+    fn inode(&self, i: usize) -> &Node<PTR, LEN> {
+        match &self.arena[i] {
+            ArenaNode::Inode(n) => n,
+            ArenaNode::Fnode(_) => panic!("inode(): arena[{i}] is an Fnode (Inode-only path)"),
+        }
+    }
+
+    /// Mutably borrow the `Inode` at arena index `i`. See [`inode`](Self::inode).
+    #[inline]
+    fn inode_mut(&mut self, i: usize) -> &mut Node<PTR, LEN> {
+        match &mut self.arena[i] {
+            ArenaNode::Inode(n) => n,
+            ArenaNode::Fnode(_) => panic!("inode_mut(): arena[{i}] is an Fnode (Inode-only path)"),
+        }
+    }
+
     pub fn new() -> Self {
         NibbleTrie {
             arena: Vec::new(),
@@ -597,6 +841,105 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     // Lookup
     // -----------------------------------------------------------------------
 
+    /// Flat scan over a [`FlatNode`] (Fnode): a pre-order DFS of a
+    /// path-compressed micro-trie. The Fnode collapses the subtree **rooted at
+    /// `base`** (the leftmost key), so every array slot is a *descendant* of
+    /// `base` and diverges at a depth `> parent.prefix_len` (= `P`, the depth
+    /// the parent Inode already matched when it dispatched here). `base`'s own
+    /// discriminating depth is `P` — already consumed — so it is not stored and
+    /// not an array slot; the scan walks only the array slots (all depth `> P`)
+    /// and falls back to `base` when no array slot is reachable.
+    ///
+    /// Each array slot `i` is `(prefix_len, offset)`: `prefix_len` is the
+    /// *discriminating depth* (absolute nibble position where this key diverges
+    /// from a sibling); `offset` is `key_index - base` (`0xFF` = branch marker,
+    /// no terminal; otherwise a terminal key index at `base + offset`).
+    ///
+    /// A non-NULL offset with deeper slots following is a **terminal+branch**
+    /// node (a prefix key). The scan handles terminals and branches uniformly:
+    /// on a nibble match, descend into the entry's subtree iff the next entry is
+    /// strictly deeper *and* the query hasn't exhausted (`can_descend`);
+    /// otherwise *land* on this slot — return the terminal (verified by full-key
+    /// `simd_eq`, since path compression means bytes between discriminant depths
+    /// were never compared) for a non-NULL offset, or `None` for a branch
+    /// marker. A terminal+branch slot is **descended past** when the query
+    /// continues (the longer key lives below) and **landed on** when the query
+    /// is exhausted (the prefix key itself).
+    ///
+    /// When the scan exhausts / surfaces above the frontier without landing on
+    /// an array slot, the query's path leads to `base`: return `base` iff
+    /// `terminal` and `simd_eq(base_key, query)`. (`base` at depth `P` is the
+    /// only terminal not encoded as an array slot; the parent already matched
+    /// its nibble at `P`, so it is the implicit landing point for a query that
+    /// equals `base` or is a prefix of all array keys.)
+    ///
+    /// Algorithm mirrors `notes/fnode.md` §"Step 4 design (REVISED)" / §"flat
+    /// scan algorithm": descend following the query key's nibbles; on a nibble
+    /// mismatch advance — entries in a subtree we haven't descended into
+    /// (`d > depth`) are skipped by the depth guard.
+    fn flat_get(&self, node: &FlatNode<PTR, LEN>, key: &[u8]) -> Option<usize> {
+        let slots = node.slots.as_slice();
+        let max_nib = key.len() * 2;
+        // Scan the array slots (all depth > P). Skip the scan entirely if the
+        // shallowest array slot is already past the query's length — then the
+        // query can only land on `base`.
+        if !slots.is_empty() {
+            let mut depth = slots[0].0.as_usize(); // shallowest array-slot depth
+            if depth < max_nib {
+                let mut i = 0;
+                while i < slots.len() {
+                    let d = slots[i].0.as_usize();
+                    if d < depth {
+                        // Surfaced above the current frontier — no further match.
+                        break;
+                    }
+                    if d > depth {
+                        // In a subtree we haven't descended into — skip.
+                        i += 1;
+                        continue;
+                    }
+                    let nib = node.slot_nibble(i);
+                    if key_nibble_at(key, d) != nib {
+                        i += 1;
+                        continue;
+                    }
+                    // On path. Can the query descend further into this entry's subtree?
+                    let can_descend = i + 1 < slots.len()
+                        && slots[i + 1].0.as_usize() > d
+                        && slots[i + 1].0.as_usize() < max_nib;
+                    if can_descend {
+                        depth = slots[i + 1].0.as_usize();
+                        i += 1;
+                    } else {
+                        // Landed on array slot i — the query can't go deeper.
+                        // The offset tells terminal-ness; a non-NULL offset is
+                        // verified by full-key equality (path compression).
+                        let offset = slots[i].1;
+                        return if offset != FNODE_OFFSET_NULL {
+                            let ki = node.base.as_usize() + offset as usize;
+                            if simd_eq(self.key_slice(PTR::from_usize(ki)), key) {
+                                Some(ki)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None // pure branch marker
+                        };
+                    }
+                }
+            }
+        }
+        // No array slot matched at the query's remaining depth → land on `base`.
+        // Return it iff `terminal` and its full key equals the query.
+        if node.terminal {
+            let ki = node.base;
+            if simd_eq(self.key_slice(ki), key) {
+                return Some(ki.as_usize());
+            }
+        }
+        None
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
@@ -604,7 +947,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let mut phys_idx: usize = 0;
         let max_nib = key.len() * 2;
         loop {
-            let node = &self.arena[phys_idx];
+            let node = self.inode(phys_idx);
             let prefix_len = node.prefix_len.as_usize();
             // Key nibbles exhausted — check if this node is terminal.
             if prefix_len >= max_nib {
@@ -631,8 +974,12 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                     None
                 };
             }
-            // Internal child — direct arena index
-            phys_idx = node.children[nib].get().as_usize();
+            // Internal child — Inode or Fnode.
+            let child = node.children[nib].get().as_usize();
+            match &self.arena[child] {
+                ArenaNode::Inode(_) => phys_idx = child,
+                ArenaNode::Fnode(f) => return self.flat_get(f, key),
+            }
         }
     }
 
@@ -648,7 +995,13 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let mut phys_idx: usize = 0;
         let max_nib = key.len() * 2;
         loop {
-            let node = unsafe { self.arena.get_unchecked(phys_idx) };
+            // SAFETY: phys_idx is the root (always an Inode by invariant) or an
+            // Inode child arena index. Fnode children are dispatched below
+            // before re-looping, so this read is always an Inode.
+            let node = match unsafe { self.arena.get_unchecked(phys_idx) } {
+                ArenaNode::Inode(n) => n,
+                ArenaNode::Fnode(_) => panic!("get_unchecked: phys_idx {phys_idx} is an Fnode (dispatcher missed it)"),
+            };
             let prefix_len = node.prefix_len.as_usize();
             if prefix_len >= max_nib {
                 debug_assert!(node.is_terminal(), "get_unchecked: key not in set");
@@ -662,7 +1015,13 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             if node.is_leaf(nib) {
                 return Some(slot.get().as_usize());
             }
-            phys_idx = slot.get().as_usize();
+            let child = slot.get().as_usize();
+            // Internal child — Inode or Fnode.
+            // SAFETY: `child` is a valid arena index read from an Inode.
+            match unsafe { self.arena.get_unchecked(child) } {
+                ArenaNode::Inode(_) => phys_idx = child,
+                ArenaNode::Fnode(f) => return self.flat_get(f, key),
+            }
         }
     }
 
@@ -749,12 +1108,19 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         new_buf.truncate(cursor);
         self.buf = new_buf;
         self.index = new_index;
+        // NOTE: `flatten()` is NOT called here yet. Wiring it in makes `optimize`
+        // produce Fnodes, but `insert` (step 5) is still Inode-only and panics on
+        // an Fnode — so insert-after-optimize would break until the
+        // `fnode_mode::OptimizeOnly` expand-on-write path lands. `walk_optimize`
+        // already remaps Fnode `base`+offsets, so a *standalone* `flatten` →
+        // `optimize` → `flatten` cycle is correct; call `flatten()` explicitly.
     }
 
     /// DFS walk that places each key at `2*i+1` in `new_index`, copies its bytes
     /// contiguously into `new_buf`, rewrites the arena's key-index references
-    /// (`children[nib]` for leaf children, `leaf` for the node's leftmost), and
-    /// returns the slot of the leftmost key placed in this subtree.
+    /// (`children[nib]` for leaf children, `leaf` for the node's leftmost,
+    /// `base`+offsets for Fnode children), and returns the slot of the leftmost
+    /// key placed in this subtree.
     fn walk_optimize(
         &mut self,
         phys_idx: usize,
@@ -763,50 +1129,67 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         cursor: &mut usize,
         i: &mut usize,
     ) -> usize {
-        let node = self.arena[phys_idx]; // copy to avoid borrow conflicts
+        // `Node: Copy`, so copy the inner Inode out to avoid borrow conflicts
+        // while we recurse (which needs `&mut self`) and rewrite arena slots.
+        let node = *self.inode(phys_idx);
         let mut first: Option<usize> = None;
 
         // This node's own terminal key sorts before all its descendants.
         if node.is_terminal() {
-            let slot = 2 * *i + 1;
-            *i += 1;
-            let old_ki = node.leaf.get().as_usize();
-            let (off, len, val) = self.index[old_ki].take().unwrap();
-            let old_off = off.get();
-            let start = *cursor;
-            new_buf.resize(start + len.as_usize(), 0);
-            new_buf[start..start + len.as_usize()]
-                .copy_from_slice(&self.buf[old_off..old_off + len.as_usize()]);
-            *cursor = start + len.as_usize();
-            new_index[slot] = Some((NonZero::new(start).unwrap(), len, val));
+            let slot = self.place_key(node.leaf.get().as_usize(), new_index, new_buf, cursor, i);
             first = Some(slot);
         }
 
         // Visit children in nibble order (== sorted order); leaf children become
-        // keys, internal children are recursed into.
+        // keys, internal children (Inode or Fnode) are recursed into / remapped.
         for nib in 0..16 {
             if !node.is_occupied(nib) {
                 continue;
             }
+            let child_phys = node.children[nib].get().as_usize();
             if node.is_leaf(nib) {
-                let slot = 2 * *i + 1;
-                *i += 1;
-                let old_ki = node.children[nib].get().as_usize();
-                let (off, len, val) = self.index[old_ki].take().unwrap();
-                let old_off = off.get();
-                let start = *cursor;
-                new_buf.resize(start + len.as_usize(), 0);
-                new_buf[start..start + len.as_usize()]
-                    .copy_from_slice(&self.buf[old_off..old_off + len.as_usize()]);
-                *cursor = start + len.as_usize();
-                new_index[slot] = Some((NonZero::new(start).unwrap(), len, val));
-                self.arena[phys_idx].children[nib] = OptNz::from_index(PTR::from_usize(slot));
+                let slot = self.place_key(child_phys, new_index, new_buf, cursor, i);
+                self.inode_mut(phys_idx).children[nib] = OptNz::from_index(PTR::from_usize(slot));
                 if first.is_none() {
                     first = Some(slot);
                 }
             } else {
-                let child_first =
-                    self.walk_optimize(node.children[nib].get().as_usize(), new_index, new_buf, cursor, i);
+                let child_first = match self.arena[child_phys] {
+                    ArenaNode::Inode(_) => {
+                        self.walk_optimize(child_phys, new_index, new_buf, cursor, i)
+                    }
+                    // An Fnode child: place its keys in pre-order (base then
+                    // array terminal slots) and remap `base`+offsets to the new
+                    // `2i+1` slots. Branch markers place no key (offset stays
+                    // `0xFF`). The Fnode is a DAG leaf — no arena refs to fix.
+                    ArenaNode::Fnode(f) => {
+                        let old_base = f.base.as_usize();
+                        let new_base = self.place_key(old_base, new_index, new_buf, cursor, i);
+                        let mut new_slots: TinyArray<(LEN, u8), FNODE_SLOTS> = TinyArray::new();
+                        for (plen, offset) in f.slots.as_slice() {
+                            if *offset == FNODE_OFFSET_NULL {
+                                // Branch marker — no key to place.
+                                new_slots.push((*plen, FNODE_OFFSET_NULL));
+                            } else if *offset == 0 {
+                                // The base key itself (terminal=false case: `base`
+                                // is an array slot at offset 0). Already placed
+                                // above as `new_base`; keep it at offset 0.
+                                new_slots.push((*plen, 0));
+                            } else {
+                                let old_ki = old_base + *offset as usize;
+                                let new_slot = self.place_key(old_ki, new_index, new_buf, cursor, i);
+                                new_slots.push((*plen, (new_slot - new_base) as u8));
+                            }
+                        }
+                        self.arena[child_phys] = ArenaNode::Fnode(FlatNode {
+                            nibbles: f.nibbles,
+                            base: PTR::from_usize(new_base),
+                            terminal: f.terminal,
+                            slots: new_slots,
+                        });
+                        new_base
+                    }
+                };
                 if first.is_none() {
                     first = Some(child_first);
                 }
@@ -814,8 +1197,240 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
 
         let leftmost = first.expect("walk_optimize: node must have at least one key in subtree");
-        self.arena[phys_idx].leaf = OptNz::from_index(PTR::from_usize(leftmost));
+        self.inode_mut(phys_idx).leaf = OptNz::from_index(PTR::from_usize(leftmost));
         leftmost
+    }
+
+    /// Place the key currently at `old_ki` into `new_index`/`new_buf` at slot
+    /// `2*i+1` (advancing `i`), copy its bytes contiguously, and return the new
+    /// slot. Takes the old slot out of `index` (so the value moves, no `T:
+    /// Clone`). Shared by the Inode terminal/leaf-child paths and the Fnode
+    /// base/slot paths of [`walk_optimize`](Self::walk_optimize).
+    fn place_key(
+        &mut self,
+        old_ki: usize,
+        new_index: &mut Vec<Option<Slot<LEN, T>>>,
+        new_buf: &mut Vec<u8>,
+        cursor: &mut usize,
+        i: &mut usize,
+    ) -> usize {
+        let slot = 2 * *i + 1;
+        *i += 1;
+        let (off, len, val) = self.index[old_ki].take().unwrap();
+        let old_off = off.get();
+        let start = *cursor;
+        new_buf.resize(start + len.as_usize(), 0);
+        new_buf[start..start + len.as_usize()]
+            .copy_from_slice(&self.buf[old_off..old_off + len.as_usize()]);
+        *cursor = start + len.as_usize();
+        new_index[slot] = Some((NonZero::new(start).unwrap(), len, val));
+        slot
+    }
+
+    /// Flatten small multi-Inode subtrees into single [`FlatNode`]s.
+    ///
+    /// Rebuilds the arena top-down: any non-root subtree with ≤ [`FNODE_CAP`]
+    /// keys and ≥ 2 Inodes (so collapsing it actually saves memory) is replaced
+    /// by one Fnode built from a pre-order DFS of that subtree. The root stays
+    /// an Inode. This is an **arena-only** rebuild — key indices (leaf children,
+    /// each Inode's `leaf`, and Fnode `base`/offsets) are unchanged; only
+    /// internal-child arena indices are remapped. So `index`/`buf` are untouched
+    /// and the existing `get`/`iter`/`seek` paths work unchanged.
+    ///
+    /// Idempotent: an Fnode holds no arena refs, so a subtree already containing
+    /// an Fnode can't be re-flattened (the Fnode is copied verbatim and
+    /// [`build_fnode_subtree`] rejects Fnode children). Calling `flatten` on an
+    /// already-flat trie is a no-op topology copy.
+    ///
+    /// Best called after [`optimize`](Self::optimize): the `2i+1` respread
+    /// makes a ≤16-key subtree span exactly ≤32 `index` slots, so every offset
+    /// fits in `u8` with room (≤ 30 ≪ `0xFF`), and offsets come out canonical
+    /// even values `0, 2, 4, …`.
+    pub fn flatten(&mut self) {
+        if self.arena.is_empty() {
+            return;
+        }
+        // Pass 1: count keys & Inodes per subtree (bottom-up), keyed by old phys.
+        // `(0, 0)` is the "not yet counted" sentinel (every real subtree has ≥1
+        // key and ≥1 Inode).
+        let mut counts: Vec<(usize, usize)> = vec![(0, 0); self.arena.len()];
+        self.count_subtree(0, &mut counts);
+        // Pass 2: rebuild the arena top-down, flattening qualifying subtrees.
+        let mut new_arena: Vec<ArenaNode<PTR, LEN>> = Vec::with_capacity(self.arena.len());
+        self.rebuild_subtree(0, &mut new_arena, &counts);
+        self.arena = new_arena;
+    }
+
+    /// Bottom-up subtree key/Inode counts. Fills `counts[phys] = (n_keys,
+    /// n_inodes)` for `phys` and every descendant. Fnodes are DAG leaves (no
+    /// arena children): they contribute their [`FlatNode::key_count`] and 1
+    /// Inode-equivalent.
+    fn count_subtree(&self, phys: usize, counts: &mut [(usize, usize)]) {
+        if counts[phys] != (0, 0) {
+            return; // already counted (defensive — a tree, so reached once)
+        }
+        let (keys, inodes) = match &self.arena[phys] {
+            ArenaNode::Fnode(f) => (f.key_count(), 1),
+            ArenaNode::Inode(node) => {
+                let mut k = if node.is_terminal() { 1 } else { 0 };
+                let mut i = 1;
+                for nib in 0..16 {
+                    if !node.is_occupied(nib) {
+                        continue;
+                    }
+                    if node.is_leaf(nib) {
+                        k += 1;
+                    } else {
+                        let child = node.children[nib].get().as_usize();
+                        self.count_subtree(child, counts);
+                        let (ck, ci) = counts[child];
+                        k += ck;
+                        i += ci;
+                    }
+                }
+                (k, i)
+            }
+        };
+        counts[phys] = (keys, inodes);
+    }
+
+    /// Rebuild the subtree rooted at old `phys` into `new_arena`, returning its
+    /// new arena index. Flattens qualifying non-root subtrees into one Fnode
+    /// (consuming their old child Inodes — no orphans); otherwise copies the
+    /// Inode and recurses, remapping internal-child arena indices. Fnode
+    /// children are copied verbatim (no arena refs to remap). Leaf children and
+    /// `leaf` are key indices, unchanged by this arena-only rebuild.
+    fn rebuild_subtree(
+        &self,
+        phys: usize,
+        new_arena: &mut Vec<ArenaNode<PTR, LEN>>,
+        counts: &[(usize, usize)],
+    ) -> usize {
+        if let ArenaNode::Fnode(f) = &self.arena[phys] {
+            new_arena.push(ArenaNode::Fnode(*f));
+            return new_arena.len() - 1;
+        }
+        let node = *self.inode(phys);
+        let (n_keys, n_inodes) = counts[phys];
+        // Flatten qualifying subtrees. The root (phys == 0) is always kept an
+        // Inode. `build_fnode_subtree` may still reject (Fnode child / offset
+        // overflow); then fall through to copy + recurse.
+        if phys != 0 && n_keys <= FNODE_CAP && n_inodes >= 2 {
+            if let Some(fnode) = self.build_fnode_subtree(phys) {
+                new_arena.push(ArenaNode::Fnode(fnode));
+                return new_arena.len() - 1;
+            }
+        }
+        // Copy the Inode (with old internal-child indices) and remap its internal
+        // children. Leaf-child slots and `leaf` carry key indices — unchanged.
+        let new_phys = new_arena.len();
+        new_arena.push(ArenaNode::Inode(node));
+        for nib in 0..16 {
+            if node.is_occupied(nib) && !node.is_leaf(nib) {
+                let child_old = node.children[nib].get().as_usize();
+                let child_new = self.rebuild_subtree(child_old, new_arena, counts);
+                match &mut new_arena[new_phys] {
+                    ArenaNode::Inode(n) => {
+                        n.children[nib] = OptNz::from_index(PTR::from_usize(child_new))
+                    }
+                    _ => unreachable!("rebuild_subtree: placeholder was Inode"),
+                }
+            }
+        }
+        new_phys
+    }
+
+    /// Build a [`FlatNode`] from the Inode subtree rooted at `phys`: pre-order
+    /// DFS collecting `(prefix_len, key_index)` per array slot, with `base` =
+    /// the root's `leaf` (leftmost key) and `terminal` = the root's own
+    /// terminal flag. Returns `None` if `phys` is not an Inode, the subtree
+    /// contains an Fnode child (merging Fnodes is not supported), the slot count
+    /// would exceed [`FNODE_SLOTS`], or an offset would collide with the `0xFF`
+    /// sentinel. Does NOT check `phys != 0` — the root-stays-Inode invariant is
+    /// the caller's responsibility.
+    fn build_fnode_subtree(&self, phys: usize) -> Option<FlatNode<PTR, LEN>> {
+        if !matches!(self.arena[phys], ArenaNode::Inode(_)) {
+            return None;
+        }
+        let root = *self.inode(phys);
+        let base = root.leaf.get();
+        let terminal = root.is_terminal();
+        let mut plens: Vec<LEN> = Vec::new();
+        let mut key_idxs: Vec<Option<PTR>> = Vec::new();
+        let mut nibbles: u64 = 0;
+        let mut ok = true;
+        self.collect_flat_slots(phys, &mut plens, &mut key_idxs, &mut nibbles, &mut ok);
+        if !ok || plens.is_empty() || plens.len() > FNODE_SLOTS {
+            return None;
+        }
+        let base_u = base.as_usize();
+        let mut slots: TinyArray<(LEN, u8), FNODE_SLOTS> = TinyArray::new();
+        for (plen, kidx) in plens.into_iter().zip(key_idxs.into_iter()) {
+            let offset = match kidx {
+                None => FNODE_OFFSET_NULL,
+                Some(ki) => {
+                    let off = ki.as_usize() - base_u;
+                    if off >= FNODE_OFFSET_NULL as usize {
+                        return None;
+                    }
+                    off as u8
+                }
+            };
+            slots.push((plen, offset));
+        }
+        Some(FlatNode { nibbles, base, terminal, slots })
+    }
+
+    /// Pre-order DFS collecting the subtree at `phys` into `plens`/`key_idxs`/
+    /// `nibbles` (per-slot `(prefix_len, Option<key_index>)`). Sets `ok = false`
+    /// and returns early on: an Fnode child (can't merge), or the slot count
+    /// exceeding [`FNODE_SLOTS`]. A terminal+branch internal child emits its
+    /// own key (`Some`) as the edge slot, then its descendants; a pure branch
+    /// emits `None`. For a terminal subtree root, the root's own key is pulled
+    /// out into `base`/`terminal` (by the caller) and NOT emitted here.
+    fn collect_flat_slots(
+        &self,
+        phys: usize,
+        plens: &mut Vec<LEN>,
+        key_idxs: &mut Vec<Option<PTR>>,
+        nibbles: &mut u64,
+        ok: &mut bool,
+    ) {
+        let node = *self.inode(phys);
+        let p = node.prefix_len;
+        for nib in 0..16 {
+            if !node.is_occupied(nib) {
+                continue;
+            }
+            let i = plens.len();
+            if i >= FNODE_SLOTS {
+                *ok = false;
+                return;
+            }
+            *nibbles |= (nib as u64) << (4 * i);
+            if node.is_leaf(nib) {
+                plens.push(p);
+                key_idxs.push(Some(node.children[nib].get()));
+            } else {
+                let child = node.children[nib].get().as_usize();
+                if matches!(self.arena[child], ArenaNode::Fnode(_)) {
+                    *ok = false;
+                    return;
+                }
+                let child_node = *self.inode(child);
+                let ptr = if child_node.is_terminal() {
+                    Some(child_node.leaf.get())
+                } else {
+                    None
+                };
+                plens.push(p);
+                key_idxs.push(ptr);
+                self.collect_flat_slots(child, plens, key_idxs, nibbles, ok);
+                if !*ok {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -958,7 +1573,14 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 );
                 it.stack
                     .iter()
-                    .map(|&(a, b, c)| (a.as_usize(), b, c))
+                    .map(|frame| match *frame {
+                        Frame::Inode { encoded, mask, nib } => (encoded.as_usize(), mask, nib),
+                        // Fnode frames can't reach bump_walk yet — inserts never
+                        // touch an Fnode until step 5 wires flat_insert/split.
+                        Frame::Fnode { .. } => panic!(
+                            "bump_walk init: Fnode frame on stack — insert-into-Fnode is step 5"
+                        ),
+                    })
                     .collect()
             };
 
@@ -1011,7 +1633,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let mut path: Vec<(usize, usize)> = Vec::new();
 
         loop {
-            let node = &self.arena[phys_idx];
+            let node = self.inode(phys_idx);
             let ki = node.leaf.get();
             let (off, ref_len, _) = self.index[ki.as_usize()].as_ref().unwrap();
             let off = off.get();
@@ -1103,7 +1725,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     /// largest (END — append, no shift). Reads only pre-mutation state.
     fn compute_p(&self, case: &Case, path: &[(usize, usize)]) -> Option<usize> {
         match case {
-            Case::Terminal { phys } => Some(self.arena[*phys].leaf.get().as_usize()),
+            Case::Terminal { phys } => Some(self.inode(*phys).leaf.get().as_usize()),
             Case::NewLeafChild { phys, nib } => self.right_anchor(*phys, *nib, path),
             Case::SplitNode {
                 phys,
@@ -1115,7 +1737,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 if *new_is_terminal || *new_nib < *ref_nib {
                     // New key is the new leftmost of `phys`'s subtree → successor
                     // is the old leftmost (the ref key), read before mutation.
-                    Some(self.arena[*phys].leaf.get().as_usize())
+                    Some(self.inode(*phys).leaf.get().as_usize())
                 } else {
                     self.subtree_successor(path)
                 }
@@ -1129,7 +1751,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 exist_nib,
                 ..
             } => {
-                let existing_key_index = self.arena[*phys].children[*nib].get().as_usize();
+                let existing_key_index = self.inode(*phys).children[*nib].get().as_usize();
                 if *new_is_terminal {
                     Some(existing_key_index)
                 } else if *existing_is_terminal {
@@ -1149,15 +1771,15 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     /// Uses the leftmost-`leaf` invariant: an internal child's `leaf` is its
     /// subtree's leftmost key index.
     fn right_anchor(&self, phys: usize, nib: usize, path: &[(usize, usize)]) -> Option<usize> {
-        let mask = self.arena[phys].children_mask();
+        let mask = self.inode(phys).children_mask();
         let higher = if nib >= 15 { 0u16 } else { mask & !((1u16 << (nib + 1)) - 1) };
         if higher != 0 {
             let next_nib = higher.trailing_zeros() as usize;
-            let r = self.arena[phys].children[next_nib].get();
-            Some(if self.arena[phys].is_leaf(next_nib) {
+            let r = self.inode(phys).children[next_nib].get();
+            Some(if self.inode(phys).is_leaf(next_nib) {
                 r.as_usize()
             } else {
-                self.arena[r.as_usize()].leaf.get().as_usize()
+                self.inode(r.as_usize()).leaf.get().as_usize()
             })
         } else {
             self.subtree_successor(path)
@@ -1170,15 +1792,15 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     /// the new key is the largest (END).
     fn subtree_successor(&self, path: &[(usize, usize)]) -> Option<usize> {
         for &(parent, nib) in path.iter().rev() {
-            let mask = self.arena[parent].children_mask();
+            let mask = self.inode(parent).children_mask();
             let higher = if nib >= 15 { 0u16 } else { mask & !((1u16 << (nib + 1)) - 1) };
             if higher != 0 {
                 let next_nib = higher.trailing_zeros() as usize;
-                let r = self.arena[parent].children[next_nib].get();
-                return Some(if self.arena[parent].is_leaf(next_nib) {
+                let r = self.inode(parent).children[next_nib].get();
+                return Some(if self.inode(parent).is_leaf(next_nib) {
                     r.as_usize()
                 } else {
-                    self.arena[r.as_usize()].leaf.get().as_usize()
+                    self.inode(r.as_usize()).leaf.get().as_usize()
                 });
             }
         }
@@ -1208,9 +1830,9 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         // Bump `leaf` of every node on the initial (seek) stack if in range.
         // These are the ancestors of `lo` plus `lo`'s owning node.
         for &(phys, _mask, _nib) in &stack {
-            let l = self.arena[phys].leaf.get().as_usize();
+            let l = self.inode(phys).leaf.get().as_usize();
             if l >= lo && l <= hi {
-                self.arena[phys].leaf = OptNz::from_index(PTR::from_usize(l + 1));
+                self.inode_mut(phys).leaf = OptNz::from_index(PTR::from_usize(l + 1));
             }
         }
 
@@ -1224,9 +1846,9 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 // key's index, which is in range).
                 seen += 1;
             } else {
-                let k = self.arena[phys].children[nib].get().as_usize();
+                let k = self.inode(phys).children[nib].get().as_usize();
                 // k ∈ [lo,hi] by construction (we visit exactly the shifted run).
-                self.arena[phys].children[nib] = OptNz::from_index(PTR::from_usize(k + 1));
+                self.inode_mut(phys).children[nib] = OptNz::from_index(PTR::from_usize(k + 1));
                 seen += 1;
             }
             if seen == n {
@@ -1250,10 +1872,12 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         hi: usize,
     ) {
         loop {
-            let node = self.arena[phys]; // Copy to avoid borrow conflicts.
+            // `Node: Copy` — copy the inner Inode out so we can mutate the
+            // arena slot (bumping `leaf`) and re-loop without borrow conflicts.
+            let node = *self.inode(phys);
             let l = node.leaf.get().as_usize();
             if l >= lo && l <= hi {
-                self.arena[phys].leaf = OptNz::from_index(PTR::from_usize(l + 1));
+                self.inode_mut(phys).leaf = OptNz::from_index(PTR::from_usize(l + 1));
             }
             if node.is_terminal() {
                 let mask = node.children_mask();
@@ -1292,8 +1916,8 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let nib = start_nib + shifted.trailing_zeros() as usize;
         debug_assert!(nib < 16);
         stack.push((encoded, mask, nib));
-        if !self.arena[encoded].is_leaf(nib) {
-            let addr = self.arena[encoded].children[nib].get().as_usize();
+        if !self.inode(encoded).is_leaf(nib) {
+            let addr = self.inode(encoded).children[nib].get().as_usize();
             self.bump_descend_first(stack, addr, lo, hi);
         }
         true
@@ -1335,12 +1959,12 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let p_idx = PTR::from_usize(p);
         match case {
             Case::Terminal { phys } => {
-                self.arena[phys].set_terminal(true);
-                self.arena[phys].leaf = OptNz::from_index(p_idx);
+                self.inode_mut(phys).set_terminal(true);
+                self.inode_mut(phys).leaf = OptNz::from_index(p_idx);
                 self.up_walk_leftmost(phys, p_idx, path);
             }
             Case::NewLeafChild { phys, nib } => {
-                self.arena[phys].set_leaf_child(nib, p_idx);
+                self.inode_mut(phys).set_leaf_child(nib, p_idx);
                 self.update_leftmost_on_leaf_insert(phys, nib, p_idx, path);
             }
             Case::SplitNode {
@@ -1362,10 +1986,10 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                         new_parent.leaf = OptNz::from_index(p_idx);
                     }
                 }
-                let old_node = std::mem::replace(&mut self.arena[phys], new_parent);
+                let old_node = std::mem::replace(&mut self.arena[phys], ArenaNode::Inode(new_parent));
                 let old_addr = PTR::from_usize(self.arena.len()); // new node index (>= 1)
                 self.arena.push(old_node);
-                self.arena[phys].set_internal_child(ref_nib, old_addr);
+                self.inode_mut(phys).set_internal_child(ref_nib, old_addr);
                 if new_is_leftmost {
                     // New key is the new parent's leftmost — propagate up the spine.
                     // (Overrides the bump's p→p+1 on this spine back to p.)
@@ -1373,7 +1997,8 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 } else {
                     // Old subtree is leftmost; its leftmost key index lives on in
                     // the pushed old node and was bumped there if in range.
-                    self.arena[phys].leaf = self.arena[old_addr.as_usize()].leaf;
+                    let child_leaf = self.inode(old_addr.as_usize()).leaf;
+                    self.inode_mut(phys).leaf = child_leaf;
                 }
             }
             Case::SplitLeaf {
@@ -1388,7 +2013,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             } => {
                 // Re-read existing key index post-bump (may have been bumped
                 // from p to p+1 if existing was the successor).
-                let existing_key_index = self.arena[phys].children[nib].get();
+                let existing_key_index = self.inode(phys).children[nib].get();
                 let mut split_node = Node::new();
                 split_node.prefix_len = LEN::from_usize(d);
                 if new_is_terminal {
@@ -1409,8 +2034,8 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                     });
                 }
                 let split_addr = PTR::from_usize(self.arena.len());
-                self.arena.push(split_node);
-                self.arena[phys].set_internal_child(nib, split_addr);
+                self.arena.push(ArenaNode::Inode(split_node));
+                self.inode_mut(phys).set_internal_child(nib, split_addr);
                 if new_is_leftmost {
                     // path.last() == (phys, nib): if split_node is phys's leftmost
                     // child, propagate the new leftmost up the spine.
@@ -1433,13 +2058,13 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     ) {
         // A terminal node's own key is a prefix of all its descendants, so it
         // is always the leftmost — a new leaf child can never precede it.
-        if self.arena[phys_idx].is_terminal() {
+        if self.inode(phys_idx).is_terminal() {
             return;
         }
-        let mask = self.arena[phys_idx].children_mask();
+        let mask = self.inode(phys_idx).children_mask();
         let lowest = mask.trailing_zeros() as usize;
         if nib == lowest {
-            self.arena[phys_idx].leaf = OptNz::from_index(new_index);
+            self.inode_mut(phys_idx).leaf = OptNz::from_index(new_index);
             self.up_walk_leftmost(phys_idx, new_index, path);
         }
     }
@@ -1459,13 +2084,13 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         while idx > 0 {
             idx -= 1;
             let (parent_phys, nib) = path[idx];
-            if self.arena[parent_phys].is_terminal() {
+            if self.inode(parent_phys).is_terminal() {
                 break;
             }
-            let parent_mask = self.arena[parent_phys].children_mask();
+            let parent_mask = self.inode(parent_phys).children_mask();
             let lowest = parent_mask.trailing_zeros() as usize;
             if nib == lowest {
-                self.arena[parent_phys].leaf = OptNz::from_index(new_leftmost);
+                self.inode_mut(parent_phys).leaf = OptNz::from_index(new_leftmost);
             } else {
                 break;
             }
@@ -1495,13 +2120,13 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             let mut root = Node::new();
             root.set_terminal(true);
             root.leaf = OptNz::from_index(p_idx);
-            self.arena.push(root);
+            self.arena.push(ArenaNode::Inode(root));
         } else {
             let first_nib = key_nibble_at(key, 0) as usize;
             let mut root = Node::new();
             root.set_leaf_child(first_nib, p_idx);
             root.leaf = OptNz::from_index(p_idx);
-            self.arena.push(root);
+            self.arena.push(ArenaNode::Inode(root));
         }
         p
     }
@@ -1552,13 +2177,32 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
 /// Sentinel nib value meaning "positioned at the terminal value of this node."
 const TERMINAL_NIB: usize = 16;
 
+/// A stack frame for [`NibbleIter`]. The root is always an [`Frame::Inode`]
+/// (the root Inode); [`Frame::Fnode`] frames appear only below the root,
+/// mirroring the "Fnodes only appear below the root" arena invariant.
+#[derive(Clone, Copy)]
+pub(crate) enum Frame<PTR: TrieIndex> {
+    /// An Inode frame: `encoded` = arena index, `mask` = its child occupancy
+    /// mask, `nib` = the current child nibble (0..16), `TERMINAL_NIB` for the
+    /// node's own terminal, or `usize::MAX` for "parked before the first child"
+    /// (the initial root frame).
+    Inode { encoded: PTR, mask: u16, nib: usize },
+    /// An Fnode frame: positioned on terminal position `pos` — `0` = `base`
+    /// (only when the Fnode's `terminal` flag is set), `i+1` = array slot `i`
+    /// (a non-NULL-offset slot). Pre-order (base then array slots) is sorted key
+    /// order, so `pos` enumerates the Fnode's terminals ascending.
+    Fnode { arena_idx: PTR, pos: usize },
+}
+
 /// Internal tree-walking cursor (stack-based arena DFS). Used only for
 /// `bump_walk`'s seek-positioning and to land the public `Cursor`'s `seek` on
 /// a key in O(keylen). Public iteration uses the linear-scan [`Cursor`].
 pub(crate) struct NibbleIter<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> {
     trie: &'a NibbleTrie<K, T, PTR, LEN>,
-    /// Stack of (arena_index, occupancy_mask, nibble_position) tuples.
-    pub(crate) stack: Vec<(PTR, u16, usize)>,
+    /// DFS stack of [`Frame`]s — `Inode` for the direct-addressed 16-slot nodes,
+    /// `Fnode` for the flat leaf-pack nodes (a DAG leaf: walk terminals in
+    /// slot order, skip `None` branch markers).
+    pub(crate) stack: Vec<Frame<PTR>>,
 }
 
 impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR, LEN> {
@@ -1566,28 +2210,42 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
         if trie.arena.is_empty() {
             return NibbleIter { trie, stack: Vec::new() };
         }
-        let mask = trie.arena[0].children_mask();
-        let nib = if trie.arena[0].is_terminal() { TERMINAL_NIB } else { usize::MAX };
-        NibbleIter { trie, stack: vec![(PTR::zero(), mask, nib)] }
+        let mask = trie.inode(0).children_mask();
+        let nib = if trie.inode(0).is_terminal() { TERMINAL_NIB } else { usize::MAX };
+        NibbleIter { trie, stack: vec![Frame::Inode { encoded: PTR::zero(), mask, nib }] }
     }
 
     fn descend_first(&mut self, mut phys_idx: usize) {
         loop {
-            let node = &self.trie.arena[phys_idx];
+            // Fnode? Position at its first terminal and stop (an Fnode is a
+            // leaf). Compute the position without holding an arena borrow
+            // across the `stack.push`.
+            let fnode_pos = match &self.trie.arena[phys_idx] {
+                ArenaNode::Fnode(f) => Some(
+                    f.first_terminal_pos()
+                        .expect("descend_first: Fnode with no terminals"),
+                ),
+                ArenaNode::Inode(_) => None,
+            };
+            if let Some(pos) = fnode_pos {
+                self.stack.push(Frame::Fnode { arena_idx: PTR::from_usize(phys_idx), pos });
+                return;
+            }
+            // Inode: copy out (Node: Copy) so no borrow is held across `push`.
+            let node = *self.trie.inode(phys_idx);
             if node.is_terminal() {
                 let mask = node.children_mask();
-                self.stack.push((PTR::from_usize(phys_idx), mask, TERMINAL_NIB));
+                self.stack.push(Frame::Inode { encoded: PTR::from_usize(phys_idx), mask, nib: TERMINAL_NIB });
                 return;
             }
             let mask = node.children_mask();
             debug_assert!(mask != 0, "descend_first: non-terminal node with no children");
             let nib = mask.trailing_zeros() as usize;
-            self.stack.push((PTR::from_usize(phys_idx), mask, nib));
+            self.stack.push(Frame::Inode { encoded: PTR::from_usize(phys_idx), mask, nib });
             if node.is_leaf(nib) {
                 return;
-            } else {
-                phys_idx = node.children[nib].get().as_usize();
             }
+            phys_idx = node.children[nib].get().as_usize();
         }
     }
 
@@ -1601,9 +2259,13 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
         debug_assert!(nib < 16);
         debug_assert!(mask & (1 << nib) != 0);
         let phys_idx = encoded.as_usize();
-        self.stack.push((encoded, mask, nib));
-        if !self.trie.arena[phys_idx].is_leaf(nib) {
-            let addr = self.trie.arena[phys_idx].children[nib].get().as_usize();
+        // `encoded` is the parent Inode (Fnodes never have children, so a frame
+        // passed here is always an Inode). Copy it out to release the borrow
+        // before `push`.
+        let node = *self.trie.inode(phys_idx);
+        self.stack.push(Frame::Inode { encoded, mask, nib });
+        if !node.is_leaf(nib) {
+            let addr = node.children[nib].get().as_usize();
             self.descend_first(addr);
         }
         true
@@ -1612,68 +2274,123 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
     #[inline]
     fn backtrack_to_next(&mut self) -> Option<(&[u8], &T)> {
         loop {
-            let (parent_encoded, parent_mask, child_nib) = self.stack.pop()?;
-            if self.push_next_child(parent_encoded, parent_mask, child_nib + 1) {
-                return self.current();
+            let frame = self.stack.pop()?;
+            match frame {
+                Frame::Inode { encoded, mask, nib } => {
+                    if self.push_next_child(encoded, mask, nib + 1) {
+                        return self.current();
+                    }
+                }
+                Frame::Fnode { .. } => {
+                    // Exhausted Fnode frame left on the stack — skip it (the pop
+                    // above already consumed it) and continue backtracking.
+                    continue;
+                }
             }
         }
     }
 
     pub fn current(&self) -> Option<(&[u8], &T)> {
-        let (encoded, _, nib) = self.stack.last()?;
-        if *nib == usize::MAX {
-            return None;
-        }
-        let phys_idx = encoded.as_usize();
-        let node = &self.trie.arena[phys_idx];
-        if *nib == TERMINAL_NIB {
-            let ki = node.leaf.get();
-            let (off, len, val) = self.trie.index[ki.as_usize()].as_ref().unwrap();
-            let off = off.get();
-            let key = &self.trie.buf[off..off + len.as_usize()];
-            Some((key, val))
-        } else if let Some(key_index) = node.leaf_key_index(*nib) {
-            let key = self.trie.key_slice(key_index);
-            let val = &self.trie.index[key_index.as_usize()].as_ref().unwrap().2;
-            Some((key, val))
-        } else {
-            None
+        let frame = self.stack.last()?;
+        match *frame {
+            Frame::Inode { encoded, nib, .. } => {
+                if nib == usize::MAX {
+                    return None;
+                }
+                let phys_idx = encoded.as_usize();
+                let node = self.trie.inode(phys_idx);
+                if nib == TERMINAL_NIB {
+                    let ki = node.leaf.get();
+                    let (off, len, val) = self.trie.index[ki.as_usize()].as_ref().unwrap();
+                    let off = off.get();
+                    Some((&self.trie.buf[off..off + len.as_usize()], val))
+                } else if let Some(key_index) = node.leaf_key_index(nib) {
+                    Some((self.trie.key_slice(key_index), &self.trie.index[key_index.as_usize()].as_ref().unwrap().2))
+                } else {
+                    None
+                }
+            }
+            Frame::Fnode { arena_idx, pos } => {
+                let f = match &self.trie.arena[arena_idx.as_usize()] {
+                    ArenaNode::Fnode(f) => f,
+                    ArenaNode::Inode(_) => unreachable!("Fnode frame points at an Inode"),
+                };
+                let ki = f
+                    .pos_key_index(pos)
+                    .expect("current: Fnode frame positioned on a non-terminal");
+                Some((self.trie.key_slice(ki), &self.trie.index[ki.as_usize()].as_ref().unwrap().2))
+            }
         }
     }
 
     pub fn current_index(&self) -> Option<usize> {
-        let &(_, _, nib) = self.stack.last()?;
-        if nib == usize::MAX {
-            return None;
-        }
-        let (encoded, _, _) = self.stack.last()?;
-        let phys_idx = encoded.as_usize();
-        let node = &self.trie.arena[phys_idx];
-        if nib == TERMINAL_NIB {
-            Some(node.leaf.get().as_usize())
-        } else {
-            node.leaf_key_index(nib).map(|ki| ki.as_usize())
+        let frame = self.stack.last()?;
+        match *frame {
+            Frame::Inode { encoded, nib, .. } => {
+                if nib == usize::MAX {
+                    return None;
+                }
+                let phys_idx = encoded.as_usize();
+                let node = self.trie.inode(phys_idx);
+                if nib == TERMINAL_NIB {
+                    Some(node.leaf.get().as_usize())
+                } else {
+                    node.leaf_key_index(nib).map(|ki| ki.as_usize())
+                }
+            }
+            Frame::Fnode { arena_idx, pos } => {
+                let f = match &self.trie.arena[arena_idx.as_usize()] {
+                    ArenaNode::Fnode(f) => f,
+                    ArenaNode::Inode(_) => unreachable!("Fnode frame points at an Inode"),
+                };
+                Some(
+                    f.pos_key_index(pos)
+                        .expect("current_index: Fnode frame positioned on a non-terminal")
+                        .as_usize(),
+                )
+            }
         }
     }
 
     #[inline]
     fn advance_next(&mut self) -> bool {
         loop {
-            let (encoded, mask, nib) = match self.stack.pop() {
+            let frame = match self.stack.pop() {
                 Some(v) => v,
                 None => return false,
             };
-
-            if nib == TERMINAL_NIB {
-                if self.push_next_child(encoded, mask, 0) {
-                    return true;
+            match frame {
+                Frame::Inode { encoded, mask, nib } => {
+                    if nib == TERMINAL_NIB {
+                        if self.push_next_child(encoded, mask, 0) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
+                    if self.push_next_child(encoded, mask, search_start) {
+                        return true;
+                    }
+                    // `push_next_child` returned false and this frame is already
+                    // popped — loop to pop the next frame and backtrack from it.
+                    continue;
                 }
-                continue;
-            }
-
-            let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
-            if self.push_next_child(encoded, mask, search_start) {
-                return true;
+                Frame::Fnode { arena_idx, pos } => {
+                    // Advance to the next terminal position in this Fnode (base
+                    // then array terminal slots). Extract the result without
+                    // holding an arena borrow across `push`.
+                    let next_pos = match &self.trie.arena[arena_idx.as_usize()] {
+                        ArenaNode::Fnode(f) => f.next_terminal_pos(pos),
+                        ArenaNode::Inode(_) => unreachable!("Fnode frame points at an Inode"),
+                    };
+                    if let Some(np) = next_pos {
+                        self.stack.push(Frame::Fnode { arena_idx, pos: np });
+                        return true;
+                    }
+                    // Exhausted Fnode: this frame is already popped — loop to
+                    // pop the parent Inode frame and backtrack from there.
+                    continue;
+                }
             }
         }
     }
@@ -1681,6 +2398,65 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
     #[inline]
     pub fn next(&mut self) -> Option<(&[u8], &T)> {
         if self.advance_next() { self.current() } else { None }
+    }
+
+    /// Seek within an Fnode child for the first terminal key ≥ `key`. The parent
+    /// Inode frame is already on the stack (pushed by [`seek`](Self::seek) before
+    /// dispatching here). On a hit, push an [`Frame::Fnode`] and return `current`.
+    /// On exhaust (all Fnode terminals < `key`), pop the parent and backtrack to
+    /// its next child.
+    fn fnode_seek(&mut self, arena_idx: usize, key: &[u8], _max_nib: usize) -> Option<(&[u8], &T)> {
+        // Pre-order (base then array slots) == sorted key order: the first
+        // terminal whose key is ≥ `key` is the lower bound. Scan inside a block
+        // so the arena borrow ends before the `stack.push` below.
+        let found_pos: Option<usize> = {
+            let f = match &self.trie.arena[arena_idx] {
+                ArenaNode::Fnode(f) => f,
+                ArenaNode::Inode(_) => unreachable!("fnode_seek on an Inode"),
+            };
+            // `base` first (if it is a terminal).
+            if f.terminal && self.trie.key_slice(f.base) >= key {
+                Some(0)
+            } else {
+                // Array terminal slots in pre-order (ascending key order).
+                let slots = f.slots.as_slice();
+                let base = f.base.as_usize();
+                let mut found = None;
+                for (i, (_plen, offset)) in slots.iter().enumerate() {
+                    if *offset == FNODE_OFFSET_NULL {
+                        continue;
+                    }
+                    let ki = PTR::from_usize(base + *offset as usize);
+                    if self.trie.key_slice(ki) >= key {
+                        found = Some(i + 1);
+                        break;
+                    }
+                }
+                found
+            }
+        };
+        if let Some(pos) = found_pos {
+            self.stack.push(Frame::Fnode { arena_idx: PTR::from_usize(arena_idx), pos });
+            return self.current();
+        }
+        // All Fnode terminals < key → backtrack to the parent Inode's next child.
+        match self.stack.pop() {
+            Some(Frame::Inode { encoded, mask, nib }) => {
+                if self.push_next_child(encoded, mask, nib + 1) {
+                    return self.current();
+                }
+                self.backtrack_to_next()
+            }
+            other => {
+                // The root is never an Fnode and `seek` always pushes the parent
+                // Inode frame before dispatching, so there must be one. Defensively
+                // restore anything unexpected and report no match.
+                if let Some(frm) = other {
+                    self.stack.push(frm);
+                }
+                None
+            }
+        }
     }
 
     pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &T)> {
@@ -1694,7 +2470,11 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
         let max_nib = key.len() * 2;
 
         loop {
-            let node = &self.trie.arena[phys_idx];
+            // Root and every ephemeral-descent target are Inodes — Fnode children
+            // are dispatched below and `return` before re-looping. Copy the node
+            // out (Node: Copy) so no borrow is held across `stack.push` /
+            // recursive `self.` calls.
+            let node = *self.trie.inode(phys_idx);
             let mask = node.children_mask();
 
             if node.is_terminal() && node.prefix_len.as_usize() >= max_nib {
@@ -1703,7 +2483,7 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
                 let off = off.get();
                 let node_key = &self.trie.buf[off..off + len.as_usize()];
                 if node_key >= key {
-                    self.stack.push((PTR::from_usize(phys_idx), mask, TERMINAL_NIB));
+                    self.stack.push(Frame::Inode { encoded: PTR::from_usize(phys_idx), mask, nib: TERMINAL_NIB });
                     return self.current();
                 }
             }
@@ -1724,7 +2504,7 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
                 return self.backtrack_to_next();
             }
 
-            self.stack.push((PTR::from_usize(phys_idx), mask, nib));
+            self.stack.push(Frame::Inode { encoded: PTR::from_usize(phys_idx), mask, nib });
             if node.is_leaf(nib) {
                 let leaf_key = self.trie.key_slice(node.children[nib].get());
                 if leaf_key >= key {
@@ -1733,7 +2513,13 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
                 // Leaf key < seek key: advance past it
                 return self.next();
             } else {
-                phys_idx = node.children[nib].get().as_usize();
+                let child_addr = node.children[nib].get().as_usize();
+                if matches!(self.trie.arena[child_addr], ArenaNode::Fnode(_)) {
+                    // Parent Inode frame already pushed above. Flat-seek the
+                    // Fnode: either land on a terminal ≥ key, or backtrack out.
+                    return self.fnode_seek(child_addr, key, max_nib);
+                }
+                phys_idx = child_addr;
             }
         }
     }
@@ -1770,20 +2556,25 @@ pub struct Cursor<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> {
 }
 
 impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LEN> {
-    /// Park at slot `pos`, recomputing the cached current value from `index`.
-    /// `pos` may be a sentinel (`0` or `len`) or a `Some` slot.
-    fn park(&mut self, pos: usize) {
+    /// Park at a known-occupied slot, building the cached current value
+    /// directly from the already-fetched `slot` ref. `slot` borrows the trie
+    /// with lifetime `'a` (so the cached refs carry `'a`, not the cursor
+    /// borrow) — safe to then write `self.cur`. The caller has already proven
+    /// the slot is `Some`, so this is branch-free apart from the slice bounds.
+    #[inline]
+    fn park_slot(&mut self, pos: usize, slot: &'a Slot<LEN, T>) {
         self.pos = pos;
-        // Read through the `'a` trie ref so the cached refs carry lifetime `'a`
-        // (borrowing `*self.trie`, not `*self`) — safe to then write `self.cur`.
-        self.cur = match self.trie.index.get(pos) {
-            Some(Some(slot)) => {
-                let off = slot.0.get();
-                let klen = slot.1.as_usize();
-                Some((&self.trie.buf[off..off + klen], &slot.2))
-            }
-            _ => None,
-        };
+        let off = slot.0.get();
+        let klen = slot.1.as_usize();
+        self.cur = Some((&self.trie.buf[off..off + klen], &slot.2));
+    }
+
+    /// Park at a sentinel (`0` = before-first / backward exhausted, or `len` =
+    /// forward exhausted): no live key, so the cached current is `None`.
+    #[inline]
+    fn park_sentinel(&mut self, pos: usize) {
+        self.pos = pos;
+        self.cur = None;
     }
 
     /// Forward cursor parked *before* the first key.
@@ -1804,13 +2595,13 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         let len = self.trie.index.len();
         let mut i = 1;
         while i < len {
-            if self.trie.index[i].is_some() {
-                self.park(i);
+            if let Some(slot) = self.trie.index[i].as_ref() {
+                self.park_slot(i, slot);
                 return self.cur;
             }
             i += 1;
         }
-        self.park(0);
+        self.park_sentinel(0);
         None
     }
 
@@ -1820,12 +2611,12 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         let mut i = self.trie.index.len();
         while i > 1 {
             i -= 1;
-            if self.trie.index[i].is_some() {
-                self.park(i);
+            if let Some(slot) = self.trie.index[i].as_ref() {
+                self.park_slot(i, slot);
                 return self.cur;
             }
         }
-        self.park(0);
+        self.park_sentinel(0);
         None
     }
 
@@ -1876,41 +2667,55 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
             w.current_index()
         };
         match pos {
-            Some(p) => { self.park(p); self.cur }
-            None => { self.park(self.trie.index.len()); None }
+            Some(p) => {
+                // `p` is a tree-walker-confirmed occupied slot.
+                if let Some(slot) = self.trie.index[p].as_ref() {
+                    self.park_slot(p, slot);
+                    self.cur
+                } else {
+                    self.park_sentinel(self.trie.index.len());
+                    None
+                }
+            }
+            None => { self.park_sentinel(self.trie.index.len()); None }
         }
     }
 
     // --- core linear scans ---
 
     /// Scan forward from `pos+1` to the next `Some` slot; park there on hit,
-    /// or at the `len` sentinel on miss.
+    /// or at the `len` sentinel on miss. Each slot is fetched once and, on a
+    /// hit, handed straight to `park_slot` — no second `index` load and no
+    /// re-match of the `Option` (which the old `park` did).
+    #[inline]
     fn advance_next(&mut self) -> bool {
         let len = self.trie.index.len();
         let mut i = self.pos + 1;
         while i < len {
-            if self.trie.index[i].is_some() {
-                self.park(i);
+            if let Some(slot) = self.trie.index[i].as_ref() {
+                self.park_slot(i, slot);
                 return true;
             }
             i += 1;
         }
-        self.park(len);
+        self.park_sentinel(len);
         false
     }
 
     /// Scan backward from `pos-1` to the previous `Some` slot; park there on
-    /// hit, or at the `0` (before-first) sentinel on miss.
+    /// hit, or at the `0` (before-first) sentinel on miss. Same single-fetch
+    /// strategy as `advance_next`.
+    #[inline]
     fn advance_prev(&mut self) -> bool {
         let mut i = self.pos;
         while i > 1 {
             i -= 1;
-            if self.trie.index[i].is_some() {
-                self.park(i);
+            if let Some(slot) = self.trie.index[i].as_ref() {
+                self.park_slot(i, slot);
                 return true;
             }
         }
-        self.park(0);
+        self.park_sentinel(0);
         false
     }
 }

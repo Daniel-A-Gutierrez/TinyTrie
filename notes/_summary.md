@@ -237,4 +237,205 @@ Unlike in the btree, the ordering of our index is strictly enforced.
 Thats probably a good optimization route for the btree too. 
 We lost a lot of our insertion speed though. 
 
+### Small iter optimizations
+─── Insertion (keys/sec) ───
+                               1000000
+NibbleTrie                       4.41M
+
+─── Lookup (keys/sec) ───
+                               1000000
+NibbleTrie                      12.46M
+
+─── Iter forward (keys/sec) ───
+                               1000000
+NibbleTrie                     927.89M
+
+─── Iter backward (keys/sec) ───
+                               1000000
+NibbleTrie                     938.03M
+
+─── Iter fwd index (keys/sec) ───
+                               1000000
+NibbleTrie                     662.65M
+
+─── Iter rev index (keys/sec) ───
+                               1000000
+NibbleTrie                       1.01G
+
+─── Memory (bytes/key) ───
+                               1000000
+NibbleTrie                       186.3
+
+
 ### Leaf Nodes
+The nibble trie node arena takes up ~60% of its memory. 
+Node occupancy likely falls as we get deeper in the tree. 
+The index is already ordered by key as well. 
+A leaf node which is dedicated to storing leaves may cut down the memory footprint. 
+We'd have to give up on direct addressing - each slot gets to store just its discriminant byte, and the offset to it. 
+
+aaab
+baaa
+baab
+aaaa
+
+would create a prefix trie like 
+0: [prefix_len : 0, children : [a->1,b->2 ...]]
+1: [prefix_len : 3, children : [a->leaf4, b->leaf1 ...]]
+2: [prefix_len : 3, children : [a->leaf2, b->leaf3 ...]]
+
+but a leaf node that stores only the discriminating byte could store all 4 in one node.
+They have to be stored lexigraphically ordered, each needs a prefixlen, a nibble, a leafptr, and a terminal bit. 
+The node should store a u8 len as well. 
+
+{ children : [ {prefixlen, ptr} ; 8 ], terminal : [bool;16], nibbles : u64, len : u8 }
+The layout in this case would be 
+
+in this example nibbles are just whole bytes instead for simplicity's sake.
+{ [(0, null), (3,leaf4), (3, leaf1), (0, null), (3, leaf2), (3,leaf3)] , terminal : 0, nibbles : [a,a,b,b,a,b], len : 4 }
+
+so , how do we logically scan a flattened tree like this? 
+prefix_len is our only real hint, key[prefix] == nibbles[i] .
+any increase in prefix len means a increase in the depth of the node. 
+also, how do we properly represent terminal nodes here? we have to OR the comparison with the bool in terminal. 
+
+0 : store 'parent check' , & it with previous
+
+basically, prefix_len MUST increase once we've found a match. 
+if a node doesnt match, we don't care about any subsequent nodes with prefix_len  > it. 
+
+depth = children[0].prefix_len
+i = 0 
+L = query.len
+let child = None
+if depth >= L { return None }
+for i in 0..len {
+        let d  = children[i].prefix_len;
+        if d < depth { break; }
+        if d > depth { continue; }
+        if (query[depth] == nibbles[i]) {
+                //if terminal[i] && depth == L-1 { child= children[i]; } //terminal flag unnecessary? rather, not terminal is stored in the nonzeroness of the ptr
+                child = children[i]
+                if i+1==len {break} 
+                let next_depth = children[i+1].prefix_len
+                if next_depth <= depth || next_depth >= L {break}
+                depth = next_depth
+        }
+}
+if child.is_some() && index[child].key==query {return Some(index[child])} else {return None}
+ok 
+iteration doesnt touch this, index is sorted so there's no need. 
+
+struct FlatNode {
+        children : TinyArray< (Option< Nonzero< Ptr>>, LEN), 16> // len is children.len
+        nibbles : u64,
+}
+
+Splitting : When its full, how do we split it up? 
+
+find all the things at depth of child[0] : make a regular node, insert them as children, 
+make leafnodes from their children and point the new node at them. 
+
+worst case scenario : a chain. every child is a child of the previous one. 
+either way we have to use child[0], leaf nodes cant point at other nodes. just have to hope we don't have chains > 16 elements very often. 
+
+
+insertion : 
+
+once we get to a leaf node, take the first pointer you can find down to index, 
+scan it and compare from prefix_len..end between the stored keys and the new one to find what position the new one should be at in the leaf. 
+We're also looking for the next none after that point, so we know how many pointers we have to shift. 
+Worst case scenario the shift spans past the end of the leaf, so we need to traverse back up the tree and to the next neighbor and shift more things over.
+check at what point it diverges from the immediately previous child (starting from its prefix_len), thats our new childs prefix length. 
+take the nibble out, bitshift the bits from 4*i in nibbles right by 4 bits. ill let ai figure out the specifics of the bit operations. 
+remember, theres a tricky edge case, when we have a new leftmost 
+
+With leafnodes in the logic but not actually being made in insert : 
+
+
+─── Insertion (keys/sec) ───
+                               1000000
+NibbleTrie                       4.28M
+
+─── Lookup (keys/sec) ───
+                               1000000
+NibbleTrie                      11.94M
+
+─── Iter forward (keys/sec) ───
+                               1000000
+NibbleTrie                     864.83M
+
+─── Iter backward (keys/sec) ───
+                               1000000
+NibbleTrie                     953.67M
+
+─── Iter fwd index (keys/sec) ───
+                               1000000
+NibbleTrie                     636.36M
+
+─── Iter rev index (keys/sec) ───
+                               1000000
+NibbleTrie                     887.88M
+
+─── Memory (bytes/key) ───
+                               1000000
+NibbleTrie                       186.3
+
+With FNodes
+
+─── Insertion (keys/sec) ───
+                               1000000
+NibbleTrie                       3.85M
+
+─── Lookup (keys/sec) ───
+                               1000000
+NibbleTrie                      11.62M
+
+─── Iter forward (keys/sec) ───
+                               1000000
+NibbleTrie                     489.75M
+
+─── Iter backward (keys/sec) ───
+                               1000000
+NibbleTrie                     923.44M
+
+─── Iter fwd index (keys/sec) ───
+                               1000000
+NibbleTrie                     424.55M
+
+─── Iter rev index (keys/sec) ───
+                               1000000
+NibbleTrie                     997.54M
+
+─── Memory (bytes/key) ───
+                               1000000
+NibbleTrie                       257.6
+
+
+ok shoving fnodes and inodes into an enum is wasting a ton of space.
+
+Also working on btree, 
+
+=== TinyTrie Benchmark Suite ===
+Tests:    insert
+Sizes:    1000000
+Structs:  IntBTree
+Keys:     SeqU64
+4s per bench · sequential per size
+
+[n = 1000000]
+  generating keys (SeqU64)... ✓ (0 byte keys, 1000000 u64 keys)
+  insertion:
+    IntBTree: 1 iters in 39.31s (39.31s/iter) ✓
+
+
+─── Insertion (keys/sec) ───
+                               1000000
+IntBTree                         25.4K
+
+Insertion on reverse sorted keys is terrible!
+Turns out the particular way the agent handled this, if we don't have space after a leaf to split into it reallocs and spreads,
+but since the capacity doubles without the number of elements doubling (in forward sorted keys) we get a ton of empty space at the end, 
+then waste the space in the middle (everything else remains at 50% fill). 
+
+But in the reverse case its just a sorted vec inserting at the beginning over and over. 

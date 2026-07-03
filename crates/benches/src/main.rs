@@ -613,8 +613,8 @@ fn all_contestants() -> Vec<Contestant> {
         Contestant { name: "PolyOpt",            max_size: None, bytes: None, nonzero: Some(Box::new(PolyOptBench::new())), u64: None },
         Contestant { name: "FixedLen",            max_size: None, bytes: Some(Box::new(FixedLenBench::new())),  nonzero: None, u64: None },
         Contestant { name: "FixedLenOpt",         max_size: None, bytes: Some(Box::new(FixedLenOptBench::new())), nonzero: None, u64: None },
-        Contestant { name: "IntBTree",      max_size: None, bytes: Some(Box::new(IntBTreeBench::new())),    nonzero: None, u64: None },
-        Contestant { name: "IntBTreeOpt",   max_size: None, bytes: Some(Box::new(IntBTreeOptBench::new())), nonzero: None, u64: None },
+        Contestant { name: "IntBTree",      max_size: None, bytes: None, nonzero: None, u64: Some(Box::new(IntBTreeBench::new()))    },
+        // Contestant { name: "IntBTreeOpt",   max_size: None, bytes: None, nonzero: None, u64: Some(Box::new(IntBTreeOptBench::new())) },
         Contestant { name: "StrBTree",      max_size: None, bytes: Some(Box::new(StrBTreeBench::new())),     nonzero: None, u64: None },
     ]
 }
