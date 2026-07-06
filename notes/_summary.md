@@ -438,4 +438,25 @@ Turns out the particular way the agent handled this, if we don't have space afte
 but since the capacity doubles without the number of elements doubling (in forward sorted keys) we get a ton of empty space at the end, 
 then waste the space in the middle (everything else remains at 50% fill). 
 
-But in the reverse case its just a sorted vec inserting at the beginning over and over. 
+But in the reverse case its just a sorted vec inserting at the beginning over and over. bad. 
+
+
+Tests im going to do 
+
+Sorted array vs FlatTree vs DecisionTree
+We'll test at various sizes. 
+Key is a u8, value is a u8. 
+
+To be fair, sorted_array should have keys of u32s. 
+
+Sorted array is just a vec of (u32,u8). 
+
+Flattree is fnode in its current state effectively.
+Similar to decision tree but we store depth instead of next. 
+The algorithm for scanning this is listed above. 
+
+Decision tree : 
+(key, next) - if key matches, descend (i+1). if it doesnt, follow next.
+If next is 0 , exit. Values are stored in a side array. 
+
+assume keys are unique. 

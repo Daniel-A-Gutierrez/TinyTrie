@@ -1,5 +1,4 @@
 #![allow(incomplete_features)]
-#![feature(generic_const_exprs)]
 #![feature(portable_simd)]
 
 //! Compact arena-based radix tries with SIMD-accelerated lookup.
@@ -24,8 +23,7 @@ pub mod fixed_len_nibble_trie;
 mod key_store;
 mod tiny_array;
 pub mod flat_node;
-
-pub use tiny_trie_trait::TinyTrieMap;
+pub use benchable_map::BenchableMap;
 
 pub use nibble_trie::{NibbleTrie, Node, OptNz, TrieIndex};
 pub use nib_trie::{NibTrie, NibNode};

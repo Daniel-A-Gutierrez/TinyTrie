@@ -1,25 +1,27 @@
 # Trait Architecture
 
-Three independent trait systems serve different purposes: **TinyTrieMap** for benchmark
+Three independent trait systems serve different purposes: **BenchableMap** for benchmark
 abstraction, **ByteKey** for radix-trie key genericity, and **CTree's trait chain**
 for B+ tree SIMD dispatch.
 
 ---
-
-## TinyTrieMap (`tiny-trie-trait` crate)
+## BenchableMap (`benchable_map` crate, formerly `tiny-trie-trait` / `TinyTrieMap`)
 
 A minimal trait in its own crate, implemented by each tree structure independently.
 Exists so the bench harness can treat all trees uniformly without orphan-rule issues.
+The `map_` prefix avoids collisions with inherent methods (e.g. `insert`, `get`, `iter`).
 
 ```rust
-pub trait TinyTrieMap: Sized {
-    fn trie_new() -> Self;
-    fn trie_insert(&mut self, key: Vec<u8>, value: usize);
-    fn trie_get(&self, key: &[u8]) -> Option<usize>;
-    fn trie_iter_fwd(&self, f: impl FnMut(&[u8], &usize));
-    fn trie_iter_rev(&self, f: impl FnMut(&[u8], &usize));
-    fn trie_len(&self) -> usize;
-    fn trie_optimize(&mut self) { }  // default no-op
+pub trait BenchableMap: Sized {
+    fn map_new() -> Self;
+    fn map_insert(&mut self, key: Vec<u8>, value: usize);
+    fn map_get(&self, key: &[u8]) -> Option<usize>;
+    fn map_iter_fwd(&self, f: impl FnMut(&[u8], &usize));
+    fn map_iter_rev(&self, f: impl FnMut(&[u8], &usize));
+    fn map_iter_fwd_index(&self, _f: impl FnMut(usize)) { unimplemented!(...) }
+    fn map_iter_rev_index(&self, _f: impl FnMut(usize)) { unimplemented!(...) }
+    fn map_len(&self) -> usize;
+    fn map_optimize(&mut self) {}  // default no-op
 }
 ```
 
@@ -27,11 +29,11 @@ Each crate implements it for its own type:
 
 | Crate | Implementation |
 |-------|---------------|
-| `tiny-trie` | `impl TinyTrieMap for NibbleTrie<Vec<u8>, usize>`, `NibTrie<usize>`, `BitTrie<Vec<u8>, usize>`, `FixedLenNibbleTrie<usize, u32>` |
-| `poly-trie` | `impl TinyTrieMap for PolyTrie<usize>` |
+| `tiny-trie` | `impl BenchableMap for NibbleTrie<Vec<u8>, usize>`, `NibTrie<usize>`, `BitTrie<Vec<u8>, usize>`, `FixedLenNibbleTrie<usize, u32>` |
+| `poly-trie` | `impl BenchableMap for PolyTrie<usize>` |
 
-The bench harness (`tiny-trie-bench` crate) depends on `tiny-trie-trait` and all three
-tree crates, so it can compare them head-to-head.
+The bench harness (`bencher` crate, lib name `tiny_trie_bench`) depends on `benchable_map`
+and the tree crates, so it can compare them head-to-head.
 
 ---
 
@@ -178,7 +180,7 @@ carry both bytes and u64 variants; `variant_for(mode)` dispatches by key mode.
 
 The three trait systems are **independent** and live in separate crates:
 
-- **`tiny-trie-trait`** (`TinyTrieMap`) — bench abstraction, implemented by each tree
+- **`benchable_map`** (`BenchableMap`) — bench abstraction, implemented by each tree
 - **`tiny-trie`** (`ByteKey`/`NonNullKey`) — radix-trie key genericity, insert takes
   `K: ByteKey`, internal comparison is `&[u8]`
 - **`ctree`** (`TreeKey`/`StoredKey`/`Preview`/`SearchStrategy`) — B+ tree node search
@@ -194,13 +196,13 @@ currently the two systems serve different purposes and don't interact.
 ## Crate layout
 
 ```
-tiny-trie-trait/    ← TinyTrieMap trait (no dependencies)
+benchable_map/      ← BenchableMap trait (no dependencies)
 tiny-trie/          ← NibbleTrie, NibTrie, BitTrie, DynTrie, FixedLenNibbleTrie
-                    ← depends on: tiny-trie-trait
-ctree/              ← CTree B+ tree, TinyArray
-                    ← depends on: tiny-trie-trait
+                    ← depends on: benchable_map
+btrees/             ← IntBTree/StrBTree B+ tree, TinyArray
+                    ← depends on: benchable_map
 poly-trie/          ← PolyTrie, Arena
-                    ← depends on: tiny-trie-trait
-tiny-trie-bench/    ← Bench harness + trie-stats binary
-                    ← depends on: tiny-trie, tiny-trie-trait, ctree, poly-trie
+                    ← depends on: benchable_map
+benches/            ← Bench harness (bin: bencher, lib: tiny_trie_bench)
+                    ← depends on: tiny-trie, benchable_map, btrees, poly-trie
 ```

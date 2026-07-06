@@ -6,7 +6,7 @@ description = "Compact arena-based radix tries (2/4/16-way) with SIMD lookup"
 license = "MIT"
 
 [dependencies]
-tiny-trie-trait = { path = "../tiny-trie-trait" }
+benchable_map = { path = "../benchable_map" }
 serde = { version = "1.0.228", features = ["derive"] }
 
 [features]

@@ -9,4 +9,4 @@ pub mod results;
 
 // Re-export types that both binaries need.
 pub use tiny_trie::NonZeroBytes;
-pub use tiny_trie_trait::TinyTrieMap;
+pub use benchable_map::BenchableMap;

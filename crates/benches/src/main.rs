@@ -16,7 +16,7 @@ use tiny_trie::NibbleTrie;
 // Usage:
 //   bench_query_methods! {
 //       field: trie,
-//       lookup: get(lookup),           // trie_get|get|get_unchecked × lookup|null|truncated|hit
+//       lookup: get(lookup),           // map_get|get|get_unchecked × lookup|null|truncated|hit
 //       fwd_iter: iter_kv,             // trie_callback|dyn_callback|iter_kv|iter_kv_no_current|none
 //       rev_iter: iter_kv,             // trie_callback|dyn_callback|iter_kv|iter_kv_no_current|none
 //       index_iter: true,              // optional, default false
@@ -95,15 +95,15 @@ macro_rules! bench_query_methods {
 
     // ── Lookup ────────────────────────────────────────────────────────
 
-    (@lookup $field:ident, $ctx:ident, trie_get, lookup) => {
+    (@lookup $field:ident, $ctx:ident, map_get, lookup) => {
         fn bench_lookup(&self, ctx: &$ctx) -> Option<()> {
-            for k in &ctx.lookup_keys { std::hint::black_box(self.$field.trie_get(k)); }
+            for k in &ctx.lookup_keys { std::hint::black_box(self.$field.map_get(k)); }
             Some(())
         }
     };
-    (@lookup $field:ident, $ctx:ident, trie_get, null) => {
+    (@lookup $field:ident, $ctx:ident, map_get, null) => {
         fn bench_lookup(&self, ctx: &$ctx) -> Option<()> {
-            for k in &ctx.lookup_keys_null { std::hint::black_box(self.$field.trie_get(k)); }
+            for k in &ctx.lookup_keys_null { std::hint::black_box(self.$field.map_get(k)); }
             Some(())
         }
     };
@@ -136,7 +136,7 @@ macro_rules! bench_query_methods {
 
     (@fwd $field:ident, trie_callback) => {
         fn bench_fwd_iter(&self) -> Option<()> {
-            self.$field.trie_iter_fwd(|k, v| { std::hint::black_box(k); std::hint::black_box(v); });
+            self.$field.map_iter_fwd(|k, v| { std::hint::black_box(k); std::hint::black_box(v); });
             Some(())
         }
     };
@@ -169,7 +169,7 @@ macro_rules! bench_query_methods {
 
     (@rev $field:ident, trie_callback) => {
         fn bench_rev_iter(&self) -> Option<()> {
-            self.$field.trie_iter_rev(|k, v| { std::hint::black_box(k); std::hint::black_box(v); });
+            self.$field.map_iter_rev(|k, v| { std::hint::black_box(k); std::hint::black_box(v); });
             Some(())
         }
     };

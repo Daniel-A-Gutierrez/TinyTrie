@@ -7,4 +7,4 @@ license = "MIT"
 
 [dependencies]
 smallvec = "1.15.2"
-tiny-trie-trait = { path = "../tiny-trie-trait" }
+benchable_map = { path = "../benchable_map" }

@@ -21,7 +21,7 @@
 use std::collections::VecDeque;
 
 use crate::arena::Arena;
-use tiny_trie_trait::TinyTrieMap;
+use benchable_map::BenchableMap;
 
 // ---------------------------------------------------------------------------
 // NodeRef — tagged reference (8 bytes, #[repr(u8)])
@@ -1406,22 +1406,22 @@ impl<'a, T> PolyIter<'a, T> {
 // Tests
 // ---------------------------------------------------------------------------
 
-impl TinyTrieMap for PolyTrie<usize> {
-    fn trie_new() -> Self { Self::new() }
-    fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
-    fn trie_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
+impl BenchableMap for PolyTrie<usize> {
+    fn map_new() -> Self { Self::new() }
+    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
+    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.next() { f(k, v); }
     }
-    fn trie_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
+    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter_last();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.prev() { f(k, v); }
     }
-    fn trie_len(&self) -> usize { self.len() }
-    fn trie_optimize(&mut self) { self.optimize(); }
+    fn map_len(&self) -> usize { self.len() }
+    fn map_optimize(&mut self) { self.optimize(); }
 }
 
 

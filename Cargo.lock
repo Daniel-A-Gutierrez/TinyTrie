@@ -57,9 +57,14 @@ name = "arrays"
 version = "0.1.0"
 
 [[package]]
+name = "benchable_map"
+version = "0.1.0"
+
+[[package]]
 name = "bencher"
 version = "0.1.0"
 dependencies = [
+ "benchable_map",
  "btrees",
  "clap",
  "poly-trie",
@@ -67,15 +72,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tiny-trie",
- "tiny-trie-trait",
 ]
 
 [[package]]
 name = "btrees"
 version = "0.1.0"
 dependencies = [
+ "benchable_map",
  "smallvec",
- "tiny-trie-trait",
 ]
 
 [[package]]
@@ -182,7 +186,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "poly-trie"
 version = "0.1.0"
 dependencies = [
- "tiny-trie-trait",
+ "benchable_map",
 ]
 
 [[package]]
@@ -317,13 +321,9 @@ dependencies = [
 name = "tiny-trie"
 version = "0.1.0"
 dependencies = [
+ "benchable_map",
  "serde",
- "tiny-trie-trait",
 ]
-
-[[package]]
-name = "tiny-trie-trait"
-version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use tiny_trie_trait::TinyTrieMap;
+use benchable_map::BenchableMap;
 
 use super::{Benchable, BenchContext, NT, read_allocated};
 
@@ -14,21 +14,21 @@ impl NibbleTrieBench {
 
 impl Benchable<Vec<u8>> for NibbleTrieBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
-        self.trie = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
+        self.trie = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
     }
 
     fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
-        let mut m = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let mut m = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
         black_box(&m);
         Some(())
     }
 
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
         let before = read_allocated();
-        let mut m = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let mut m = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
         let bytes = read_allocated() - before;
         drop(m);
         Some(bytes as f64 / keys.len() as f64)
@@ -37,7 +37,7 @@ impl Benchable<Vec<u8>> for NibbleTrieBench {
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,
-        lookup: trie_get(lookup),
+        lookup: map_get(lookup),
         fwd_iter: trie_callback,
         rev_iter: trie_callback,
         index_iter: true,
@@ -56,31 +56,31 @@ impl NibbleOptBench {
 
 impl Benchable<Vec<u8>> for NibbleOptBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
-        self.trie = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
-        self.trie.trie_optimize();
+        self.trie = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
+        self.trie.map_optimize();
     }
 
     fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
-        let mut m = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
+        let mut m = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
         black_box(&m);
         Some(())
     }
 
     fn bench_optimize(&self, keys: &[Vec<u8>]) -> Option<()> {
-        let mut m = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        m.trie_optimize();
+        let mut m = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
+        m.map_optimize();
         black_box(&m);
         Some(())
     }
 
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
         let before = read_allocated();
-        let mut m = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { m.trie_insert(k.clone(), i); }
-        m.trie_optimize();
+        let mut m = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
+        m.map_optimize();
         let bytes = read_allocated() - before;
         drop(m);
         Some(bytes as f64 / keys.len() as f64)
@@ -89,7 +89,7 @@ impl Benchable<Vec<u8>> for NibbleOptBench {
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,
-        lookup: trie_get(lookup),
+        lookup: map_get(lookup),
         fwd_iter: trie_callback,
         rev_iter: trie_callback,
         index_iter: true,
@@ -108,8 +108,8 @@ impl NibbleUncheckedBench {
 
 impl Benchable<Vec<u8>> for NibbleUncheckedBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
-        self.trie = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
+        self.trie = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
     }
 
     bench_query_methods! {
@@ -134,9 +134,9 @@ impl NibbleOptUncheckedBench {
 
 impl Benchable<Vec<u8>> for NibbleOptUncheckedBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
-        self.trie = NT::trie_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.trie_insert(k.clone(), i); }
-        self.trie.trie_optimize();
+        self.trie = NT::map_new();
+        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
+        self.trie.map_optimize();
     }
 
     bench_query_methods! {

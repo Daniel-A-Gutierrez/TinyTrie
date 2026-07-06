@@ -30,7 +30,7 @@
 //! indices. Called automatically after each insert when `values.len()` is a power
 //! of two (amortized O(1) per insert).
 
-use tiny_trie_trait::TinyTrieMap;
+use benchable_map::BenchableMap;
 use std::simd::{Simd, cmp::SimdPartialEq};
 
 // ---------------------------------------------------------------------------
@@ -1053,51 +1053,51 @@ impl<'a, T, PTR: TrieIndex> FixedLenIter<'a, T, PTR> {
 }
 
 // ---------------------------------------------------------------------------
-// TinyTrieMap implementation
+// BenchableMap implementation
 // ---------------------------------------------------------------------------
 
-impl TinyTrieMap for FixedLenNibbleTrie<usize, u32> {
-    fn trie_new() -> Self {
+impl BenchableMap for FixedLenNibbleTrie<usize, u32> {
+    fn map_new() -> Self {
         Self::new(256)
     }
 
-    fn trie_insert(&mut self, key: Vec<u8>, value: usize) {
+    fn map_insert(&mut self, key: Vec<u8>, value: usize) {
         self.insert(key, value).unwrap();
     }
 
-    fn trie_get(&self, key: &[u8]) -> Option<usize> {
+    fn map_get(&self, key: &[u8]) -> Option<usize> {
         self.get(key)
     }
 
-    fn trie_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
+    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.next() { f(k, v); }
     }
 
-    fn trie_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
+    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter_last();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.prev() { f(k, v); }
     }
 
-    fn trie_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
+    fn map_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
         let mut it = self.iter();
         if let Some(i) = it.current_index() { f(i); }
         while let Some(i) = it.next_index() { f(i); }
     }
 
-    fn trie_iter_rev_index(&self, mut f: impl FnMut(usize)) {
+    fn map_iter_rev_index(&self, mut f: impl FnMut(usize)) {
         let mut it = self.iter_last();
         if let Some(i) = it.current_index() { f(i); }
         while let Some(i) = it.prev_index() { f(i); }
     }
 
-    fn trie_len(&self) -> usize {
+    fn map_len(&self) -> usize {
         self.len()
     }
 
-    fn trie_optimize(&mut self) {
+    fn map_optimize(&mut self) {
         self.optimize();
     }
 }

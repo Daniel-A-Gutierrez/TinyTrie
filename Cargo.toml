@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/tiny-trie-trait",
+    "crates/benchable_map",
     "crates/tiny-trie",
     "crates/btrees",
     "crates/poly-trie",
@@ -11,7 +11,7 @@ resolver = "2"
 [workspace.dependencies]
 # Workspace crates — path declared once here
 tiny-trie = { path = "crates/tiny-trie" }
-tiny-trie-trait = { path = "crates/tiny-trie-trait" }
+benchable_map = { path = "crates/benchable_map" }
 btrees = { path = "crates/btrees" }
 poly-trie = { path = "crates/poly-trie" }
 bencher = { path = "crates/benches" }

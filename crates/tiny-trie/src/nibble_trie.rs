@@ -30,7 +30,7 @@
 
 use crate::ByteKey;
 use crate::tiny_array::TinyArray;
-use tiny_trie_trait::TinyTrieMap;
+use benchable_map::BenchableMap;
 use std::{fmt, marker::PhantomData, num::NonZero, simd::{Simd, cmp::SimdPartialEq}};
 
 /// One slot of the sparse `index`: the buf offset (>= 1; buf[0] is the dummy byte),
@@ -2721,63 +2721,63 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
 }
 
 // ---------------------------------------------------------------------------
-// TinyTrieMap implementations
+// BenchableMap implementations
 // ---------------------------------------------------------------------------
 
-impl TinyTrieMap for NibbleTrie<Vec<u8>, usize> {
-    fn trie_new() -> Self { Self::new() }
-    fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
-    fn trie_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
+impl BenchableMap for NibbleTrie<Vec<u8>, usize> {
+    fn map_new() -> Self { Self::new() }
+    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
+    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.next() { f(k, v); }
     }
-    fn trie_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
+    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter_last();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.prev() { f(k, v); }
     }
-    fn trie_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
+    fn map_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
         let mut it = self.iter();
         if let Some(i) = it.current_index() { f(i); }
         while let Some(i) = it.next_index() { f(i); }
     }
-    fn trie_iter_rev_index(&self, mut f: impl FnMut(usize)) {
+    fn map_iter_rev_index(&self, mut f: impl FnMut(usize)) {
         let mut it = self.iter_last();
         if let Some(i) = it.current_index() { f(i); }
         while let Some(i) = it.prev_index() { f(i); }
     }
-    fn trie_len(&self) -> usize { self.len() }
-    fn trie_optimize(&mut self) { self.optimize(); }
+    fn map_len(&self) -> usize { self.len() }
+    fn map_optimize(&mut self) { self.optimize(); }
 }
 
-impl TinyTrieMap for NibbleTrie<Vec<u8>, usize, u32, u32> {
-    fn trie_new() -> Self { Self::new() }
-    fn trie_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn trie_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
-    fn trie_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
+impl BenchableMap for NibbleTrie<Vec<u8>, usize, u32, u32> {
+    fn map_new() -> Self { Self::new() }
+    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
+    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.next() { f(k, v); }
     }
-    fn trie_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
+    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter_last();
         if let Some((k, v)) = it.current() { f(k, v); }
         while let Some((k, v)) = it.prev() { f(k, v); }
     }
-    fn trie_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
+    fn map_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
         let mut it = self.iter();
         if let Some(i) = it.current_index() { f(i); }
         while let Some(i) = it.next_index() { f(i); }
     }
-    fn trie_iter_rev_index(&self, mut f: impl FnMut(usize)) {
+    fn map_iter_rev_index(&self, mut f: impl FnMut(usize)) {
         let mut it = self.iter_last();
         if let Some(i) = it.current_index() { f(i); }
         while let Some(i) = it.prev_index() { f(i); }
     }
-    fn trie_len(&self) -> usize { self.len() }
-    fn trie_optimize(&mut self) { self.optimize(); }
+    fn map_len(&self) -> usize { self.len() }
+    fn map_optimize(&mut self) { self.optimize(); }
 }
 
 #[cfg(test)]
