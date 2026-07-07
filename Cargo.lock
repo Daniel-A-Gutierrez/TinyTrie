@@ -310,10 +310,7 @@ dependencies = [
 
 [[package]]
 name = "tiny-trie"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
+version = "0.0.1"
 
 [[package]]
 name = "unicode-ident"

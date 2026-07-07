@@ -1,16 +1,21 @@
 [package]
 name = "tiny-trie"
 authors = ["Daniel A Gutierrez"]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 description = "Arena-based radix tries (2/4/16-way)"
-license = "MIT"
-
+license = "Apache 2.0"
+repository = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+homepage = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+readme = "README.md"
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
 
 [features]
 default = []
 dyn = []
 fixed-len = []
 unchecked = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
