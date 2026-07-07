@@ -6,4 +6,3 @@ description = "Graduated radix trie with adaptive node sizes (Node2/Node4/Node16
 license = "MIT"
 
 [dependencies]
-benchable_map = { path = "../benchable_map" }

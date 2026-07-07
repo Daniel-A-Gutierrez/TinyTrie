@@ -16,5 +16,4 @@ mod poly_trie;
 
 pub use arena::Arena;
 pub use poly_trie::{NodeRef, PolyTrie};
-pub use benchable_map::BenchableMap;
 

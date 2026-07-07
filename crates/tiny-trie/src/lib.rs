@@ -28,8 +28,6 @@ pub mod fixed_len_nibble_trie;
 mod key_store;
 mod tiny_array;
 
-pub use benchable_map::BenchableMap;
-
 // The three public trees.
 pub use nibble_trie::{NibbleTrie, TrieIndex};
 pub use nib_trie::NibTrie;

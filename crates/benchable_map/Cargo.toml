@@ -1,8 +1,0 @@
-[package]
-name = "benchable_map"
-version = "0.1.0"
-edition = "2024"
-description = "Unified trait for trie data structure benchmarking"
-license = "MIT"
-
-[dependencies]

@@ -30,7 +30,6 @@
 
 use crate::ByteKey;
 use crate::tiny_array::TinyArray;
-use benchable_map::BenchableMap;
 use std::{fmt, marker::PhantomData, num::NonZero, ops::{Bound, RangeBounds}, simd::{Simd, cmp::SimdPartialEq}};
 
 /// One slot of the sparse `index`: the buf offset (>= 1; buf[0] is the dummy byte),
@@ -943,7 +942,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         None
     }
 
-    pub(crate) fn get_index(&self, key: &[u8]) -> Option<usize> {
+    pub fn get_index(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
@@ -2599,7 +2598,7 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
 /// `&'a T` returned by `current`/`next`/`prev`/`seek` outlives the cursor
 /// borrow. The key is returned as [`ByteKey::Borrowed<'a>`] (via
 /// [`ByteKey::as_borrowed`]) — a zero-allocation view into the trie's key
-/// buffer (`&'a [u8]` for `Vec<u8>`/`NonZeroBytes` keys, `&'a str` for
+/// buffer (`&'a [u8]` for `Vec<u8>` keys, `&'a str` for
 /// `String` keys). The slice is cached internally, so `current()`/`next()` pay
 /// only the `as_borrowed` view (no allocation, no re-scan).
 pub struct Cursor<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> {
@@ -3115,66 +3114,6 @@ fn ceiling_strict_index<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex>(
     } else {
         Some(p)
     }
-}
-
-// ---------------------------------------------------------------------------
-// BenchableMap implementations
-// ---------------------------------------------------------------------------
-
-impl BenchableMap for NibbleTrie<Vec<u8>, usize> {
-    fn map_new() -> Self { Self::new() }
-    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
-    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.next() { f(k, v); }
-    }
-    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter_last();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.prev() { f(k, v); }
-    }
-    fn map_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.next_index() { f(i); }
-    }
-    fn map_iter_rev_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter_last();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.prev_index() { f(i); }
-    }
-    fn map_len(&self) -> usize { self.len() }
-    fn map_optimize(&mut self) { self.optimize(); }
-}
-
-impl BenchableMap for NibbleTrie<Vec<u8>, usize, u32, u32> {
-    fn map_new() -> Self { Self::new() }
-    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
-    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.next() { f(k, v); }
-    }
-    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter_last();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.prev() { f(k, v); }
-    }
-    fn map_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.next_index() { f(i); }
-    }
-    fn map_iter_rev_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter_last();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.prev_index() { f(i); }
-    }
-    fn map_len(&self) -> usize { self.len() }
-    fn map_optimize(&mut self) { self.optimize(); }
 }
 
 #[cfg(test)]

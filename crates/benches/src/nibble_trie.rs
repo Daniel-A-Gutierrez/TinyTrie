@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use benchable_map::BenchableMap;
+use tiny_trie_bench::BenchableMap;
 
 use super::{Benchable, BenchContext, NT, read_allocated};
 

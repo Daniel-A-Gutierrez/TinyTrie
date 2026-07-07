@@ -1,5 +1,5 @@
 use clap::ValueEnum;
-pub use benchable_map::NonZeroBytes;
+pub use crate::benchable_map::NonZeroBytes;
 
 pub const SIZES: &[usize] = &[100, 10_000, 1_000_000];
 

@@ -18,7 +18,6 @@
 //!
 //! [`NibbleTrie`]: crate::NibbleTrie
 //! [`PolyTrie`]: crate::PolyTrie
-use benchable_map::NonZeroBytes;
 // ---------------------------------------------------------------------------
 // TrieKey
 // ---------------------------------------------------------------------------
@@ -206,7 +205,7 @@ pub trait ByteKey: TrieKey {
     /// Borrowed view of the key, constructible from `&[u8]` without allocation.
     ///
     /// This is the natural zero-alloc form handed back by iteration: `Vec<u8>`
-    /// → `&'a [u8]`, `String` → `&'a str`, `NonZeroBytes` → `&'a [u8]`. It
+    /// → `&'a [u8]`, `String` → `&'a str`. It
     /// satisfies [`AsRef`]`<[u8]>` so callers can recover the raw bytes when
     /// needed. The [`Borrow`] equivalence contract (Eq/Ord/Hash matching `Self`)
     /// is already guaranteed by this trait's byte-order invariant and is not
@@ -267,23 +266,6 @@ impl ByteKey for String {
     }
 }
 
-impl ByteKey for NonZeroBytes {
-    type Borrowed<'a> = &'a [u8] where Self: 'a;
-    fn bytes(&self) -> &[u8] {
-        self.as_ref()
-    }
-    /// Panics if bytes contains a 0
-    fn from_bytes(bytes: &[u8]) -> Self {
-        Self::new(bytes.to_vec()).unwrap()
-    }
-    fn as_borrowed<'a>(bytes: &'a [u8]) -> &'a [u8] {
-        // SAFETY: only called with bytes from a NonZeroBytes key (no 0x00), so
-        // the no-zero invariant is preserved by construction; the borrowed
-        // view is just the raw slice.
-        bytes
-    }
-}
-
 // ---------------------------------------------------------------------------
 // TrieKey implementations
 // ---------------------------------------------------------------------------
@@ -299,13 +281,6 @@ impl TrieKey for String {
     type Store = VecKeyStore<String>;
     fn as_bytes(&self) -> &[u8] {
         self.as_bytes()
-    }
-}
-
-impl TrieKey for NonZeroBytes {
-    type Store = VecKeyStore<NonZeroBytes>;
-    fn as_bytes(&self) -> &[u8] {
-        self.as_ref()
     }
 }
 // ---------------------------------------------------------------------------

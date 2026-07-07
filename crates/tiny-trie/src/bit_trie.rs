@@ -32,7 +32,6 @@
 //! "empty" in `children[]` slots.
 
 use crate::{KeyStore, TrieKey};
-use benchable_map::BenchableMap;
 use std::simd::{Simd, cmp::SimdPartialEq};
 
 // ---------------------------------------------------------------------------
@@ -368,7 +367,7 @@ impl<K: TrieKey, V> BitTrie<K, V> {
     // -----------------------------------------------------------------------
 
     #[inline]
-    pub(crate) fn get_index(&self, key: &[u8]) -> Option<usize> {
+    pub fn get_index(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
@@ -1427,24 +1426,6 @@ impl<'a, K: TrieKey, V> CursorMut<'a, K, V> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-impl BenchableMap for BitTrie<Vec<u8>, usize> {
-    fn map_new() -> Self { Self::new() }
-    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
-    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.next() { f(k, v); }
-    }
-    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter_last();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.prev() { f(k, v); }
-    }
-    fn map_len(&self) -> usize { self.len() }
-    // map_optimize: default no-op (BitTrie has no optimize)
-}
 
 #[cfg(test)]
 #[path = "tests/bit_trie.rs"]

@@ -21,7 +21,6 @@
 use std::collections::VecDeque;
 
 use crate::arena::Arena;
-use benchable_map::BenchableMap;
 
 // ---------------------------------------------------------------------------
 // NodeRef — tagged reference (8 bytes, #[repr(u8)])
@@ -1405,25 +1404,6 @@ impl<'a, T> PolyIter<'a, T> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-impl BenchableMap for PolyTrie<usize> {
-    fn map_new() -> Self { Self::new() }
-    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
-    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.next() { f(k, v); }
-    }
-    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter_last();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.prev() { f(k, v); }
-    }
-    fn map_len(&self) -> usize { self.len() }
-    fn map_optimize(&mut self) { self.optimize(); }
-}
-
 
 #[cfg(test)]
 #[path = "tests/poly_trie.rs"]

@@ -57,14 +57,9 @@ name = "arrays"
 version = "0.1.0"
 
 [[package]]
-name = "benchable_map"
-version = "0.1.0"
-
-[[package]]
 name = "bencher"
 version = "0.1.0"
 dependencies = [
- "benchable_map",
  "btrees",
  "clap",
  "poly-trie",
@@ -78,7 +73,6 @@ dependencies = [
 name = "btrees"
 version = "0.1.0"
 dependencies = [
- "benchable_map",
  "smallvec",
 ]
 
@@ -185,9 +179,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "poly-trie"
 version = "0.1.0"
-dependencies = [
- "benchable_map",
-]
 
 [[package]]
 name = "ppv-lite86"
@@ -321,7 +312,6 @@ dependencies = [
 name = "tiny-trie"
 version = "0.1.0"
 dependencies = [
- "benchable_map",
  "serde",
 ]
 

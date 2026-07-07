@@ -34,7 +34,6 @@
 //!
 //! Total nib count for a key of length L is `L * 4`.
 
-use benchable_map::BenchableMap;
 use crate::nibble_trie::TrieIndex;
 use std::{fmt, simd::{Simd, cmp::SimdPartialEq}};
 
@@ -465,7 +464,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
     // Lookup
     // -----------------------------------------------------------------------
 
-    pub(crate) fn get_index(&self, key: &[u8]) -> Option<usize> {
+    pub fn get_index(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
@@ -1662,66 +1661,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// BenchableMap implementations
-// ---------------------------------------------------------------------------
-
-impl BenchableMap for NibTrie<usize> {
-    fn map_new() -> Self { Self::new() }
-    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
-    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.next() { f(k, v); }
-    }
-    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter_last();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.prev() { f(k, v); }
-    }
-    fn map_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.next_index() { f(i); }
-    }
-    fn map_iter_rev_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter_last();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.prev_index() { f(i); }
-    }
-    fn map_len(&self) -> usize { self.len() }
-    fn map_optimize(&mut self) { self.optimize(); }
-}
-
-impl BenchableMap for NibTrie<usize, u32, u32> {
-    fn map_new() -> Self { Self::new() }
-    fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
-    fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.next() { f(k, v); }
-    }
-    fn map_iter_rev(&self, mut f: impl FnMut(&[u8], &usize)) {
-        let mut it = self.iter_last();
-        if let Some((k, v)) = it.current() { f(k, v); }
-        while let Some((k, v)) = it.prev() { f(k, v); }
-    }
-    fn map_iter_fwd_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.next_index() { f(i); }
-    }
-    fn map_iter_rev_index(&self, mut f: impl FnMut(usize)) {
-        let mut it = self.iter_last();
-        if let Some(i) = it.current_index() { f(i); }
-        while let Some(i) = it.prev_index() { f(i); }
-    }
-    fn map_len(&self) -> usize { self.len() }
-    fn map_optimize(&mut self) { self.optimize(); }
 }
 
 #[cfg(test)]
