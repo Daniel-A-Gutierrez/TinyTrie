@@ -15,9 +15,8 @@ fn node_size_compact() {
 #[test]
 fn insert_empty_and_get() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
-    assert_eq!(trie.get(b"hello"), Some(idx));
-    assert_eq!(trie.get_value(b"hello"), Some(&42));
+    trie.insert(b"hello".to_vec(), 42).unwrap();
+    assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.get(b"world"), None);
 }
 
@@ -33,80 +32,80 @@ fn insert_duplicate_returns_error() {
 #[test]
 fn insert_null_byte_allowed() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let idx = trie.insert(b"hel\0lo".to_vec(), 1).unwrap();
-    assert_eq!(trie.get(b"hel\0lo"), Some(idx));
+    trie.insert(b"hel\0lo".to_vec(), 1).unwrap();
+    assert_eq!(trie.get(b"hel\0lo"), Some(&1));
 }
 
 #[test]
 fn insert_two_keys_split_leaf() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abd"), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"abd".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abd"), Some(&2));
     assert_eq!(trie.len(), 2);
 }
 
 #[test]
 fn insert_prefix_key() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abcd".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abcd"), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"abcd".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abcd"), Some(&2));
 }
 
 #[test]
 fn insert_reverse_prefix_key() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let i1 = trie.insert(b"abcd".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abc".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abcd"), Some(i1));
-    assert_eq!(trie.get(b"abc"), Some(i2));
+    trie.insert(b"abcd".to_vec(), 1).unwrap();
+    trie.insert(b"abc".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abcd"), Some(&1));
+    assert_eq!(trie.get(b"abc"), Some(&2));
 }
 
 #[test]
 fn insert_no_common_prefix() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"xyz".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"xyz"), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"xyz".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"xyz"), Some(&2));
 }
 
 #[test]
 fn insert_three_keys() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
-    let i3 = trie.insert(b"abx".to_vec(), 3).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abd"), Some(i2));
-    assert_eq!(trie.get(b"abx"), Some(i3));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"abd".to_vec(), 2).unwrap();
+    trie.insert(b"abx".to_vec(), 3).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abd"), Some(&2));
+    assert_eq!(trie.get(b"abx"), Some(&3));
     assert_eq!(trie.len(), 3);
 }
 
 #[test]
 fn insert_empty_key() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let idx = trie.insert(b"".to_vec(), 42).unwrap();
-    assert_eq!(trie.get(b""), Some(idx));
+    trie.insert(b"".to_vec(), 42).unwrap();
+    assert_eq!(trie.get(b""), Some(&42));
     assert_eq!(trie.get(b"a"), None);
 }
 
 #[test]
 fn insert_single_byte_keys() {
     let mut trie: NibTrie<i32> = NibTrie::new();
-    let i0 = trie.insert(b"\x00".to_vec(), 0).unwrap();
-    let i1 = trie.insert(b"\x01".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"\x02".to_vec(), 2).unwrap();
-    let i3 = trie.insert(b"\x03".to_vec(), 3).unwrap();
-    let i4 = trie.insert(b"\x04".to_vec(), 4).unwrap();
-    assert_eq!(trie.get(b"\x00"), Some(i0));
-    assert_eq!(trie.get(b"\x01"), Some(i1));
-    assert_eq!(trie.get(b"\x02"), Some(i2));
-    assert_eq!(trie.get(b"\x03"), Some(i3));
-    assert_eq!(trie.get(b"\x04"), Some(i4));
+    trie.insert(b"\x00".to_vec(), 0).unwrap();
+    trie.insert(b"\x01".to_vec(), 1).unwrap();
+    trie.insert(b"\x02".to_vec(), 2).unwrap();
+    trie.insert(b"\x03".to_vec(), 3).unwrap();
+    trie.insert(b"\x04".to_vec(), 4).unwrap();
+    assert_eq!(trie.get(b"\x00"), Some(&0));
+    assert_eq!(trie.get(b"\x01"), Some(&1));
+    assert_eq!(trie.get(b"\x02"), Some(&2));
+    assert_eq!(trie.get(b"\x03"), Some(&3));
+    assert_eq!(trie.get(b"\x04"), Some(&4));
     assert_eq!(trie.len(), 5);
 }
 
@@ -114,16 +113,14 @@ fn insert_single_byte_keys() {
 fn insert_many_sequential() {
     let mut trie: NibTrie<i32> = NibTrie::new();
     let n = 1000;
-    let mut indices = Vec::new();
     for i in 0..n {
         let key = format!("key_{:04}", i).into_bytes();
-        let idx = trie.insert(key, i).unwrap();
-        indices.push(idx);
+        trie.insert(key, i).unwrap();
     }
     assert_eq!(trie.len(), n as usize);
     for i in 0..n {
         let key = format!("key_{:04}", i).into_bytes();
-        assert_eq!(trie.get(&key), Some(indices[i as usize]));
+        assert_eq!(trie.get(&key), Some(&i));
     }
     assert_eq!(trie.get(b"key_9999"), None);
 }
@@ -176,16 +173,15 @@ fn iteration_backward() {
 fn optimize_preserves_keys() {
     let mut trie: NibTrie<i32> = NibTrie::new();
     let n = 100;
-    let mut indices = Vec::new();
     for i in 0..n {
         let key = format!("key_{:04}", i).into_bytes();
-        indices.push(trie.insert(key, i).unwrap());
+        trie.insert(key, i).unwrap();
     }
     trie.optimize();
     assert_eq!(trie.len(), n as usize);
     for i in 0..n {
         let key = format!("key_{:04}", i).into_bytes();
-        assert_eq!(trie.get(&key), Some(indices[i as usize]));
+        assert_eq!(trie.get(&key), Some(&i));
     }
 }
 

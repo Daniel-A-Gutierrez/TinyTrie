@@ -55,13 +55,23 @@ impl<T> DynTrie<T> {
         }
     }
 
-    /// Look up a key. Returns the key index if found.
-    pub fn get(&self, key: &[u8]) -> Option<usize> {
+    /// Look up a key. Returns the value if found.
+    pub fn get(&self, key: &[u8]) -> Option<&T> {
         match &self.inner {
             DynInner::U8(t) => t.get(key),
             DynInner::U16(t) => t.get(key),
             DynInner::U32(t) => t.get(key),
             DynInner::U64(t) => t.get(key),
+        }
+    }
+
+    /// Look up a key's value for mutation. Returns the value if found.
+    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut T> {
+        match &mut self.inner {
+            DynInner::U8(t) => t.get_mut(key),
+            DynInner::U16(t) => t.get_mut(key),
+            DynInner::U32(t) => t.get_mut(key),
+            DynInner::U64(t) => t.get_mut(key),
         }
     }
 

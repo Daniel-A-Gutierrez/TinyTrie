@@ -49,17 +49,17 @@ use std::{fmt, simd::{Simd, cmp::SimdPartialEq}};
 ///
 /// Layout with PTR=u32, LEN=u16: 24 bytes (4×u32 + u32 + u16 + 3×u8 + padding).
 #[derive(Copy, Clone)]
-pub struct NibNode<PTR: TrieIndex = u32, LEN: TrieIndex = u16> {
-    pub children: [PTR; 4],     // one per 2-bit value; PTR::MAX = empty
-    pub leaf: PTR,              // key index for prefix comparison
-    pub prefix_len: LEN,        // prefix length in nibs (2-bit positions)
-    pub leaf_mask: u8,          // bit N = children[N] is leaf key index
-    pub occupancy: u8,          // bit N = slot N is occupied
-    pub terminal: u8,           // bit 0 = this node is terminal
+pub(crate) struct NibNode<PTR: TrieIndex = u32, LEN: TrieIndex = u16> {
+    pub(crate) children: [PTR; 4],     // one per 2-bit value; PTR::MAX = empty
+    pub(crate) leaf: PTR,              // key index for prefix comparison
+    pub(crate) prefix_len: LEN,        // prefix length in nibs (2-bit positions)
+    pub(crate) leaf_mask: u8,          // bit N = children[N] is leaf key index
+    pub(crate) occupancy: u8,          // bit N = slot N is occupied
+    pub(crate) terminal: u8,           // bit 0 = this node is terminal
 }
 
 impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         NibNode {
             children: [PTR::max_value_sentinel(); 4],
             leaf: PTR::max_value_sentinel(),
@@ -72,7 +72,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
 
     /// Check if this node is terminal (represents a key that ends here).
     #[inline]
-    pub fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(&self) -> bool {
         self.terminal != 0
     }
 
@@ -88,7 +88,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
 
     /// Check if nib slot `nib` is a leaf (key index).
     #[inline]
-    pub fn is_leaf(&self, nib: usize) -> bool {
+    pub(crate) fn is_leaf(&self, nib: usize) -> bool {
         debug_assert!(nib < 4);
         (self.leaf_mask >> nib) & 1 == 1
     }
@@ -109,7 +109,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
 
     /// Check if nib slot `nib` is occupied.
     #[inline]
-    pub fn is_occupied(&self, nib: usize) -> bool {
+    pub(crate) fn is_occupied(&self, nib: usize) -> bool {
         debug_assert!(nib < 4);
         (self.occupancy >> nib) & 1 == 1
     }
@@ -154,13 +154,14 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
     }
 
     /// Compute a 4-bit mask where bit N is set if `children[N]` is not the sentinel.
+    #[allow(dead_code)]
     #[inline]
-    pub fn children_mask(&self) -> u8 {
+    pub(crate) fn children_mask(&self) -> u8 {
         self.occupancy
     }
 
     /// Promote this node's PTR type to a wider one.
-    pub fn promote<NewPTR: TrieIndex>(self) -> NibNode<NewPTR, LEN> {
+    pub(crate) fn promote<NewPTR: TrieIndex>(self) -> NibNode<NewPTR, LEN> {
         let mut children = [NewPTR::max_value_sentinel(); 4];
         for i in 0..4 {
             if self.occupancy & (1 << i) != 0 {
@@ -183,7 +184,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
 
     /// Demote this node's PTR type to a narrower one.
     /// Returns `Err(self)` if any address doesn't fit.
-    pub fn demote<NewPTR: TrieIndex>(self) -> Result<NibNode<NewPTR, LEN>, Self> {
+    pub(crate) fn demote<NewPTR: TrieIndex>(self) -> Result<NibNode<NewPTR, LEN>, Self> {
         for i in 0..4 {
             if self.occupancy & (1 << i) != 0 {
                 if self.children[i].as_usize() > NewPTR::max_value() {
@@ -241,10 +242,10 @@ impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for NibNode<PTR, LEN> {
 
 #[derive(Clone)]
 pub struct NibTrie<T, PTR: TrieIndex = u32, LEN: TrieIndex = u16> {
-    pub arena: Vec<NibNode<PTR, LEN>>,
-    pub buf: Vec<u8>,                // all keys concatenated (no null terminators)
-    pub index: Vec<(usize, LEN)>,   // (offset into buf, len) per key — offset is usize, len is compact
-    pub values: Vec<T>,              // values[i] ↔ index[i]
+    pub(crate) arena: Vec<NibNode<PTR, LEN>>,
+    pub(crate) buf: Vec<u8>,                // all keys concatenated (no null terminators)
+    pub(crate) index: Vec<(usize, LEN)>,   // (offset into buf, len) per key — offset is usize, len is compact
+    pub(crate) values: Vec<T>,              // values[i] ↔ index[i]
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +465,7 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
     // Lookup
     // -----------------------------------------------------------------------
 
-    pub fn get(&self, key: &[u8]) -> Option<usize> {
+    pub(crate) fn get_index(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
@@ -511,7 +512,8 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
     ///
     /// # Safety
     /// The key **must** have been inserted into this trie.
-    pub unsafe fn get_unchecked(&self, key: &[u8]) -> Option<usize> {
+    #[cfg(feature = "unchecked")]
+    unsafe fn get_index_unchecked(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
@@ -536,20 +538,46 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         }
     }
 
-    pub fn get_value(&self, key: &[u8]) -> Option<&T> {
-        self.get(key).map(|idx| &self.values[idx - 1])
+    pub fn get(&self, key: &[u8]) -> Option<&T> {
+        self.get_index(key).map(|idx| &self.values[idx - 1])
+    }
+
+    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut T> {
+        self.get_index(key).map(|idx| &mut self.values[idx - 1])
+    }
+
+    /// Unchecked value lookup — assumes the key is present in the trie.
+    ///
+    /// # Safety
+    /// The key **must** have been inserted into this trie.
+    #[cfg(feature = "unchecked")]
+    pub unsafe fn get_unchecked(&self, key: &[u8]) -> Option<&T> {
+        unsafe { self.get_index_unchecked(key).map(|idx| &self.values[idx - 1]) }
     }
 
     // -----------------------------------------------------------------------
     // Iteration
     // -----------------------------------------------------------------------
 
-    pub fn iter(&self) -> NibIter<'_, T, PTR, LEN> {
-        NibIter::new(self)
+    pub fn iter(&self) -> Cursor<'_, T, PTR, LEN> {
+        Cursor::new(self)
     }
 
-    pub fn iter_last(&self) -> NibIter<'_, T, PTR, LEN> {
-        NibIter::new_last(self)
+    pub fn iter_last(&self) -> Cursor<'_, T, PTR, LEN> {
+        Cursor::new_last(self)
+    }
+
+    /// Public forward mutable cursor: a lending tree-walk that hands out `&mut T`
+    /// borrows tied to the cursor (see [`CursorMut`]). Parked *before* the first
+    /// key — call `next()`/`first()` to position.
+    pub fn iter_mut(&mut self) -> CursorMut<'_, T, PTR, LEN> {
+        CursorMut::new(self)
+    }
+
+    /// Public reverse mutable cursor: a lending tree-walk parked *on* the last
+    /// key (see [`CursorMut`]).
+    pub fn iter_mut_last(&mut self) -> CursorMut<'_, T, PTR, LEN> {
+        CursorMut::new_last(self)
     }
 
     pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
@@ -993,25 +1021,25 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
 /// Sentinel nib value meaning "positioned at the terminal value of this node."
 const TERMINAL_NIB: usize = 4;
 
-pub struct NibIter<'a, T, PTR: TrieIndex, LEN: TrieIndex> {
+pub struct Cursor<'a, T, PTR: TrieIndex, LEN: TrieIndex> {
     trie: &'a NibTrie<T, PTR, LEN>,
     /// Stack of (node_index, occupancy_mask, nib_position) tuples.
     stack: Vec<(usize, u8, usize)>,
 }
 
-impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibIter<'a, T, PTR, LEN> {
+impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
     fn new(trie: &'a NibTrie<T, PTR, LEN>) -> Self {
         if trie.arena.is_empty() {
-            return NibIter { trie, stack: Vec::new() };
+            return Cursor { trie, stack: Vec::new() };
         }
         let mask = trie.arena[0].occupancy;
         let nib = if trie.arena[0].is_terminal() { TERMINAL_NIB } else { usize::MAX };
-        NibIter { trie, stack: vec![(0, mask, nib)] }
+        Cursor { trie, stack: vec![(0, mask, nib)] }
     }
 
     fn new_last(trie: &'a NibTrie<T, PTR, LEN>) -> Self {
         if trie.arena.is_empty() {
-            return NibIter { trie, stack: Vec::new() };
+            return Cursor { trie, stack: Vec::new() };
         }
         let mut stack = Vec::new();
         let mut node_idx: usize = 0;
@@ -1033,7 +1061,7 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibIter<'a, T, PTR, LEN> {
                 break;
             }
         }
-        NibIter { trie, stack }
+        Cursor { trie, stack }
     }
 
     fn descend_first(&mut self, mut node_idx: usize) {
@@ -1285,13 +1313,365 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> NibIter<'a, T, PTR, LEN> {
 }
 
 // ---------------------------------------------------------------------------
+// CursorMut — lending tree-walk iterator handing out &mut T
+// ---------------------------------------------------------------------------
+
+/// Mutable counterpart to [`Cursor`]: a tree-walk iterator that lends out
+/// `&mut T` borrows over the stored values, in sorted (DFS) key order.
+///
+/// Unlike [`Cursor`], the value reference is tied to `&mut self` (a *lending*
+/// cursor), not to the trie lifetime `'a`. This is a soundness requirement, not
+/// a stylistic choice: a cursor is re-positionable — `current()`, `seek()`,
+/// `first()`, `last()` can all revisit a slot already visited. An `'a`-tied
+/// `&mut T` (as the immutable cursor hands out `&'a T`) would let two such
+/// calls return `&mut T` to the *same* element simultaneously — aliasing
+/// undefined behavior. Tying the borrow to `&mut self` makes the borrow checker
+/// enforce "one live `&mut T` at a time," which is the only sound rule for a
+/// re-positionable mutable cursor. The practical consequence: you cannot
+/// collect the `&mut T` into a `Vec` or hold two at once; each must be released
+/// before the next `next()`/`prev()`/`current()`/`seek()` call. In-place
+/// mutation loops (`while let Some((k, v)) = c.next() { *v += 1; }`) work as
+/// expected.
+///
+/// The key is returned as `&[u8]` borrowing the trie's key buffer (zero
+/// allocation, matching the immutable cursor's borrowed key). Both the key and
+/// the `&mut T` are tied to `&mut self`. Only the stored *value* is mutated;
+/// the cursor never alters key bytes, node structure, or slot occupancy, so
+/// trie invariants are preserved.
+pub struct CursorMut<'a, T, PTR: TrieIndex, LEN: TrieIndex> {
+    trie: &'a mut NibTrie<T, PTR, LEN>,
+    /// Stack of (node_index, occupancy_mask, nib_position) tuples — same shape
+    /// as [`Cursor::stack`].
+    stack: Vec<(usize, u8, usize)>,
+}
+
+impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
+    /// Forward mutable cursor parked *before* the first key.
+    pub fn new(trie: &'a mut NibTrie<T, PTR, LEN>) -> Self {
+        if trie.arena.is_empty() {
+            return CursorMut { trie, stack: Vec::new() };
+        }
+        let mask = trie.arena[0].occupancy;
+        let nib = if trie.arena[0].is_terminal() { TERMINAL_NIB } else { usize::MAX };
+        CursorMut { trie, stack: vec![(0, mask, nib)] }
+    }
+
+    /// Reverse mutable cursor parked *on* the last key (or empty if the trie is
+    /// empty).
+    pub fn new_last(trie: &'a mut NibTrie<T, PTR, LEN>) -> Self {
+        let mut c = CursorMut { trie, stack: Vec::new() };
+        c.last();
+        c
+    }
+
+    fn descend_first(&mut self, mut node_idx: usize) {
+        loop {
+            let node = &self.trie.arena[node_idx];
+            if node.is_terminal() {
+                let mask = node.occupancy;
+                self.stack.push((node_idx, mask, TERMINAL_NIB));
+                return;
+            }
+            let mask = node.occupancy;
+            debug_assert!(mask != 0, "descend_first: non-terminal node with no children");
+            let nib = mask.trailing_zeros() as usize;
+            debug_assert!(nib < 4);
+            self.stack.push((node_idx, mask, nib));
+            if node.is_leaf(nib) {
+                return;
+            } else {
+                node_idx = node.children[nib].as_usize();
+            }
+        }
+    }
+
+    fn descend_last(&mut self, mut node_idx: usize) {
+        loop {
+            let node = &self.trie.arena[node_idx];
+            if node.is_terminal() && node.occupancy == 0 {
+                self.stack.push((node_idx, node.occupancy, TERMINAL_NIB));
+                return;
+            }
+            let mask = node.occupancy;
+            if mask == 0 {
+                if node.is_terminal() {
+                    self.stack.push((node_idx, mask, TERMINAL_NIB));
+                }
+                return;
+            }
+            let nib = (mask as u32).ilog2() as usize;
+            debug_assert!(nib < 4);
+            self.stack.push((node_idx, mask, nib));
+            if node.is_leaf(nib) {
+                return;
+            } else {
+                node_idx = node.children[nib].as_usize();
+            }
+        }
+    }
+
+    #[inline]
+    fn push_next_child(&mut self, node_idx: usize, mask: u8, start_nib: usize) -> bool {
+        let shifted = if start_nib >= 4 { 0u8 } else { mask >> start_nib };
+        if shifted == 0 {
+            return false;
+        }
+        let nib = start_nib + shifted.trailing_zeros() as usize;
+        debug_assert!(nib < 4);
+        debug_assert!(mask & (1 << nib) != 0);
+        self.stack.push((node_idx, mask, nib));
+        if !self.trie.arena[node_idx].is_leaf(nib) {
+            let addr = self.trie.arena[node_idx].children[nib].as_usize();
+            self.descend_first(addr);
+        }
+        true
+    }
+
+    #[inline]
+    fn backtrack_to_next(&mut self) -> Option<(&[u8], &mut T)> {
+        loop {
+            let (parent_idx, parent_mask, child_nib) = self.stack.pop()?;
+            if self.push_next_child(parent_idx, parent_mask, child_nib + 1) {
+                return self.current();
+            }
+        }
+    }
+
+    /// The key/value the cursor is parked on, or `None` if not parked (before
+    /// first, or exhausted). The key borrows the trie's key buffer and the
+    /// `&mut T` reborrows the stored value — both tied to `&mut self`.
+    ///
+    /// Three sequential, non-overlapping borrows: (1) shared peek of `stack` /
+    /// `arena` to recover the key index (copied out as `usize`), (2) shared
+    /// read of `index`/`buf` for the key slice, (3) mutable borrow of `values`
+    /// for `&mut T`. `buf` and `values` are disjoint fields, so the shared key
+    /// borrow and the mutable value borrow coexist.
+    #[inline]
+    pub fn current(&mut self) -> Option<(&[u8], &mut T)> {
+        let (node_idx, _, nib) = *self.stack.last()?;
+        if nib == usize::MAX {
+            return None;
+        }
+        let ki: PTR = if nib == TERMINAL_NIB {
+            self.trie.arena[node_idx].leaf
+        } else {
+            self.trie.arena[node_idx].leaf_key_index(nib)?
+        };
+        let (off, len) = self.trie.index[ki.as_usize()];
+        let key = &self.trie.buf[off..off + len.as_usize()];
+        let value = &mut self.trie.values[ki.as_usize() - 1];
+        Some((key, value))
+    }
+
+    /// The key index the cursor is parked on, or `None` if not parked.
+    #[inline]
+    pub fn current_index(&self) -> Option<usize> {
+        let &(_, _, nib) = self.stack.last()?;
+        if nib == usize::MAX {
+            return None;
+        }
+        let (node_idx, _, _) = *self.stack.last()?;
+        let node = &self.trie.arena[node_idx];
+        if nib == TERMINAL_NIB {
+            Some(node.leaf.as_usize())
+        } else {
+            node.leaf_key_index(nib).map(|ki| ki.as_usize())
+        }
+    }
+
+    #[inline]
+    fn advance_next(&mut self) -> bool {
+        loop {
+            let (node_idx, mask, nib) = match self.stack.pop() {
+                Some(v) => v,
+                None => return false,
+            };
+
+            if nib == TERMINAL_NIB {
+                if self.push_next_child(node_idx, mask, 0) {
+                    return true;
+                }
+                continue;
+            }
+
+            let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
+            if self.push_next_child(node_idx, mask, search_start) {
+                return true;
+            }
+        }
+    }
+
+    #[inline]
+    fn advance_prev(&mut self) -> bool {
+        loop {
+            let (node_idx, mask, nib) = match self.stack.pop() {
+                Some(v) => v,
+                None => return false,
+            };
+
+            if nib == TERMINAL_NIB {
+                continue;
+            }
+
+            if nib == 0 || nib == usize::MAX {
+                let node = &self.trie.arena[node_idx];
+                if node.is_terminal() {
+                    self.stack.push((node_idx, mask, TERMINAL_NIB));
+                    return true;
+                }
+                continue;
+            }
+
+            let mask_below = mask & ((1 << nib) - 1);
+            if mask_below != 0 {
+                let prev_nib = (mask_below as u32).ilog2() as usize;
+                self.stack.push((node_idx, mask, prev_nib));
+                if !self.trie.arena[node_idx].is_leaf(prev_nib) {
+                    let addr = self.trie.arena[node_idx].children[prev_nib].as_usize();
+                    self.descend_last(addr);
+                }
+                return true;
+            }
+
+            let node = &self.trie.arena[node_idx];
+            if node.is_terminal() {
+                self.stack.push((node_idx, mask, TERMINAL_NIB));
+                return true;
+            }
+        }
+    }
+
+    /// Jump to the first key (smallest in sorted order). Returns its key/value,
+    /// or `None` if the trie is empty.
+    pub fn first(&mut self) -> Option<(&[u8], &mut T)> {
+        if self.trie.arena.is_empty() {
+            self.stack.clear();
+            return None;
+        }
+        let mask = self.trie.arena[0].occupancy;
+        let nib = if self.trie.arena[0].is_terminal() { TERMINAL_NIB } else { usize::MAX };
+        self.stack.clear();
+        self.stack.push((0, mask, nib));
+        if nib == TERMINAL_NIB {
+            // Parked on the root's terminal value — `current` returns it.
+            return self.current();
+        }
+        // Before-first sentinel — advance to the first key.
+        if self.advance_next() { self.current() } else { None }
+    }
+
+    /// Jump to the last key (largest in sorted order). Returns its key/value,
+    /// or `None` if the trie is empty.
+    pub fn last(&mut self) -> Option<(&[u8], &mut T)> {
+        if self.trie.arena.is_empty() {
+            self.stack.clear();
+            return None;
+        }
+        self.stack.clear();
+        let mut node_idx: usize = 0;
+        loop {
+            let node = &self.trie.arena[node_idx];
+            let mask = node.occupancy;
+            if mask != 0 {
+                let nib = (mask as u32).ilog2() as usize;
+                self.stack.push((node_idx, mask, nib));
+                if node.is_leaf(nib) {
+                    break;
+                } else {
+                    node_idx = node.children[nib].as_usize();
+                }
+            } else if node.is_terminal() {
+                self.stack.push((node_idx, mask, TERMINAL_NIB));
+                break;
+            } else {
+                break;
+            }
+        }
+        self.current()
+    }
+
+    #[inline]
+    pub fn next(&mut self) -> Option<(&[u8], &mut T)> {
+        if self.advance_next() { self.current() } else { None }
+    }
+
+    #[inline]
+    pub fn prev(&mut self) -> Option<(&[u8], &mut T)> {
+        if self.advance_prev() { self.current() } else { None }
+    }
+
+    #[inline]
+    pub fn next_index(&mut self) -> Option<usize> {
+        if self.advance_next() { self.current_index() } else { None }
+    }
+
+    #[inline]
+    pub fn prev_index(&mut self) -> Option<usize> {
+        if self.advance_prev() { self.current_index() } else { None }
+    }
+
+    pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &mut T)> {
+        if self.trie.arena.is_empty() {
+            self.stack.clear();
+            return None;
+        }
+
+        self.stack.clear();
+        let mut node_idx: usize = 0;
+        let max_nib = key.len() * 4;
+
+        loop {
+            let node = &self.trie.arena[node_idx];
+            let mask = node.occupancy;
+
+            if node.is_terminal() && node.prefix_len.as_usize() >= max_nib {
+                let ki = node.leaf;
+                let (off, len) = self.trie.index[ki.as_usize()];
+                let node_key = &self.trie.buf[off..off + len.as_usize()];
+                if node_key >= key {
+                    self.stack.push((node_idx, mask, TERMINAL_NIB));
+                    return self.current();
+                }
+            }
+
+            if node.prefix_len.as_usize() >= max_nib {
+                if self.push_next_child(node_idx, mask, 0) {
+                    return self.current();
+                }
+                return self.backtrack_to_next();
+            }
+
+            let nib = key_nib_at(key, node.prefix_len.as_usize()) as usize;
+            if !node.is_occupied(nib) {
+                if self.push_next_child(node_idx, mask, nib + 1) {
+                    return self.current();
+                }
+                return self.backtrack_to_next();
+            }
+
+            self.stack.push((node_idx, mask, nib));
+            let slot = node.children[nib];
+            if node.is_leaf(nib) {
+                let leaf_key = self.trie.key_slice(slot);
+                if leaf_key >= key {
+                    return self.current();
+                }
+                return self.next();
+            } else {
+                node_idx = slot.as_usize();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BenchableMap implementations
 // ---------------------------------------------------------------------------
 
 impl BenchableMap for NibTrie<usize> {
     fn map_new() -> Self { Self::new() }
     fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
     fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter();
         if let Some((k, v)) = it.current() { f(k, v); }
@@ -1319,7 +1699,7 @@ impl BenchableMap for NibTrie<usize> {
 impl BenchableMap for NibTrie<usize, u32, u32> {
     fn map_new() -> Self { Self::new() }
     fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
     fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter();
         if let Some((k, v)) = it.current() { f(k, v); }

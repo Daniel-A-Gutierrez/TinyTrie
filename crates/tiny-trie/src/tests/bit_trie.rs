@@ -8,9 +8,8 @@ fn node_size() {
 #[test]
 fn insert_empty_and_get() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
-    assert_eq!(trie.get(b"hello"), Some(idx));
-    assert_eq!(trie.get_value(b"hello"), Some(&42));
+    trie.insert(b"hello".to_vec(), 42).unwrap();
+    assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.get(b"world"), None);
 }
 
@@ -26,86 +25,85 @@ fn insert_duplicate_returns_error() {
 #[test]
 fn insert_null_byte_allowed() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let idx = trie.insert(b"hel\0lo".to_vec(), 1).unwrap();
-    assert_eq!(trie.get(b"hel\0lo"), Some(idx));
+    trie.insert(b"hel\0lo".to_vec(), 1).unwrap();
+    assert_eq!(trie.get(b"hel\0lo"), Some(&1));
 }
 
 #[test]
 fn insert_two_keys_split_leaf() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abd"), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"abd".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abd"), Some(&2));
     assert_eq!(trie.len(), 2);
 }
 
 #[test]
 fn insert_prefix_key() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abcd".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abcd"), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"abcd".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abcd"), Some(&2));
 }
 
 #[test]
 fn insert_reverse_prefix_key() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let i1 = trie.insert(b"abcd".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abc".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abcd"), Some(i1));
-    assert_eq!(trie.get(b"abc"), Some(i2));
+    trie.insert(b"abcd".to_vec(), 1).unwrap();
+    trie.insert(b"abc".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abcd"), Some(&1));
+    assert_eq!(trie.get(b"abc"), Some(&2));
 }
 
 #[test]
 fn insert_empty_key() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let i1 = trie.insert(b"".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abc".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b""), Some(i1));
-    assert_eq!(trie.get(b"abc"), Some(i2));
+    trie.insert(b"".to_vec(), 1).unwrap();
+    trie.insert(b"abc".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b""), Some(&1));
+    assert_eq!(trie.get(b"abc"), Some(&2));
 }
 
 #[test]
 fn insert_empty_key_after() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b""), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b""), Some(&2));
 }
 
 #[test]
 fn insert_no_common_prefix() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"xyz".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"xyz"), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"xyz".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"xyz"), Some(&2));
 }
 
 #[test]
 fn insert_three_keys() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abd".to_vec(), 2).unwrap();
-    let i3 = trie.insert(b"abe".to_vec(), 3).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abd"), Some(i2));
-    assert_eq!(trie.get(b"abe"), Some(i3));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"abd".to_vec(), 2).unwrap();
+    trie.insert(b"abe".to_vec(), 3).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abd"), Some(&2));
+    assert_eq!(trie.get(b"abe"), Some(&3));
 }
 
 #[test]
 fn insert_single_char_keys() {
     let mut trie: BitTrie<Vec<u8>, i32> = BitTrie::new();
-    let mut indices = Vec::new();
     for c in b'a'..=b'f' {
-        let idx = trie.insert(vec![c], c as i32).unwrap();
-        indices.push(idx);
+        trie.insert(vec![c], c as i32).unwrap();
     }
-    for (i, c) in (b'a'..=b'f').enumerate() {
-        assert_eq!(trie.get(&[c]), Some(indices[i]));
+    for c in b'a'..=b'f' {
+        let v = c as i32;
+        assert_eq!(trie.get(&[c]), Some(&v));
     }
 }
 
@@ -129,8 +127,8 @@ fn insert_deeply_nested() {
     let mut key = Vec::new();
     for i in 0..100 {
         key.push(b'a');
-        let idx = trie.insert(key.clone(), i).unwrap();
-        assert_eq!(trie.get(&key), Some(idx));
+        trie.insert(key.clone(), i).unwrap();
+        assert_eq!(trie.get(&key), Some(&i));
     }
 }
 
@@ -274,11 +272,11 @@ fn iter_seek_prefix_key() {
 }
 
 #[test]
-fn get_value_found_and_missing() {
+fn get_found_and_missing() {
     let mut trie: BitTrie<Vec<u8>, String> = BitTrie::new();
     trie.insert(b"hello".to_vec(), "world".to_string()).unwrap();
-    assert_eq!(trie.get_value(b"hello"), Some(&"world".to_string()));
-    assert_eq!(trie.get_value(b"world"), None);
+    assert_eq!(trie.get(b"hello"), Some(&"world".to_string()));
+    assert_eq!(trie.get(b"world"), None);
 }
 
 #[test]
@@ -308,21 +306,20 @@ fn iter_backward_large() {
 #[test]
 fn string_key_insert_and_get() {
     let mut trie: BitTrie<String, i32> = BitTrie::new();
-    let i1 = trie.insert("hello".to_string(), 1).unwrap();
-    let i2 = trie.insert("world".to_string(), 2).unwrap();
-    assert_eq!(trie.get(b"hello"), Some(i1));
-    assert_eq!(trie.get(b"world"), Some(i2));
-    assert_eq!(trie.get_value(b"hello"), Some(&1));
+    trie.insert("hello".to_string(), 1).unwrap();
+    trie.insert("world".to_string(), 2).unwrap();
+    assert_eq!(trie.get(b"hello"), Some(&1));
+    assert_eq!(trie.get(b"world"), Some(&2));
     assert_eq!(trie.get(b"xyz"), None);
 }
 
 #[test]
 fn string_key_prefix() {
     let mut trie: BitTrie<String, i32> = BitTrie::new();
-    let i1 = trie.insert("abc".to_string(), 1).unwrap();
-    let i2 = trie.insert("abcd".to_string(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abcd"), Some(i2));
+    trie.insert("abc".to_string(), 1).unwrap();
+    trie.insert("abcd".to_string(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abcd"), Some(&2));
 }
 
 #[test]

@@ -97,6 +97,11 @@ impl Benchable<Vec<u8>> for NibbleOptBench {
 }
 
 // ── NibbleUnchecked ──────────────────────────────────────────────────
+//
+// Benchmarks the `get_unchecked` escape hatch (a hit-only, unchecked lookup).
+// `get_unchecked` is gated behind tiny-trie's `unchecked` cargo feature so it
+// is absent from the published default API; the benches crate enables that
+// feature.
 
 pub(crate) struct NibbleUncheckedBench {
     trie: NT,

@@ -1,8 +1,9 @@
 [package]
 name = "tiny-trie"
+authors = ["Daniel A Gutierrez"]
 version = "0.1.0"
 edition = "2024"
-description = "Compact arena-based radix tries (2/4/16-way) with SIMD lookup"
+description = "Arena-based radix tries (2/4/16-way)"
 license = "MIT"
 
 [dependencies]
@@ -10,3 +11,7 @@ benchable_map = { path = "../benchable_map" }
 serde = { version = "1.0.228", features = ["derive"] }
 
 [features]
+default = []
+dyn = []
+fixed-len = []
+unchecked = []

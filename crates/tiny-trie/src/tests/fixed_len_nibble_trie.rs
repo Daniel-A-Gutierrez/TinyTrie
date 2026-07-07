@@ -34,8 +34,7 @@ fn insert_empty_key() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     let idx = trie.insert(vec![], 42).unwrap();
     assert_eq!(idx, 0);
-    assert_eq!(trie.get(b""), Some(0));
-    assert_eq!(trie.get_value(b""), Some(&42));
+    assert_eq!(trie.get(b""), Some(&42));
 }
 
 #[test]
@@ -43,8 +42,7 @@ fn insert_single_key() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     let idx = trie.insert(b"hello".to_vec(), 1).unwrap();
     assert_eq!(idx, 0);
-    assert_eq!(trie.get(b"hello"), Some(0));
-    assert_eq!(trie.get_value(b"hello"), Some(&1));
+    assert_eq!(trie.get(b"hello"), Some(&1));
 }
 
 #[test]
@@ -52,8 +50,8 @@ fn insert_two_keys() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(0));
-    assert_eq!(trie.get(b"abd"), Some(1));
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abd"), Some(&2));
     assert_eq!(trie.get(b"ab"), None);
     assert_eq!(trie.get(b"abcd"), None);
 }
@@ -71,8 +69,8 @@ fn insert_no_common_prefix() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"xyz".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(0));
-    assert_eq!(trie.get(b"xyz"), Some(1));
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"xyz"), Some(&2));
 }
 
 #[test]
@@ -80,8 +78,8 @@ fn insert_prefix_key() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abcd".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(0));
-    assert_eq!(trie.get(b"abcd"), Some(1));
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abcd"), Some(&2));
 }
 
 #[test]
@@ -89,8 +87,8 @@ fn insert_reverse_prefix_key() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     trie.insert(b"abcd".to_vec(), 1).unwrap();
     trie.insert(b"abc".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abcd"), Some(0));
-    assert_eq!(trie.get(b"abc"), Some(1));
+    assert_eq!(trie.get(b"abcd"), Some(&1));
+    assert_eq!(trie.get(b"abc"), Some(&2));
 }
 
 #[test]
@@ -99,9 +97,9 @@ fn insert_three_keys() {
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(0));
-    assert_eq!(trie.get(b"abd"), Some(1));
-    assert_eq!(trie.get(b"abe"), Some(2));
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abd"), Some(&2));
+    assert_eq!(trie.get(b"abe"), Some(&3));
 }
 
 #[test]
@@ -114,7 +112,7 @@ fn insert_many_keys_same_prefix() {
     assert_eq!(trie.len(), 50);
     for i in 0..50 {
         let key = format!("prefix_{:02}", i);
-        assert_eq!(trie.get(&key.into_bytes()), Some(i));
+        assert_eq!(trie.get(&key.into_bytes()), Some(&i));
     }
 }
 
@@ -127,15 +125,15 @@ fn key_with_embedded_null() {
     // Keys with embedded null bytes (not trailing) should work
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     trie.insert(b"a\x00b".to_vec(), 1).unwrap();
-    assert_eq!(trie.get(b"a\x00b"), Some(0));
+    assert_eq!(trie.get(b"a\x00b"), Some(&1));
 }
 
 #[test]
 fn key_max_length() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(8);
     let key = vec![b'x'; 8];
-    let idx = trie.insert(key.clone(), 1).unwrap();
-    assert_eq!(trie.get(&key), Some(idx));
+    trie.insert(key.clone(), 1).unwrap();
+    assert_eq!(trie.get(&key), Some(&1));
 }
 
 #[test]
@@ -153,7 +151,7 @@ fn trailing_zero_key_preserved() {
     // "a\0" has length 2, so get(b"a") should NOT match (different length)
     assert_eq!(trie.get(b"a"), None);
     // get(b"a\0") should match
-    assert_eq!(trie.get(b"a\x00"), Some(0));
+    assert_eq!(trie.get(b"a\x00"), Some(&1));
 }
 
 #[test]
@@ -182,7 +180,8 @@ fn compact_u16_ptr() {
     assert_eq!(trie.len(), 100);
     for i in 0..100u8 {
         let key = format!("key_{:03}", i);
-        assert_eq!(trie.get(&key.into_bytes()), Some(i as usize));
+        let v = i as usize;
+        assert_eq!(trie.get(&key.into_bytes()), Some(&v));
     }
 }
 
@@ -298,7 +297,7 @@ fn optimize_preserves_lookups() {
     }
     trie.optimize();
     for (i, k) in keys.iter().enumerate() {
-        assert_eq!(trie.get(k), Some(i), "key {:?} not found after optimize", String::from_utf8_lossy(k));
+        assert_eq!(trie.get(k), Some(&i), "key {:?} not found after optimize", String::from_utf8_lossy(k));
     }
 }
 
@@ -377,7 +376,7 @@ fn auto_optimize_at_power_of_two() {
     // Should still find all keys
     for i in 0..8 {
         let key = format!("key_{:02}", i);
-        assert_eq!(trie.get(&key.into_bytes()), Some(i));
+        assert_eq!(trie.get(&key.into_bytes()), Some(&i));
     }
 }
 
@@ -404,8 +403,8 @@ fn empty_key_as_terminal() {
     let mut trie: FLN<usize> = FixedLenNibbleTrie::new(16);
     trie.insert(vec![], 99).unwrap();
     trie.insert(b"abc".to_vec(), 1).unwrap();
-    assert_eq!(trie.get(b""), Some(0));
-    assert_eq!(trie.get(b"abc"), Some(1));
+    assert_eq!(trie.get(b""), Some(&99));
+    assert_eq!(trie.get(b"abc"), Some(&1));
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +422,7 @@ fn many_keys() {
     assert_eq!(trie.len(), n);
     for i in 0..n {
         let key = format!("key_{:06}", i);
-        assert_eq!(trie.get(&key.into_bytes()), Some(i), "missing key {}", i);
+        assert_eq!(trie.get(&key.into_bytes()), Some(&i), "missing key {}", i);
     }
     // Test iteration count
     let mut count = 0;

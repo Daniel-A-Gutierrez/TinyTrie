@@ -3,8 +3,8 @@ use super::*;
 #[test]
 fn dyn_new_insert_get() {
     let mut trie: DynTrie<i32> = DynTrie::new();
-    let idx = trie.insert(b"hello".to_vec(), 42).unwrap();
-    assert_eq!(trie.get(b"hello"), Some(idx));
+    trie.insert(b"hello".to_vec(), 42).unwrap();
+    assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.get(b"world"), None);
 }
 
@@ -138,8 +138,8 @@ fn dyn_duplicate_key_returns_error() {
 #[test]
 fn dyn_prefix_keys() {
     let mut trie: DynTrie<i32> = DynTrie::new();
-    let i1 = trie.insert(b"abc".to_vec(), 1).unwrap();
-    let i2 = trie.insert(b"abcd".to_vec(), 2).unwrap();
-    assert_eq!(trie.get(b"abc"), Some(i1));
-    assert_eq!(trie.get(b"abcd"), Some(i2));
+    trie.insert(b"abc".to_vec(), 1).unwrap();
+    trie.insert(b"abcd".to_vec(), 2).unwrap();
+    assert_eq!(trie.get(b"abc"), Some(&1));
+    assert_eq!(trie.get(b"abcd"), Some(&2));
 }

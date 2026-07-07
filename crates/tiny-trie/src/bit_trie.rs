@@ -64,6 +64,7 @@ const TERMINAL_POS: u8 = 2;
 ///   The node's own prefix length comes from its parent.
 /// - `leaf`: bit 31 = is_terminal (this node represents a key that ends here);
 ///   bits 0-30 = key index for the reference/terminal key.
+#[derive(Clone, Copy)]
 struct Node {
     children: [u32; 2],
     prefix_lens: [u16; 2],
@@ -192,6 +193,7 @@ impl std::fmt::Debug for Node {
 // BitTrie
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct BitTrie<K: TrieKey, V> {
     arena: Vec<Node>,
     keys: K::Store,
@@ -366,7 +368,7 @@ impl<K: TrieKey, V> BitTrie<K, V> {
     // -----------------------------------------------------------------------
 
     #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<usize> {
+    pub(crate) fn get_index(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
@@ -413,8 +415,12 @@ impl<K: TrieKey, V> BitTrie<K, V> {
         }
     }
 
-    pub fn get_value(&self, key: &[u8]) -> Option<&V> {
-        self.get(key).map(|idx| &self.values[idx - 1])
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
+        self.get_index(key).map(|idx| &self.values[idx - 1])
+    }
+
+    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut V> {
+        self.get_index(key).map(|idx| &mut self.values[idx - 1])
     }
 
     // -----------------------------------------------------------------------
@@ -599,12 +605,25 @@ impl<K: TrieKey, V> BitTrie<K, V> {
     // Iteration
     // -----------------------------------------------------------------------
 
-    pub fn iter(&self) -> BitIter<'_, K, V> {
-        BitIter::new(self)
+    pub fn iter(&self) -> Cursor<'_, K, V> {
+        Cursor::new(self)
     }
 
-    pub fn iter_last(&self) -> BitIter<'_, K, V> {
-        BitIter::new_last(self)
+    pub fn iter_last(&self) -> Cursor<'_, K, V> {
+        Cursor::new_last(self)
+    }
+
+    /// Public forward mutable cursor: a lending tree-walk that hands out `&mut V`
+    /// borrows tied to the cursor (see [`CursorMut`]). Parked *before* the first
+    /// key — call `next()`/`first()` to position.
+    pub fn iter_mut(&mut self) -> CursorMut<'_, K, V> {
+        CursorMut::new(self)
+    }
+
+    /// Public reverse mutable cursor: a lending tree-walk parked *on* the last
+    /// key (see [`CursorMut`]).
+    pub fn iter_mut_last(&mut self) -> CursorMut<'_, K, V> {
+        CursorMut::new_last(self)
     }
 
     pub fn into_keys_values(self) -> (Vec<K>, Vec<V>) {
@@ -623,7 +642,7 @@ impl<K: TrieKey, V> Default for BitTrie<K, V> {
 // Iterator
 // ---------------------------------------------------------------------------
 
-pub struct BitIter<'a, K: TrieKey, V> {
+pub struct Cursor<'a, K: TrieKey, V> {
     trie: &'a BitTrie<K, V>,
     /// Stack of (arena_index, which_child) pairs.
     ///
@@ -633,19 +652,19 @@ pub struct BitIter<'a, K: TrieKey, V> {
     stack: Vec<(u32, u8)>,
 }
 
-impl<'a, K: TrieKey, V> BitIter<'a, K, V> {
+impl<'a, K: TrieKey, V> Cursor<'a, K, V> {
     fn new(trie: &'a BitTrie<K, V>) -> Self {
         if trie.arena.is_empty() {
-            return BitIter { trie, stack: Vec::new() };
+            return Cursor { trie, stack: Vec::new() };
         }
-        BitIter { trie, stack: vec![(0, u8::MAX)] }
+        Cursor { trie, stack: vec![(0, u8::MAX)] }
     }
 
     fn new_last(trie: &'a BitTrie<K, V>) -> Self {
         if trie.arena.is_empty() {
-            return BitIter { trie, stack: Vec::new() };
+            return Cursor { trie, stack: Vec::new() };
         }
-        let mut iter = BitIter { trie, stack: Vec::new() };
+        let mut iter = Cursor { trie, stack: Vec::new() };
         iter.descend_last(0);
         iter
     }
@@ -1009,13 +1028,410 @@ impl<'a, K: TrieKey, V> BitIter<'a, K, V> {
 }
 
 // ---------------------------------------------------------------------------
+// CursorMut — lending tree-walk iterator handing out &mut V
+// ---------------------------------------------------------------------------
+
+/// Mutable counterpart to [`Cursor`]: a tree-walk iterator that lends out
+/// `&mut V` borrows over the stored values, in sorted (DFS) key order.
+///
+/// Unlike [`Cursor`], the value reference is tied to `&mut self` (a *lending*
+/// cursor), not to the trie lifetime `'a`. This is a soundness requirement, not
+/// a stylistic choice: a cursor is re-positionable — `current()`, `seek()`,
+/// `first()`, `last()` can all revisit a slot already visited. An `'a`-tied
+/// `&mut V` (as the immutable cursor hands out `&'a V`) would let two such
+/// calls return `&mut V` to the *same* element simultaneously — aliasing
+/// undefined behavior. Tying the borrow to `&mut self` makes the borrow checker
+/// enforce "one live `&mut V` at a time," which is the only sound rule for a
+/// re-positionable mutable cursor. The practical consequence: you cannot
+/// collect the `&mut V` into a `Vec` or hold two at once; each must be released
+/// before the next `next()`/`prev()`/`current()`/`seek()` call. In-place
+/// mutation loops (`while let Some((k, v)) = c.next() { *v += 1; }`) work as
+/// expected.
+///
+/// The key is returned as `&[u8]` borrowing the trie's key store (zero
+/// allocation, matching the immutable cursor's borrowed key). Both the key and
+/// the `&mut V` are tied to `&mut self`. Only the stored *value* is mutated;
+/// the cursor never alters key bytes, node structure, or slot occupancy, so
+/// trie invariants are preserved.
+pub struct CursorMut<'a, K: TrieKey, V> {
+    trie: &'a mut BitTrie<K, V>,
+    /// Stack of (arena_index, which_child) pairs — same shape as
+    /// [`Cursor::stack`].
+    stack: Vec<(u32, u8)>,
+}
+
+impl<'a, K: TrieKey, V> CursorMut<'a, K, V> {
+    /// Forward mutable cursor parked *before* the first key.
+    pub fn new(trie: &'a mut BitTrie<K, V>) -> Self {
+        if trie.arena.is_empty() {
+            return CursorMut { trie, stack: Vec::new() };
+        }
+        CursorMut { trie, stack: vec![(0, u8::MAX)] }
+    }
+
+    /// Reverse mutable cursor parked *on* the last key (or empty if the trie is
+    /// empty).
+    pub fn new_last(trie: &'a mut BitTrie<K, V>) -> Self {
+        let mut c = CursorMut { trie, stack: Vec::new() };
+        c.last();
+        c
+    }
+
+    fn descend_first(&mut self, mut idx: u32) {
+        loop {
+            let node = &self.trie.arena[idx as usize];
+            if node.is_terminal() {
+                self.stack.push((idx, TERMINAL_POS));
+                return;
+            }
+            if !node.is_empty(0) {
+                self.stack.push((idx, 0));
+                if node.is_leaf(0) {
+                    return;
+                } else {
+                    idx = node.child_index(0);
+                    continue;
+                }
+            }
+            if !node.is_empty(1) {
+                self.stack.push((idx, 1));
+                if node.is_leaf(1) {
+                    return;
+                } else {
+                    idx = node.child_index(1);
+                    continue;
+                }
+            }
+            return;
+        }
+    }
+
+    fn descend_last(&mut self, mut idx: u32) {
+        loop {
+            let node = &self.trie.arena[idx as usize];
+            if !node.is_empty(1) {
+                self.stack.push((idx, 1));
+                if node.is_leaf(1) {
+                    return;
+                } else {
+                    idx = node.child_index(1);
+                    continue;
+                }
+            }
+            if !node.is_empty(0) {
+                self.stack.push((idx, 0));
+                if node.is_leaf(0) {
+                    return;
+                } else {
+                    idx = node.child_index(0);
+                    continue;
+                }
+            }
+            if node.is_terminal() {
+                self.stack.push((idx, TERMINAL_POS));
+            }
+            return;
+        }
+    }
+
+    /// The key/value the cursor is parked on, or `None` if not parked (before
+    /// first, or exhausted). The key borrows the trie's key store and the
+    /// `&mut V` reborrows the stored value — both tied to `&mut self`.
+    ///
+    /// `keys` and `values` are disjoint fields of the trie, so the shared key
+    /// borrow (via `key_bytes`) and the mutable value borrow coexist without
+    /// aliasing.
+    #[inline]
+    pub fn current(&mut self) -> Option<(&[u8], &mut V)> {
+        let ki = self.current_index()?;
+        let key = self.trie.keys.key_bytes(ki as u32);
+        let value = &mut self.trie.values[ki - 1];
+        Some((key, value))
+    }
+
+    /// The key index the cursor is parked on, or `None` if not parked.
+    #[inline]
+    pub fn current_index(&self) -> Option<usize> {
+        let &(arena_idx, which) = self.stack.last()?;
+        if which == u8::MAX {
+            return None;
+        }
+        let node = &self.trie.arena[arena_idx as usize];
+        if which == TERMINAL_POS {
+            Some(node.leaf_key_index_val() as usize)
+        } else {
+            node.leaf_key_index(which as usize).map(|ki| ki as usize)
+        }
+    }
+
+    #[inline]
+    fn advance_next(&mut self) -> bool {
+        loop {
+            let (arena_idx, which) = match self.stack.pop() {
+                Some(v) => v,
+                None => return false,
+            };
+
+            if which == TERMINAL_POS {
+                let node = &self.trie.arena[arena_idx as usize];
+                if !node.is_empty(0) {
+                    self.stack.push((arena_idx, 0));
+                    if node.is_leaf(0) {
+                        return true;
+                    } else {
+                        self.descend_first(node.child_index(0));
+                        return true;
+                    }
+                }
+                if !node.is_empty(1) {
+                    self.stack.push((arena_idx, 1));
+                    if node.is_leaf(1) {
+                        return true;
+                    } else {
+                        self.descend_first(node.child_index(1));
+                        return true;
+                    }
+                }
+                continue;
+            }
+
+            if which == u8::MAX {
+                let node = &self.trie.arena[arena_idx as usize];
+                if node.is_terminal() {
+                    self.stack.push((arena_idx, TERMINAL_POS));
+                    return true;
+                }
+                for bit in 0..2u8 {
+                    if !node.is_empty(bit as usize) {
+                        self.stack.push((arena_idx, bit));
+                        if node.is_leaf(bit as usize) {
+                            return true;
+                        } else {
+                            self.descend_first(node.child_index(bit as usize));
+                            return true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let search_bit = which as usize + 1;
+            if search_bit < 2 {
+                let node = &self.trie.arena[arena_idx as usize];
+                if !node.is_empty(search_bit) {
+                    self.stack.push((arena_idx, search_bit as u8));
+                    if node.is_leaf(search_bit) {
+                        return true;
+                    } else {
+                        self.descend_first(node.child_index(search_bit));
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn advance_prev(&mut self) -> bool {
+        loop {
+            let (arena_idx, which) = match self.stack.pop() {
+                Some(v) => v,
+                None => return false,
+            };
+
+            if which == TERMINAL_POS {
+                continue;
+            }
+
+            if which == u8::MAX {
+                continue;
+            }
+
+            let bit = which as usize;
+
+            if bit > 0 {
+                let prev_bit = bit - 1;
+                let node = &self.trie.arena[arena_idx as usize];
+                if !node.is_empty(prev_bit) {
+                    self.stack.push((arena_idx, prev_bit as u8));
+                    if node.is_leaf(prev_bit) {
+                        return true;
+                    } else {
+                        self.descend_last(node.child_index(prev_bit));
+                        return true;
+                    }
+                }
+            }
+
+            if bit == 0 {
+                let node = &self.trie.arena[arena_idx as usize];
+                if node.is_terminal() {
+                    self.stack.push((arena_idx, TERMINAL_POS));
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Jump to the first key (smallest in sorted order). Returns its key/value,
+    /// or `None` if the trie is empty.
+    pub fn first(&mut self) -> Option<(&[u8], &mut V)> {
+        if self.trie.arena.is_empty() {
+            self.stack.clear();
+            return None;
+        }
+        self.stack.clear();
+        self.stack.push((0, u8::MAX));
+        if self.advance_next() { self.current() } else { None }
+    }
+
+    /// Jump to the last key (largest in sorted order). Returns its key/value,
+    /// or `None` if the trie is empty.
+    pub fn last(&mut self) -> Option<(&[u8], &mut V)> {
+        if self.trie.arena.is_empty() {
+            self.stack.clear();
+            return None;
+        }
+        self.stack.clear();
+        self.descend_last(0);
+        self.current()
+    }
+
+    #[inline]
+    pub fn next(&mut self) -> Option<(&[u8], &mut V)> {
+        if self.advance_next() { self.current() } else { None }
+    }
+
+    #[inline]
+    pub fn prev(&mut self) -> Option<(&[u8], &mut V)> {
+        if self.advance_prev() { self.current() } else { None }
+    }
+
+    #[inline]
+    pub fn next_index(&mut self) -> Option<usize> {
+        if self.advance_next() { self.current_index() } else { None }
+    }
+
+    #[inline]
+    pub fn prev_index(&mut self) -> Option<usize> {
+        if self.advance_prev() { self.current_index() } else { None }
+    }
+
+    pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &mut V)> {
+        if self.trie.arena.is_empty() {
+            self.stack.clear();
+            return None;
+        }
+
+        self.stack.clear();
+        let mut node_idx: u32 = 0;
+        let mut prefix_len = self.trie.root_prefix_len as usize;
+        let max_bits = key.len() * 8;
+
+        loop {
+            let node = &self.trie.arena[node_idx as usize];
+
+            if prefix_len >= max_bits {
+                if node.is_terminal() {
+                    self.stack.push((node_idx, TERMINAL_POS));
+                    return self.current();
+                }
+                for bit in 0..2u8 {
+                    if !node.is_empty(bit as usize) {
+                        self.stack.push((node_idx, bit));
+                        if node.is_leaf(bit as usize) {
+                            return self.current();
+                        } else {
+                            self.descend_first(node.child_index(bit as usize));
+                            return self.current();
+                        }
+                    }
+                }
+                return self.next();
+            }
+
+            let bit = key_bit_at(key, prefix_len) as usize;
+            let child = node.children[bit];
+
+            if child != 0 {
+                self.stack.push((node_idx, bit as u8));
+                if child & LEAF_BIT != 0 {
+                    let ki = child & !LEAF_BIT;
+                    let leaf_key = self.trie.keys.key_bytes(ki);
+                    if leaf_key >= key {
+                        return self.current();
+                    }
+                    return self.next();
+                } else {
+                    prefix_len = node.prefix_lens[bit] as usize;
+                    node_idx = child;
+                    continue;
+                }
+            }
+
+            let other_bit = 1 - bit;
+            let other_child = node.children[other_bit];
+            if other_child != 0 && other_bit > bit {
+                self.stack.push((node_idx, other_bit as u8));
+                if other_child & LEAF_BIT != 0 {
+                    return self.current();
+                } else {
+                    self.descend_first(other_child);
+                    return self.current();
+                }
+            }
+
+            if node.is_terminal() && bit == 0 {
+                let ki = node.leaf_key_index_val();
+                let term_key = self.trie.keys.key_bytes(ki);
+                if term_key >= key {
+                    self.stack.push((node_idx, TERMINAL_POS));
+                    return self.current();
+                }
+            }
+
+            loop {
+                let (parent_idx, parent_bit) = self.stack.pop()?;
+                if parent_bit == TERMINAL_POS || parent_bit == u8::MAX {
+                    let parent = &self.trie.arena[parent_idx as usize];
+                    for next_bit in 0..2u8 {
+                        if !parent.is_empty(next_bit as usize) {
+                            self.stack.push((parent_idx, next_bit));
+                            if parent.is_leaf(next_bit as usize) {
+                                return self.current();
+                            } else {
+                                self.descend_first(parent.child_index(next_bit as usize));
+                                return self.current();
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if parent_bit == 0 {
+                    let parent = &self.trie.arena[parent_idx as usize];
+                    if !parent.is_empty(1) {
+                        self.stack.push((parent_idx, 1));
+                        if parent.is_leaf(1) {
+                            return self.current();
+                        } else {
+                            self.descend_first(parent.child_index(1));
+                            return self.current();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 impl BenchableMap for BitTrie<Vec<u8>, usize> {
     fn map_new() -> Self { Self::new() }
     fn map_insert(&mut self, key: Vec<u8>, value: usize) { self.insert(key, value).unwrap(); }
-    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get(key) }
+    fn map_get(&self, key: &[u8]) -> Option<usize> { self.get_index(key) }
     fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {
         let mut it = self.iter();
         if let Some((k, v)) = it.current() { f(k, v); }

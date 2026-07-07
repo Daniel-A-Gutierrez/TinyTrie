@@ -148,8 +148,6 @@ where
 // ── Contestant aliases ─────────────────────────────────────────────────
 
 pub(crate) type IntBTreeBench = IntBTreeBenchGen<u64, usize, u32, 8, 9, false>;
-/// `IntBTreeBench` + `optimize` after build (arena contiguity for iteration).
-pub(crate) type IntBTreeOptBench = IntBTreeBenchGen<u64, usize, u32, 4, 5, true>;
 
 // ── StrBTree contestant ──────────────────────────────────────────────────
 //

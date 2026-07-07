@@ -333,7 +333,7 @@ impl<T, PTR: TrieIndex> FixedLenNibbleTrie<T, PTR> {
     // Lookup
     // -------------------------------------------------------------------
 
-    pub fn get(&self, key: &[u8]) -> Option<usize> {
+    pub(crate) fn get_index(&self, key: &[u8]) -> Option<usize> {
         if key.len() > self.max_len || self.arena.is_empty() {
             return None;
         }
@@ -372,7 +372,8 @@ impl<T, PTR: TrieIndex> FixedLenNibbleTrie<T, PTR> {
     ///
     /// The key **must** have been inserted into this trie. If the key is not
     /// present, the result is unspecified.
-    pub unsafe fn get_unchecked(&self, key: &[u8]) -> Option<usize> {
+    #[cfg(feature = "unchecked")]
+    unsafe fn get_index_unchecked(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
         }
@@ -397,8 +398,23 @@ impl<T, PTR: TrieIndex> FixedLenNibbleTrie<T, PTR> {
         }
     }
 
-    pub fn get_value(&self, key: &[u8]) -> Option<&T> {
-        self.get(key).map(|ki| &self.values[ki])
+    pub fn get(&self, key: &[u8]) -> Option<&T> {
+        self.get_index(key).map(|ki| &self.values[ki])
+    }
+
+    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut T> {
+        self.get_index(key).map(|ki| &mut self.values[ki])
+    }
+
+    /// Unchecked value lookup — assumes the key is present in the trie.
+    ///
+    /// # Safety
+    ///
+    /// The key **must** have been inserted into this trie. If the key is not
+    /// present, the result is unspecified.
+    #[cfg(feature = "unchecked")]
+    pub unsafe fn get_unchecked(&self, key: &[u8]) -> Option<&T> {
+        unsafe { self.get_index_unchecked(key).map(|ki| &self.values[ki]) }
     }
 
     // -------------------------------------------------------------------
@@ -1066,7 +1082,7 @@ impl BenchableMap for FixedLenNibbleTrie<usize, u32> {
     }
 
     fn map_get(&self, key: &[u8]) -> Option<usize> {
-        self.get(key)
+        self.get_index(key)
     }
 
     fn map_iter_fwd(&self, mut f: impl FnMut(&[u8], &usize)) {

@@ -1,4 +1,3 @@
-#![feature(generic_const_exprs)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -260,7 +259,7 @@ use std_contestants::{
     BTreeMapBench, BTreeMapBenchU64, HashMapBench, HashMapBenchU64,
     SortedVecBench, SortedVecBenchU64,
 };
-use btree::{IntBTreeBench, IntBTreeOptBench, StrBTreeBench};
+use btree::{IntBTreeBench, StrBTreeBench};
 
 // ── Type aliases ─────────────────────────────────────────────────────
 
