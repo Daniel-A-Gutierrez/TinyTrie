@@ -1,0 +1,19 @@
+[package]
+name = "doa"
+authors = ["Daniel A Gutierrez"]
+version = "0.0.1"
+edition = "2024"
+description = "Dense ordered arenas. Under construction."
+license = "Apache-2.0"
+repository = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+homepage = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+readme = "README.md"
+[dependencies]
+itertools = "0.15.0"
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

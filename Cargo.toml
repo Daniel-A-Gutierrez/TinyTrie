@@ -3,7 +3,7 @@ members = [
     "crates/tiny-trie",
     "crates/btrees",
     "crates/poly-trie",
-    "crates/benches", "crates/arrays",
+    "crates/benches", "crates/arrays", "crates/doa",
 ]
 resolver = "2"
 
