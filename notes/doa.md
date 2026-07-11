@@ -1,5 +1,168 @@
 # Structure
 The most recent top level entries are towards the top.
+# Interfaces
+
+as for the block primitives
+try_insert_before(idx)
+try_insert_after(idx)
+split_end(&mut arena, block_id, range, split_strategy) -> (block_id)
+split_mid(&mut arena, block_id, range, split_strategy) -> ([block_id;3])
+shift(change to addr_shift)
+spread() //moves every item to phys<<1, doubles v_offset. 
+remove(idx)
+get(virtual)
+
+//not sold on these 4, but something like it. 
+range(pos, amt, dir) -> iter //over a rage of addresses. not reversible. 
+range_mut(pos, amt, dir)
+cursor() //freely positionable 
+cursor_mut() //supports try_insert_before and try_insert_afer 
+iter() //never yields an element twice. 
+iter_mut()
+
+Use through arena.blocks[i] exposes the raw interface, 
+arena itself holds the methods for automatic handling, and stores a queue of the last say, 16 insert hints given. 
+
+Arena meanwhile has 
+insert_before(block_id, block_idx, val)
+insert_after(block_id, block_idx, val)
+remove(block_id, block_idx) 
+get(block_id,block_idx)
+iter() //supports fwd, rev
+cursor() //supports seek, advance, etc.
+range() //same as for block
+
+Summary of nontrivial insert cases
+- block is full
+    - auto : split depending on strategy
+    - manual : reject inserts
+- out of addresses 
+    - cause is append/prepend heavy work in random block, or prepend in append, append in prepend
+    - for manual, either split the block or readdress. 
+- block not found in budget
+    - theres a dense region, caused by strategy misalignment
+    - auto : resolves based on strategy by splitting/growing/spreading
+Optimization Misses : 
+- sequential block has floaters at the hot end prevent an easy append/prepend on the block
+    - auto fix : shove items off into another block 
+- sequential inserts in the middle of any type of block except pluripotent
+    - auto fix : carefully split a pluripotent block out of the middle
+
+Things that can go wrong : 
+- couldnt find a space nearby (within budget)
+    - auto : strategy dependent, assuming were not out of address space...
+        - append : depending on location
+            - beginning (Front) : not possible, would just be a push_front if we're not out of addresses. 
+            - middle : split_mid at position, would help to know if the last few inserts were sequential or random.
+                - if sequential : pluripotent block only gets a few addresses around the last insertion site. 
+                - if random : pluripotent block gets half a halfptr::max addresses centered on the middle of the last insertions. 
+            - end : not possible, would be a push_back if we're not out of addrsses.
+        - prepend : mirror append
+        - random : 
+            - beginning or end : split off pluripotent block from last several elements. 
+            - middle : 
+                - occupancy high => 
+                    - if cap < max grow & spread
+                    - else split in 2
+                - occupancy < 75% => look at prior inserts for pattern
+                    - sequential : split off pluripotent with a few elements near last insertion
+                    - random : bad luck, 
+                        - if cap < max : grow & spread
+                        - else : split off a random block from the dense region, spread it. 
+        
+        - pluripotent : budget is the entire block so it cant fail. 
+            - limited address space and max size to halfptr::max
+            - math guarantees we can do halfptr::max appends/prepends before we hit len=halfptr::max
+            - middle inserts push elements off the end to other blocks, but appending and prepending are always legal.
+            - budget has to be the whole thing so that prepends/appends at any spot can clear out floaters. 
+            - we have to trigger growth on len > 3/4 cap.
+                - if cap >= halfptr it grows and changes strategy
+                - else grow & spread & shift down 1
+            - initialized with at most 1/4 halfptr::max() elements (64 for u16). 
+    - out of address space 
+        - append : (hint location)
+            - beginning : split off a pluripotent node from the frontmost say, 64 elements. 
+            - middle (has to be near end to trigger address space) : split off pluripotent node from hint
+            - end : split off empty pluripotent node from end
+        - prepend (mirror append) 
+        - rand : look at occupancy
+            - high : split in 2
+            - <75% : same as above case i guess , look at prior inserts for a pattern, (sorted or rev_sorted), 
+                - if there isnt one just split off a pluripotent node near hint, give it like 128 elements.
+                - if there is one try splitting off a pluripotent node with a few elements near the hint location. 
+    
+
+One alternative method for remedying 'slot not found , low density'  : density inversion, or hole punching
+density inversion : 
+    cant be done in place. 
+    if src[0].is_some{dst.push[src[0]]}
+    for i in 0..src.len-1
+        if src[i+1].is_some() {dst.push(src[i])}
+        if src[i].is_some() { dst.push(None) } //kinda like a spread, but sparse regions get dense.
+        //growth = len - occupancy, so new len is 2*len - occupancy instead of 2 * len for spread. 
+hole punch : 
+//take everything up to or after idx, move it left/right by amt, leave None's where it was. 
+//more of a tool for the manual block managers.
+
+
+# An idea about nibble tries integration
+1. itd be better to call structures that make a single block a subtree , a forest. 
+2. if we preorder the nodes, 'leftmost child' descent just becomes a linear walk while prefix_len is decreasing. 
+3. in a forest, inodes could store u8s and leaves could be flattened and store (block_id), pointing at 0.
+4. whether a inode ptr is a pointer to a leaf or not can be indicated based on the relative positions. 
+    If the nodes are preordered its impossible for them to point backwards, so ptr <= current implies leaf ptr. 
+    Still need to store 'terminal'. If we're avoiding the 'leaf' ptr per node, (really stingy ngl) we could try enforcing leaf=current for terminal inodes. 
+    Nah that all doesnt get us enough space, except the terminal one. A single 2 tier tree with 17 nodes could fill up a 256 slot leaf node array. 
+    If they cohabitate with the inodes we get the same enum problem we have right now, but it saves a read/hop. 
+    we could store 4 leaves in an fnode plus parent pointers, for 20 bytes and a branch per hop. That probably fits in an inode. 
+
+## DOA Block_Idx type needs sign
+I think i need to actually go back to signed. Otherwise when we prepend and hand back the new virtual address... whats it supposed to be? 
+Even if i increase v_offset, 0 was already given out, we're not repointing it, the new one has to be -1. 
+So we use signed ints , just not with wrapping. 
+
+## NonGrowing Blocks
+start at max size, no v_offset map or addr_shift on lookup, we just track those on insert to decide where to put the new item. 
+better lookup performance, more aggressive memory utilization, blocks can still learn they just never resize/spread. 
+repoints are still done on splits, iteration performance will be horrible for low fill random blocks. 
+i could call this 'SOA' instead of 'DOA' lol.
+
+## Find Slot
+address limit is the hard wall, capacity limit is a 'push_back/push_front'. 
+Our search is aligned-stride * budget..aligned+stride*budget
+out min/max WOULD be 0,len , but if those are at the address limits we don't want to bother. 
+0 is at the limit if v_offset==PTR::MAX + 1
+len is at the limit if buf.len()-v_offset == PTR::MAX + 1
+so if we set variables OVERFLOW = PTR::MAX as isize + 1 , 
+our left bound of the search is the max between (aligned+budget*stride) and minimum assignable address, which is the physical address for PTR::min(). 
+    since PTR::Min is a power of 2 its aligned to any none_stride thats a power of 2 with magnitude < it (any practical case).
+    its only assignable if v_offset < -(PTR::min() as isize)
+    -V_offset
+ugh this is ugly. 
+just precheck these in the append / prepend cases, have them fail if that address space is exhausted. 
+our rightbound is the min of aligned+budget*stride and 
+im thinking for simplicity and correctness's sake, the block uses isize/usize but enforces that the PTRs it hands out are representable as PTR. 
+
+search outward from align(position)+1 both left and right stepping by stride up to budget times
+if left or right hits the end of the address space , it returns none
+if right hits the end it returns append
+if left hits the front it returns prepend
+if left or right finds a None , it returns the position of the none
+
+with less branches : 
+max = min(align(PTR::MAX-stride)+1 , aligned.saturating_add(budget*stride))
+min = max(align(PTR::MIN+stride)+1+v_offset, aligned.saturating_sub(budget*stride))
+let left = min..aligned.iter().rev()
+let right = aligned..max.iter.rev()
+let longer = left.len > right.len {left} else {right}
+//eh, lots of setup for a couple searches. lets just go one at a time. 
+//and check the result after. 
+
+right = aligned+1..align(PTR::max).step_by(stride).take(budget)
+r_res = right.position(|i| buf[i].is_none())
+left =  ..aligned.step_by(stride).rev().take(budget)
+if v_offset == PTR::MAX + 1, {left.skip(1)}; 
+
 
 # Lookup math
 Going to just use a vecdeque instead of a circular array but i need to nail down the math to preserve addresses. 
