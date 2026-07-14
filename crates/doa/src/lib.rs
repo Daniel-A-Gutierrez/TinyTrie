@@ -1,5 +1,6 @@
 pub mod find_slot;
+pub mod strategy;
 
-mod index;
 mod arena;
-mod block;
+pub mod block;
+mod index;

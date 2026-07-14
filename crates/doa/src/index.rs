@@ -3,74 +3,56 @@ use std::hash::Hash;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem, Shl, Shr, Sub};
 
 /// A natively-signed integer usable as an arena address.
-///
-/// `Self` is the signed address type; `Unsigned` is its magnitude type
-/// (`i16` -> `u16`, `i32` -> `u32`). The supertrait list is the set of things a
-/// real signed integer can do — arithmetic, bitwise ops, shifts, ordering — so
-/// address math on the per-read path compiles to single native instructions
-/// with no `as usize` detours or trait-method dispatch.
-///
-/// `min`/`max` return `Self` (the native signed min/max), not `usize`: the
-/// pointer is signed, and `i16::MIN` is a perfectly representable `Self` value,
-/// so the bottom of the address space needs no `MAX + 1` magnitude hack.
-pub trait BlockIndex:
+/// The valid address space is NOT Min..=Max, its -Max..Max
+pub trait SignedBlockIndex:
     Copy
-        + Clone
-        + PartialEq
-        + Eq
-        + PartialOrd
-        + Ord
-        + Hash
-        + fmt::Debug
-        + 'static
-        + Add<Output = Self>
-        + Sub<Output = Self>
-        + Mul<Output = Self>
-        + Div<Output = Self>
-        + Rem<Output = Self>
-        + BitAnd<Output = Self>
-        + BitOr<Output = Self>
-        + BitXor<Output = Self>
-        + Not<Output = Self>
-        + Shl<u32, Output = Self>
-        + Shr<u32, Output = Self>
+    + Clone
+    + PartialEq
+    + Eq
+    + PartialOrd
+    + Ord
+    + Hash
+    + fmt::Debug
+    + 'static
+    + Add<Output = Self>
+    + Sub<Output = Self>
+    + Mul<Output = Self>
+    + Div<Output = Self>
+    + Rem<Output = Self>
+    + BitAnd<Output = Self>
+    + BitOr<Output = Self>
+    + BitXor<Output = Self>
+    + Not<Output = Self>
+    + Shl<u32, Output = Self>
+    + Shr<u32, Output = Self>
+    + std::ops::Neg
 {
-    /// Additive identity (`0`).
     const ZERO: Self;
-    /// Multiplicative / increment identity (`1`).
     const ONE: Self;
-
-    /// Native signed minimum (`i16::MIN` for `i16`).
-    fn min() -> Self;
-    /// Native signed maximum (`i16::MAX` for `i16`).
-    fn max() -> Self;
-    /// Bit width (`i16` -> 16).
-    fn width() -> u8;
-    //max of half ptr (256 for u16, 16 for u8)
-    fn sqrt_max() -> Self {Self::ONE << (Self::width() as u32/2) - 1}
-    /// Build `+n` or `-n` from a magnitude. May truncate or overflow-panic in
-    /// debug for out-of-range `n`.
+    fn MIN() -> Self;
+    fn MAX() -> Self;
+    fn bit_width() -> u8;
     fn from_usize(n: usize) -> Self;
-
     fn as_usize(self) -> usize;
+    fn as_isize(self) -> isize;
 }
 
 macro_rules! impl_block_index {
     ($($t:ty),* $(,)?) => {
         $(
-            impl BlockIndex for $t {
+            impl SignedBlockIndex for $t {
                 const ZERO: Self = 0;
                 const ONE: Self = 1;
                 #[inline]
-                fn min() -> Self {
-                    <$t>::MIN
+                fn MIN() -> Self {
+                    -<$t>::MAX
                 }
                 #[inline]
-                fn max() -> Self {
+                fn MAX() -> Self {
                     <$t>::MAX
                 }
                 #[inline]
-                fn width() -> u8 {
+                fn bit_width() -> u8 {
                     (std::mem::size_of::<$t>() * 8) as u8
                 }
                 #[inline]
@@ -81,12 +63,16 @@ macro_rules! impl_block_index {
                 fn as_usize(self) -> usize {
                     self as usize
                 }
+                #[inline]
+                fn as_isize(self) -> isize {
+                    self as isize
+                }
             }
         )*
     };
 }
 
-impl_block_index!(u8, u16, u32, u64, u128, usize);
+impl_block_index!(i8, i16, i32);
 
 /// A natively-unsigned integer usable as an address magnitude / slot index.
 ///
@@ -98,27 +84,27 @@ mod private {
 }
 pub trait UnsignedIndex:
     private::Sealed
-        + Copy
-        + Clone
-        + PartialEq
-        + Eq
-        + PartialOrd
-        + Ord
-        + Hash
-        + fmt::Debug
-        + Default
-        + 'static
-        + Add<Output = Self>
-        + Sub<Output = Self>
-        + Mul<Output = Self>
-        + Div<Output = Self>
-        + Rem<Output = Self>
-        + BitAnd<Output = Self>
-        + BitOr<Output = Self>
-        + BitXor<Output = Self>
-        + Not<Output = Self>
-        + Shl<u32, Output = Self>
-        + Shr<u32, Output = Self>
+    + Copy
+    + Clone
+    + PartialEq
+    + Eq
+    + PartialOrd
+    + Ord
+    + Hash
+    + fmt::Debug
+    + Default
+    + 'static
+    + Add<Output = Self>
+    + Sub<Output = Self>
+    + Mul<Output = Self>
+    + Div<Output = Self>
+    + Rem<Output = Self>
+    + BitAnd<Output = Self>
+    + BitOr<Output = Self>
+    + BitXor<Output = Self>
+    + Not<Output = Self>
+    + Shl<u32, Output = Self>
+    + Shr<u32, Output = Self>
 {
     /// Lossless conversion to `usize` (for `Vec` indexing).
     fn as_usize(self) -> usize;

@@ -1,5 +1,76 @@
 # Structure
 The most recent top level entries are towards the top.
+
+# Review
+
+## Block Module
+Why is there a try insert at? 
+ah i see its reused for before and after, but all 3 take a physical address, which a caller shouldn't know. 
+Fix : before and after take virtual and map it. 
+
+Strategy for some reason is mem::taken, then the 'handle_insertion' is given to the strategy.
+The strategy then gets to run a post insert check, gets put back , and we return. 
+
+Ah, the ai was worried about insertion triggering a strategy change (ie pluripotent). 
+Thats not a concern for the block level api, the arena does that based on the NotFound variant and other things.
+Fix : need to read strategy module first
+
+## Strategy Module 
+block comment at the top is a lotta yapping.
+insert budget is const rn, not sure about that
+    an auto consumer shouldnt care. the strategy would though.
+    a block level consumer ... might? 
+
+assert_cap_pow2(cap) is probably overhead , if its constrained to debug asserts thats fine for now. 
+instead it should be verified by tests... maybe we could make a Pow2<T>(usize) that has T impl bitshift etc. 
+so we can guarantee it statically.
+
+The InsertDelta<T> type seems pretty incomplete. 
+I suppose the expected 'readdress' flow is find_slot -> fail -> bounce back 'address exhaust'. 
+
+There's not a shove variant either, for when a item is shoved from one block to another. 
+
+Fixes : 
+I think strategy exists at the wrong level. Right now block.insert -> strategy -> feedback & operations
+I think block stays more primitive, just block.insert -> operate & feedback
+arena.insert(self,block_id) -> read strategy from block -> operate -> feedback. 
+
+### impl Block Strategy
+Each seems to store its budget
+we can set it
+they handle insertion, removal, and do a post_insert_check
+
+handle removal has a default impl 
+
+#### handle_removal 
+return early if block is fully dense, no point in shifting to stride.
+if removed value was on aligned slot also no-op
+first-right is allowed to be anchor it seems - wait no that returns early
+right_in and left_in do a bounds check for our first values
+look to see if a neighboring aligned slot is some, if so we can shift it towards the removed slot to free up 
+the none. 
+
+### Growth Strategy
+each struct independently impls new_block? why not have this on growth strategy? 
+all they take is cap as an arg
+Fix : that
+
+### Default handle insertion
+right now none of the strategies actually do anything special they all just call this. 
+It starts from the result of find_slot :: Found
+if its append or prepend we do push_front or push_back
+prepend is pretty underdeveloped right now, it doesnt insert None on stride like append does. 
+FoundAt(phys) currently doesn't do any sort of shifting. it just says 'free' and gives it back. 
+
+Fix : make it symmetrical. 
+
+### Post insert check
+currently does nothing.
+Fix : i dont think this is necessary? 
+
+### Comments
+I think a lot of these are ... practically wrong/useless, some are good. 
+
 # Interfaces
 
 as for the block primitives
