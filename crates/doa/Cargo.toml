@@ -14,6 +14,9 @@ itertools = "0.15.0"
 [features]
 default = []
 
+[[bench]]
+name = "layout_bench"
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

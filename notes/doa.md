@@ -1,6 +1,590 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Node Management
+the consumer holds the 'node header'. 
+internal representation is still a bunch of sparse Option< (K,V) >
+so len and cap are invalidated when we grow. 
+or, specifically, cap is, len isnt. 
+cap is computable from P and the next P. 
+in fact, i think we can do the 'free' scan entirely in the parent. awesome. 
+
+this seems like it needs a cross arena cursor. 
+i think thats been coming for a bit now. one specific for leafblock / some other pointing block. 
+so what does that parent structure need to provide
+
+cursor_leaves
+cursor_nodes
+
+maybe cross_arena_cursor? the 'parent' arena's value type must be a Ptr into the child arena. 
+we store a physical position in both. 
+in the case of this leafblock... this is basically the BTree. 
+the leafblock doesnt actually need to provide anything beyond a way to access its None values through the cursor, so maybe a RawCursor? 
+
+parent can more efficiently find the closest empty slot. 
+moving items / lending capacity may require shifting the positions of leaf nodes. 
+so really what i want is for nodes to support neighbor aware operations. 
+
+lend_next(&mut self, &mut right_neighbor)
+lend_prev(&mut self, &mut left_neighbor)
+is_full(&self, &next_neighbor)
+pack_left(&mut self)
+pack_right(&mut self)
+
+not sure how i guarantee 'right neighbor' is actually the adjacent node though. 
+with that insert shouldn't have to worry about shifting items, it should assume it has space, find the spot
+by comparing with K, and do the insert itself. It doesnt need to report shifts it does within the node. 
+
+theres a nuance though. the nearest 'none' to the insert position may not be in the node. 
+So insert , to be safe, should take 2 ptrs. it should be 'insert between', and disallow shifts from affecting
+elements outside those bounds. 
+
+So parent : 
+reaches terminal node - gets LPtr { Vaddr, len } 
+
+cap = ( v2p(next_v) - v2p(vaddr) ) 
+if len = max, 
+    if cap == len , easy split in 2, nothing moves we just insert a new header.
+    if cap > len, 
+        (left,right) = node.split(next)
+else    
+    cap = node.calc_cap(p, next);
+    if cap>len+1
+        node_mut = block.get_mut(vrange)
+        node.insert(item)
+    else 
+        borrow_capacity(&mut self, p) 
+
+the parent more or less needs a cursor. 
+fn borrow_capacity(cursor_mut) {
+    let mut dist = 1;
+    prev_dist, next_dist
+    let leftward = cursor_mut.clone()
+    //check next for capacity
+    //check prev for capacity
+    //if no, add next_cap to dist
+    //if found, move free to front/back
+        //front -> move ptr +1; 
+        //leafblock shift everything from next to found +1
+        //update ptrs (including next)
+        //do node.insert
+}
+
+## Ownership flow
+
+tree.try_insert(&mut self)
+    if root is leaf : 
+        skip to self.leaves.root_mut()
+    else: 
+        nav inodes to find node to put item in - it either goes between 2 nodes or at an end
+        the tree thus needs to get to the target node, then step forward 1 for between.
+         
+
+
+# Bit rotation
+
+bit rotation on binary split. 
+say we have 4 bit ptrs and our tree is a binary tree layed out in-order.
+
+[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+          [8]
+         [4,12]
+     [[2,6],[10,14]]
+[[1,3],[5,7],[9,11],[13,15]]
+
+say we want to split the whole thing into 2 slices, one for the right, one for the left, without invalidating ptrs
+[1..=7], 8 , [9..=15]
+
+we can to lay out the elements non-contiguously
+[1,0,2,0,3,0,4...]
+Then rotate the ptrs left 1.
+They were already offset by 1 due to 1 based indexing so theyre currently
+[0,0,1,0,2,0,3,0,4,0,5,0,6,0,7,0..]
+rotating left is just a doubling, so 
+[0,0,2,0,4,0,6,0,8,0,10,0,12,0,14,0,0]... pointers work out. 
+left half doesnt even need to rotate actually , just increase its shift by 1. 
+
+right half (minus 1)
+[8,0,9,0,10,0,12,0,14,0] = [0b1000,0, 0b1001,0, 0b1010,0, 0b1011...]
+rotated left : 
+[1,0,3,0,5,0,7] // hmm not quite, we need to reserve the 0 space and it works
+[0,1,0,3,0,5,0,7]
+thats fine gives us a place to put the new root. 
+
+wait actually no thats not good. the midpoint needs to be the root. we can insert a 0 at the left thats fine...
+but the midpoint will be even, and all our new elements are on odds, so i think we're in the clear.
+
+for the left half though...not exactly so. 
+we need to add an offset of 1 into the math so all the elements end up on odd physical indeces. 
+
+so tracking this through the sizes of a random block with a u8 ptr
+[],                     cap=0, addr_shift=8, rotate=0, v_offset = 0
+[MIDPOINT],             cap=1, addr_shift=8, rotate=0, v_offset = 0
+[0,MIDPOINT],           cap=2, addr_shift=7, rotate=0, v_offset = 0
+[0,M/2,M,3/2*M],        cap=4, addr_shift=6, rotate=0, v_offset = 0
+[0,1,2,3,4...]          cap=256, addr_shift=0, rotate=0, v_offset = 0
+post max cap split
+[0,1,0,2],              cap=128 (incorrect layout for these next 3)
+[M],                    cap=1   
+[0,M,0,M+1]             cap=128 
+
+wait i see the problem, the root going into each is a new node. we took 1 out and put 2 in. 
+0b1000_0001=>0b0000_0011, 129=>3 not 1. 
+0=>0, 1=>2. 
+so left is both even and full. if the highest was 127, that becomes 254. so an offset of 1 puts it at max. 
+
+so for left new_addr = (old_ptr + 1) << 1
+[0,0,0,1,0,2,0,3,0]     cap=256, addr_shift=0, rotate_left=1, v_offset=1
+so ptr=0=>phys=2, M=>3. M-1->1. thats a wrapping add i guess for v_offset. 
+an iterator will have to start at v_offset and just keep adding until i=v_offset again lol . with wrapping addition.  
+
+and for the right new_addr = (old_ptr-(M+1)).rotate_left(1)
+[0,M+1,0,M+2]           cap=256, addr_shift=0, rotate_left=1, v_offset = MAX (sub 1) 
+
+when they split next, the pointers will be interleaved
+
+[255, 0, 128, 1, 129, 2, 130, 3, 131,..] for v_offset=1 (left half)
+[128, 1, 129, 2, 130, 3, 131, 4, …, 254, 127, 255, 0] for v_offset=-1 (right half)
+
+so actually i think i dont want to offset the right so things stay off the evens. 
+[0, 128, 1, 129, 2, 130, 3, …, 254, 127, 255]
+
+the newly filled elements are the lower ones in that case. 
+
+now Midpoint is free in both to accept a new Root. We need the mapped addresses from the old root and we're good. 
+
+fn virt_to_phys(v , rot, off) = { v.rotate_left(rot) + off } 
+question : f(f(v, 1, 1),1,1) = f(v,2,2) ? answer ; no, its f(v,2,1.rotate_right(2))
+
+[0,128,1,129...] means we want offset=128, since the elements above 128 will be empty. 
+midpoint = virt 127 = 127.rotate_left(1) = 254? or phys 128 = 256 = 1 ? no its vaddr 64, so phys 128. 
+Makes sense i guess, offset.rot_r(1) is easy. 
+
+[0,64,128,192,1,65]... means we want offset=64. etc. midpoint = vaddr 32, rot_l(2) = 128. 
+
+so to offset the empty slots by 1 physical slot we make offset = 1.rotate_right(rot)
+fn virt_to_phys(v) : 
+    (v + offset).rot_left(rotate) //ex : rotate 1, offset 1.rot_r(1), 128-> 2
+fn phys_to_virt(p) : 
+    (p).rot_r(rotate)+offset  //ex : rotate 1, offset 1.rot_r(1) 2-> 1+128=129? yup. 
+
+thing is... idk if we need the offset? midpoint isnt at vaddr MIDPOINT , its at vaddr MIDPOINT.rotate_right(rot), which translates to phys MIDPOINT. 
+
+128 will be occupied for a u8 example, whereas 1 wont be. so i guess offset makes it so 128 is free but 1 isnt? thats fine i guess. so the grow and spread and rotate logic is
+
+fn split_and_rotate(self)->[Self,Self] {
+    left = self
+    right = vec![None;self.cap]
+    oldroot = right[0]
+    left.rotate+=1;
+    left.offset=left.offset.rotate_right(1)
+    left.cap*=2
+    for i in 0..MIDPOINT.rev() {
+        self[i*2+1] = self[i]
+        right[i*2+1] = self[MIDPOINT+i]
+    }
+    right = Block::new(right, self.rotate, offset=0);
+    let left_root = node::from_ptrs(oldroot::left_children())
+    let right_root = node::from_ptrs(oldroot::right_children())
+    left[MIDPOINT]=left_root
+    right[MIDPOINT]=right_root
+    return [left,right]
+}
+
+
+# Continued.
+I think for a first iteration i can just limit the max cap of the parent tree.
+But even in doing so, i need to store the capacity and length of the leafnodes. 
+so i need a ptr variant for the leafnode type. 
+either the data gets stored in the ptr or in the array as a union. 
+the parent could be a union over a u16 + len + cap
+
+No other way around this i guess. Its the cleanest solution. 
+
+# Roadmap cotd.
+
+Get a minimal version working for a BTree-forest-like thing
+See what i can abstract from the btree into it. 
+
+I think i repeatedly build structure -> refine reusable bits
+So Forest
+General BTreeMap
+SortedVec
+LinkedList
+NibbleTrie
+
+## Questions rn
+How does the partitioned strategy work? 
+
+It only works when paired with a pluripotent block.
+A pluripotent block only uses half of an 'address' but shifted so the top or bottom half of the bits combined are empty. 
+Append heavy => top bits empty , random heavy => bottom bits empty. 
+At high fanout, the 'nodes that dont have leaves' are few
+The bottom nodes get 1 ptr, so itd be best if that referred to a continuous persistent area of size M. 
+Also the leaves have to be in order. 
+
+Lets think squishy. So 'leaf blocks' are variable sized, internally sparse, and ordered. 
+Also, when a leaf block splits, we dont want to have to physically move it, since its big. 
+We run into the same random/append conflict we see everywhere else.
+Lets assume it inherits that mode from its 'parent' . 
+
+So a random leafnode stores a ptr that shifts to remain stable when the arena size doubles, and when it doubles
+the internal space of leaf partitions also doubles. Hmm but shouldnt it be up to the limit? 
+we can assume we know fanout or M or whatever, either at runtime or compile time, either way we dont want to 
+allocate space for a partition it will never use. 
+
+How about partition size is adaptive in a range? The leaf points at the start of the range. 
+Actually lets formalize the microblocks, can call em uBlocks. 
+We need a 'tiny sparse array' type thing. 
+The ublock stores its len and capacity (u8s probably). 
+It can attempt to grow by requesting capacity from the ublock to its right or left, and updating its parent. 
+
+when the partition block 'grows' each block is given more space only up to a limit. 
+the remainder of the space is used between them to create more partitions. 
+If we enforce that the block headers len is nonzero we can have Option< uBlock > be free. 
+
+Theres trouble with splitting a full block. We dont have space for another block header. It needs to be in a sidearray i think. 
+
+So we'd need perstrategy data then.   A Vec< Option < nonzero u8> > on the side. the u8 can be a generic param on S so its fine for later. 
+
+When partitioned spreads and grows, *some* of the pointers will need updating i think...
+idk though... a full node is likely to split, so just leaving the spot to its right empty is fine. The start point
+doesnt change. So its the same layout as random but the elements size also doubles?
+Whats the point of storing len... to disambiguate 1 block doubling in size from 2 blocks. 
+Maybe lazier is better. 
+
+So if we store len+cap , and the tree stores ptr, weve basically just reinvented vec but the storage is contiguous and has neighbors. 
+
+otherwise if i just directly associate Inode at PTR with LNodes at PTR..PTR+M , i skip all that complexity but waste some ram. dynamically sizing things adds pointers but allows for compression of the data...
+But leaf nodes are big, not having to store empty leafnode slots we dont need saves a lot of space. And we're 
+storing the ptr anyway. 
+
+So i think inline Len+Cap is probably good. 
+So what if the header block is counted as sizeof Leafnode. as in our block is a Vec< Option < Enum < PartitionHeader, Leafnode>>>
+
+The partition header is what inodes point to, and stores a len + cap. 
+An enum is a bit of overhead though, and logically there's no point in the branch. 
+So a union maybe?
+
+Yup a union fits , no discriminant but it takes enough space for both, and i dont need to branch. 
+ 
+## Leafblock
+
+i think this could work as either a discrete type or within block
+its very different from block's typical interface though so I think i want to separate it for now. 
+
+The 'header' can be inline in a union/enum, in a sidevec, or in a union over the internal pointer type of the parent, in the inode.
+
+For example, Inode{ keys : _, ptrs : UPtr } , UPtr {internal : u32, leaf : (ptr : u16, len : u8 , cap : u8 )}
+but leaves would have to be densely packed. which kidna defeats the purpose of defaulting to pluripotent. 
+So inline header is a valid strat, but i shouldnt presume its the only strat. 
+
+## Addressing 
+
+The addressing really is the tough part though. 
+If i assume the items *within* a block aught to be continuous and cant be pointed to individually its like a 
+pluripotent over [T;M]. 
+Its like i want to be able to address 1 item as 2. 
+
+So if i want more address space 
+- i extend the parent ptr and link the physical spaces
+- maybe i can do some sort of bit rotation using the parent's shift?
+
+A pluripotent block has the limitation log2(cap)+shift >= bit_width/2
+if growing and spreading shift decreases
+[0,8] shift = 3
+[0,4,8,12] shift= 2
+[0,2,4,6,8,10,12,14,] shift = 1
+
+if appending it doesnt
+[0,8,16,24,32,40,48,56] etc. as cap=>64
+each time we grow and spread we free up more address headroom
+each time we append we increase the usable space thatll be expandec by grow and spread. 
+So a pluripotent can reach AT LEAST a filled len of 1<< bit_width, but can also hit full capacity with both
+appends and random inserts. 
+
+so it doesn't have free address space we can repurpose, unless we artificially impose a MAX. 
+if we set the max len to 2<<16, then we'll have 16 free bits for a u32 address no matter what. 
+Its an artifcial constraint. Thus if we take virt_addr >> shift we get physical , shift that left by log2(M)
+and we'll guarantee we have enough spaces. 
+
+So not every physical slot is representable by an adress. maybe one every FANOUT/2 . 
+Beyond that, we use pluripotent logic but... we spread out a few times first to free more usable address space? 
+
+So say we start our addr_shift at 6 instead of 4, or 4 at cap 8
+[0,16,..112] 
+
+on top of that each address only points to every 4th slot 
+
+[0,x,x,x,16,x,x,x,32,x,x,x,...]
+
+but when we grow and split we want physical addresses 4..8 to stay contiguous, a new empty slice gets put in between. 
+
+[0:[x,x,x,x], 8[x,x,x,x]...]
+
+if we hit strict append, we end up with more spaces than we would have had... but less headroom for random insert.
+So i think, this is basically fine grained biasing going above halfptr::MAX, with the drawback that we're going to hit n^2 insert if we're off strategy.
+
+If the tree only grows by splitting though random makes more sense.
+A pluripotent can only split and grow 8x, so itd have a max bottom tier size of 256 (u16).
+The bottom would have to be random to support enough leaf splits, i dont even fully understand the optimization thatd put all the new nodes on the right yet. 
+
+I think though, pluripotent up to cap then we either 'refill' addr_shift or send it to 0 and readdress in either case is fair. 
+
+itd be nice if we had a way to represent multiple slices as belonging to 1 chunk. 
+Why not just the space between 2 parent ptrs? 
+That physical space doubles each spread. 
+The actual internal rep should be [T;MIN]. Keeps a node together. 
+That frees us log2(MIN) bits to use for NodeLen, expressed in multiples of MIN.
+so min=4 means 2 bits so we can have a continuous region of 4*MIN T represented by a ptr. 
+
+So with that we end up with 
+
+[0:[T;4], 1:[T;4], 2:[T;4], 3:[T;4]]
+if that started as random 0-3 map u8 0,64,128,192
+
+if im sparing the bottommost bits for length (in chunks), i can grow&spread that many fewer times. 
+my actual length won't be affected though...
+
+Honestly this doesnt sell me over just doing a Block with strategy random and type = Leafnode with some inline array. 
+
+the pointer solution encodes capacity but not length . 
+# New Roadmap
+
+The 'final' version with the adaptive blocks and arena is really complex, i want to try something more reachable first.
+
+- preliminary changes - 
+    - unsigned indexes allowed, but blocks initial value is 0 for signed and 1<<(width-1) for unsigned
+- planned changes
+    - wrapping is allowed only once cap has been reached, and rotate_left activated. 
+    - phys->virt and reverse translation arithmetic changed to include a rotate_left(1) after splitting from max cap.
+        - a bit more info - the right and left physical halves of the block become 2 blocks, rotate_left(1) is applied to the virt->phys translations, and the remaining elements are spread across the physical space.
+        - the negatives (or upper half) i think map to odd physical indeces, the positives (or right half) map to even spaces I THINK. 
+    
+
+- Block Primitive
+    - block is generic over strategy, Block< Overprovisioned > ::new() makes an overprovisioned block. 
+    - strategy determines how find slot, insert_before/after, addr_range, etc. actually work
+    - adaptive will be a future strategy
+    - insert_before, insert_after, get, get_mut, cursor, remove, virt->phys, phys->virt, compare(ptr,ptr)
+
+Its a bit annoying that a block-level interface user doesnt get to use the arena at all but thats the price we pay i guess. Block needs set_prev and set_next methods that map the ordering tag modification. 
+If the arena could somehow be generic over the things that impl block-like thatd be nice. 
+
+theres 2 orderings - nodes, and values. blocks can expose an ordering over nodes. 
+its up to the structure to expose an ordering over values. 
+No i dont think a general arena is possible for the block level users. 
+For a b+tree a vecdeque lets the root stay at 0 , everything else that splits can just go on the end idc. 
+
+## Note 
+realized a node can have children when its inserted. The root for example .
+Also the same function impl'ed in different blocks can have different arg names so long as types match. 
+If im taking the ordering as a generic arg i can do a little leg work for the consumer. 
+
+bfo : we want the parent and a sibling to insert_before or insert_after. sibing is optional. 
+unordered : just append we dont care
+dfo : we want the parent and optionally a child
+
+if i want to maintain an ordering automatically i need an abstract tree interface, it can do the wiring itself to maintain the ordering. 
+
+then i just tell it the parent and the child index to insert at and its done. 
+
+right now i need Unordered, just appends to the block to keep it easy, 
+I also need Manual for no-funny-business 
+
+# Pseudocoding
+new directions 
+- walker might have to be a front-and-center interface for the arena. 
+- walker supplied by consumer needs lineage to be remapped before returning. 
+- block level functions that do balancing only do alterations which can statelessly compute updated ptrs 
+    - and return a (block_id, ptr_range, Transform)
+- adaptive arena capstone , impl fixed strategies first? 
+- do i need a generic tree/ordered map thing? 
+- walker needs a way to seek by PTR, so PTR needs to be ord, but not the default ord - block_id needs the arena to map it to a OrderingTag, generally a u64, first gets 1<<63, append/prepend add/sub 1<<32, insert takes the mean of what its inserted between.
+- are virtual pointers worth the overhead? Should i supply a way to index by physical pointer? Making no guarantees about physical ptr stability? 
+    - vptrs arent stable across shifts which is the big one
+    - they ARE stable across grow/spread
+    - theyre currently not stable across append/prepend splits without wrapping, and doing that would complicate
+        - the ptr seek/comparison. 
+
+- on append split - left half keeps  -32768..0 , right keeps 0..32768. why bother ever splitting in half though? Just make a new node on the right. I guess if we're getting mid inserts it can be bad. I think itd mostly just be 'done' though. 
+
+- on random split, -32768..0, etc. , yea that does hurt a bit. even if we spread things (which would work with wrapping) thats still a remap of all the pointers into the block. If we allowed ptrs to wrap on the end, maybe we adjust v_offset? actually wouldnt we just be shifting out of the address space? If we shift everything so they live at even addresses (physically in memory) spanning the whole deque, then we go from addr_shift = 0 back up to addr_shift = 1 ... funny isnt it? is my math right there?
+
+say we had -128, we bitshift it left 1 so the sign is shifted out, then... 0b11111111 becomes b11111110
+and if addr_shift goes from 0 to 1 that means the physical would be 0b01111111 so 127? the old min becomes the new max? what became the min? Nothing right? 
+
+so if addr_shift became -1... all the vptrs would have to be doubled, overflowing, to become physical indeces. but we're unable to express the spaces in between them as virtual addresses... right? the previous positive range is still valid... could those interleave somehow? what if we rotate the bits? 
+well, when the positive addresses overflow, they become negative right? Do they become odd?  
+64->128=-128...
+
+so we need a more clever spread for a wrap. we're trying to preserve all the negative ptrs, while allowing positive ptrs to interleave them. 
+that to me sounds like the rightmost bit has to go into the leftmost place, and vice versa, so a rotation instead of a shift. 
+so item[phys] = item[phys.rotate_right(1)]? But 0 is just 0. 
+
+So the contract must be that the physical ordering of the nodes implies the nodes logical ordering.
+Also when does the shift become a rotate? from the beginning i guess? 
+
+Yk what i think unsigned indexes for the blockptrs would have been fine if they just started out at MAX/2 instead of 0. 
+
+I do think this is a special case , wrapping should only be allowed when cap>=PTR::max-ptr::min. 
+
+What about when it splits again?
+The pointers are already interleaved. 
+Hmm well 0b01... was the evens, and physically the lower half, 0b10... were the odds, the were the upper half (unsigned ptrs). 
+The new min lies in the middle, and the end at mid-1. for signed ints 0=start, -1=end. 
+For the left half -128..0 or 128..256 for unsigned ( i think) all the negatives -64..0 end up at positive indeces 2*abs(i). in signed arithmetic thats just doubling the distance from min, in unsigned its a bit rotation. simpler probably. 
+I dont see a reason why a full block can't keep splitting with rotation. but the wrap point seems different. 
+Their starting points dont move, thats it. so the left half's min is still at phys 0 while the right half's min is still at MAX/2. 
+
+So the right half needs that offset to happen so it can act like an ordinary shift. 
+If we make sure the right half gets moved to the physical address 0 first before we spread it, the ptrs are stable just by a change of voffset. 
+voffset becomes a wrapping add of MAX/2. 
+So we go from virt<< shift + offset (signed)
+to (virt+offset).shift_right(shift).rotate_left(rot)
+
+So any remapping ranges *have* to be expressed in physical addresses, otherwise they wont capture this. 
+
+When we're comparing ptrs we have to map them to their physical addresses and compare them. 
+If we have to visit the block anyway we might as well store the ordering tag on it. 
+
+Most ranges are going to be within the same block anyway , one we're already in, so accessing that shouldn't be hard. 
+
+Can i get the wrapping math to be consistent with non-wrapping blocks? What actually is allowed? 
+I think ... basically we constrain the wrapping arithmetic to just address translation on max_cap blocks. 
+Honestly once its max cap we dont need the vecdeque either, it can just be a vec. 
+
+virt<< shift + offset is equivalent to (addr + voffset) << shift if offset >> shift = old offset. 
+so before when we prepended once v_offset becomes 1 right? So vptr + 1 = 0 , regardless of the shift.
+Now itd be 1<< addr_shift , and when we prepend, we increase it by that. 
+addr_shift is equivalent to rotate for addresses 0..MAX/2, so do we just artificially constrain it until it hits max cap? well actually , rotate_left(0) is still fine for append/prepend. 
+But for random... we dont start at MID/2 , we start at MID/4, when we do our final grow and spread, rotate_right(1)->rotate_right(0), then when split we swap to rotate_left(1) and never change after that. 
+
+so no enum or branching, just 1 additional instruction and 1 additional field per block, set on split at max cap. 
+
+of course none of this matters if the caller is storing (U,I) full pointers cuz we'd need to visit all those anyway. 
+
+Lets try a simpler impl first - just random that only spreads&shifts on split or out of budget. 
+We'll use overprovisioned ptrs first , so appending and prepending and address exhaustion arent a concern. just running out of cap. 
+
+oh but how does wrapping work with overprovisioning? I think the same right? 
+256,512...65536 fills a u16s addr space for a u8's cap. When we split, the addresses still overflow like we want... we just have a nonzero right shift before our rotate_left. though i think we need to do a conversion in the middle to the lesser ptr type then back up to usize. 
+thankfully overp is a const gneric so the compiler should easily optimize that branch out.
+virt->phys:
+    if OVERP
+        (virt+offset).shr(shift).as_halfptr().rotate_left(rotate)
+    else 
+        (virt+offset).shr(shift).rotate_left(rotate)
+
+with the manual block impl we don't care about any of the walker stuff so we dont have to do that right now. 
+block just exposes prepend, append, insert_before(PTR), insert_after(PTR)
+
+
+## manual b+tree
+for a btree we concern ourselves with the following :
+each block is a tree in a forest. 
+if U=I, block_id = block_idx, then we just query our tree for the value of its bottom node, go to that tree / block, and continue. 
+
+we need the subtree to i guess just store the address of its root in the block. 
+We need a variant of block.insert that takes a fixed position also. 
+and a find slot that doesn't cross that position. 
+Since the root should be the first thing inserted, itd be at virtual address 0 for signed or MAX/2 for unsigned. 
+If we fix that it might make find_slot simpler...maybe maybe not. 
+
+A block split is equivalent to a tree split. The awkward part is that the tree grows upward.
+If we have a fanout of 16, once the first block fills up, it has to split into 16 pieces + 1 for the root. 
+The root block is just it, alone. It gets to have a height of 1 until its children fill up. 
+Depending on the order we're storing the btree inodes in a new root is more or less just a prepend. 
+
+For bfs block.prepend(new root), block.insert_after(left_child, right_child) //left child is old root. 
+for preorder block.prepend(new_root), block.insert_after(oldroot.midpoint , right_child)
+
+i think with this forest type design, the b+tree no longer has a fixed height. 
+the subtree needs to store a bool for whether its internal or not. 
+
+we also need a leafnode arena. if its also handled manually with pluripotent/overprovisioned block then 
+we only have to worry about shifts... though , it needs a wider pointer type, which wouldnt match (U,I), otherwise
+we cant store enough leaves. 
+
+for a fanout F we can have F/2 times as many leafnodes than inodes, so 1 block of leafnodes per block of inodes is out. 
+
+F/(F+1) actually not /2. Thats the ratio of leafnodes to total nodes. 
+I think leafnodes though, basically always split in 2. If we want the tree to optimize for append/prepend its a different story. The tree would have to take advantage of that to create an empty half tree on split. 
+So random with lazy spread? 
+Hm if the inodes did a strict append pattern, their stride is still half_ptr::MAX(). So theyve got bits to spare.
+If they did a strict random pattern, theyre dense but they don't utilize the full range of the address space. 
+for a u8 for example , its max cap when overprovisioned is 16. It starts out with a stride of 16. 
+If it grows_and_spreads that stride halves. [0]->[0,8]->[0,4,8,12]->[0,2,4,8,12,14] -> 0..16. so 17..128 are unused.
+Our leaf arena can definitely fit more than halfptr::Max nodes in it using the unused address space of the parent.
+
+if we knew the parent was append only, we could use the low bits to encode 16 leaves per inode for a u8.
+16 -> 17,18,19,20..=31 
+if we knew it was random only, we could store leaves for an inode at I at I+16...I*2+16. 
+
+interesting isnt it? So overprovisioned arenas have a child arena that can store far more items then they can. 
+It eliminates the need for reverse pointers too, we can calculate the parent from the childs ptr and the parent strategy. 
+
+Wider pointer types would waste a ton of space, the fanout16 and u8 overprovisioned case is lucky, for u16s 
+we dont want to actually have 256 slots per slot in the parent. 
+
+We need a multiple , so our leaf can have capacity Parent*M. 
+We dont really get to choose the pointers we hand out, we're subservient, so when any of the parent inodes wants to have more than M leafnodes we need to grow. preferably exponentially. The terminal btree should do its best to keep that even - making sure its terminal nodes all have a similar amount of children. Like, if sibling has 2 less than me, i shift things over. that way our leaf arena keeps the lowest feasible value for M. 
+
+question though, pluripotent / overprovisioned isnt strictly append or random; it can be a mix.
+lazy shift still shifts sometimes. 
+so hows that mapping look?
+
+say our inodes are [0,4,8,12,16,20,24,28,32] . How does that map to our leaf array? What if we want 16 leaves per 
+inode still? or 15 i guess. 1..4 and 33..45?
+
+nah src_phys*M..(src_phys+1) *M
+we'd be wasting a ton of space though on the first nodes in the b+tree which dont even have leaves. 
+this sort of thing would be best with bfs and a physical offset. 
+so 
+(src_phys-first_terminal_inode) * M..(src_phys-that+1) * M
+Then when we increase M we can spread the leaves out over the new space. 
+
+Im not sure what kind of structure this is honestly. Its like a dual-block. 2 blocks of different node types who's address spaces are intertwined. We dont insert_before or insert_after in the dual, we demand a spot for a child of the thing at (parent_address). Well i guess thats still insert_before or insert_after if it already had children. 
+
+but the insert logic is totally different. we cant arbitrarily leave our 'slice' owned by this parent, if we overfill it the entire block needs to resize, double M. we can probably get away without updating parent ptrs by spreading our addresses. evenly across the range. in all likelyhood fanout <= halfptr width so we can get away with that without readdress. 
+
+I think its worth developing this as a specific thing then broadening it later if we can. 
+we're dodging a ton of complexity and this *should* still be faster than our previous manual arenas we made for b+tree and nibble trie. 
+
+
+struct BForest {
+    arena : VecDeque< ForestTree > //root goes at 0
+}
+
+struct ForestTree {
+    next : u32, prev : u32, id : u32
+    inodes : Block< INode, u32, Strategy::Overprovision>
+    leaves : Block< LNode, u32, Strategy::Leaves>
+    arena_id: u32,
+    root: u32,
+    height: u32,
+    terminal : bool,
+    is_leaf : bool
+}
+
+Ok so block.find_slot(ptr, bias, budget, stride) , prepend(value), append(value)
+if budget is 0 we look for adjacent spots in bias direction, no shifting allowed. 
+
+If we dont want to implement shifting yet we can just always spread when we cant find an adjacent spot. 
+Also searching only every none_stride is wasteful i think, the array wont be full before it spreads so you'll 
+overlook Some slots. Thats only for random/pluripotent though. 
+
+When the root node fills up it promotes to an inode with 2 ptrs to 2 leafnodes. 
+Its starting address is 2^31. 
+We're using bfo, so our leaves block gets an offset of 2^31 with a shift of fanout. 
+So the 1st leaf goes at fanout/2 with vaddr 1<< fanout/2 .
+or maybe its log2(fanout)? or just , fanout/2 .  
+Though i suppose we grow up to fanout, if it starts at 1, then its physical address is 1. 
+
+Come to think of it, if we're storing the offset to the first leaf node, each ptr to a leaf just has to be relative
+to the start of that inode's section. could be a u8 up to fanout 255. though, the first root will grow its leaf to full size before splitting, so we're going to have M=MAX from the start more or less. 
+in that case, we could consider it like an 'overprovisioned' u64, where the u64 is made by concatenating the parents ptr and its leaf ptr. 
+
 # Review
 
 ## Block Module

@@ -18,3 +18,4 @@ Notably in crates theres
 - Code quality and performance are of the utmost importance.
 - Its not necessary for things to compile at each iteration - use the compiler errors to guide you, its faster and can tell you where problems lie after a change faster than you can pre-emptively look for all the call sites/uses.
 - When starting work in a crate within this workspace, based on the crates claude.md and the user's promps preemptively read the entirety of the relevant source files, don't bother grepping around for call sites of individual items. 
+- KEEP COMMENTS AS CONCISE AS POSSIBLE. Don't summarize anything thats obvious from reading the code or the function signature. Don't expound on things you're not sure are correct. 
