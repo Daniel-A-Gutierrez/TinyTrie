@@ -1,10 +1,8 @@
 use super::*;
-
 #[test]
 fn node_ref_size() {
     assert_eq!(std::mem::size_of::<NodeRef>(), 8);
 }
-
 #[test]
 fn node_ref_discriminant_values() {
     // NodeRef uses #[repr(u8)] with explicit discriminants.
@@ -18,23 +16,18 @@ fn node_ref_discriminant_values() {
     assert_eq!(discriminant(NodeRef::Node4 { prefix_len: 0, idx: 0 }), 3);
     assert_eq!(discriminant(NodeRef::Node16 { prefix_len: 0, idx: 0 }), 4);
 }
-
 #[test]
 fn node_ref_constructors() {
     // Verify that convenience constructors work correctly
     let leaf = NodeRef::leaf(42, 100);
     assert_eq!(leaf, NodeRef::Leaf { prefix_len: 42, idx: 100 });
-
     let node2 = NodeRef::node2(7, 3);
     assert_eq!(node2, NodeRef::Node2 { prefix_len: 7, idx: 3 });
-
     let node4 = NodeRef::node4(10, 5);
     assert_eq!(node4, NodeRef::Node4 { prefix_len: 10, idx: 5 });
-
     let node16 = NodeRef::node16(20, 8);
     assert_eq!(node16, NodeRef::Node16 { prefix_len: 20, idx: 8 });
 }
-
 #[test]
 fn node_ref_accessors() {
     // prefix_len and idx accessors
@@ -42,28 +35,23 @@ fn node_ref_accessors() {
     assert_eq!(leaf.prefix_len(), 42);
     assert_eq!(leaf.idx(), 100);
     assert!(!leaf.is_internal());
-
     let node2 = NodeRef::node2(7, 3);
     assert_eq!(node2.prefix_len(), 7);
     assert_eq!(node2.idx(), 3);
     assert!(node2.is_internal());
     assert_eq!(node2.width(), 2);
     assert_eq!(node2.radix_bits(), 1);
-
     let node4 = NodeRef::node4(10, 5);
     assert_eq!(node4.width(), 4);
     assert_eq!(node4.radix_bits(), 2);
-
     let node16 = NodeRef::node16(20, 8);
     assert_eq!(node16.width(), 16);
     assert_eq!(node16.radix_bits(), 4);
-
     // Empty accessors
     assert_eq!(NodeRef::Empty.prefix_len(), 0);
     assert_eq!(NodeRef::Empty.idx(), 0);
     assert!(!NodeRef::Empty.is_internal());
 }
-
 #[test]
 fn insert_empty_and_get() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -72,7 +60,6 @@ fn insert_empty_and_get() {
     assert_eq!(trie.get_value(b"hello\0"), Some(&42));
     assert_eq!(trie.get(b"world\0"), None);
 }
-
 #[test]
 fn insert_two_keys_split() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -83,7 +70,6 @@ fn insert_two_keys_split() {
     assert_eq!(trie.get(b"abe\0"), None);
     assert_eq!(trie.len(), 2);
 }
-
 #[test]
 fn insert_duplicate_returns_error() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -92,14 +78,12 @@ fn insert_duplicate_returns_error() {
     assert_eq!(result, Err(()));
     assert_eq!(trie.len(), 1);
 }
-
 #[test]
 fn insert_rejects_null_byte() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
     let result = trie.insert(b"hel\0lo".to_vec(), 1);
     assert_eq!(result, Err(()));
 }
-
 #[test]
 fn insert_prefix_key() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -108,7 +92,6 @@ fn insert_prefix_key() {
     assert_eq!(trie.get(b"abc\0"), Some(i1));
     assert_eq!(trie.get(b"abcd\0"), Some(i2));
 }
-
 #[test]
 fn insert_reverse_prefix_key() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -117,7 +100,6 @@ fn insert_reverse_prefix_key() {
     assert_eq!(trie.get(b"abcd\0"), Some(i1));
     assert_eq!(trie.get(b"abc\0"), Some(i2));
 }
-
 #[test]
 fn insert_no_common_prefix() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -127,7 +109,6 @@ fn insert_no_common_prefix() {
     assert_eq!(trie.get(b"xyz\0"), Some(i2));
     assert_eq!(trie.get(b"ab\0"), None);
 }
-
 #[test]
 fn insert_three_keys() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -138,7 +119,6 @@ fn insert_three_keys() {
     assert_eq!(trie.get(b"abd\0"), Some(i2));
     assert_eq!(trie.get(b"abe\0"), Some(i3));
 }
-
 #[test]
 fn insert_many_keys() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -153,7 +133,6 @@ fn insert_many_keys() {
     }
     assert_eq!(trie.len(), 100);
 }
-
 #[test]
 fn len_and_is_empty() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -165,7 +144,6 @@ fn len_and_is_empty() {
     trie.insert(b"world".to_vec(), 2).unwrap();
     assert_eq!(trie.len(), 2);
 }
-
 #[test]
 fn insert_single_char_keys() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -179,7 +157,6 @@ fn insert_single_char_keys() {
         assert_eq!(trie.get(&key), Some(indices[i]));
     }
 }
-
 #[test]
 fn insert_deeply_nested() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -192,7 +169,6 @@ fn insert_deeply_nested() {
         assert_eq!(trie.get(&nt_key), Some(idx));
     }
 }
-
 #[test]
 fn into_keys_values_roundtrip() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -202,7 +178,6 @@ fn into_keys_values_roundtrip() {
     assert_eq!(trie.get(b"def\0"), Some(1));
     assert_eq!(trie.len(), 2);
 }
-
 #[test]
 fn arena_and_ref_keys_populated() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -214,7 +189,6 @@ fn arena_and_ref_keys_populated() {
     assert!(trie.arena.len() >= 2);
     assert_eq!(trie.ref_keys.len(), trie.arena.capacity());
 }
-
 #[test]
 fn insert_stress() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -236,7 +210,6 @@ fn insert_stress() {
     assert_eq!(trie.get(b"aaa\0"), None);
     assert_eq!(trie.get(b"zzz\0"), None);
 }
-
 #[test]
 fn insert_reverse_order() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -250,7 +223,6 @@ fn insert_reverse_order() {
         assert!(trie.get(key.as_bytes()).is_some());
     }
 }
-
 #[test]
 fn insert_same_first_byte() {
     // Keys that all start with the same byte — tests deeper trie levels
@@ -272,7 +244,6 @@ fn insert_same_first_byte() {
         assert_eq!(trie.get(&nt_key), Some(i));
     }
 }
-
 #[test]
 fn get_value_found_and_missing() {
     let mut trie: PolyTrie<String> = PolyTrie::new();
@@ -280,7 +251,6 @@ fn get_value_found_and_missing() {
     assert_eq!(trie.get_value(b"hello\0"), Some(&"world".to_string()));
     assert_eq!(trie.get_value(b"world\0"), None);
 }
-
 #[test]
 fn stress_large_keys() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -304,7 +274,6 @@ fn stress_large_keys() {
         assert_eq!(trie.get(&nt_key), Some(i));
     }
 }
-
 #[test]
 fn structure_report_empty() {
     let trie: PolyTrie<i32> = PolyTrie::new();
@@ -318,7 +287,6 @@ fn structure_report_empty() {
     assert_eq!(report.node4, 0);
     assert_eq!(report.node16, 0);
 }
-
 #[test]
 fn structure_report_single_key() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -330,7 +298,6 @@ fn structure_report_single_key() {
     assert_eq!(report.depth, 1); // root is a leaf
     assert_eq!(report.empty_slots, 0);
 }
-
 #[test]
 fn structure_report_two_keys() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -344,7 +311,6 @@ fn structure_report_two_keys() {
     assert!(report.total_internal >= 1);
     assert!(report.depth >= 2);
 }
-
 #[test]
 fn graduation_two_leaves() {
     // Insert two keys that fill a Node2 with both leaves.
@@ -360,7 +326,6 @@ fn graduation_two_leaves() {
     // Should have graduated from Node2 to Node4
     assert!(report.node4 >= 1, "expected at least 1 Node4, got {}", report.node4);
 }
-
 #[test]
 fn graduation_three_keys() {
     // Insert "a", "b", "c". After "a" and "b", graduation creates Node4.
@@ -373,7 +338,6 @@ fn graduation_three_keys() {
     assert_eq!(trie.get(b"b\0"), Some(i2));
     assert_eq!(trie.get(b"c\0"), Some(i3));
 }
-
 #[test]
 fn graduation_debug_key_prefix() {
     // Debug: insert "key_000" through "key_009" and verify lookups
@@ -397,7 +361,6 @@ fn graduation_debug_key_prefix() {
         assert_eq!(result, Some(i), "get({:?}) failed for i={}", key, i);
     }
 }
-
 #[test]
 fn structure_report_many_keys() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -411,12 +374,8 @@ fn structure_report_many_keys() {
     assert!(report.total_internal > 0);
     assert!(report.depth > 1);
     // Invariants
-    assert_eq!(
-        report.total_internal,
-        report.node2 + report.node4 + report.node16
-    );
+    assert_eq!(report.total_internal, report.node2 + report.node4 + report.node16);
 }
-
 #[test]
 fn structure_report_display() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -428,7 +387,6 @@ fn structure_report_display() {
     assert!(s.contains("Node2:"));
     assert!(s.contains("Depth:"));
 }
-
 #[test]
 fn aligned_graduation_creates_node4() {
     // Keys that diverge at bit 6 (even position) should allow Node2→Node4
@@ -438,11 +396,14 @@ fn aligned_graduation_creates_node4() {
     trie.insert(b"a".to_vec(), 1).unwrap();
     trie.insert(b"b".to_vec(), 2).unwrap();
     let report = trie.structure_report();
-    assert!(report.node4 >= 1, "expected Node4 from aligned graduation, got node4={}", report.node4);
+    assert!(
+        report.node4 >= 1,
+        "expected Node4 from aligned graduation, got node4={}",
+        report.node4
+    );
     assert_eq!(trie.get(b"a\0"), Some(0));
     assert_eq!(trie.get(b"b\0"), Some(1));
 }
-
 #[test]
 fn aligned_graduation_stress_1000() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -452,8 +413,10 @@ fn aligned_graduation_stress_1000() {
         assert!(result.is_ok(), "insert failed at i={}", i);
     }
     let report = trie.structure_report();
-    println!("Stress: keys={}, node2={}, node4={}, node16={}",
-        report.total_keys, report.node2, report.node4, report.node16);
+    println!(
+        "Stress: keys={}, node2={}, node4={}, node16={}",
+        report.total_keys, report.node2, report.node4, report.node16
+    );
     // All lookups must succeed
     for i in 0..1000u32 {
         let key = format!("key_{:05}\0", i);
@@ -461,7 +424,6 @@ fn aligned_graduation_stress_1000() {
         assert_eq!(result, Some(i as usize), "lookup failed at i={}", i);
     }
 }
-
 #[test]
 fn aligned_graduation_byte_boundary_keys() {
     // Keys that diverge at byte boundaries (bit positions 0, 8, 16, etc.)
@@ -472,19 +434,19 @@ fn aligned_graduation_byte_boundary_keys() {
     }
     assert_eq!(trie.len(), 255);
     let report = trie.structure_report();
-    println!("Byte keys: node2={}, node4={}, node16={}",
-        report.node2, report.node4, report.node16);
+    println!(
+        "Byte keys: node2={}, node4={}, node16={}",
+        report.node2, report.node4, report.node16
+    );
     // Verify all lookups
     for b in 1u8..=255 {
         let key = vec![b, 0];
         assert_eq!(trie.get(&key), Some(b as usize - 1), "lookup failed for byte {}", b);
     }
 }
-
 // -----------------------------------------------------------------------
 // Iterator tests
 // -----------------------------------------------------------------------
-
 #[test]
 fn iter_empty() {
     let trie: PolyTrie<i32> = PolyTrie::new();
@@ -493,7 +455,6 @@ fn iter_empty() {
     assert!(it.prev().is_none());
     assert!(it.current().is_none());
 }
-
 #[test]
 fn iter_single_key() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -505,7 +466,6 @@ fn iter_single_key() {
     assert_eq!(*v, 42);
     assert!(it.next().is_none()); // exhausted
 }
-
 #[test]
 fn iter_forward() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -519,7 +479,6 @@ fn iter_forward() {
     assert_eq!(it.next().unwrap().0, b"abz");
     assert!(it.next().is_none());
 }
-
 #[test]
 fn iter_backward() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -534,7 +493,6 @@ fn iter_backward() {
     assert_eq!(it.prev().unwrap().0, b"abc");
     assert!(it.prev().is_none());
 }
-
 #[test]
 fn iter_backward_full() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -556,7 +514,6 @@ fn iter_backward_full() {
     assert_eq!(collected[0], b"abd");
     assert_eq!(collected[1], b"abc");
 }
-
 #[test]
 fn iter_forward_backward_interleaved() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -574,7 +531,6 @@ fn iter_forward_backward_interleaved() {
     // Can't go further back
     assert!(it.prev().is_none());
 }
-
 #[test]
 fn iter_seek_exact() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -586,7 +542,6 @@ fn iter_seek_exact() {
     assert_eq!(k, b"abd");
     assert_eq!(*v, 2);
 }
-
 #[test]
 fn iter_seek_between() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -598,7 +553,6 @@ fn iter_seek_between() {
     let (k, _) = it.seek(b"abe\0").unwrap();
     assert_eq!(k, b"abz");
 }
-
 #[test]
 fn iter_seek_prefix_key() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -610,34 +564,28 @@ fn iter_seek_prefix_key() {
     assert_eq!(k, b"abc");
     assert_eq!(*v, 1);
 }
-
 #[test]
 fn iter_seek_past_end() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
-
     // Forward iteration should return both keys
     let mut it = trie.iter();
     assert_eq!(it.next().unwrap().0, b"abc");
     assert_eq!(it.next().unwrap().0, b"abd");
     assert!(it.next().is_none());
-
     // Seek past all keys should return None
     let mut it = trie.iter();
     assert!(it.seek(b"zzz\0").is_none());
-
     // Seek between existing keys should find the next one
     let mut it = trie.iter();
     let (k, _) = it.seek(b"abcd\0").unwrap();
     assert_eq!(k, b"abd");
-
     // Seek to exact key should find it
     let mut it = trie.iter();
     let (k, _) = it.seek(b"abc\0").unwrap();
     assert_eq!(k, b"abc");
 }
-
 #[test]
 fn iter_seek_before_all() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -647,7 +595,6 @@ fn iter_seek_before_all() {
     let (k, _) = it.seek(b"abc\0").unwrap();
     assert_eq!(k, b"def");
 }
-
 #[test]
 fn iter_stress_forward() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -666,7 +613,6 @@ fn iter_stress_forward() {
         assert!(keys[i] > keys[i - 1], "not in sorted order at index {}", i);
     }
 }
-
 #[test]
 fn iter_stress_backward() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -691,7 +637,6 @@ fn iter_stress_backward() {
         assert!(keys[i] < keys[i - 1], "not in reverse order at index {}", i);
     }
 }
-
 #[test]
 fn iter_with_graduation() {
     // Insert enough keys to trigger graduation through Node2 → Node4 → Node16
@@ -703,7 +648,6 @@ fn iter_with_graduation() {
     let report = trie.structure_report();
     // Should have some graduated nodes
     assert!(report.node4 + report.node16 > 0, "expected some graduated nodes");
-
     // Verify forward iteration
     let mut it = trie.iter();
     let mut forward_keys: Vec<Vec<u8>> = Vec::new();
@@ -714,7 +658,6 @@ fn iter_with_graduation() {
     for i in 1..forward_keys.len() {
         assert!(forward_keys[i] > forward_keys[i - 1]);
     }
-
     // Verify backward iteration
     let mut it = trie.iter_last();
     let mut backward_keys: Vec<Vec<u8>> = Vec::new();
@@ -732,7 +675,6 @@ fn iter_with_graduation() {
         assert!(backward_keys[i] < backward_keys[i - 1]);
     }
 }
-
 #[test]
 fn iter_byte_boundary_keys() {
     // 255 single-byte keys (0x01..=0xFF) — creates wider node types
@@ -751,23 +693,26 @@ fn iter_byte_boundary_keys() {
     for i in 1..keys.len() {
         assert!(keys[i] > keys[i - 1], "not in order: {} <= {}", keys[i], keys[i - 1]);
     }
-
     // Backward iteration
     let mut it = trie.iter_last();
     keys.clear();
     loop {
         match it.current() {
-            Some((k, _)) => { assert_eq!(k.len(), 1); keys.push(k[0]); }
+            Some((k, _)) => {
+                assert_eq!(k.len(), 1);
+                keys.push(k[0]);
+            }
             None => break,
         }
-        if it.prev().is_none() { break; }
+        if it.prev().is_none() {
+            break;
+        }
     }
     assert_eq!(keys.len(), 255);
     for i in 1..keys.len() {
         assert!(keys[i] < keys[i - 1], "not in reverse order");
     }
 }
-
 #[test]
 fn iter_seek_stress() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -787,24 +732,20 @@ fn iter_seek_stress() {
     let mut it = trie.iter();
     let (k, _) = it.seek(b"key_00050\0").unwrap();
     assert_eq!(k, b"key_00050");
-
     let mut it = trie.iter();
     let (k, _) = it.seek(b"key_00049\x01\0").unwrap();
     // Between key_00049 and key_00050: should land on key_00050
     assert!(k >= b"key_00050", "expected key >= key_00050, got {:?}", k);
 }
-
 // -----------------------------------------------------------------------
 // Optimize tests
 // -----------------------------------------------------------------------
-
 #[test]
 fn optimize_empty() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
     trie.optimize();
     assert!(trie.is_empty());
 }
-
 #[test]
 fn optimize_single_key() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -813,7 +754,6 @@ fn optimize_single_key() {
     assert_eq!(trie.get(b"hello\0"), Some(0));
     assert_eq!(trie.len(), 1);
 }
-
 #[test]
 fn optimize_preserves_lookups() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -824,12 +764,15 @@ fn optimize_preserves_lookups() {
     trie.optimize();
     for i in 0..100 {
         let key = format!("key_{:03}\0", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(i),
-            "lookup failed after optimize for i={}", i);
+        assert_eq!(
+            trie.get(key.as_bytes()),
+            Some(i),
+            "lookup failed after optimize for i={}",
+            i
+        );
     }
     assert_eq!(trie.len(), 100);
 }
-
 #[test]
 fn optimize_preserves_iteration() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -838,7 +781,6 @@ fn optimize_preserves_iteration() {
         trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     trie.optimize();
-
     // Forward
     let mut it = trie.iter();
     let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -849,7 +791,6 @@ fn optimize_preserves_iteration() {
     for i in 1..keys.len() {
         assert!(keys[i] > keys[i - 1], "not sorted after optimize at index {}", i);
     }
-
     // Backward
     let mut it = trie.iter_last();
     keys.clear();
@@ -858,14 +799,15 @@ fn optimize_preserves_iteration() {
             Some((k, _)) => keys.push(k.to_vec()),
             None => break,
         }
-        if it.prev().is_none() { break; }
+        if it.prev().is_none() {
+            break;
+        }
     }
     assert_eq!(keys.len(), 100);
     for i in 1..keys.len() {
         assert!(keys[i] < keys[i - 1], "not reverse-sorted after optimize at index {}", i);
     }
 }
-
 #[test]
 fn optimize_compacts_arena() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -881,13 +823,14 @@ fn optimize_compacts_arena() {
     // Occupied slots should be the same (same number of live nodes)
     assert_eq!(after_occupied, before_occupied);
     // Capacity should equal occupied (no freed gaps)
-    assert_eq!(after_capacity, after_occupied,
+    assert_eq!(
+        after_capacity, after_occupied,
         "arena not compact after optimize: capacity={} occupied={}",
-        after_capacity, after_occupied);
+        after_capacity, after_occupied
+    );
     // Capacity should be <= before (freed slots from graduation are reclaimed)
     assert!(after_capacity <= before_capacity);
 }
-
 #[test]
 fn optimize_byte_boundary_keys() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -897,11 +840,14 @@ fn optimize_byte_boundary_keys() {
     trie.optimize();
     for b in 1u8..=255 {
         let key = vec![b, 0];
-        assert_eq!(trie.get(&key), Some(b as usize - 1),
-            "lookup failed after optimize for byte {}", b);
+        assert_eq!(
+            trie.get(&key),
+            Some(b as usize - 1),
+            "lookup failed after optimize for byte {}",
+            b
+        );
     }
 }
-
 #[test]
 fn optimize_seek_preserved() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -915,7 +861,6 @@ fn optimize_seek_preserved() {
     assert_eq!(k, b"key_00025");
     assert_eq!(*v, 25);
 }
-
 #[test]
 fn optimize_idempotent() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -933,7 +878,6 @@ fn optimize_idempotent() {
         assert_eq!(trie.get(key.as_bytes()), Some(i));
     }
 }
-
 #[test]
 fn optimize_stress_1000() {
     let mut trie: PolyTrie<i32> = PolyTrie::new();
@@ -944,7 +888,11 @@ fn optimize_stress_1000() {
     trie.optimize();
     for i in 0..1000u32 {
         let key = format!("key_{:05}\0", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(i as usize),
-            "lookup failed after optimize at i={}", i);
+        assert_eq!(
+            trie.get(key.as_bytes()),
+            Some(i as usize),
+            "lookup failed after optimize at i={}",
+            i
+        );
     }
 }

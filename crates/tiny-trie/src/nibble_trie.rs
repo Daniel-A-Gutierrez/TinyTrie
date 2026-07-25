@@ -27,19 +27,19 @@
 //! Real keys start at index 1 (index 0 is the dummy entry pointing at buf[0],
 //! an unused byte). `values[i]` corresponds to `index[i+1]` (i.e. key index
 //! `ki` maps to `values[ki - 1]`).
-
 use crate::ByteKey;
 use crate::tiny_array::TinyArray;
-use std::{fmt, marker::PhantomData, num::NonZero, ops::{Bound, RangeBounds}, simd::{Simd, cmp::SimdPartialEq}};
-
+use std::{fmt,
+          marker::PhantomData,
+          num::NonZero,
+          ops::{Bound, RangeBounds},
+          simd::{Simd, cmp::SimdPartialEq}};
 /// One slot of the sparse `index`: the buf offset (>= 1; buf[0] is the dummy byte),
 /// the key length, and the value inline. `None` slots are gaps.
 pub type Slot<LEN, T> = (NonZero<usize>, LEN, T);
-
 // ---------------------------------------------------------------------------
 // TrieIndex trait
 // ---------------------------------------------------------------------------
-
 /// Trait for types used as arena/key indices and prefix lengths in NibbleTrie.
 ///
 /// Implemented for `u8`, `u16`, `u32`, and `u64`. The type parameter `PTR` (pointer
@@ -64,64 +64,116 @@ pub trait TrieIndex: Copy + Clone + Default + PartialEq + Eq + fmt::Debug + 'sta
     /// Bit N is set if `children[N]` is not zero.
     fn children_mask(children: &[Self; 16]) -> u16;
 }
-
 impl TrieIndex for u8 {
-    #[inline] fn as_usize(self) -> usize { self as usize }
-    #[inline] fn max_value() -> usize { u8::MAX as usize }
-    #[inline] fn zero() -> Self { 0 }
-    #[inline] fn max_value_sentinel() -> Self { u8::MAX }
-    #[inline] fn from_usize(n: usize) -> Self {
+    #[inline]
+    fn as_usize(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn max_value() -> usize {
+        u8::MAX as usize
+    }
+    #[inline]
+    fn zero() -> Self {
+        0
+    }
+    #[inline]
+    fn max_value_sentinel() -> Self {
+        u8::MAX
+    }
+    #[inline]
+    fn from_usize(n: usize) -> Self {
         debug_assert!(n <= u8::MAX as usize, "u8 overflow: {n}");
         n as u8
     }
-    #[inline] fn children_mask(children: &[Self; 16]) -> u16 {
+    #[inline]
+    fn children_mask(children: &[Self; 16]) -> u16 {
         crate::simd::children_mask_u8(children)
     }
 }
-
 impl TrieIndex for u16 {
-    #[inline] fn as_usize(self) -> usize { self as usize }
-    #[inline] fn max_value() -> usize { u16::MAX as usize }
-    #[inline] fn zero() -> Self { 0 }
-    #[inline] fn max_value_sentinel() -> Self { u16::MAX }
-    #[inline] fn from_usize(n: usize) -> Self {
+    #[inline]
+    fn as_usize(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn max_value() -> usize {
+        u16::MAX as usize
+    }
+    #[inline]
+    fn zero() -> Self {
+        0
+    }
+    #[inline]
+    fn max_value_sentinel() -> Self {
+        u16::MAX
+    }
+    #[inline]
+    fn from_usize(n: usize) -> Self {
         debug_assert!(n <= u16::MAX as usize, "u16 overflow: {n}");
         n as u16
     }
-    #[inline] fn children_mask(children: &[Self; 16]) -> u16 {
+    #[inline]
+    fn children_mask(children: &[Self; 16]) -> u16 {
         crate::simd::children_mask_u16(children)
     }
 }
-
 impl TrieIndex for u32 {
-    #[inline] fn as_usize(self) -> usize { self as usize }
-    #[inline] fn max_value() -> usize { u32::MAX as usize }
-    #[inline] fn zero() -> Self { 0 }
-    #[inline] fn max_value_sentinel() -> Self { u32::MAX }
-    #[inline] fn from_usize(n: usize) -> Self {
+    #[inline]
+    fn as_usize(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn max_value() -> usize {
+        u32::MAX as usize
+    }
+    #[inline]
+    fn zero() -> Self {
+        0
+    }
+    #[inline]
+    fn max_value_sentinel() -> Self {
+        u32::MAX
+    }
+    #[inline]
+    fn from_usize(n: usize) -> Self {
         debug_assert!(n <= u32::MAX as usize, "u32 overflow: {n}");
         n as u32
     }
-    #[inline] fn children_mask(children: &[Self; 16]) -> u16 {
+    #[inline]
+    fn children_mask(children: &[Self; 16]) -> u16 {
         crate::simd::children_mask(children)
     }
 }
-
 impl TrieIndex for u64 {
-    #[inline] fn as_usize(self) -> usize { self as usize }
-    #[inline] fn max_value() -> usize { u64::MAX as usize }
-    #[inline] fn zero() -> Self { 0 }
-    #[inline] fn max_value_sentinel() -> Self { u64::MAX }
-    #[inline] fn from_usize(n: usize) -> Self { n as u64 }
-    #[inline] fn children_mask(children: &[Self; 16]) -> u16 {
+    #[inline]
+    fn as_usize(self) -> usize {
+        self as usize
+    }
+    #[inline]
+    fn max_value() -> usize {
+        u64::MAX as usize
+    }
+    #[inline]
+    fn zero() -> Self {
+        0
+    }
+    #[inline]
+    fn max_value_sentinel() -> Self {
+        u64::MAX
+    }
+    #[inline]
+    fn from_usize(n: usize) -> Self {
+        n as u64
+    }
+    #[inline]
+    fn children_mask(children: &[Self; 16]) -> u16 {
         crate::simd::children_mask_u64(children)
     }
 }
-
 // ---------------------------------------------------------------------------
 // OptNz: 0-encoded optional index (no tag byte, layout-identical to PTR)
 // ---------------------------------------------------------------------------
-
 /// A nonzero-style optional index: a `#[repr(transparent)]` wrapper over `PTR`
 /// where the value `0` denotes "empty" and any nonzero value is a real index.
 ///
@@ -131,53 +183,53 @@ impl TrieIndex for u64 {
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) struct OptNz<PTR: TrieIndex>(PTR);
-
 impl<PTR: TrieIndex> OptNz<PTR> {
     /// The empty value (encodes `0`).
     #[inline]
-    pub(crate) fn empty() -> Self { Self(PTR::zero()) }
-
+    pub(crate) fn empty() -> Self {
+        Self(PTR::zero())
+    }
     /// Build from a raw `PTR`. Returns `None` if `v` is zero.
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn new(v: PTR) -> Option<Self> {
         if v == PTR::zero() { None } else { Some(Self(v)) }
     }
-
     /// Build from a known-nonzero `PTR`. Debug-asserts `v != 0`.
     #[inline]
     pub(crate) fn from_index(v: PTR) -> Self {
         debug_assert!(v != PTR::zero(), "OptNz::from_index: zero value");
         Self(v)
     }
-
     /// The raw underlying `PTR` (zero if empty).
     #[inline]
-    pub(crate) fn get(self) -> PTR { self.0 }
-
+    pub(crate) fn get(self) -> PTR {
+        self.0
+    }
     /// Whether this slot holds a real index.
     #[inline]
-    pub(crate) fn is_some(self) -> bool { self.0 != PTR::zero() }
-
+    pub(crate) fn is_some(self) -> bool {
+        self.0 != PTR::zero()
+    }
     /// Whether this slot is empty.
     #[inline]
-    pub(crate) fn is_none(self) -> bool { self.0 == PTR::zero() }
+    pub(crate) fn is_none(self) -> bool {
+        self.0 == PTR::zero()
+    }
 }
-
 impl<PTR: TrieIndex> Default for OptNz<PTR> {
-    fn default() -> Self { Self(PTR::zero()) }
+    fn default() -> Self {
+        Self(PTR::zero())
+    }
 }
-
 impl<PTR: TrieIndex> fmt::Debug for OptNz<PTR> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_none() { write!(f, "-") } else { write!(f, "{:?}", self.0) }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
-
 /// A single node in the nibble trie arena.
 ///
 /// Generic over `PTR` (pointer/index type for children and arena references)
@@ -188,64 +240,56 @@ impl<PTR: TrieIndex> fmt::Debug for OptNz<PTR> {
 /// With PTR=u16, LEN=u16: 40 bytes (32 children + 2 + 2 + 2 + 1 + 1 padding).
 #[derive(Copy, Clone)]
 pub(crate) struct Node<PTR: TrieIndex, LEN: TrieIndex> {
-    pub(crate) children: [OptNz<PTR>; 16],  // 0 = empty; leaf key index or arena index otherwise
-    pub(crate) prefix_len: LEN,             // absolute nibble position of the discriminating nibble
-    pub(crate) leaf_mask: u16,              // bit N set → children[N] is a leaf key index
-    pub(crate) leaf: OptNz<PTR>,            // key index of a reference/descendant leaf (for retrieval)
-    pub(crate) terminal: bool,              // true → this node's key ends here (prefix key)
+    pub(crate) children:   [OptNz<PTR>; 16], // 0 = empty; leaf key index or arena index otherwise
+    pub(crate) prefix_len: LEN, // absolute nibble position of the discriminating nibble
+    pub(crate) leaf_mask:  u16, // bit N set → children[N] is a leaf key index
+    pub(crate) leaf:       OptNz<PTR>, // key index of a reference/descendant leaf (for retrieval)
+    pub(crate) terminal:   bool,       // true → this node's key ends here (prefix key)
 }
-
 impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
     pub(crate) fn new() -> Self {
         Node {
-            children: [OptNz::empty(); 16],
+            children:   [OptNz::empty(); 16],
             prefix_len: LEN::zero(),
-            leaf_mask: 0,
-            leaf: OptNz::empty(),
-            terminal: false,
+            leaf_mask:  0,
+            leaf:       OptNz::empty(),
+            terminal:   false,
         }
     }
-
     /// Whether this node is terminal (its own key ends here).
     #[inline]
     pub(crate) fn is_terminal(&self) -> bool {
         self.terminal
     }
-
     /// Set the terminal flag.
     #[inline]
     fn set_terminal(&mut self, val: bool) {
         self.terminal = val;
     }
-
     /// Check if nibble slot `nib` is a leaf (key index).
     #[inline]
     pub(crate) fn is_leaf(&self, nib: usize) -> bool {
         debug_assert!(nib < 16);
         (self.leaf_mask >> nib) & 1 == 1
     }
-
     /// Set the leaf flag for nibble slot `nib`.
     #[inline]
     fn set_leaf(&mut self, nib: usize) {
         debug_assert!(nib < 16);
         self.leaf_mask |= 1 << nib;
     }
-
     /// Clear the leaf flag for nibble slot `nib`.
     #[inline]
     fn clear_leaf(&mut self, nib: usize) {
         debug_assert!(nib < 16);
         self.leaf_mask &= !(1 << nib);
     }
-
     /// Check if nibble slot `nib` is occupied (holds a child, leaf or internal).
     #[inline]
     pub(crate) fn is_occupied(&self, nib: usize) -> bool {
         debug_assert!(nib < 16);
         self.children[nib].is_some()
     }
-
     /// Store a leaf key index at `nib`. Key index must be nonzero.
     #[inline]
     fn set_leaf_child(&mut self, nib: usize, key_index: PTR) {
@@ -254,7 +298,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
         self.set_leaf(nib);
         self.children[nib] = OptNz::from_index(key_index);
     }
-
     /// Store an arena index at `nib` (internal node reference). Must be nonzero.
     #[inline]
     fn set_internal_child(&mut self, nib: usize, arena_idx: PTR) {
@@ -263,7 +306,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
         self.clear_leaf(nib);
         self.children[nib] = OptNz::from_index(arena_idx);
     }
-
     /// Decode a leaf child at `nib` into a key index.
     /// Returns `None` if the slot is empty or not a leaf.
     #[inline]
@@ -275,7 +317,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
             None
         }
     }
-
     /// Compute a 16-bit mask where bit N is set if `children[N]` is occupied.
     /// Reuses the SIMD `children_mask` over the raw `[PTR; 16]` view — sound
     /// because `OptNz<PTR>` is `#[repr(transparent)]` over `PTR`.
@@ -283,17 +324,18 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
     pub(crate) fn children_mask(&self) -> u16 {
         // SAFETY: OptNz<PTR> is #[repr(transparent)] over PTR, so
         // [OptNz<PTR>; 16] has identical layout to [PTR; 16].
-        let raw: &[PTR; 16] = unsafe { &*(&self.children as *const [OptNz<PTR>; 16] as *const [PTR; 16]) };
+        let raw: &[PTR; 16] =
+            unsafe { &*(&self.children as *const [OptNz<PTR>; 16] as *const [PTR; 16]) };
         PTR::children_mask(raw)
     }
-
     /// Promote this node's PTR type to a wider one.
     /// Child arena indices and leaf key indices are widened via `NewPTR::from_usize`.
     pub(crate) fn promote<NewPTR: TrieIndex>(self) -> Node<NewPTR, LEN> {
         let mut children = [OptNz::empty(); 16];
         for i in 0..16 {
             if self.children[i].is_some() {
-                children[i] = OptNz::from_index(NewPTR::from_usize(self.children[i].get().as_usize()));
+                children[i] =
+                    OptNz::from_index(NewPTR::from_usize(self.children[i].get().as_usize()));
             }
         }
         Node {
@@ -308,13 +350,14 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
             terminal: self.terminal,
         }
     }
-
     /// Demote this node's PTR type to a narrower one.
     /// Returns `Err(self)` if any child index or leaf index doesn't fit
     /// in the narrower type.
     pub(crate) fn demote<NewPTR: TrieIndex>(self) -> Result<Node<NewPTR, LEN>, Self> {
         for i in 0..16 {
-            if self.children[i].is_some() && self.children[i].get().as_usize() > NewPTR::max_value() {
+            if self.children[i].is_some()
+                && self.children[i].get().as_usize() > NewPTR::max_value()
+            {
                 return Err(self);
             }
         }
@@ -324,7 +367,8 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
         let mut children = [OptNz::empty(); 16];
         for i in 0..16 {
             if self.children[i].is_some() {
-                children[i] = OptNz::from_index(NewPTR::from_usize(self.children[i].get().as_usize()));
+                children[i] =
+                    OptNz::from_index(NewPTR::from_usize(self.children[i].get().as_usize()));
             }
         }
         Ok(Node {
@@ -340,7 +384,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> Node<PTR, LEN> {
         })
     }
 }
-
 impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for Node<PTR, LEN> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let active: Vec<(usize, &str, PTR)> = (0..16)
@@ -359,24 +402,19 @@ impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for Node<PTR, LEN> {
             .finish()
     }
 }
-
 // ---------------------------------------------------------------------------
 // FlatNode (Fnode) — dense leaf-pack node (step 4: base + terminal + offset)
 // ---------------------------------------------------------------------------
-
 /// Maximum number of keys a [`FlatNode`] can hold: 1 reference key (`base`) +
 /// `FNODE_SLOTS` array slots.
 pub(crate) const FNODE_CAP: usize = 16;
-
 /// Number of array slots in a [`FlatNode`] (one less than [`FNODE_CAP`] — the
 /// leftmost/reference key is pulled out of the array into `base`).
 pub(crate) const FNODE_SLOTS: usize = 15;
-
 /// `offset` value meaning "branch marker" (no terminal key at this slot; its
 /// children follow as deeper array slots). Real offsets are `>= 1` because
 /// `base` is the smallest key index in the subtree.
 pub(crate) const FNODE_OFFSET_NULL: u8 = 0xFF;
-
 /// A dense leaf-pack node: collapses a small/deep subtree (≤ [`FNODE_CAP`]
 /// keys) into one node holding a flattened pre-order micro-trie.
 ///
@@ -423,22 +461,20 @@ pub(crate) const FNODE_OFFSET_NULL: u8 = 0xFF;
 /// [`ArenaNode`] is `Copy` too — no borrow-not-copy constraint on the arena.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct FlatNode<PTR: TrieIndex, LEN: TrieIndex> {
-    pub(crate) nibbles: u64,                       // 15 nibbles × 4 bits (array slots 0..FNODE_SLOTS)
-    pub(crate) base: PTR,                          // index into `index` of the leftmost (reference) key
-    pub(crate) terminal: bool,                     // whether `base` (the subtree root) is itself terminal
-    pub(crate) slots: TinyArray<(LEN, u8), FNODE_SLOTS>, // (prefix_len, offset); offset 0xFF = branch marker
+    pub(crate) nibbles:  u64, // 15 nibbles × 4 bits (array slots 0..FNODE_SLOTS)
+    pub(crate) base:     PTR, // index into `index` of the leftmost (reference) key
+    pub(crate) terminal: bool, // whether `base` (the subtree root) is itself terminal
+    pub(crate) slots:    TinyArray<(LEN, u8), FNODE_SLOTS>, // (prefix_len, offset); offset 0xFF = branch marker
 }
-
 impl<PTR: TrieIndex, LEN: TrieIndex> FlatNode<PTR, LEN> {
     pub(crate) fn new() -> Self {
         FlatNode {
-            nibbles: 0,
-            base: PTR::zero(),
+            nibbles:  0,
+            base:     PTR::zero(),
             terminal: false,
-            slots: TinyArray::new(),
+            slots:    TinyArray::new(),
         }
     }
-
     /// The `index` position of the key at array slot `i` (`base + offset`), or
     /// `None` if slot `i` is a branch marker (offset == [`FNODE_OFFSET_NULL`]).
     #[allow(dead_code)]
@@ -451,13 +487,11 @@ impl<PTR: TrieIndex, LEN: TrieIndex> FlatNode<PTR, LEN> {
             Some(PTR::from_usize(self.base.as_usize() + offset as usize))
         }
     }
-
     /// The nibble stored at array slot `i`.
     #[inline]
     pub(crate) fn slot_nibble(&self, i: usize) -> u8 {
         ((self.nibbles >> (4 * i)) & 0xF) as u8
     }
-
     /// The key index at [`Frame::Fnode`] position `pos`: `0` = `base`, `i+1` =
     /// array slot `i`. Returns `None` if `pos` is not a terminal — `base` when
     /// `!terminal`, or an array branch-marker slot (the latter never occurs: the
@@ -478,18 +512,12 @@ impl<PTR: TrieIndex, LEN: TrieIndex> FlatNode<PTR, LEN> {
             }
         }
     }
-
     /// First terminal position: `0` if `terminal`, else the first array slot
     /// with a non-NULL offset (encoded as `slot+1`). `None` if no terminals.
     #[inline]
     pub(crate) fn first_terminal_pos(&self) -> Option<usize> {
-        if self.terminal {
-            Some(0)
-        } else {
-            self.next_terminal_pos(0)
-        }
+        if self.terminal { Some(0) } else { self.next_terminal_pos(0) }
     }
-
     /// Next terminal position strictly after `pos`: scans array slots from
     /// `pos` for the next non-NULL offset (returned as `slot+1`). `pos==0`
     /// (after `base`) starts at array slot 0; `pos==i+1` (after array slot `i`)
@@ -505,7 +533,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> FlatNode<PTR, LEN> {
         }
         None
     }
-
     /// Number of terminal keys this Fnode represents: `base` (if `terminal`) plus
     /// every array slot with a non-NULL offset. When `terminal=false`, `base` is
     /// itself an array slot (offset 0), so it is counted by the loop; when `true`,
@@ -519,18 +546,16 @@ impl<PTR: TrieIndex, LEN: TrieIndex> FlatNode<PTR, LEN> {
         }
         n
     }
-
     /// Promote the reference key index type to a wider `PTR` (only `base`
     /// carries a `PTR`; the array slots are `(LEN, u8)` offsets).
     fn promote<NewPTR: TrieIndex>(self) -> FlatNode<NewPTR, LEN> {
         FlatNode {
-            nibbles: self.nibbles,
-            base: NewPTR::from_usize(self.base.as_usize()),
+            nibbles:  self.nibbles,
+            base:     NewPTR::from_usize(self.base.as_usize()),
             terminal: self.terminal,
-            slots: self.slots,
+            slots:    self.slots,
         }
     }
-
     /// Demote the reference key index type to a narrower `PTR`. Returns
     /// `Err(self)` if `base` doesn't fit in the narrower type. (Array-slot
     /// offsets are `u8`, so they always fit.)
@@ -539,18 +564,18 @@ impl<PTR: TrieIndex, LEN: TrieIndex> FlatNode<PTR, LEN> {
             return Err(self);
         }
         Ok(FlatNode {
-            nibbles: self.nibbles,
-            base: NewPTR::from_usize(self.base.as_usize()),
+            nibbles:  self.nibbles,
+            base:     NewPTR::from_usize(self.base.as_usize()),
             terminal: self.terminal,
-            slots: self.slots,
+            slots:    self.slots,
         })
     }
 }
-
 impl<PTR: TrieIndex, LEN: TrieIndex> Default for FlatNode<PTR, LEN> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
-
 /// Tagged arena element: `Inode` (the existing 16-slot direct-addressed
 /// [`Node`]) or `Fnode` (a [`FlatNode`]). `Copy` — both variants are `Copy`
 /// (`FlatNode` is `Copy` since `TinyArray` is), so arena reads may copy freely.
@@ -559,7 +584,6 @@ pub(crate) enum ArenaNode<PTR: TrieIndex, LEN: TrieIndex> {
     Inode(Node<PTR, LEN>),
     Fnode(FlatNode<PTR, LEN>),
 }
-
 impl<PTR: TrieIndex, LEN: TrieIndex> ArenaNode<PTR, LEN> {
     /// Promote the arena index type to a wider `PTR` (dispatches by variant).
     fn promote<NewPTR: TrieIndex>(self) -> ArenaNode<NewPTR, LEN> {
@@ -568,7 +592,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> ArenaNode<PTR, LEN> {
             ArenaNode::Fnode(f) => ArenaNode::Fnode(f.promote()),
         }
     }
-
     /// Demote the arena index type to a narrower `PTR` (dispatches by variant).
     /// Returns `Err(self)` if any index doesn't fit.
     fn demote<NewPTR: TrieIndex>(self) -> Result<ArenaNode<NewPTR, LEN>, Self> {
@@ -578,27 +601,23 @@ impl<PTR: TrieIndex, LEN: TrieIndex> ArenaNode<PTR, LEN> {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // NibbleTrie
 // ---------------------------------------------------------------------------
-
 #[derive(Clone)]
 pub struct NibbleTrie<K, T, PTR: TrieIndex = u32, LEN: TrieIndex = u16>
 where
     K: ByteKey,
 {
-    pub(crate) arena: Vec<ArenaNode<PTR, LEN>>,
-    pub(crate) buf: Vec<u8>,                // all keys concatenated (no null terminators)
-    pub(crate) index: Vec<Option<Slot<LEN, T>>>, // sparse: position == key index; None = gap; [0] = dummy
-    pub(crate) n_keys: usize,               // live key count (replaces index.len()-1)
-    _key: PhantomData<K>,
+    pub(crate) arena:  Vec<ArenaNode<PTR, LEN>>,
+    pub(crate) buf:    Vec<u8>, // all keys concatenated (no null terminators)
+    pub(crate) index:  Vec<Option<Slot<LEN, T>>>, // sparse: position == key index; None = gap; [0] = dummy
+    pub(crate) n_keys: usize,                     // live key count (replaces index.len()-1)
+    _key:              PhantomData<K>,
 }
-
 // ---------------------------------------------------------------------------
 // Divergence result
 // ---------------------------------------------------------------------------
-
 /// Outcome of comparing two keys for divergence starting from a given nibble
 /// position. `from` lets callers skip already-confirmed-matching prefixes.
 enum DivergeResult {
@@ -608,7 +627,6 @@ enum DivergeResult {
     /// other (position = length of the shorter key in nibbles).
     At(usize),
 }
-
 /// Outcome of a bounded prefix check: scan nibbles `from..to` and report
 /// whether the keys match in that range or diverge at a specific nibble.
 /// Unlike `DivergeResult`, this does not scan past `to` and has no
@@ -619,7 +637,6 @@ enum PrefixCheck {
     /// The keys diverge at this nibble position (within `from..to`).
     Diverges(usize),
 }
-
 /// Scan two keys from `from` onward to find the first diverging nibble.
 #[inline]
 fn find_divergence(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult {
@@ -633,13 +650,8 @@ fn find_divergence(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult {
         }
         d += 1;
     }
-    if total_a == total_b {
-        DivergeResult::Duplicate
-    } else {
-        DivergeResult::At(d)
-    }
+    if total_a == total_b { DivergeResult::Duplicate } else { DivergeResult::At(d) }
 }
-
 /// Given two differing bytes, return the nibble index of the first divergence.
 /// High nibble (bits 7–4) is checked first; if they match, the low nibble
 /// (bits 3–0) diverges. Branchless: XOR → check if high nibble is zero → add 1.
@@ -647,7 +659,6 @@ fn find_divergence(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult {
 fn diverging_nibble(xor: u8, byte_idx: usize) -> usize {
     byte_idx * 2 + ((xor >> 4 == 0) as usize)
 }
-
 /// SIMD-accelerated byte equality check. Returns `true` if both slices have
 /// the same length and identical content. Uses 16-byte lanes for the bulk
 /// of the comparison, with a scalar tail for the remainder.
@@ -675,28 +686,29 @@ fn simd_eq(a: &[u8], b: &[u8]) -> bool {
     }
     true
 }
-
-fn simd_find_divergence<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult
-{
+fn simd_find_divergence<const N: usize>(
+    key_a: &[u8],
+    key_b: &[u8],
+    from: usize,
+) -> DivergeResult {
     let minlen = key_a.len().min(key_b.len());
     let mut i = from / 2; // byte containing nibble `from`
-
     while i + N <= minlen {
         let a = Simd::<u8, N>::from_slice(unsafe { key_a.get_unchecked(i..i + N) });
         let b = Simd::<u8, N>::from_slice(unsafe { key_b.get_unchecked(i..i + N) });
         let mask = a.simd_ne(b);
         if mask.any() {
             let diff_byte_idx = i + mask.first_set().unwrap();
-            let xor = unsafe { *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx) };
+            let xor = unsafe {
+                *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx)
+            };
             return DivergeResult::At(diverging_nibble(xor, diff_byte_idx));
         }
         i += N;
     }
-
     // Scalar tail
     find_divergence(key_a, key_b, i * 2)
 }
-
 /// Scan nibbles `from..to` of two keys. Returns `Diverges(pos)` if they differ
 /// at any nibble in that range, or `Matches` if they agree throughout.
 /// An empty range (`from >= to`) is trivially `Matches`.
@@ -709,28 +721,31 @@ fn check_prefix(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixChe
     }
     PrefixCheck::Matches
 }
-
 /// SIMD-accelerated bounded prefix check. Scans nibbles `from..to` and stops
 /// at the first divergence within that range. Returns `Matches` if the keys
 /// agree throughout, or `Diverges(pos)` at the first differing nibble.
-fn simd_check_prefix<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixCheck
-{
+fn simd_check_prefix<const N: usize>(
+    key_a: &[u8],
+    key_b: &[u8],
+    from: usize,
+    to: usize,
+) -> PrefixCheck {
     if from >= to {
         return PrefixCheck::Matches;
     }
-
     let from_byte = from / 2;
     let to_byte = (to + 1) / 2; // first byte fully outside the nibble range
     let minlen = key_a.len().min(key_b.len()).min(to_byte);
     let mut i = from_byte;
-
     while i + N <= minlen {
         let a = Simd::<u8, N>::from_slice(unsafe { key_a.get_unchecked(i..i + N) });
         let b = Simd::<u8, N>::from_slice(unsafe { key_b.get_unchecked(i..i + N) });
         let mask = a.simd_ne(b);
         if mask.any() {
             let diff_byte_idx = i + mask.first_set().unwrap();
-            let xor = unsafe { *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx) };
+            let xor = unsafe {
+                *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx)
+            };
             let nib = diverging_nibble(xor, diff_byte_idx);
             if nib < to {
                 return PrefixCheck::Diverges(nib);
@@ -740,29 +755,21 @@ fn simd_check_prefix<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize, to
         }
         i += N;
     }
-
     // Scalar tail
     check_prefix(key_a, key_b, i * 2, to)
 }
-
 // ---------------------------------------------------------------------------
 // Nibble helpers
 // ---------------------------------------------------------------------------
-
 #[inline]
 fn key_nibble_at(key: &[u8], idx: usize) -> u8 {
     let byte_idx = idx / 2;
     if byte_idx < key.len() {
-        if idx % 2 == 0 {
-            key[byte_idx] >> 4
-        } else {
-            key[byte_idx] & 0x0F
-        }
+        if idx % 2 == 0 { key[byte_idx] >> 4 } else { key[byte_idx] & 0x0F }
     } else {
         0
     }
 }
-
 /// Unchecked version of `key_nibble_at`.
 ///
 /// # Safety
@@ -778,16 +785,13 @@ unsafe fn key_nibble_at_unchecked(key: &[u8], idx: usize) -> u8 {
         unsafe { *key.get_unchecked(byte_idx) & 0x0F }
     }
 }
-
 #[inline]
 fn nibble_count(key: &[u8]) -> usize {
     key.len() * 2
 }
-
 // ---------------------------------------------------------------------------
 // NibbleTrie methods
 // ---------------------------------------------------------------------------
-
 impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     /// Return the key slice for `key_index`.
     #[inline]
@@ -795,7 +799,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let (off, len, _) = self.index[key_index.as_usize()].as_ref().unwrap();
         &self.buf[off.get()..off.get() + len.as_usize()]
     }
-
     /// Borrow the `Inode` at arena index `i`.
     ///
     /// This is the single chokepoint for the **Inode-only** code paths (insert,
@@ -808,41 +811,39 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     fn inode(&self, i: usize) -> &Node<PTR, LEN> {
         match &self.arena[i] {
             ArenaNode::Inode(n) => n,
-            ArenaNode::Fnode(_) => panic!("inode(): arena[{i}] is an Fnode (Inode-only path)"),
+            ArenaNode::Fnode(_) => {
+                panic!("inode(): arena[{i}] is an Fnode (Inode-only path)")
+            }
         }
     }
-
     /// Mutably borrow the `Inode` at arena index `i`. See [`inode`](Self::inode).
     #[inline]
     fn inode_mut(&mut self, i: usize) -> &mut Node<PTR, LEN> {
         match &mut self.arena[i] {
             ArenaNode::Inode(n) => n,
-            ArenaNode::Fnode(_) => panic!("inode_mut(): arena[{i}] is an Fnode (Inode-only path)"),
+            ArenaNode::Fnode(_) => {
+                panic!("inode_mut(): arena[{i}] is an Fnode (Inode-only path)")
+            }
         }
     }
-
     pub fn new() -> Self {
         NibbleTrie {
-            arena: Vec::new(),
-            buf: vec![0],           // buf[0] = dummy (unused byte)
-            index: vec![None],      // index[0] = dummy gap
+            arena:  Vec::new(),
+            buf:    vec![0],    // buf[0] = dummy (unused byte)
+            index:  vec![None], // index[0] = dummy gap
             n_keys: 0,
-            _key: PhantomData,
+            _key:   PhantomData,
         }
     }
-
     pub fn len(&self) -> usize {
         self.n_keys
     }
-
     pub fn is_empty(&self) -> bool {
         self.n_keys == 0
     }
-
     // -----------------------------------------------------------------------
     // Lookup
     // -----------------------------------------------------------------------
-
     /// Flat scan over a [`FlatNode`] (Fnode): a pre-order DFS of a
     /// path-compressed micro-trie. The Fnode collapses the subtree **rooted at
     /// `base`** (the leftmost key), so every array slot is a *descendant* of
@@ -941,7 +942,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
         None
     }
-
     pub fn get_index(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
@@ -984,7 +984,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     /// Unchecked lookup — assumes the key is present in the trie.
     ///
     /// # Safety
@@ -1003,7 +1002,11 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             // before re-looping, so this read is always an Inode.
             let node = match unsafe { self.arena.get_unchecked(phys_idx) } {
                 ArenaNode::Inode(n) => n,
-                ArenaNode::Fnode(_) => panic!("get_unchecked: phys_idx {phys_idx} is an Fnode (dispatcher missed it)"),
+                ArenaNode::Fnode(_) => {
+                    panic!(
+                        "get_unchecked: phys_idx {phys_idx} is an Fnode (dispatcher missed it)"
+                    )
+                }
             };
             let prefix_len = node.prefix_len.as_usize();
             if prefix_len >= max_nib {
@@ -1027,56 +1030,46 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     pub fn get(&self, key: &[u8]) -> Option<&T> {
         self.get_index(key).map(|idx| &self.index[idx].as_ref().unwrap().2)
     }
-
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut T> {
         self.get_index(key).map(|idx| &mut self.index[idx].as_mut().unwrap().2)
     }
-
     ///if the key is guaranteed to be in the set, the final comparison can be skipped, improving perf substantially.
     #[cfg(feature = "unchecked")]
     pub unsafe fn get_unchecked(&self, key: &[u8]) -> Option<&T> {
-        unsafe {self.get_index_unchecked(key).map(|idx| &self.index[idx].as_ref().unwrap().2) }
+        unsafe { self.get_index_unchecked(key).map(|idx| &self.index[idx].as_ref().unwrap().2) }
     }
-
     // -----------------------------------------------------------------------
     // Iteration
     // -----------------------------------------------------------------------
-
     /// An internal tree-walking cursor, used to position the public `Cursor`
     /// (via `seek`) and by `bump_walk` (via `seek` + `stack`).
     pub(crate) fn walk_iter(&self) -> NibbleIter<'_, K, T, PTR, LEN> {
         NibbleIter::new(self)
     }
-
     /// Public forward cursor: parked *before* the first key (so `current()` is
     /// `None` and `next()` yields the first key). A linear scan over the sparse
     /// `index`, skipping `None` gaps.
     pub fn iter(&self) -> Cursor<'_, K, T, PTR, LEN> {
         Cursor::new(self)
     }
-
     /// Public reverse cursor: parked *on* the last key (`current()` returns it,
     /// `prev()` walks backward). Linear scan over `index`.
     pub fn iter_last(&self) -> Cursor<'_, K, T, PTR, LEN> {
         Cursor::new_last(self)
     }
-
     /// Public forward mutable cursor: parked *before* the first key, lending out
     /// `&mut T` borrows tied to the cursor (see [`CursorMut`]).
     pub fn iter_mut(&mut self) -> CursorMut<'_, K, T, PTR, LEN> {
         CursorMut::new(self)
     }
-
     /// Public reverse mutable cursor: parked *on* the last key, lending out
     /// `&mut T` borrows tied to the cursor (see [`CursorMut`]).
     pub fn iter_mut_last(&mut self) -> CursorMut<'_, K, T, PTR, LEN> {
         CursorMut::new_last(self)
     }
-
     /// Iterate the keys in `bounds` in ascending order — a zero-allocation
     /// [`Range`] yielding `(K::Borrowed<'_>, &T)`. Both bounds are resolved by
     /// O(keylen) seeks up front; the scan between them is then bounded by slot
@@ -1091,7 +1084,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let end = bounds.end_bound().map(|b| *b);
         Range::new(self, start, end)
     }
-
     /// Like [`range`](Self::range) but with explicit [`Bound`]s — for mixed
     /// `Included`/`Excluded` bounds without the `&&[u8]` double-reference the
     /// `RangeBounds` tuple form would require.
@@ -1102,13 +1094,14 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     ) -> Range<'_, K, T, PTR, LEN> {
         Range::new(self, start, end)
     }
-
     pub fn into_keys_values(self) -> (Vec<K>, Vec<T>) {
         let buf = self.buf;
         let mut keys: Vec<K> = Vec::with_capacity(self.n_keys);
         let mut values: Vec<T> = Vec::with_capacity(self.n_keys);
         for (i, slot) in self.index.into_iter().enumerate() {
-            if i == 0 { continue; } // dummy
+            if i == 0 {
+                continue;
+            } // dummy
             if let Some((off, len, val)) = slot {
                 keys.push(K::from_bytes(&buf[off.get()..off.get() + len.as_usize()]));
                 values.push(val);
@@ -1116,20 +1109,16 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
         (keys, values)
     }
-
     // -----------------------------------------------------------------------
     // Capacity
     // -----------------------------------------------------------------------
-
     pub fn near_capacity(&self) -> bool {
         // Arena child addresses and key indices are nonzero and must fit in PTR.
         self.arena.len() >= PTR::max_value() || self.index.len() >= PTR::max_value()
     }
-
     // -----------------------------------------------------------------------
     // Optimize (DFS key-sorted buf rewrite + sparse 2*i+1 index re-spread)
     // -----------------------------------------------------------------------
-
     /// Rewrite `buf` in DFS (key-sorted) order and re-spread `index` into a
     /// sparse layout: a fresh vec of capacity `2*n+1` with each key placed at
     /// slot `2*i+1` (DFS rank `i`), leaving even slots as `None` gaps. Forward
@@ -1144,7 +1133,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         if self.arena.is_empty() {
             return;
         }
-
         let n = self.n_keys;
         let cap = 2 * n + 1;
         // Build a gap-filled vec without requiring T: Clone (vec![None; cap] would).
@@ -1153,9 +1141,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         new_buf.push(0); // dummy byte at position 0
         let mut cursor: usize = 1;
         let mut i: usize = 0; // global DFS rank
-
         self.walk_optimize(0, &mut new_index, &mut new_buf, &mut cursor, &mut i);
-
         new_buf.truncate(cursor);
         self.buf = new_buf;
         self.index = new_index;
@@ -1166,7 +1152,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         // already remaps Fnode `base`+offsets, so a *standalone* `flatten` →
         // `optimize` → `flatten` cycle is correct; call `flatten()` explicitly.
     }
-
     /// DFS walk that places each key at `2*i+1` in `new_index`, copies its bytes
     /// contiguously into `new_buf`, rewrites the arena's key-index references
     /// (`children[nib]` for leaf children, `leaf` for the node's leftmost,
@@ -1184,13 +1169,12 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         // while we recurse (which needs `&mut self`) and rewrite arena slots.
         let node = *self.inode(phys_idx);
         let mut first: Option<usize> = None;
-
         // This node's own terminal key sorts before all its descendants.
         if node.is_terminal() {
-            let slot = self.place_key(node.leaf.get().as_usize(), new_index, new_buf, cursor, i);
+            let slot =
+                self.place_key(node.leaf.get().as_usize(), new_index, new_buf, cursor, i);
             first = Some(slot);
         }
-
         // Visit children in nibble order (== sorted order); leaf children become
         // keys, internal children (Inode or Fnode) are recursed into / remapped.
         for nib in 0..16 {
@@ -1200,7 +1184,8 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             let child_phys = node.children[nib].get().as_usize();
             if node.is_leaf(nib) {
                 let slot = self.place_key(child_phys, new_index, new_buf, cursor, i);
-                self.inode_mut(phys_idx).children[nib] = OptNz::from_index(PTR::from_usize(slot));
+                self.inode_mut(phys_idx).children[nib] =
+                    OptNz::from_index(PTR::from_usize(slot));
                 if first.is_none() {
                     first = Some(slot);
                 }
@@ -1228,15 +1213,16 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                                 new_slots.push((*plen, 0));
                             } else {
                                 let old_ki = old_base + *offset as usize;
-                                let new_slot = self.place_key(old_ki, new_index, new_buf, cursor, i);
+                                let new_slot =
+                                    self.place_key(old_ki, new_index, new_buf, cursor, i);
                                 new_slots.push((*plen, (new_slot - new_base) as u8));
                             }
                         }
                         self.arena[child_phys] = ArenaNode::Fnode(FlatNode {
-                            nibbles: f.nibbles,
-                            base: PTR::from_usize(new_base),
+                            nibbles:  f.nibbles,
+                            base:     PTR::from_usize(new_base),
                             terminal: f.terminal,
-                            slots: new_slots,
+                            slots:    new_slots,
                         });
                         new_base
                     }
@@ -1246,12 +1232,11 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 }
             }
         }
-
-        let leftmost = first.expect("walk_optimize: node must have at least one key in subtree");
+        let leftmost =
+            first.expect("walk_optimize: node must have at least one key in subtree");
         self.inode_mut(phys_idx).leaf = OptNz::from_index(PTR::from_usize(leftmost));
         leftmost
     }
-
     /// Place the key currently at `old_ki` into `new_index`/`new_buf` at slot
     /// `2*i+1` (advancing `i`), copy its bytes contiguously, and return the new
     /// slot. Takes the old slot out of `index` (so the value moves, no `T:
@@ -1277,7 +1262,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         new_index[slot] = Some((NonZero::new(start).unwrap(), len, val));
         slot
     }
-
     /// Flatten small multi-Inode subtrees into single [`FlatNode`]s.
     ///
     /// Rebuilds the arena top-down: any non-root subtree with ≤ [`FNODE_CAP`]
@@ -1311,7 +1295,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         self.rebuild_subtree(0, &mut new_arena, &counts);
         self.arena = new_arena;
     }
-
     /// Bottom-up subtree key/Inode counts. Fills `counts[phys] = (n_keys,
     /// n_inodes)` for `phys` and every descendant. Fnodes are DAG leaves (no
     /// arena children): they contribute their [`FlatNode::key_count`] and 1
@@ -1344,7 +1327,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         };
         counts[phys] = (keys, inodes);
     }
-
     /// Rebuild the subtree rooted at old `phys` into `new_arena`, returning its
     /// new arena index. Flattens qualifying non-root subtrees into one Fnode
     /// (consuming their old child Inodes — no orphans); otherwise copies the
@@ -1390,7 +1372,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
         new_phys
     }
-
     /// Build a [`FlatNode`] from the Inode subtree rooted at `phys`: pre-order
     /// DFS collecting `(prefix_len, key_index)` per array slot, with `base` =
     /// the root's `leaf` (leftmost key) and `terminal` = the root's own
@@ -1431,7 +1412,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
         Some(FlatNode { nibbles, base, terminal, slots })
     }
-
     /// Pre-order DFS collecting the subtree at `phys` into `plens`/`key_idxs`/
     /// `nibbles` (per-slot `(prefix_len, Option<key_index>)`). Sets `ok = false`
     /// and returns early on: an Fnode child (can't merge), or the slot count
@@ -1469,11 +1449,8 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                     return;
                 }
                 let child_node = *self.inode(child);
-                let ptr = if child_node.is_terminal() {
-                    Some(child_node.leaf.get())
-                } else {
-                    None
-                };
+                let ptr =
+                    if child_node.is_terminal() { Some(child_node.leaf.get()) } else { None };
                 plens.push(p);
                 key_idxs.push(ptr);
                 self.collect_flat_slots(child, plens, key_idxs, nibbles, ok);
@@ -1484,15 +1461,14 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
     }
 }
-
 impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Default for NibbleTrie<K, T, PTR, LEN> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
-
 // ---------------------------------------------------------------------------
 // Insertion (Stage B: shift-based slot allocation + bump walk)
 // ---------------------------------------------------------------------------
-
 /// The resolved insertion case, produced by a non-mutating descent
 /// (`find_insert_case`) BEFORE any arena/index mutation. All sub-cases and
 /// nibble values are read from the pre-mutation tree, so the case stays valid
@@ -1509,27 +1485,26 @@ enum Case {
     /// New key diverges from the node's reference key mid-prefix → split `phys`
     /// into a new parent (at `diverge`) holding the new key and the old subtree.
     SplitNode {
-        phys: usize,
-        diverge: usize,
+        phys:            usize,
+        diverge:         usize,
         new_is_terminal: bool,
-        new_nib: usize,
-        ref_nib: usize,
+        new_nib:         usize,
+        ref_nib:         usize,
         new_is_leftmost: bool,
     },
     /// New key diverges from an existing leaf child of `phys` at nibble `nib`
     /// → replace that leaf with a new split node holding both keys.
     SplitLeaf {
-        phys: usize,
-        nib: usize,
-        d: usize,
-        new_is_terminal: bool,
+        phys:                 usize,
+        nib:                  usize,
+        d:                    usize,
+        new_is_terminal:      bool,
         existing_is_terminal: bool,
-        new_nib: usize,
-        exist_nib: usize,
-        new_is_leftmost: bool,
+        new_nib:              usize,
+        exist_nib:            usize,
+        new_is_leftmost:      bool,
     },
 }
-
 impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     pub fn insert(&mut self, key: K, value: T) -> Result<usize, ()> {
         let key_bytes = key.bytes();
@@ -1540,7 +1515,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         if key_bytes.len() * 2 > LEN::max_value() {
             return Err(());
         }
-
         // 90% capacity trigger: when the sparse index or buf is nearly full,
         // re-spread into a fresh 2n+1 layout so future shifts have gaps to land in.
         // Skip the re-spread if `2n+1` would overflow PTR (`2n < max` ⟺ `2n+1 <= max`,
@@ -1553,18 +1527,15 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         if self.arena.len() >= PTR::max_value() || self.index.len() >= PTR::max_value() {
             return Err(());
         }
-
         let key_len = LEN::from_usize(key_bytes.len());
         let off = self.buf.len();
         self.buf.extend_from_slice(key_bytes);
         // buf[0] is the dummy byte, so every real key offset is >= 1 → NonZero.
         self.n_keys += 1;
         let max_nib = key_bytes.len() * 2;
-
         if self.arena.is_empty() {
             return Ok(self.insert_into_empty_trie(off, key_len, value, key_bytes, max_nib));
         }
-
         // 1. Detect: non-mutating descent resolves the case + the descent path.
         let (case, path) = match self.find_insert_case(key_bytes, max_nib) {
             Ok(c) => c,
@@ -1576,7 +1547,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 return Err(());
             }
         };
-
         // 2. Compute p: the slot the successor key currently occupies (the new
         //    key sorts into position p, shifting [p, p+n-1] right). None = END
         //    (new key is the largest → append, no shift, no bump).
@@ -1584,8 +1554,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         let (p, n) = match p_opt {
             None => {
                 let p = self.index.len();
-                self.index
-                    .push(Some((NonZero::new(off).unwrap(), key_len, value)));
+                self.index.push(Some((NonZero::new(off).unwrap(), key_len, value)));
                 self.execute_case(case, p, &path);
                 return Ok(p);
             }
@@ -1600,12 +1569,10 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 (p, n)
             }
         };
-
         // Ensure room for the shift: the trailing gap may lie past `index.len()`.
         if p + n >= self.index.len() {
             self.index.push(None);
         }
-
         if n > 0 {
             // 3. Position a forward walk at the successor key (slot p) by seeking.
             //    The seek borrows self immutably; copy out the (all-Copy) stack
@@ -1628,17 +1595,15 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                         Frame::Inode { encoded, mask, nib } => (encoded.as_usize(), mask, nib),
                         // Fnode frames can't reach bump_walk yet — inserts never
                         // touch an Fnode until step 5 wires flat_insert/split.
-                        Frame::Fnode { .. } => panic!(
-                            "bump_walk init: Fnode frame on stack — insert-into-Fnode is step 5"
-                        ),
+                        Frame::Fnode { .. } => {
+                            panic!("bump_walk init: Fnode frame on stack — insert-into-Fnode is step 5")
+                        }
                     })
                     .collect()
             };
-
             // 4. Bump arena refs whose key index ∈ [p, p+n-1] (every shifted key's
             //    structural ptr + every node whose leftmost is a shifted key).
             self.bump_walk(stack, p, n);
-
             // 5. Shift the slots right by one. A `take()` walk from the right end
             //    (not `copy_within`, which needs `T: Copy`) — a true element-wise
             //    move that leaves `None` at `p` for the new slot.
@@ -1646,17 +1611,14 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 self.index[p + i + 1] = self.index[p + i].take();
             }
         }
-
         // 6. Place the new key's slot at p.
         self.index[p] = Some((NonZero::new(off).unwrap(), key_len, value));
-
         // 7. Wire the new key into the arena at slot p (re-reading any
         //    bump-sensitive leaf index from the arena post-bump), then propagate
         //    the leftmost-`leaf` invariant up the spine.
         self.execute_case(case, p, &path);
         Ok(p)
     }
-
     /// 90% capacity trigger. Measures fill as `n_keys / index.capacity()` (NOT
     /// `len / capacity`): after `optimize`, `len == capacity` because the gaps
     /// are real `None` slots, so `len` would always read as 100% full.
@@ -1667,7 +1629,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         (idx_cap > 0 && 10 * self.n_keys > 9 * idx_cap)
             || (buf_cap > 0 && 10 * self.buf.len() > 9 * buf_cap)
     }
-
     /// Non-mutating descent mirroring the lookup walk, but it RECORDS the
     /// resolved `Case` and descent `path` instead of mutating. Reads the
     /// reference/existing keys here (before any shift moves their slots).
@@ -1682,7 +1643,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         // Path of (ancestor_phys, nib_used_to_descend) from root to the current
         // node, used to propagate the leftmost-`leaf` invariant up the spine.
         let mut path: Vec<(usize, usize)> = Vec::new();
-
         loop {
             let node = self.inode(phys_idx);
             let ki = node.leaf.get();
@@ -1690,7 +1650,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             let off = off.get();
             let ref_key = &self.buf[off..off + ref_len.as_usize()];
             let prefix_len = node.prefix_len.as_usize();
-
             match simd_check_prefix::<8>(key, ref_key, confirmed, prefix_len) {
                 PrefixCheck::Diverges(diverge) => {
                     let new_nib = key_nibble_at(key, diverge) as usize;
@@ -1717,14 +1676,12 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                         // New key is a prefix of the ref key → node becomes terminal.
                         return Ok((Case::Terminal { phys: phys_idx }, path));
                     }
-
                     confirmed = prefix_len + 1;
                     let nib = key_nibble_at(key, prefix_len) as usize;
                     if !node.is_occupied(nib) {
                         // Empty slot — new key diverges here as a leaf child.
                         return Ok((Case::NewLeafChild { phys: phys_idx, nib }, path));
                     }
-
                     if node.is_leaf(nib) {
                         // Split the existing leaf child: resolve divergence here.
                         path.push((phys_idx, nib));
@@ -1762,14 +1719,12 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                             }
                         }
                     }
-
                     path.push((phys_idx, nib));
                     phys_idx = node.children[nib].get().as_usize();
                 }
             }
         }
     }
-
     /// Compute `p`: the key index of the successor (the leftmost key that sorts
     /// STRICTLY AFTER the new key). The new key takes slot `p`, shifting the
     /// successor and its trailing run right. `None` means the new key is the
@@ -1778,13 +1733,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         match case {
             Case::Terminal { phys } => Some(self.inode(*phys).leaf.get().as_usize()),
             Case::NewLeafChild { phys, nib } => self.right_anchor(*phys, *nib, path),
-            Case::SplitNode {
-                phys,
-                new_is_terminal,
-                new_nib,
-                ref_nib,
-                ..
-            } => {
+            Case::SplitNode { phys, new_is_terminal, new_nib, ref_nib, .. } => {
                 if *new_is_terminal || *new_nib < *ref_nib {
                     // New key is the new leftmost of `phys`'s subtree → successor
                     // is the old leftmost (the ref key), read before mutation.
@@ -1815,7 +1764,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     /// The leftmost key index of the next-higher subtree at `phys` (relative to
     /// nib `nib`), i.e. the successor of a key ending at `phys` via `nib`. Falls
     /// back to `subtree_successor` if `phys` has no higher occupied nibble.
@@ -1836,7 +1784,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             self.subtree_successor(path)
         }
     }
-
     /// Walk up `path` (deepest first); at each `(parent, nib)` find a higher
     /// occupied nibble than the one descended through. The leftmost of that
     /// higher subtree is the successor. `None` = no higher ancestor nibble =
@@ -1857,7 +1804,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
         None
     }
-
     /// Bump every arena ref whose key index ∈ [lo, lo+n-1]: each shifted key's
     /// structural ptr (terminal → `node.leaf`, leaf child → `node.children[nib]`)
     /// and every node whose `leaf` (leftmost) is a shifted key.
@@ -1877,7 +1823,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         debug_assert!(n >= 1);
         let hi = lo + n - 1; // inclusive
         let mut stack = init_stack;
-
         // Bump `leaf` of every node on the initial (seek) stack if in range.
         // These are the ancestors of `lo` plus `lo`'s owning node.
         for &(phys, _mask, _nib) in &stack {
@@ -1886,7 +1831,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                 self.inode_mut(phys).leaf = OptNz::from_index(PTR::from_usize(l + 1));
             }
         }
-
         // Walk forward exactly n keys, bumping each leaf-child structural ptr.
         let mut seen = 0;
         while seen < n {
@@ -1911,7 +1855,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     /// `descend_first` with `leaf`-bumping: walk down the lowest-nib spine of
     /// the subtree at `phys`, pushing a frame per node and bumping each node's
     /// `leaf` if in range, until a terminal key or a leaf-child is current.
@@ -1946,7 +1889,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     /// `push_next_child` with descent: find the next occupied nibble ≥
     /// `start_nib` at `encoded`, push its frame, and if it is an internal
     /// child, `bump_descend_first` into it. Returns false if no such nibble.
@@ -1973,7 +1915,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         }
         true
     }
-
     /// `advance_next` with mutation: pop frames and `bump_push_next` from the
     /// next nibble until a key is current. Returns false if the stack empties.
     #[inline]
@@ -2000,7 +1941,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     /// Wire the new key (at slot `p`) into the arena according to `case`, then
     /// propagate the leftmost-`leaf` invariant up the spine. Re-reads any
     /// bump-sensitive leaf key index from the arena (post-bump) instead of using
@@ -2037,7 +1977,8 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
                         new_parent.leaf = OptNz::from_index(p_idx);
                     }
                 }
-                let old_node = std::mem::replace(&mut self.arena[phys], ArenaNode::Inode(new_parent));
+                let old_node =
+                    std::mem::replace(&mut self.arena[phys], ArenaNode::Inode(new_parent));
                 let old_addr = PTR::from_usize(self.arena.len()); // new node index (>= 1)
                 self.arena.push(old_node);
                 self.inode_mut(phys).set_internal_child(ref_nib, old_addr);
@@ -2095,7 +2036,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     /// If the new leaf child at `nib` is the lowest occupied nib of `phys_idx`,
     /// it is the node's new leftmost descendant — set `phys_idx.leaf` and
     /// propagate the new leftmost up the leftmost spine via `path`.
@@ -2119,7 +2059,6 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             self.up_walk_leftmost(phys_idx, new_index, path);
         }
     }
-
     /// Propagate `new_leftmost` up the leftmost spine: for each ancestor in
     /// `path` (deepest first) via which we descended through that ancestor's
     /// lowest occupied nib, set its `leaf` to `new_leftmost`. Stop at the first
@@ -2129,7 +2068,12 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     /// stay pinned to the terminal key's slot (ancestors above see that same
     /// fixed leftmost, so propagation stops entirely there).
     #[inline]
-    fn up_walk_leftmost(&mut self, attach_phys: usize, new_leftmost: PTR, path: &[(usize, usize)]) {
+    fn up_walk_leftmost(
+        &mut self,
+        attach_phys: usize,
+        new_leftmost: PTR,
+        path: &[(usize, usize)],
+    ) {
         let _ = attach_phys; // attach's parent is path.last(); attach itself already set.
         let mut idx = path.len();
         while idx > 0 {
@@ -2147,11 +2091,9 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             }
         }
     }
-
     // -----------------------------------------------------------------------
     // Insert helpers
     // -----------------------------------------------------------------------
-
     /// Empty trie: `index` is `[None]` (dummy at 0). Place the key at slot 1
     /// and build a root that is terminal (0-length key) or a leaf child.
     #[inline]
@@ -2164,8 +2106,7 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         max_nib: usize,
     ) -> usize {
         let p = 1usize;
-        self.index
-            .push(Some((NonZero::new(off).unwrap(), key_len, value)));
+        self.index.push(Some((NonZero::new(off).unwrap(), key_len, value)));
         let p_idx = PTR::from_usize(p);
         if max_nib == 0 {
             let mut root = Node::new();
@@ -2182,11 +2123,9 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         p
     }
 }
-
 // ---------------------------------------------------------------------------
 // PTR width conversions (promote/demote)
 // ---------------------------------------------------------------------------
-
 impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
     /// Promote the arena index type to a wider PTR.
     /// All child indices and leaf key indices are widened via `NewPTR::from_usize`.
@@ -2200,16 +2139,17 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
             _key: PhantomData,
         }
     }
-
     /// Demote the arena index type to a narrower PTR.
     /// Returns `Err(self)` if any index doesn't fit in the narrower type.
     pub fn demote<NewPTR: TrieIndex>(self) -> Result<NibbleTrie<K, T, NewPTR, LEN>, Self> {
         if self.arena.len() > NewPTR::max_value() || self.index.len() > NewPTR::max_value() {
             return Err(self);
         }
-        let arena = self.arena.into_iter().map(|node| {
-            node.demote().expect("demote capacity check should have caught this")
-        }).collect();
+        let arena = self
+            .arena
+            .into_iter()
+            .map(|node| node.demote().expect("demote capacity check should have caught this"))
+            .collect();
         Ok(NibbleTrie {
             arena,
             buf: self.buf,
@@ -2219,15 +2159,11 @@ impl<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleTrie<K, T, PTR, LEN> {
         })
     }
 }
-
-
 // ---------------------------------------------------------------------------
 // Iterator
 // ---------------------------------------------------------------------------
-
 /// Sentinel nib value meaning "positioned at the terminal value of this node."
 const TERMINAL_NIB: usize = 16;
-
 /// A stack frame for [`NibbleIter`]. The root is always an [`Frame::Inode`]
 /// (the root Inode); [`Frame::Fnode`] frames appear only below the root,
 /// mirroring the "Fnodes only appear below the root" arena invariant.
@@ -2244,18 +2180,16 @@ pub(crate) enum Frame<PTR: TrieIndex> {
     /// order, so `pos` enumerates the Fnode's terminals ascending.
     Fnode { arena_idx: PTR, pos: usize },
 }
-
 /// Internal tree-walking cursor (stack-based arena DFS). Used only for
 /// `bump_walk`'s seek-positioning and to land the public `Cursor`'s `seek` on
 /// a key in O(keylen). Public iteration uses the linear-scan [`Cursor`].
 pub(crate) struct NibbleIter<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> {
-    trie: &'a NibbleTrie<K, T, PTR, LEN>,
+    trie:             &'a NibbleTrie<K, T, PTR, LEN>,
     /// DFS stack of [`Frame`]s — `Inode` for the direct-addressed 16-slot nodes,
     /// `Fnode` for the flat leaf-pack nodes (a DAG leaf: walk terminals in
     /// slot order, skip `None` branch markers).
     pub(crate) stack: Vec<Frame<PTR>>,
 }
-
 impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR, LEN> {
     fn new(trie: &'a NibbleTrie<K, T, PTR, LEN>) -> Self {
         if trie.arena.is_empty() {
@@ -2265,7 +2199,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
         let nib = if trie.inode(0).is_terminal() { TERMINAL_NIB } else { usize::MAX };
         NibbleIter { trie, stack: vec![Frame::Inode { encoded: PTR::zero(), mask, nib }] }
     }
-
     fn descend_first(&mut self, mut phys_idx: usize) {
         loop {
             // Fnode? Position at its first terminal and stop (an Fnode is a
@@ -2273,8 +2206,7 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             // across the `stack.push`.
             let fnode_pos = match &self.trie.arena[phys_idx] {
                 ArenaNode::Fnode(f) => Some(
-                    f.first_terminal_pos()
-                        .expect("descend_first: Fnode with no terminals"),
+                    f.first_terminal_pos().expect("descend_first: Fnode with no terminals"),
                 ),
                 ArenaNode::Inode(_) => None,
             };
@@ -2286,7 +2218,11 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             let node = *self.trie.inode(phys_idx);
             if node.is_terminal() {
                 let mask = node.children_mask();
-                self.stack.push(Frame::Inode { encoded: PTR::from_usize(phys_idx), mask, nib: TERMINAL_NIB });
+                self.stack.push(Frame::Inode {
+                    encoded: PTR::from_usize(phys_idx),
+                    mask,
+                    nib: TERMINAL_NIB,
+                });
                 return;
             }
             let mask = node.children_mask();
@@ -2299,7 +2235,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             phys_idx = node.children[nib].get().as_usize();
         }
     }
-
     #[inline]
     fn push_next_child(&mut self, encoded: PTR, mask: u16, start_nib: usize) -> bool {
         let shifted = if start_nib >= 16 { 0u16 } else { mask >> start_nib };
@@ -2321,7 +2256,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
         }
         true
     }
-
     #[inline]
     fn backtrack_to_next(&mut self) -> Option<(&[u8], &T)> {
         loop {
@@ -2340,7 +2274,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             }
         }
     }
-
     pub fn current(&self) -> Option<(&[u8], &T)> {
         let frame = self.stack.last()?;
         match *frame {
@@ -2356,7 +2289,10 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
                     let off = off.get();
                     Some((&self.trie.buf[off..off + len.as_usize()], val))
                 } else if let Some(key_index) = node.leaf_key_index(nib) {
-                    Some((self.trie.key_slice(key_index), &self.trie.index[key_index.as_usize()].as_ref().unwrap().2))
+                    Some((
+                        self.trie.key_slice(key_index),
+                        &self.trie.index[key_index.as_usize()].as_ref().unwrap().2,
+                    ))
                 } else {
                     None
                 }
@@ -2369,11 +2305,13 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
                 let ki = f
                     .pos_key_index(pos)
                     .expect("current: Fnode frame positioned on a non-terminal");
-                Some((self.trie.key_slice(ki), &self.trie.index[ki.as_usize()].as_ref().unwrap().2))
+                Some((
+                    self.trie.key_slice(ki),
+                    &self.trie.index[ki.as_usize()].as_ref().unwrap().2,
+                ))
             }
         }
     }
-
     pub fn current_index(&self) -> Option<usize> {
         let frame = self.stack.last()?;
         match *frame {
@@ -2402,7 +2340,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             }
         }
     }
-
     #[inline]
     fn advance_next(&mut self) -> bool {
         loop {
@@ -2432,7 +2369,9 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
                     // holding an arena borrow across `push`.
                     let next_pos = match &self.trie.arena[arena_idx.as_usize()] {
                         ArenaNode::Fnode(f) => f.next_terminal_pos(pos),
-                        ArenaNode::Inode(_) => unreachable!("Fnode frame points at an Inode"),
+                        ArenaNode::Inode(_) => {
+                            unreachable!("Fnode frame points at an Inode")
+                        }
                     };
                     if let Some(np) = next_pos {
                         self.stack.push(Frame::Fnode { arena_idx, pos: np });
@@ -2445,18 +2384,21 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             }
         }
     }
-
     #[inline]
     pub fn next(&mut self) -> Option<(&[u8], &T)> {
         if self.advance_next() { self.current() } else { None }
     }
-
     /// Seek within an Fnode child for the first terminal key ≥ `key`. The parent
     /// Inode frame is already on the stack (pushed by [`seek`](Self::seek) before
     /// dispatching here). On a hit, push an [`Frame::Fnode`] and return `current`.
     /// On exhaust (all Fnode terminals < `key`), pop the parent and backtrack to
     /// its next child.
-    fn fnode_seek(&mut self, arena_idx: usize, key: &[u8], _max_nib: usize) -> Option<(&[u8], &T)> {
+    fn fnode_seek(
+        &mut self,
+        arena_idx: usize,
+        key: &[u8],
+        _max_nib: usize,
+    ) -> Option<(&[u8], &T)> {
         // Pre-order (base then array slots) == sorted key order: the first
         // terminal whose key is ≥ `key` is the lower bound. Scan inside a block
         // so the arena borrow ends before the `stack.push` below.
@@ -2509,17 +2451,14 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             }
         }
     }
-
     pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &T)> {
         if self.trie.arena.is_empty() {
             self.stack.clear();
             return None;
         }
-
         self.stack.clear();
         let mut phys_idx: usize = 0;
         let max_nib = key.len() * 2;
-
         loop {
             // Root and every ephemeral-descent target are Inodes — Fnode children
             // are dispatched below and `return` before re-looping. Copy the node
@@ -2527,25 +2466,26 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
             // recursive `self.` calls.
             let node = *self.trie.inode(phys_idx);
             let mask = node.children_mask();
-
             if node.is_terminal() && node.prefix_len.as_usize() >= max_nib {
                 let ki = node.leaf.get();
                 let (off, len, _) = self.trie.index[ki.as_usize()].as_ref().unwrap();
                 let off = off.get();
                 let node_key = &self.trie.buf[off..off + len.as_usize()];
                 if node_key >= key {
-                    self.stack.push(Frame::Inode { encoded: PTR::from_usize(phys_idx), mask, nib: TERMINAL_NIB });
+                    self.stack.push(Frame::Inode {
+                        encoded: PTR::from_usize(phys_idx),
+                        mask,
+                        nib: TERMINAL_NIB,
+                    });
                     return self.current();
                 }
             }
-
             if node.prefix_len.as_usize() >= max_nib {
                 if self.push_next_child(PTR::from_usize(phys_idx), mask, 0) {
                     return self.current();
                 }
                 return self.backtrack_to_next();
             }
-
             let nib = key_nibble_at(key, node.prefix_len.as_usize()) as usize;
             if !node.is_occupied(nib) {
                 // No child at this nibble — find next higher child, or backtrack
@@ -2554,7 +2494,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
                 }
                 return self.backtrack_to_next();
             }
-
             self.stack.push(Frame::Inode { encoded: PTR::from_usize(phys_idx), mask, nib });
             if node.is_leaf(nib) {
                 let leaf_key = self.trie.key_slice(node.children[nib].get());
@@ -2575,11 +2514,9 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> NibbleIter<'a, K, T, PTR
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Cursor — public linear-scan iterator over the sparse `index`
 // ---------------------------------------------------------------------------
-
 /// Public iteration cursor over a [`NibbleTrie`]: a linear scan of the sparse
 /// `index`, skipping `None` gaps. This is correct because the index is kept
 /// sorted by invariant — occupied slots appear in non-decreasing key order
@@ -2606,11 +2543,10 @@ pub struct Cursor<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> {
     /// Slot index parked on, or a sentinel: `0` = before-first / backward
     /// exhausted (slot 0 is the dummy `None`), `index.len()` = forward
     /// exhausted. A parked `pos` is always a `Some` slot in `[1, len-1]`.
-    pos: usize,
+    pos:  usize,
     /// Cached `current()` value: `Some` iff `pos` is a `Some` slot.
-    cur: Option<(&'a [u8], &'a T)>,
+    cur:  Option<(&'a [u8], &'a T)>,
 }
-
 impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LEN> {
     /// Park at a known-occupied slot, building the cached current value
     /// directly from the already-fetched `slot` ref. `slot` borrows the trie
@@ -2624,7 +2560,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         let klen = slot.1.as_usize();
         self.cur = Some((&self.trie.buf[off..off + klen], &slot.2));
     }
-
     /// Park at a sentinel (`0` = before-first / backward exhausted, or `len` =
     /// forward exhausted): no live key, so the cached current is `None`.
     #[inline]
@@ -2632,19 +2567,16 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         self.pos = pos;
         self.cur = None;
     }
-
     /// Forward cursor parked *before* the first key.
     pub fn new(trie: &'a NibbleTrie<K, T, PTR, LEN>) -> Self {
         Cursor { trie, pos: 0, cur: None }
     }
-
     /// Reverse cursor parked *on* the last key (or before-first if empty).
     pub fn new_last(trie: &'a NibbleTrie<K, T, PTR, LEN>) -> Self {
         let mut c = Cursor { trie, pos: 0, cur: None };
         c.last();
         c
     }
-
     /// Jump to the first key (smallest slot). Returns its key/value, or `None`
     /// if the trie is empty. Scans forward from slot 1.
     pub fn first(&mut self) -> Option<(K::Borrowed<'a>, &'a T)> {
@@ -2660,7 +2592,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         self.park_sentinel(0);
         None
     }
-
     /// Jump to the last key (largest slot). Returns its key/value, or `None` if
     /// the trie is empty. Scans backward from the end of `index`.
     pub fn last(&mut self) -> Option<(K::Borrowed<'a>, &'a T)> {
@@ -2675,7 +2606,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         self.park_sentinel(0);
         None
     }
-
     /// The key/value the cursor is parked on, or `None` if not parked (before
     /// first, or exhausted). A pure field read — the slice/value pair is cached
     /// by `park`; only the zero-alloc `as_borrowed` view runs per call.
@@ -2683,46 +2613,32 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
     pub fn current(&self) -> Option<(K::Borrowed<'a>, &'a T)> {
         self.cur.map(|(k, v)| (K::as_borrowed(k), v))
     }
-
     /// The slot index the cursor is parked on, or `None` if not parked.
     #[inline]
     pub fn current_index(&self) -> Option<usize> {
         if self.cur.is_some() { Some(self.pos) } else { None }
     }
-
     /// Advance to the next occupied slot and return its key/value. Returns
     /// `None` (parking at the forward-exhausted sentinel) when no further key
     /// exists.
     #[inline]
     pub fn next(&mut self) -> Option<(K::Borrowed<'a>, &'a T)> {
-        if self.advance_next() {
-            self.cur.map(|(k, v)| (K::as_borrowed(k), v))
-        } else {
-            None
-        }
+        if self.advance_next() { self.cur.map(|(k, v)| (K::as_borrowed(k), v)) } else { None }
     }
-
     /// Step to the previous occupied slot and return its key/value. Returns
     /// `None` (parking at the before-first sentinel) when no prior key exists.
     #[inline]
     pub fn prev(&mut self) -> Option<(K::Borrowed<'a>, &'a T)> {
-        if self.advance_prev() {
-            self.cur.map(|(k, v)| (K::as_borrowed(k), v))
-        } else {
-            None
-        }
+        if self.advance_prev() { self.cur.map(|(k, v)| (K::as_borrowed(k), v)) } else { None }
     }
-
     #[inline]
     pub fn next_index(&mut self) -> Option<usize> {
         if self.advance_next() { Some(self.pos) } else { None }
     }
-
     #[inline]
     pub fn prev_index(&mut self) -> Option<usize> {
         if self.advance_prev() { Some(self.pos) } else { None }
     }
-
     /// Land on the first key ≥ `key` — O(keylen) via the internal tree walker —
     /// then return its key/value. Returns `None` if no key is ≥ `key`.
     pub fn seek(&mut self, key: &[u8]) -> Option<(K::Borrowed<'a>, &'a T)> {
@@ -2742,12 +2658,13 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
                     None
                 }
             }
-            None => { self.park_sentinel(self.trie.index.len()); None }
+            None => {
+                self.park_sentinel(self.trie.index.len());
+                None
+            }
         }
     }
-
     // --- core linear scans ---
-
     /// Scan forward from `pos+1` to the next `Some` slot; park there on hit,
     /// or at the `len` sentinel on miss. Each slot is fetched once and, on a
     /// hit, handed straight to `park_slot` — no second `index` load and no
@@ -2766,7 +2683,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         self.park_sentinel(len);
         false
     }
-
     /// Scan backward from `pos-1` to the previous `Some` slot; park there on
     /// hit, or at the `0` (before-first) sentinel on miss. Same single-fetch
     /// strategy as `advance_next`.
@@ -2784,11 +2700,9 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, K, T, PTR, LE
         false
     }
 }
-
 // ---------------------------------------------------------------------------
 // CursorMut — public linear-scan iterator lending out &mut T
 // ---------------------------------------------------------------------------
-
 /// Mutable counterpart to [`Cursor`]: a linear scan of the sparse `index`
 /// that lends out `&mut T` borrows over the stored values.
 ///
@@ -2816,15 +2730,13 @@ pub struct CursorMut<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> {
     /// Slot index parked on, or a sentinel: `0` = before-first / backward
     /// exhausted (slot 0 is the dummy `None`), `index.len()` = forward
     /// exhausted. A parked `pos` is always a `Some` slot in `[1, len-1]`.
-    pos: usize,
+    pos:  usize,
 }
-
 impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR, LEN> {
     /// Forward mutable cursor parked *before* the first key.
     pub fn new(trie: &'a mut NibbleTrie<K, T, PTR, LEN>) -> Self {
         CursorMut { trie, pos: 0 }
     }
-
     /// Reverse mutable cursor parked *on* the last key (or before-first if
     /// empty).
     pub fn new_last(trie: &'a mut NibbleTrie<K, T, PTR, LEN>) -> Self {
@@ -2832,7 +2744,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
         c.last();
         c
     }
-
     /// Build the `(K::Borrowed<'_>, &mut T)` pair for the slot at `self.pos`.
     /// The `pos` must be a parked, occupied slot. Three sequential borrows that
     /// the borrow checker sees as disjoint fields of `*self.trie`: (1) immutable
@@ -2853,21 +2764,18 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
         let slot = self.trie.index[pos].as_mut()?;
         Some((k, &mut slot.2))
     }
-
     /// Jump to the first key (smallest slot). Returns its key/value, or `None`
     /// if the trie is empty. Scans forward from slot 1.
     pub fn first(&mut self) -> Option<(K::Borrowed<'_>, &mut T)> {
         self.pos = 0;
         if self.advance_next() { self.materialize() } else { None }
     }
-
     /// Jump to the last key (largest slot). Returns its key/value, or `None` if
     /// the trie is empty. Scans backward from the end of `index`.
     pub fn last(&mut self) -> Option<(K::Borrowed<'_>, &mut T)> {
         self.pos = self.trie.index.len();
         if self.advance_prev() { self.materialize() } else { None }
     }
-
     /// The key/value the cursor is parked on, or `None` if not parked (before
     /// first, or exhausted). Reconstructs `K` and reborrows `&mut T` per call.
     #[inline]
@@ -2878,14 +2786,12 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
         }
         self.materialize()
     }
-
     /// The slot index the cursor is parked on, or `None` if not parked.
     #[inline]
     pub fn current_index(&self) -> Option<usize> {
         let len = self.trie.index.len();
         if self.pos != 0 && self.pos < len { Some(self.pos) } else { None }
     }
-
     /// Advance to the next occupied slot and return its key/value. Returns
     /// `None` (parking at the forward-exhausted sentinel) when no further key
     /// exists.
@@ -2893,24 +2799,20 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
     pub fn next(&mut self) -> Option<(K::Borrowed<'_>, &mut T)> {
         if self.advance_next() { self.materialize() } else { None }
     }
-
     /// Step to the previous occupied slot and return its key/value. Returns
     /// `None` (parking at the before-first sentinel) when no prior key exists.
     #[inline]
     pub fn prev(&mut self) -> Option<(K::Borrowed<'_>, &mut T)> {
         if self.advance_prev() { self.materialize() } else { None }
     }
-
     #[inline]
     pub fn next_index(&mut self) -> Option<usize> {
         if self.advance_next() { Some(self.pos) } else { None }
     }
-
     #[inline]
     pub fn prev_index(&mut self) -> Option<usize> {
         if self.advance_prev() { Some(self.pos) } else { None }
     }
-
     /// Land on the first key ≥ `key` — O(keylen) via the internal tree walker —
     /// then return its key/value. Returns `None` if no key is ≥ `key`.
     pub fn seek(&mut self, key: &[u8]) -> Option<(K::Borrowed<'_>, &mut T)> {
@@ -2926,12 +2828,13 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
                 self.pos = p;
                 self.materialize()
             }
-            _ => { self.pos = len; None }
+            _ => {
+                self.pos = len;
+                None
+            }
         }
     }
-
     // --- core linear scans (position only; no borrow handed out) ---
-
     /// Scan forward from `pos+1` to the next `Some` slot; park there on hit,
     /// or at the `len` sentinel on miss. Only updates `pos` — no value borrow
     /// is taken, so the caller can then `materialize` a fresh `&mut T`.
@@ -2949,7 +2852,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
         self.pos = len;
         false
     }
-
     /// Scan backward from `pos-1` to the previous `Some` slot; park there on
     /// hit, or at the `0` sentinel on miss. Only updates `pos`.
     #[inline]
@@ -2966,11 +2868,9 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
         false
     }
 }
-
 // ---------------------------------------------------------------------------
 // Range — zero-alloc ascending iterator over a key interval
 // ---------------------------------------------------------------------------
-
 /// Ascending iterator over a half-open key interval of a [`NibbleTrie`],
 /// yielding `(K::Borrowed<'a>, &'a T)` with no allocation.
 ///
@@ -2986,13 +2886,12 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, K, T, PTR,
 /// - `Excluded(k)` lower → first key > `k`; upper → include keys < `k`.
 /// - `Unbounded` lower → first key; upper → last key.
 pub struct Range<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> {
-    trie: &'a NibbleTrie<K, T, PTR, LEN>,
+    trie:    &'a NibbleTrie<K, T, PTR, LEN>,
     /// Next slot index to scan from. `0` = before-first; `end_pos` = exhausted.
-    pos: usize,
+    pos:     usize,
     /// Exclusive upper slot bound: yield occupied slots with index `< end_pos`.
     end_pos: usize,
 }
-
 impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Range<'a, K, T, PTR, LEN> {
     /// Build a `Range` from `(start, end)` bounds. Each concrete bound costs one
     /// O(keylen) seek; `Unbounded` bounds are free.
@@ -3017,10 +2916,8 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Range<'a, K, T, PTR, LEN
         Range { trie, pos, end_pos }
     }
 }
-
 impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Iterator for Range<'a, K, T, PTR, LEN> {
     type Item = (K::Borrowed<'a>, &'a T);
-
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let end = self.end_pos;
@@ -3038,7 +2935,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Iterator for Range<'a, K
         self.pos = end;
         None
     }
-
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Upper bound: at most `end_pos - pos` slots (gaps reduce the true
@@ -3048,7 +2944,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> Iterator for Range<'a, K
         (0, Some(remaining))
     }
 }
-
 // `Range::next` only reads `index` and `buf` through the shared `&'a NibbleTrie`
 // borrow, so it is safe to hand out items that outlive the `&mut self` of
 // `next` — hence a true `Iterator`, not a lending one.
@@ -3076,7 +2971,6 @@ impl<'a, K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex> DoubleEndedIterator
         None
     }
 }
-
 /// Slot index of the first occupied slot with key ≥ `key` (the ceiling), via
 /// the O(keylen) tree walker. `None` if no key is ≥ `key`.
 fn ceiling_index<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex>(
@@ -3087,7 +2981,6 @@ fn ceiling_index<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex>(
     w.seek(key);
     w.current_index()
 }
-
 /// Slot index of the first occupied slot with key strictly > `key`. Seeks to the
 /// ceiling of `key`; if that slot's key equals `key`, advances to the next
 /// occupied slot. `None` if no such key exists.
@@ -3115,7 +3008,6 @@ fn ceiling_strict_index<K: ByteKey, T, PTR: TrieIndex, LEN: TrieIndex>(
         Some(p)
     }
 }
-
 #[cfg(test)]
 #[path = "tests/nibble_trie.rs"]
 mod tests;

@@ -1,5 +1,4 @@
 use super::*;
-
 #[test]
 fn alloc_and_get() {
     let mut arena: Arena<[u32; 2], u16> = Arena::new();
@@ -11,7 +10,6 @@ fn alloc_and_get() {
     assert_eq!(*arena.get(c), [50, 60]);
     assert_eq!(arena.len(), 3);
 }
-
 #[test]
 fn free_and_reuse() {
     let mut arena: Arena<[u32; 2], u16> = Arena::new();
@@ -20,13 +18,11 @@ fn free_and_reuse() {
     let _c = arena.alloc([50, 60]);
     arena.free(b);
     assert_eq!(arena.len(), 2);
-
     let d = arena.alloc([99, 88]); // reuses b
     assert_eq!(d, b);
     assert_eq!(*arena.get(d), [99, 88]);
     assert_eq!(arena.len(), 3);
 }
-
 #[test]
 fn stable_indices() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
@@ -37,7 +33,6 @@ fn stable_indices() {
     // a is still valid — freeing b doesn't shift anything
     assert_eq!(*arena.get(a), [1, 2]);
 }
-
 #[test]
 fn free_chain() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
@@ -55,7 +50,6 @@ fn free_chain() {
     assert_eq!(*arena.get(e), [200, 0]);
     assert_eq!(arena.len(), 3); // _b, d, e
 }
-
 #[test]
 fn u16_index_type() {
     let mut arena: Arena<[u32; 2], u16> = Arena::new();
@@ -63,7 +57,6 @@ fn u16_index_type() {
     assert_eq!(idx.to_usize(), 0);
     assert_eq!(*arena.get(idx), [42, 0]);
 }
-
 #[test]
 fn with_capacity() {
     let mut arena: Arena<[u32; 2], u32> = Arena::with_capacity(100);
@@ -72,7 +65,6 @@ fn with_capacity() {
     }
     assert_eq!(arena.len(), 100);
 }
-
 #[test]
 fn alloc_n_basic() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
@@ -84,12 +76,11 @@ fn alloc_n_basic() {
     assert_eq!(arena.len(), 4);
     assert_eq!(arena.capacity(), 4);
 }
-
 #[test]
 fn alloc_n_after_singles() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
-    let a = arena.alloc([1, 2]);  // index 0
-    let b = arena.alloc([3, 4]);  // index 1
+    let a = arena.alloc([1, 2]); // index 0
+    let b = arena.alloc([3, 4]); // index 1
     let start = arena.alloc_n(3, [9, 9]); // indices 2, 3, 4
     assert_eq!(a.to_usize(), 0);
     assert_eq!(b.to_usize(), 1);
@@ -101,7 +92,6 @@ fn alloc_n_after_singles() {
     }
     assert_eq!(arena.len(), 5);
 }
-
 #[test]
 fn alloc_n_u16_overflow() {
     let mut arena: Arena<[u32; 2], u16> = Arena::new();
@@ -124,7 +114,6 @@ fn alloc_n_u16_overflow() {
     }));
     assert!(result.is_err());
 }
-
 #[test]
 fn alloc_slice_basic() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
@@ -136,7 +125,6 @@ fn alloc_slice_basic() {
     }
     assert_eq!(arena.len(), 5);
 }
-
 #[test]
 fn alloc_slice_after_alloc() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
@@ -150,20 +138,17 @@ fn alloc_slice_after_alloc() {
         assert_eq!(*arena.get(u32::from_usize(1 + i)), [i as u32, i as u32 + 1]);
     }
 }
-
 #[test]
 fn free_n_basic() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
     let start = arena.alloc_n(4, [42, 0]);
     let single = arena.alloc([99, 88]);
     assert_eq!(arena.len(), 5);
-
     arena.free_n(start, 4);
     assert_eq!(arena.len(), 1);
     // single allocation is still valid
     assert_eq!(*arena.get(single), [99, 88]);
 }
-
 #[test]
 fn free_n_then_alloc_n_reuse() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
@@ -171,11 +156,9 @@ fn free_n_then_alloc_n_reuse() {
     let block = arena.alloc_n(3, [0, 0]); // indices 0, 1, 2
     assert_eq!(arena.len(), 3);
     assert_eq!(arena.capacity(), 3);
-
     arena.free_n(block, 3);
     assert_eq!(arena.len(), 0);
     assert_eq!(arena.capacity(), 3); // slots still present
-
     // alloc_n(3, …) should reuse the freed block at index 0.
     let reused = arena.alloc_n(3, [7, 7]);
     assert_eq!(reused, block); // same start index
@@ -185,14 +168,12 @@ fn free_n_then_alloc_n_reuse() {
     assert_eq!(arena.len(), 3);
     assert_eq!(arena.capacity(), 3); // didn't grow
 }
-
 #[test]
 fn free_n_then_alloc_slice_reuse() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
     let values: Vec<[u32; 2]> = (0..4).map(|i| [i, i * 10]).collect();
     let block = arena.alloc_slice(&values);
     arena.free_n(block, 4);
-
     // alloc_slice of same size reuses the block.
     let new_vals: Vec<[u32; 2]> = (0..4).map(|i| [i * 100, i]).collect();
     let reused = arena.alloc_slice(&new_vals);
@@ -202,43 +183,35 @@ fn free_n_then_alloc_slice_reuse() {
     }
     assert_eq!(arena.capacity(), 4); // didn't grow
 }
-
 #[test]
 fn free_n_different_sizes_no_cross_reuse() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
     // Allocate blocks of size 3 and 5.
     let block3 = arena.alloc_n(3, [1, 1]);
     let block5 = arena.alloc_n(5, [2, 2]);
-
     arena.free_n(block3, 3);
     arena.free_n(block5, 5);
-
     // alloc_n(4, …) should NOT reuse size-3 or size-5 blocks — must append.
     let block4 = arena.alloc_n(4, [3, 3]);
     assert_eq!(block4.to_usize(), 8); // appended after existing slots
     assert_eq!(arena.capacity(), 12); // 3 + 5 + 4, no reuse
-
     // alloc_n(3, …) reuses the freed size-3 block.
     let reused3 = arena.alloc_n(3, [4, 4]);
     assert_eq!(reused3, block3);
-
     // alloc_n(5, …) reuses the freed size-5 block.
     let reused5 = arena.alloc_n(5, [5, 5]);
     assert_eq!(reused5, block5);
 }
-
 #[test]
 fn free_n_multiple_blocks_same_size() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
     let a = arena.alloc_n(4, [1, 1]); // 0..4
     let b = arena.alloc_n(4, [2, 2]); // 4..8
     let c = arena.alloc_n(4, [3, 3]); // 8..12
-
     // Free all three — they form a LIFO chain on the size-4 free list.
     arena.free_n(a, 4);
     arena.free_n(b, 4);
     arena.free_n(c, 4);
-
     // alloc_n(4) reuses in LIFO order: c first, then b, then a.
     let first = arena.alloc_n(4, [10, 10]);
     assert_eq!(first, c); // most recently freed
@@ -247,22 +220,18 @@ fn free_n_multiple_blocks_same_size() {
     let third = arena.alloc_n(4, [30, 30]);
     assert_eq!(third, a);
 }
-
 #[test]
 fn free_n_partial_range() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
-    let _a = arena.alloc([1, 0]);  // 0
+    let _a = arena.alloc([1, 0]); // 0
     let start = arena.alloc_n(3, [2, 0]); // 1, 2, 3
-    let _b = arena.alloc([4, 0]);  // 4
+    let _b = arena.alloc([4, 0]); // 4
     assert_eq!(arena.len(), 5);
-
     arena.free_n(start, 3); // free indices 1, 2, 3 as a block
     assert_eq!(arena.len(), 2);
-
     // Surrounding allocations still valid
     assert_eq!(*arena.get(u32::from_usize(0)), [1, 0]);
     assert_eq!(*arena.get(u32::from_usize(4)), [4, 0]);
-
     // alloc_n(3, …) reuses the freed block.
     let reused = arena.alloc_n(3, [55, 0]);
     assert_eq!(reused, start);
@@ -270,7 +239,6 @@ fn free_n_partial_range() {
         assert_eq!(*arena.get(u32::from_usize(1 + i)), [55, 0]);
     }
 }
-
 #[test]
 fn free_n_mixed_single_and_block() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
@@ -278,33 +246,27 @@ fn free_n_mixed_single_and_block() {
     let single = arena.alloc([1, 0]); // 0
     let block = arena.alloc_n(3, [2, 0]); // 1, 2, 3
     let _other = arena.alloc([5, 0]); // 4
-
     arena.free(single); // goes to single-slot free list
     arena.free_n(block, 3); // goes to block[3] free list
-
     // Single alloc reuses the freed single slot.
     let reused_single = arena.alloc([10, 0]);
     assert_eq!(reused_single, single);
-
     // Block alloc_n(3) reuses the freed block.
     let reused_block = arena.alloc_n(3, [20, 0]);
     assert_eq!(reused_block, block);
 }
-
 #[test]
 #[should_panic(expected = "cannot allocate 0 slots")]
 fn alloc_n_zero_panics() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
     arena.alloc_n(0, [0, 0]);
 }
-
 #[test]
 #[should_panic(expected = "cannot allocate 0 slots")]
 fn alloc_slice_empty_panics() {
     let mut arena: Arena<[u32; 2], u32> = Arena::new();
     arena.alloc_slice(&[]);
 }
-
 #[test]
 #[should_panic(expected = "cannot free 0 slots")]
 fn free_n_zero_panics() {
@@ -312,7 +274,6 @@ fn free_n_zero_panics() {
     let s = arena.alloc([1, 2]);
     arena.free_n(s, 0);
 }
-
 #[test]
 fn get_range_basic() {
     let mut arena: Arena<u32, u32> = Arena::new();
@@ -327,7 +288,6 @@ fn get_range_basic() {
     let slice = arena.get_range(start, 4);
     assert_eq!(slice, &[10, 20, 30, 40]);
 }
-
 #[test]
 fn get_range_after_singles() {
     let mut arena: Arena<u32, u32> = Arena::new();
@@ -342,7 +302,6 @@ fn get_range_after_singles() {
     // Verify range
     assert_eq!(arena.get_range(start, 3), &[1, 2, 3]);
 }
-
 #[test]
 fn get_range_with_u16_index() {
     let mut arena: Arena<u16, u16> = Arena::new();
@@ -353,7 +312,6 @@ fn get_range_with_u16_index() {
     }
     assert_eq!(arena.get_range(start, 5), &[0, 1, 2, 3, 4]);
 }
-
 #[test]
 fn get_range_on_reused_block() {
     let mut arena: Arena<u32, u32> = Arena::new();

@@ -1,39 +1,39 @@
+use super::{BenchContext, Benchable, NT, read_allocated};
 use std::hint::black_box;
-
 use tiny_trie_bench::BenchableMap;
-
-use super::{Benchable, BenchContext, NT, read_allocated};
-
 pub(crate) struct NibbleTrieBench {
     trie: NT,
 }
-
 impl NibbleTrieBench {
-    pub(crate) fn new() -> Self { Self { trie: NT::new() } }
+    pub(crate) fn new() -> Self {
+        Self { trie: NT::new() }
+    }
 }
-
 impl Benchable<Vec<u8>> for NibbleTrieBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            self.trie.map_insert(k.clone(), i);
+        }
     }
-
     fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
         let mut m = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            m.map_insert(k.clone(), i);
+        }
         black_box(&m);
         Some(())
     }
-
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
         let before = read_allocated();
         let mut m = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            m.map_insert(k.clone(), i);
+        }
         let bytes = read_allocated() - before;
         drop(m);
         Some(bytes as f64 / keys.len() as f64)
     }
-
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,
@@ -43,49 +43,51 @@ impl Benchable<Vec<u8>> for NibbleTrieBench {
         index_iter: true,
     }
 }
-
 // ── NibbleOpt ────────────────────────────────────────────────────────
-
 pub(crate) struct NibbleOptBench {
     trie: NT,
 }
-
 impl NibbleOptBench {
-    pub(crate) fn new() -> Self { Self { trie: NT::new() } }
+    pub(crate) fn new() -> Self {
+        Self { trie: NT::new() }
+    }
 }
-
 impl Benchable<Vec<u8>> for NibbleOptBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            self.trie.map_insert(k.clone(), i);
+        }
         self.trie.map_optimize();
     }
-
     fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
         let mut m = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            m.map_insert(k.clone(), i);
+        }
         black_box(&m);
         Some(())
     }
-
     fn bench_optimize(&self, keys: &[Vec<u8>]) -> Option<()> {
         let mut m = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            m.map_insert(k.clone(), i);
+        }
         m.map_optimize();
         black_box(&m);
         Some(())
     }
-
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
         let before = read_allocated();
         let mut m = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { m.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            m.map_insert(k.clone(), i);
+        }
         m.map_optimize();
         let bytes = read_allocated() - before;
         drop(m);
         Some(bytes as f64 / keys.len() as f64)
     }
-
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,
@@ -95,28 +97,27 @@ impl Benchable<Vec<u8>> for NibbleOptBench {
         index_iter: true,
     }
 }
-
 // ── NibbleUnchecked ──────────────────────────────────────────────────
 //
 // Benchmarks the `get_unchecked` escape hatch (a hit-only, unchecked lookup).
 // `get_unchecked` is gated behind tiny-trie's `unchecked` cargo feature so it
 // is absent from the published default API; the benches crate enables that
 // feature.
-
 pub(crate) struct NibbleUncheckedBench {
     trie: NT,
 }
-
 impl NibbleUncheckedBench {
-    pub(crate) fn new() -> Self { Self { trie: NT::new() } }
+    pub(crate) fn new() -> Self {
+        Self { trie: NT::new() }
+    }
 }
-
 impl Benchable<Vec<u8>> for NibbleUncheckedBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            self.trie.map_insert(k.clone(), i);
+        }
     }
-
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,
@@ -126,24 +127,23 @@ impl Benchable<Vec<u8>> for NibbleUncheckedBench {
         unchecked: true,
     }
 }
-
 // ── NibbleOptUnchecked ────────────────────────────────────────────────
-
 pub(crate) struct NibbleOptUncheckedBench {
     trie: NT,
 }
-
 impl NibbleOptUncheckedBench {
-    pub(crate) fn new() -> Self { Self { trie: NT::new() } }
+    pub(crate) fn new() -> Self {
+        Self { trie: NT::new() }
+    }
 }
-
 impl Benchable<Vec<u8>> for NibbleOptUncheckedBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         self.trie = NT::map_new();
-        for (i, k) in keys.iter().enumerate() { self.trie.map_insert(k.clone(), i); }
+        for (i, k) in keys.iter().enumerate() {
+            self.trie.map_insert(k.clone(), i);
+        }
         self.trie.map_optimize();
     }
-
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,

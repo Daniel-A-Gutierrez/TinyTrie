@@ -1,5 +1,4 @@
 use crate::tiny_array::TinyArray;
-
 #[test]
 fn test_insert_and_get() {
     let mut arr: TinyArray<u64, 8> = TinyArray::new();
@@ -11,7 +10,6 @@ fn test_insert_and_get() {
     assert_eq!(*arr.get(1), 20);
     assert_eq!(*arr.get(2), 30);
 }
-
 #[test]
 fn test_insert_middle() {
     let mut arr: TinyArray<u64, 8> = TinyArray::new();
@@ -20,7 +18,6 @@ fn test_insert_middle() {
     arr.insert_at(1, 20); // insert 20 between 10 and 30
     assert_eq!(arr.as_slice(), &[10, 20, 30]);
 }
-
 #[test]
 fn test_remove_at() {
     let mut arr: TinyArray<u64, 8> = TinyArray::new();
@@ -32,7 +29,6 @@ fn test_remove_at() {
     assert_eq!(arr.as_slice(), &[10, 30]);
     assert_eq!(arr.len(), 2);
 }
-
 #[test]
 fn test_push() {
     let mut arr: TinyArray<u64, 4> = TinyArray::new();
@@ -41,7 +37,6 @@ fn test_push() {
     arr.push(3);
     assert_eq!(arr.as_slice(), &[1, 2, 3]);
 }
-
 #[test]
 fn test_truncate() {
     let mut arr: TinyArray<u64, 8> = TinyArray::new();
@@ -52,7 +47,6 @@ fn test_truncate() {
     assert_eq!(arr.len(), 1);
     assert_eq!(*arr.get(0), 10);
 }
-
 #[test]
 fn test_is_full() {
     let mut arr: TinyArray<u64, 2> = TinyArray::new();
@@ -62,7 +56,6 @@ fn test_is_full() {
     arr.push(2);
     assert!(arr.is_full());
 }
-
 #[test]
 fn test_drop_non_copy() {
     let mut arr: TinyArray<String, 4> = TinyArray::new();
@@ -72,7 +65,6 @@ fn test_drop_non_copy() {
     // Drop should free the Strings
     drop(arr);
 }
-
 #[test]
 fn test_box_keys() {
     let mut arr: TinyArray<Box<[u8]>, 4> = TinyArray::new();
@@ -84,7 +76,6 @@ fn test_box_keys() {
     // Drop should free the Boxes
     drop(arr);
 }
-
 #[test]
 fn test_drain_into() {
     let mut src: TinyArray<u64, 8> = TinyArray::new();
@@ -93,16 +84,13 @@ fn test_drain_into() {
     src.push(30);
     src.push(40);
     src.push(50);
-
     let mut dst: TinyArray<u64, 8> = TinyArray::new();
     src.drain_into(2, &mut dst);
-
     assert_eq!(src.as_slice(), &[10, 20]);
     assert_eq!(src.len(), 2);
     assert_eq!(dst.as_slice(), &[30, 40, 50]);
     assert_eq!(dst.len(), 3);
 }
-
 #[test]
 fn test_drain_into_at_boundary() {
     let mut src: TinyArray<u64, 4> = TinyArray::new();
@@ -110,29 +98,23 @@ fn test_drain_into_at_boundary() {
     src.push(2);
     src.push(3);
     src.push(4);
-
     let mut dst: TinyArray<u64, 4> = TinyArray::new();
     src.drain_into(0, &mut dst);
-
     assert_eq!(src.len(), 0);
     assert_eq!(dst.as_slice(), &[1, 2, 3, 4]);
 }
-
 #[test]
 fn test_drain_into_non_copy() {
     let mut src: TinyArray<String, 4> = TinyArray::new();
     src.push("a".to_string());
     src.push("b".to_string());
     src.push("c".to_string());
-
     let mut dst: TinyArray<String, 4> = TinyArray::new();
     src.drain_into(1, &mut dst);
-
     assert_eq!(src.as_slice(), &["a".to_string()]);
     assert_eq!(dst.as_slice(), &["b".to_string(), "c".to_string()]);
     // src truncated to 1, dst has 2 — both drop correctly
 }
-
 #[test]
 fn test_drain_into_front() {
     // src tail [30,40,50] prepended to dst front; all moved < dst's existing.
@@ -142,16 +124,13 @@ fn test_drain_into_front() {
     src.push(30);
     src.push(40);
     src.push(50);
-
     let mut dst: TinyArray<u64, 8> = TinyArray::new();
     dst.push(60);
     dst.push(70);
     src.drain_into_front(2, &mut dst);
-
     assert_eq!(src.as_slice(), &[10, 20]);
     assert_eq!(dst.as_slice(), &[30, 40, 50, 60, 70]);
 }
-
 #[test]
 fn test_drain_into_front_empty_dst() {
     let mut src: TinyArray<u64, 4> = TinyArray::new();
@@ -159,33 +138,24 @@ fn test_drain_into_front_empty_dst() {
     src.push(2);
     src.push(3);
     src.push(4);
-
     let mut dst: TinyArray<u64, 4> = TinyArray::new();
     src.drain_into_front(1, &mut dst);
-
     assert_eq!(src.as_slice(), &[1]);
     assert_eq!(dst.as_slice(), &[2, 3, 4]);
 }
-
 #[test]
 fn test_drain_into_front_non_copy() {
     let mut src: TinyArray<String, 4> = TinyArray::new();
     src.push("a".to_string());
     src.push("b".to_string());
     src.push("c".to_string());
-
     let mut dst: TinyArray<String, 4> = TinyArray::new();
     dst.push("d".to_string());
     src.drain_into_front(1, &mut dst);
-
     assert_eq!(src.as_slice(), &["a".to_string()]);
-    assert_eq!(
-        dst.as_slice(),
-        &["b".to_string(), "c".to_string(), "d".to_string()]
-    );
+    assert_eq!(dst.as_slice(), &["b".to_string(), "c".to_string(), "d".to_string()]);
     // Ownership transfers cleanly — no double-drop on scope exit.
 }
-
 #[test]
 fn test_drain_front_into() {
     // src front [10,20] appended to dst end; all moved > dst's existing.
@@ -194,41 +164,33 @@ fn test_drain_front_into() {
     src.push(20);
     src.push(30);
     src.push(40);
-
     let mut dst: TinyArray<u64, 8> = TinyArray::new();
     dst.push(0);
     dst.push(5);
     src.drain_front_into(2, &mut dst);
-
     assert_eq!(src.as_slice(), &[30, 40]);
     assert_eq!(dst.as_slice(), &[0, 5, 10, 20]);
 }
-
 #[test]
 fn test_drain_front_into_empties_src() {
     let mut src: TinyArray<u64, 4> = TinyArray::new();
     src.push(1);
     src.push(2);
     src.push(3);
-
     let mut dst: TinyArray<u64, 4> = TinyArray::new();
     src.drain_front_into(3, &mut dst);
-
     assert_eq!(src.len(), 0);
     assert_eq!(dst.as_slice(), &[1, 2, 3]);
 }
-
 #[test]
 fn test_drain_front_into_non_copy() {
     let mut src: TinyArray<Box<[u8]>, 4> = TinyArray::new();
     src.push(Box::new([1u8]));
     src.push(Box::new([2u8]));
     src.push(Box::new([3u8]));
-
     let mut dst: TinyArray<Box<[u8]>, 4> = TinyArray::new();
     dst.push(Box::new([0u8]));
     src.drain_front_into(2, &mut dst);
-
     assert_eq!(src.as_slice().len(), 1);
     assert_eq!(src.get(0).as_ref(), &[3u8][..]);
     assert_eq!(dst.as_slice().len(), 3);

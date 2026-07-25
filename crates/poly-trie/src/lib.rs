@@ -10,10 +10,7 @@
 //!
 //! `insert()` rejects keys containing `0x00` and appends a null terminator
 //! internally. `get()` requires null-terminated input.
-
 mod arena;
 mod poly_trie;
-
 pub use arena::Arena;
 pub use poly_trie::{NodeRef, PolyTrie};
-

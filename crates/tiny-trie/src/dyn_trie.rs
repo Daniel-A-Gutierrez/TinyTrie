@@ -11,26 +11,21 @@
 //! All method calls dispatch through a `match` on the enum variant — no vtable,
 //! no `Box`, no heap allocation on promotion. The compiler can inline concrete
 //! `NibbleTrie` methods per variant.
-
 use crate::nibble_trie::NibbleTrie;
-
 // ---------------------------------------------------------------------------
 // DynInner enum — replaces Box<dyn DynTrie<T>>
 // ---------------------------------------------------------------------------
-
 /// Internal enum holding one of the four concrete `NibbleTrie` variants.
 /// Promotion replaces the variant in-place via `std::mem::replace`.
 enum DynInner<T> {
-    U8 (NibbleTrie<Vec<u8>, T, u8,  u16>),
+    U8(NibbleTrie<Vec<u8>, T, u8, u16>),
     U16(NibbleTrie<Vec<u8>, T, u16, u16>),
     U32(NibbleTrie<Vec<u8>, T, u32, u16>),
     U64(NibbleTrie<Vec<u8>, T, u64, u16>),
 }
-
 // ---------------------------------------------------------------------------
 // DynTrie
 // ---------------------------------------------------------------------------
-
 /// A nibble trie that starts with compact u8 arena indices and automatically
 /// promotes to u16/u32/u64 as needed.
 ///
@@ -46,15 +41,11 @@ enum DynInner<T> {
 pub struct DynTrie<T> {
     inner: DynInner<T>,
 }
-
 impl<T> DynTrie<T> {
     /// Create an empty DynTrie starting with u8 arena indices (32-byte nodes).
     pub fn new() -> Self {
-        DynTrie {
-            inner: DynInner::U8(NibbleTrie::new()),
-        }
+        DynTrie { inner: DynInner::U8(NibbleTrie::new()) }
     }
-
     /// Look up a key. Returns the value if found.
     pub fn get(&self, key: &[u8]) -> Option<&T> {
         match &self.inner {
@@ -64,7 +55,6 @@ impl<T> DynTrie<T> {
             DynInner::U64(t) => t.get(key),
         }
     }
-
     /// Look up a key's value for mutation. Returns the value if found.
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut T> {
         match &mut self.inner {
@@ -74,7 +64,6 @@ impl<T> DynTrie<T> {
             DynInner::U64(t) => t.get_mut(key),
         }
     }
-
     /// Insert a key-value pair. Automatically promotes to a wider PTR type if
     /// the current one is approaching capacity. Returns the key index on
     /// success, or `Err(())` on duplicate key.
@@ -100,7 +89,6 @@ impl<T> DynTrie<T> {
             DynInner::U64(t) => t.insert(key, value),
         }
     }
-
     /// Number of entries in the trie.
     pub fn len(&self) -> usize {
         match &self.inner {
@@ -110,7 +98,6 @@ impl<T> DynTrie<T> {
             DynInner::U64(t) => t.len(),
         }
     }
-
     /// Returns `true` if the trie is empty.
     pub fn is_empty(&self) -> bool {
         match &self.inner {
@@ -120,7 +107,6 @@ impl<T> DynTrie<T> {
             DynInner::U64(t) => t.is_empty(),
         }
     }
-
     /// Optimize the trie's memory layout for cache locality.
     pub fn optimize(&mut self) {
         match &mut self.inner {
@@ -130,7 +116,6 @@ impl<T> DynTrie<T> {
             DynInner::U64(t) => t.optimize(),
         }
     }
-
     /// Returns the size of the current PTR type in bytes (1, 2, 4, or 8).
     /// Useful for debugging and testing promotion.
     pub fn ptr_size(&self) -> usize {
@@ -141,59 +126,88 @@ impl<T> DynTrie<T> {
             DynInner::U64(_) => 8,
         }
     }
-
     /// Iterate all key-value pairs in forward (ascending) order.
     pub fn iter_fwd(&self, f: &mut dyn FnMut(&[u8], &T)) {
         match &self.inner {
             DynInner::U8(t) => {
                 let mut it = t.iter();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.next() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.next() {
+                    f(k, v);
+                }
             }
             DynInner::U16(t) => {
                 let mut it = t.iter();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.next() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.next() {
+                    f(k, v);
+                }
             }
             DynInner::U32(t) => {
                 let mut it = t.iter();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.next() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.next() {
+                    f(k, v);
+                }
             }
             DynInner::U64(t) => {
                 let mut it = t.iter();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.next() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.next() {
+                    f(k, v);
+                }
             }
         }
     }
-
     /// Iterate all key-value pairs in reverse (descending) order.
     pub fn iter_rev(&self, f: &mut dyn FnMut(&[u8], &T)) {
         match &self.inner {
             DynInner::U8(t) => {
                 let mut it = t.iter_last();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.prev() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.prev() {
+                    f(k, v);
+                }
             }
             DynInner::U16(t) => {
                 let mut it = t.iter_last();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.prev() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.prev() {
+                    f(k, v);
+                }
             }
             DynInner::U32(t) => {
                 let mut it = t.iter_last();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.prev() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.prev() {
+                    f(k, v);
+                }
             }
             DynInner::U64(t) => {
                 let mut it = t.iter_last();
-                if let Some((k, v)) = it.current() { f(k, v); }
-                while let Some((k, v)) = it.prev() { f(k, v); }
+                if let Some((k, v)) = it.current() {
+                    f(k, v);
+                }
+                while let Some((k, v)) = it.prev() {
+                    f(k, v);
+                }
             }
         }
     }
-
     /// Manually demote to a narrower PTR type if the trie is small enough.
     /// Returns `Ok(())` on success, `Err(())` if the trie is too large or
     /// already at the minimum width (u8).
@@ -206,45 +220,38 @@ impl<T> DynTrie<T> {
                 self.inner = DynInner::U8(t);
                 Err(())
             }
-            DynInner::U16(t) => {
-                match t.demote::<u8>() {
-                    Ok(smaller) => {
-                        self.inner = DynInner::U8(smaller);
-                        Ok(())
-                    }
-                    Err(original) => {
-                        self.inner = DynInner::U16(original);
-                        Err(())
-                    }
+            DynInner::U16(t) => match t.demote::<u8>() {
+                Ok(smaller) => {
+                    self.inner = DynInner::U8(smaller);
+                    Ok(())
                 }
-            }
-            DynInner::U32(t) => {
-                match t.demote::<u16>() {
-                    Ok(smaller) => {
-                        self.inner = DynInner::U16(smaller);
-                        Ok(())
-                    }
-                    Err(original) => {
-                        self.inner = DynInner::U32(original);
-                        Err(())
-                    }
+                Err(original) => {
+                    self.inner = DynInner::U16(original);
+                    Err(())
                 }
-            }
-            DynInner::U64(t) => {
-                match t.demote::<u32>() {
-                    Ok(smaller) => {
-                        self.inner = DynInner::U32(smaller);
-                        Ok(())
-                    }
-                    Err(original) => {
-                        self.inner = DynInner::U64(original);
-                        Err(())
-                    }
+            },
+            DynInner::U32(t) => match t.demote::<u16>() {
+                Ok(smaller) => {
+                    self.inner = DynInner::U16(smaller);
+                    Ok(())
                 }
-            }
+                Err(original) => {
+                    self.inner = DynInner::U32(original);
+                    Err(())
+                }
+            },
+            DynInner::U64(t) => match t.demote::<u32>() {
+                Ok(smaller) => {
+                    self.inner = DynInner::U32(smaller);
+                    Ok(())
+                }
+                Err(original) => {
+                    self.inner = DynInner::U64(original);
+                    Err(())
+                }
+            },
         }
     }
-
     /// Promote the inner trie to the next wider PTR type.
     fn promote_inner(&mut self) {
         // We need to take ownership of the inner trie, promote it, and replace.
@@ -262,14 +269,11 @@ impl<T> DynTrie<T> {
         };
     }
 }
-
 impl<T> Default for DynTrie<T> {
     fn default() -> Self {
         Self::new()
     }
 }
-
 #[cfg(test)]
 #[path = "tests/dyn_trie.rs"]
 mod tests;
-

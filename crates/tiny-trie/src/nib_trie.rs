@@ -33,14 +33,12 @@
 //! - etc.
 //!
 //! Total nib count for a key of length L is `L * 4`.
-
 use crate::nibble_trie::TrieIndex;
-use std::{fmt, simd::{Simd, cmp::SimdPartialEq}};
-
+use std::{fmt,
+          simd::{Simd, cmp::SimdPartialEq}};
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
-
 /// A single node in the nib trie arena.
 ///
 /// Each node has 4 child slots (one per 2-bit value), a leaf reference key,
@@ -49,32 +47,29 @@ use std::{fmt, simd::{Simd, cmp::SimdPartialEq}};
 /// Layout with PTR=u32, LEN=u16: 24 bytes (4×u32 + u32 + u16 + 3×u8 + padding).
 #[derive(Copy, Clone)]
 pub(crate) struct NibNode<PTR: TrieIndex = u32, LEN: TrieIndex = u16> {
-    pub(crate) children: [PTR; 4],     // one per 2-bit value; PTR::MAX = empty
-    pub(crate) leaf: PTR,              // key index for prefix comparison
-    pub(crate) prefix_len: LEN,        // prefix length in nibs (2-bit positions)
-    pub(crate) leaf_mask: u8,          // bit N = children[N] is leaf key index
-    pub(crate) occupancy: u8,          // bit N = slot N is occupied
-    pub(crate) terminal: u8,           // bit 0 = this node is terminal
+    pub(crate) children:   [PTR; 4], // one per 2-bit value; PTR::MAX = empty
+    pub(crate) leaf:       PTR,      // key index for prefix comparison
+    pub(crate) prefix_len: LEN,      // prefix length in nibs (2-bit positions)
+    pub(crate) leaf_mask:  u8,       // bit N = children[N] is leaf key index
+    pub(crate) occupancy:  u8,       // bit N = slot N is occupied
+    pub(crate) terminal:   u8,       // bit 0 = this node is terminal
 }
-
 impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
     pub(crate) fn new() -> Self {
         NibNode {
-            children: [PTR::max_value_sentinel(); 4],
-            leaf: PTR::max_value_sentinel(),
+            children:   [PTR::max_value_sentinel(); 4],
+            leaf:       PTR::max_value_sentinel(),
             prefix_len: LEN::zero(),
-            leaf_mask: 0,
-            occupancy: 0,
-            terminal: 0,
+            leaf_mask:  0,
+            occupancy:  0,
+            terminal:   0,
         }
     }
-
     /// Check if this node is terminal (represents a key that ends here).
     #[inline]
     pub(crate) fn is_terminal(&self) -> bool {
         self.terminal != 0
     }
-
     /// Set or clear the terminal flag.
     #[inline]
     fn set_terminal(&mut self, val: bool) {
@@ -84,42 +79,36 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
             self.terminal = 0;
         }
     }
-
     /// Check if nib slot `nib` is a leaf (key index).
     #[inline]
     pub(crate) fn is_leaf(&self, nib: usize) -> bool {
         debug_assert!(nib < 4);
         (self.leaf_mask >> nib) & 1 == 1
     }
-
     /// Set the leaf flag for nib slot `nib`.
     #[inline]
     fn set_leaf(&mut self, nib: usize) {
         debug_assert!(nib < 4);
         self.leaf_mask |= 1 << nib;
     }
-
     /// Clear the leaf flag for nib slot `nib`.
     #[inline]
     fn clear_leaf(&mut self, nib: usize) {
         debug_assert!(nib < 4);
         self.leaf_mask &= !(1 << nib);
     }
-
     /// Check if nib slot `nib` is occupied.
     #[inline]
     pub(crate) fn is_occupied(&self, nib: usize) -> bool {
         debug_assert!(nib < 4);
         (self.occupancy >> nib) & 1 == 1
     }
-
     /// Set the occupancy bit for nib slot `nib`.
     #[inline]
     fn set_occupied(&mut self, nib: usize) {
         debug_assert!(nib < 4);
         self.occupancy |= 1 << nib;
     }
-
     /// Store a leaf key index at `nib`. Key index must not be the sentinel.
     #[inline]
     fn set_leaf_child(&mut self, nib: usize, key_index: PTR) {
@@ -129,7 +118,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
         self.set_occupied(nib);
         self.children[nib] = key_index;
     }
-
     /// Store an arena index at `nib` (internal node reference).
     #[inline]
     fn set_internal_child(&mut self, nib: usize, addr: PTR) {
@@ -139,26 +127,19 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
         self.set_occupied(nib);
         self.children[nib] = addr;
     }
-
     /// Decode a leaf child at `nib` into a key index.
     /// Returns `None` if the slot is empty or not a leaf.
     #[inline]
     fn leaf_key_index(&self, nib: usize) -> Option<PTR> {
         debug_assert!(nib < 4);
-        if self.is_leaf(nib) && self.is_occupied(nib) {
-            Some(self.children[nib])
-        } else {
-            None
-        }
+        if self.is_leaf(nib) && self.is_occupied(nib) { Some(self.children[nib]) } else { None }
     }
-
     /// Compute a 4-bit mask where bit N is set if `children[N]` is not the sentinel.
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn children_mask(&self) -> u8 {
         self.occupancy
     }
-
     /// Promote this node's PTR type to a wider one.
     pub(crate) fn promote<NewPTR: TrieIndex>(self) -> NibNode<NewPTR, LEN> {
         let mut children = [NewPTR::max_value_sentinel(); 4];
@@ -180,7 +161,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
             terminal: self.terminal,
         }
     }
-
     /// Demote this node's PTR type to a narrower one.
     /// Returns `Err(self)` if any address doesn't fit.
     pub(crate) fn demote<NewPTR: TrieIndex>(self) -> Result<NibNode<NewPTR, LEN>, Self> {
@@ -191,7 +171,8 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
                 }
             }
         }
-        if self.leaf != PTR::max_value_sentinel() && self.leaf.as_usize() > NewPTR::max_value() {
+        if self.leaf != PTR::max_value_sentinel() && self.leaf.as_usize() > NewPTR::max_value()
+        {
             return Err(self);
         }
         let mut children = [NewPTR::max_value_sentinel(); 4];
@@ -214,7 +195,6 @@ impl<PTR: TrieIndex, LEN: TrieIndex> NibNode<PTR, LEN> {
         })
     }
 }
-
 impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for NibNode<PTR, LEN> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let active: Vec<(usize, &str, PTR)> = (0..4)
@@ -234,41 +214,34 @@ impl<PTR: TrieIndex, LEN: TrieIndex> fmt::Debug for NibNode<PTR, LEN> {
             .finish()
     }
 }
-
 // ---------------------------------------------------------------------------
 // NibTrie
 // ---------------------------------------------------------------------------
-
 #[derive(Clone)]
 pub struct NibTrie<T, PTR: TrieIndex = u32, LEN: TrieIndex = u16> {
-    pub(crate) arena: Vec<NibNode<PTR, LEN>>,
-    pub(crate) buf: Vec<u8>,                // all keys concatenated (no null terminators)
-    pub(crate) index: Vec<(usize, LEN)>,   // (offset into buf, len) per key — offset is usize, len is compact
-    pub(crate) values: Vec<T>,              // values[i] ↔ index[i]
+    pub(crate) arena:  Vec<NibNode<PTR, LEN>>,
+    pub(crate) buf:    Vec<u8>, // all keys concatenated (no null terminators)
+    pub(crate) index:  Vec<(usize, LEN)>, // (offset into buf, len) per key — offset is usize, len is compact
+    pub(crate) values: Vec<T>,            // values[i] ↔ index[i]
 }
-
 // ---------------------------------------------------------------------------
 // Divergence result
 // ---------------------------------------------------------------------------
-
 enum DivergeResult {
     /// The keys are identical (same nib count, same content).
     Duplicate,
     /// The keys diverge at this nib position, or one key is a prefix of the other.
     At(usize),
 }
-
 enum PrefixCheck {
     /// The keys match at every nib position in `from..to`.
     Matches,
     /// The keys diverge at this nib position (within `from..to`).
     Diverges(usize),
 }
-
 // ---------------------------------------------------------------------------
 // SIMD helpers
 // ---------------------------------------------------------------------------
-
 #[inline]
 fn simd_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -292,12 +265,9 @@ fn simd_eq(a: &[u8], b: &[u8]) -> bool {
     }
     true
 }
-
-
 // ---------------------------------------------------------------------------
 // Nib helpers
 // ---------------------------------------------------------------------------
-
 /// Extract the 2-bit nib at position `idx` from `key`.
 ///
 /// Each byte contains 4 nibs:
@@ -317,7 +287,6 @@ fn key_nib_at(key: &[u8], idx: usize) -> u8 {
         0
     }
 }
-
 /// Unchecked version of `key_nib_at`.
 ///
 /// # Safety
@@ -329,12 +298,10 @@ unsafe fn key_nib_at_unchecked(key: &[u8], idx: usize) -> u8 {
     let shift = 6 - 2 * (idx % 4);
     (unsafe { *key.get_unchecked(byte_idx) } >> shift) & 0x03
 }
-
 #[inline]
 fn nib_count(key: &[u8]) -> usize {
     key.len() * 4
 }
-
 /// Given a non-zero XOR of two differing bytes, return the nib position of the
 /// first divergence. Uses `leading_zeros` for branchless computation:
 /// `group = lz / 2`, so `nib = byte_idx * 4 + lz / 2`.
@@ -342,7 +309,6 @@ fn nib_count(key: &[u8]) -> usize {
 fn diverging_nib(xor: u8, byte_idx: usize) -> usize {
     byte_idx * 4 + (xor.leading_zeros() as usize) / 2
 }
-
 /// Scan two keys from `from` onward to find the first diverging nib.
 #[inline]
 fn find_divergence(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult {
@@ -356,35 +322,33 @@ fn find_divergence(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult {
         }
         d += 1;
     }
-    if total_a == total_b {
-        DivergeResult::Duplicate
-    } else {
-        DivergeResult::At(d)
-    }
+    if total_a == total_b { DivergeResult::Duplicate } else { DivergeResult::At(d) }
 }
-
-fn simd_find_divergence<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize) -> DivergeResult
+fn simd_find_divergence<const N: usize>(
+    key_a: &[u8],
+    key_b: &[u8],
+    from: usize,
+) -> DivergeResult
 where
 {
     let minlen = key_a.len().min(key_b.len());
     let mut i = from / 4; // byte containing nib `from`
-
     while i + N <= minlen {
         let a = Simd::<u8, N>::from_slice(unsafe { key_a.get_unchecked(i..i + N) });
         let b = Simd::<u8, N>::from_slice(unsafe { key_b.get_unchecked(i..i + N) });
         let mask = a.simd_ne(b);
         if mask.any() {
             let diff_byte_idx = i + mask.first_set().unwrap();
-            let xor = unsafe { *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx) };
+            let xor = unsafe {
+                *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx)
+            };
             return DivergeResult::At(diverging_nib(xor, diff_byte_idx));
         }
         i += N;
     }
-
     // Scalar tail
     find_divergence(key_a, key_b, i * 4)
 }
-
 /// Scan nibs `from..to` of two keys. Returns `Diverges(pos)` if they differ
 /// at any nib in that range, or `Matches` if they agree throughout.
 #[inline]
@@ -396,27 +360,31 @@ fn check_prefix(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixChe
     }
     PrefixCheck::Matches
 }
-
 /// SIMD-accelerated bounded prefix check for 2-bit nibs.
-fn simd_check_prefix<const N: usize>(key_a: &[u8], key_b: &[u8], from: usize, to: usize) -> PrefixCheck
+fn simd_check_prefix<const N: usize>(
+    key_a: &[u8],
+    key_b: &[u8],
+    from: usize,
+    to: usize,
+) -> PrefixCheck
 where
 {
     if from >= to {
         return PrefixCheck::Matches;
     }
-
     let from_byte = from / 4;
     let to_byte = (to + 3) / 4; // first byte fully outside the nib range
     let minlen = key_a.len().min(key_b.len()).min(to_byte);
     let mut i = from_byte;
-
     while i + N <= minlen {
         let a = Simd::<u8, N>::from_slice(unsafe { key_a.get_unchecked(i..i + N) });
         let b = Simd::<u8, N>::from_slice(unsafe { key_b.get_unchecked(i..i + N) });
         let mask = a.simd_ne(b);
         if mask.any() {
             let diff_byte_idx = i + mask.first_set().unwrap();
-            let xor = unsafe { *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx) };
+            let xor = unsafe {
+                *key_a.get_unchecked(diff_byte_idx) ^ *key_b.get_unchecked(diff_byte_idx)
+            };
             let nib = diverging_nib(xor, diff_byte_idx);
             if nib < to {
                 return PrefixCheck::Diverges(nib);
@@ -426,15 +394,12 @@ where
         }
         i += N;
     }
-
     // Scalar tail
     check_prefix(key_a, key_b, i * 4, to)
 }
-
 // ---------------------------------------------------------------------------
 // NibTrie methods
 // ---------------------------------------------------------------------------
-
 impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
     /// Return the key slice for `key_index`.
     #[inline]
@@ -442,28 +407,23 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         let (off, len) = self.index[key_index.as_usize()];
         &self.buf[off..off + len.as_usize()]
     }
-
     pub fn new() -> Self {
         NibTrie {
-            arena: Vec::new(),
-            buf: vec![0],           // buf[0] = dummy (unused byte)
-            index: vec![(0, LEN::zero())],   // index[0] = dummy entry
+            arena:  Vec::new(),
+            buf:    vec![0],                // buf[0] = dummy (unused byte)
+            index:  vec![(0, LEN::zero())], // index[0] = dummy entry
             values: Vec::new(),
         }
     }
-
     pub fn len(&self) -> usize {
         self.index.len() - 1 // subtract dummy
     }
-
     pub fn is_empty(&self) -> bool {
         self.index.len() == 1 // only the dummy
     }
-
     // -----------------------------------------------------------------------
     // Lookup
     // -----------------------------------------------------------------------
-
     pub fn get_index(&self, key: &[u8]) -> Option<usize> {
         if self.arena.is_empty() {
             return None;
@@ -473,7 +433,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         loop {
             let node = &self.arena[node_idx];
             let prefix_len = node.prefix_len.as_usize();
-
             // Key nibs exhausted — check if this node is terminal.
             if prefix_len >= max_nib {
                 if node.is_terminal() {
@@ -486,7 +445,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                 }
                 return None;
             }
-
             // Safe to use unchecked: prefix_len < max_nib guarantees byte_idx < key.len()
             let nib = unsafe { key_nib_at_unchecked(key, prefix_len) } as usize;
             let slot = node.children[nib];
@@ -506,7 +464,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
             node_idx = slot.as_usize();
         }
     }
-
     /// Unchecked lookup — assumes the key is present in the trie.
     ///
     /// # Safety
@@ -536,15 +493,12 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
             node_idx = slot.as_usize();
         }
     }
-
     pub fn get(&self, key: &[u8]) -> Option<&T> {
         self.get_index(key).map(|idx| &self.values[idx - 1])
     }
-
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut T> {
         self.get_index(key).map(|idx| &mut self.values[idx - 1])
     }
-
     /// Unchecked value lookup — assumes the key is present in the trie.
     ///
     /// # Safety
@@ -553,101 +507,95 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
     pub unsafe fn get_unchecked(&self, key: &[u8]) -> Option<&T> {
         unsafe { self.get_index_unchecked(key).map(|idx| &self.values[idx - 1]) }
     }
-
     // -----------------------------------------------------------------------
     // Iteration
     // -----------------------------------------------------------------------
-
     pub fn iter(&self) -> Cursor<'_, T, PTR, LEN> {
         Cursor::new(self)
     }
-
     pub fn iter_last(&self) -> Cursor<'_, T, PTR, LEN> {
         Cursor::new_last(self)
     }
-
     /// Public forward mutable cursor: a lending tree-walk that hands out `&mut T`
     /// borrows tied to the cursor (see [`CursorMut`]). Parked *before* the first
     /// key — call `next()`/`first()` to position.
     pub fn iter_mut(&mut self) -> CursorMut<'_, T, PTR, LEN> {
         CursorMut::new(self)
     }
-
     /// Public reverse mutable cursor: a lending tree-walk parked *on* the last
     /// key (see [`CursorMut`]).
     pub fn iter_mut_last(&mut self) -> CursorMut<'_, T, PTR, LEN> {
         CursorMut::new_last(self)
     }
-
     pub fn into_keys_values(self) -> (Vec<Vec<u8>>, Vec<T>) {
         let buf = self.buf;
-        let keys: Vec<Vec<u8>> = self.index.into_iter().skip(1).map(|(off, len)| {
-            buf[off..off + len.as_usize()].to_vec()
-        }).collect();
+        let keys: Vec<Vec<u8>> = self
+            .index
+            .into_iter()
+            .skip(1)
+            .map(|(off, len)| buf[off..off + len.as_usize()].to_vec())
+            .collect();
         (keys, self.values)
     }
-
     // -----------------------------------------------------------------------
     // Capacity
     // -----------------------------------------------------------------------
-
     pub fn near_capacity(&self) -> bool {
         self.arena.len() >= PTR::max_value() || self.index.len() >= PTR::max_value()
     }
-
     // -----------------------------------------------------------------------
     // Optimize (DFS key-sorted buf rewrite)
     // -----------------------------------------------------------------------
-
     /// Rewrite `buf` in DFS order for cache locality.
     pub fn optimize(&mut self) {
         if self.arena.is_empty() {
             return;
         }
-
         let mut new_buf = vec![0u8; self.buf.len()];
         let mut cursor: usize = 1; // position 0 is the dummy byte
-
         // Remap table: maps old arena index → new arena index.
         let mut remap: Vec<usize> = vec![0; self.arena.len()];
-
         let mut new_arena: Vec<NibNode<PTR, LEN>> = Vec::new();
-
         // Collect key indices in DFS visitation order for index/values sorting
         let mut dfs_key_order: Vec<PTR> = Vec::new();
-
         self.walk_optimize(
             0,
-            &mut new_buf, &mut cursor,
-            &mut remap, &mut new_arena,
+            &mut new_buf,
+            &mut cursor,
+            &mut remap,
+            &mut new_arena,
             &mut dfs_key_order,
         );
-
         new_buf.truncate(cursor);
         self.buf = new_buf;
         self.arena = new_arena;
-
         // Remap all internal child addresses in the new arena
         for node in &mut self.arena {
             for nib in 0..4 {
                 if node.occupancy & (1 << nib) != 0 && !node.is_leaf(nib) {
                     let old_addr = node.children[nib].as_usize();
-                    debug_assert!(old_addr < remap.len(), "old_addr {} >= remap.len() {}", old_addr, remap.len());
-                    debug_assert!(!(remap[old_addr] == 0 && old_addr != 0), "remap[{}] == 0 but old_addr != 0", old_addr);
+                    debug_assert!(
+                        old_addr < remap.len(),
+                        "old_addr {} >= remap.len() {}",
+                        old_addr,
+                        remap.len()
+                    );
+                    debug_assert!(
+                        !(remap[old_addr] == 0 && old_addr != 0),
+                        "remap[{}] == 0 but old_addr != 0",
+                        old_addr
+                    );
                     node.children[nib] = PTR::from_usize(remap[old_addr]);
                 }
             }
         }
-
         // --- Sort index and values into DFS order ---
-
         let num_keys = dfs_key_order.len();
         let mut key_remap: Vec<usize> = vec![0; self.index.len()];
         key_remap[0] = 0; // dummy stays at 0
         for (new_ki, &old_ki) in dfs_key_order.iter().enumerate() {
             key_remap[old_ki.as_usize()] = new_ki + 1; // 1-based
         }
-
         // Remap all key index references in the arena
         for node in &mut self.arena {
             for nib in 0..4 {
@@ -664,14 +612,12 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                 node.leaf = PTR::from_usize(new_ki);
             }
         }
-
         // Rebuild index in DFS order
         let mut new_index: Vec<(usize, LEN)> = vec![(0, LEN::zero()); num_keys + 1];
         new_index[0] = self.index[0]; // keep dummy entry
         for (new_ki, &old_ki) in dfs_key_order.iter().enumerate() {
             new_index[new_ki + 1] = self.index[old_ki.as_usize()];
         }
-
         // Reorder values to match new key ordering
         let mut new_values = Vec::with_capacity(num_keys);
         unsafe {
@@ -681,11 +627,12 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                 new_values.push(old_val);
             }
         }
-        unsafe { self.values.set_len(0); }
+        unsafe {
+            self.values.set_len(0);
+        }
         std::mem::swap(&mut self.values, &mut new_values);
         self.index = new_index;
     }
-
     fn walk_optimize(
         &mut self,
         old_idx: usize,
@@ -698,11 +645,9 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         let node = self.arena[old_idx]; // copy to avoid borrow conflicts
         let occ = node.occupancy;
         let is_term = node.is_terminal();
-
         let new_idx = new_arena.len();
         new_arena.push(NibNode::new());
         remap[old_idx] = new_idx;
-
         // Populate new node fields
         new_arena[new_idx].prefix_len = node.prefix_len;
         new_arena[new_idx].occupancy = occ;
@@ -710,21 +655,18 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         if is_term {
             new_arena[new_idx].set_terminal(true);
         }
-
         // Copy key data for terminal node
         if is_term {
             let ki = node.leaf;
             let (old_off, len) = self.index[ki.as_usize()];
             let start = *cursor;
-            new_buf[start..start + len.as_usize()].copy_from_slice(
-                &self.buf[old_off..old_off + len.as_usize()]
-            );
+            new_buf[start..start + len.as_usize()]
+                .copy_from_slice(&self.buf[old_off..old_off + len.as_usize()]);
             self.index[ki.as_usize()].0 = *cursor;
             *cursor += len.as_usize();
             new_arena[new_idx].leaf = ki;
             dfs_key_order.push(ki);
         }
-
         // Recurse into children
         for nib in 0..4 {
             if (occ >> nib) & 1 == 0 {
@@ -735,9 +677,8 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                 let ki = node.children[nib];
                 let (old_off, len) = self.index[ki.as_usize()];
                 let start = *cursor;
-                new_buf[start..start + len.as_usize()].copy_from_slice(
-                    &self.buf[old_off..old_off + len.as_usize()]
-                );
+                new_buf[start..start + len.as_usize()]
+                    .copy_from_slice(&self.buf[old_off..old_off + len.as_usize()]);
                 self.index[ki.as_usize()].0 = *cursor;
                 *cursor += len.as_usize();
                 new_arena[new_idx].children[nib] = ki;
@@ -747,15 +688,16 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                 let child_old_addr = node.children[nib].as_usize();
                 self.walk_optimize(
                     child_old_addr,
-                    new_buf, cursor,
-                    remap, new_arena,
+                    new_buf,
+                    cursor,
+                    remap,
+                    new_arena,
                     dfs_key_order,
                 );
                 // Store old address so the remap loop can find it
                 new_arena[new_idx].children[nib] = node.children[nib];
             }
         }
-
         // Propagate leaf for non-terminal nodes
         if !is_term && new_arena[new_idx].leaf == PTR::max_value_sentinel() {
             let first_nib = occ.trailing_zeros() as usize;
@@ -771,15 +713,14 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         }
     }
 }
-
 impl<T, PTR: TrieIndex, LEN: TrieIndex> Default for NibTrie<T, PTR, LEN> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
-
 // ---------------------------------------------------------------------------
 // Insertion
 // ---------------------------------------------------------------------------
-
 impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
     pub fn insert(&mut self, key: Vec<u8>, value: T) -> Result<usize, ()> {
         // Overflow checks
@@ -789,30 +730,24 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         if key.len() * 4 > LEN::max_value() {
             return Err(());
         }
-
         let new_index = PTR::from_usize(self.index.len());
         let key_len = LEN::from_usize(key.len());
         let offset = self.buf.len() as usize;
         self.buf.extend_from_slice(&key);
         self.index.push((offset, key_len));
         self.values.push(value);
-
         let max_nib = key.len() * 4;
-
         if self.arena.is_empty() {
             return Ok(self.insert_into_empty_trie(&key, new_index, max_nib));
         }
-
         let mut node_idx: usize = 0;
         let mut confirmed: usize = 0;
-
         loop {
             let node = &self.arena[node_idx];
             let ki = node.leaf;
             let (off, ref_len) = self.index[ki.as_usize()];
             let ref_key = &self.buf[off..off + ref_len.as_usize()];
             let prefix_len = node.prefix_len.as_usize();
-
             match simd_check_prefix::<8>(&key, ref_key, confirmed, prefix_len) {
                 PrefixCheck::Diverges(diverge) => {
                     return Ok(self.split_node_before_prefix(
@@ -829,7 +764,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                         self.arena[node_idx].leaf = new_index;
                         return Ok(new_index.as_usize());
                     }
-
                     confirmed = prefix_len + 1;
                     let nib = key_nib_at(&key, prefix_len) as usize;
                     if !node.is_occupied(nib) {
@@ -838,31 +772,26 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                         return Ok(new_index.as_usize());
                     }
                     let slot = node.children[nib];
-
                     if node.is_leaf(nib) {
                         return self.split_leaf_child(
                             nib, node_idx, slot, new_index, &key, max_nib, confirmed,
                         );
                     }
-
                     // Internal child — descend
                     node_idx = slot.as_usize();
                 }
             }
         }
     }
-
     // -----------------------------------------------------------------------
     // Insert helpers
     // -----------------------------------------------------------------------
-
     #[inline]
     fn rollback_last_insert(&mut self) {
         let (off, _len) = self.index.pop().unwrap();
         self.buf.truncate(off);
         let _ = self.values.pop();
     }
-
     #[inline]
     fn insert_into_empty_trie(&mut self, key: &[u8], new_index: PTR, max_nib: usize) -> usize {
         if max_nib == 0 {
@@ -881,7 +810,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         self.arena.push(root);
         new_index.as_usize()
     }
-
     #[inline]
     fn split_node_before_prefix(
         &mut self,
@@ -895,13 +823,10 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         let ki = node.leaf;
         let (off, ref_len) = self.index[ki.as_usize()];
         let ref_key = &self.buf[off..off + ref_len.as_usize()];
-
         let new_nib = key_nib_at(key, diverge) as usize;
         let ref_nib = key_nib_at(ref_key, diverge) as usize;
-
         let mut new_parent = NibNode::new();
         new_parent.prefix_len = LEN::from_usize(diverge);
-
         if diverge >= max_nib {
             new_parent.set_terminal(true);
             new_parent.leaf = new_index;
@@ -909,16 +834,12 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
             new_parent.set_leaf_child(new_nib, new_index);
             new_parent.leaf = new_index;
         }
-
         let old_node = std::mem::replace(&mut self.arena[node_idx], new_parent);
         let old_addr = PTR::from_usize(self.arena.len()); // new node at next slot
         self.arena.push(old_node);
-
         self.arena[node_idx].set_internal_child(ref_nib, old_addr);
-
         new_index.as_usize()
     }
-
     #[inline]
     fn split_leaf_child(
         &mut self,
@@ -931,8 +852,8 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
         confirmed: usize,
     ) -> Result<usize, ()> {
         let (existing_offset, existing_len) = self.index[existing_key_index.as_usize()];
-        let existing_key = &self.buf[existing_offset..existing_offset + existing_len.as_usize()];
-
+        let existing_key =
+            &self.buf[existing_offset..existing_offset + existing_len.as_usize()];
         match simd_find_divergence::<8>(key, existing_key, confirmed) {
             DivergeResult::Duplicate => {
                 self.rollback_last_insert();
@@ -941,7 +862,6 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
             DivergeResult::At(d) => {
                 let mut split_node = NibNode::new();
                 split_node.prefix_len = LEN::from_usize(d);
-
                 if d >= max_nib {
                     // New key ends at the split point — terminal
                     let exist_nib = key_nib_at(existing_key, d) as usize;
@@ -963,33 +883,23 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                     split_node.set_leaf_child(exist_nib, existing_key_index);
                     split_node.leaf = existing_key_index;
                 }
-
                 let split_addr = PTR::from_usize(self.arena.len());
                 self.arena.push(split_node);
                 self.arena[node_idx].set_internal_child(nib, split_addr);
-
                 Ok(new_index.as_usize())
             }
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // PTR width conversions (promote/demote)
 // ---------------------------------------------------------------------------
-
 impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
     /// Promote the arena index type to a wider PTR.
     pub fn promote<NewPTR: TrieIndex>(self) -> NibTrie<T, NewPTR, LEN> {
         let arena = self.arena.into_iter().map(|node| node.promote()).collect();
-        NibTrie {
-            arena,
-            buf: self.buf,
-            index: self.index,
-            values: self.values,
-        }
+        NibTrie { arena, buf: self.buf, index: self.index, values: self.values }
     }
-
     /// Demote the arena index type to a narrower PTR.
     /// Returns `Err(self)` if any address doesn't fit.
     pub fn demote<NewPTR: TrieIndex>(self) -> Result<NibTrie<T, NewPTR, LEN>, Self> {
@@ -1001,31 +911,24 @@ impl<T, PTR: TrieIndex, LEN: TrieIndex> NibTrie<T, PTR, LEN> {
                 return Err(self);
             }
         }
-        let arena = self.arena.into_iter().map(|node| {
-            node.demote().expect("demote capacity check should have caught this")
-        }).collect();
-        Ok(NibTrie {
-            arena,
-            buf: self.buf,
-            index: self.index,
-            values: self.values,
-        })
+        let arena = self
+            .arena
+            .into_iter()
+            .map(|node| node.demote().expect("demote capacity check should have caught this"))
+            .collect();
+        Ok(NibTrie { arena, buf: self.buf, index: self.index, values: self.values })
     }
 }
-
 // ---------------------------------------------------------------------------
 // Iterator
 // ---------------------------------------------------------------------------
-
 /// Sentinel nib value meaning "positioned at the terminal value of this node."
 const TERMINAL_NIB: usize = 4;
-
 pub struct Cursor<'a, T, PTR: TrieIndex, LEN: TrieIndex> {
-    trie: &'a NibTrie<T, PTR, LEN>,
+    trie:  &'a NibTrie<T, PTR, LEN>,
     /// Stack of (node_index, occupancy_mask, nib_position) tuples.
     stack: Vec<(usize, u8, usize)>,
 }
-
 impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
     fn new(trie: &'a NibTrie<T, PTR, LEN>) -> Self {
         if trie.arena.is_empty() {
@@ -1035,7 +938,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
         let nib = if trie.arena[0].is_terminal() { TERMINAL_NIB } else { usize::MAX };
         Cursor { trie, stack: vec![(0, mask, nib)] }
     }
-
     fn new_last(trie: &'a NibTrie<T, PTR, LEN>) -> Self {
         if trie.arena.is_empty() {
             return Cursor { trie, stack: Vec::new() };
@@ -1062,7 +964,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
         }
         Cursor { trie, stack }
     }
-
     fn descend_first(&mut self, mut node_idx: usize) {
         loop {
             let node = &self.trie.arena[node_idx];
@@ -1083,7 +984,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
             }
         }
     }
-
     fn descend_last(&mut self, mut node_idx: usize) {
         loop {
             let node = &self.trie.arena[node_idx];
@@ -1108,7 +1008,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
             }
         }
     }
-
     #[inline]
     fn push_next_child(&mut self, node_idx: usize, mask: u8, start_nib: usize) -> bool {
         let shifted = if start_nib >= 4 { 0u8 } else { mask >> start_nib };
@@ -1125,7 +1024,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
         }
         true
     }
-
     #[inline]
     fn backtrack_to_next(&mut self) -> Option<(&[u8], &T)> {
         loop {
@@ -1135,7 +1033,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
             }
         }
     }
-
     pub fn current(&self) -> Option<(&[u8], &T)> {
         let (_, _, nib) = self.stack.last()?;
         if *nib == usize::MAX {
@@ -1157,7 +1054,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
             None
         }
     }
-
     pub fn current_index(&self) -> Option<usize> {
         let &(_, _, nib) = self.stack.last()?;
         if nib == usize::MAX {
@@ -1171,7 +1067,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
             node.leaf_key_index(nib).map(|ki| ki.as_usize())
         }
     }
-
     #[inline]
     fn advance_next(&mut self) -> bool {
         loop {
@@ -1179,21 +1074,18 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
                 Some(v) => v,
                 None => return false,
             };
-
             if nib == TERMINAL_NIB {
                 if self.push_next_child(node_idx, mask, 0) {
                     return true;
                 }
                 continue;
             }
-
             let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
             if self.push_next_child(node_idx, mask, search_start) {
                 return true;
             }
         }
     }
-
     #[inline]
     fn advance_prev(&mut self) -> bool {
         loop {
@@ -1201,11 +1093,9 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
                 Some(v) => v,
                 None => return false,
             };
-
             if nib == TERMINAL_NIB {
                 continue;
             }
-
             if nib == 0 || nib == usize::MAX {
                 let node = &self.trie.arena[node_idx];
                 if node.is_terminal() {
@@ -1214,7 +1104,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
                 }
                 continue;
             }
-
             let mask_below = mask & ((1 << nib) - 1);
             if mask_below != 0 {
                 // Highest set bit in mask_below (only bits 0-3 are valid)
@@ -1226,7 +1115,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
                 }
                 return true;
             }
-
             let node = &self.trie.arena[node_idx];
             if node.is_terminal() {
                 self.stack.push((node_idx, mask, TERMINAL_NIB));
@@ -1234,41 +1122,33 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
             }
         }
     }
-
     #[inline]
     pub fn next_index(&mut self) -> Option<usize> {
         if self.advance_next() { self.current_index() } else { None }
     }
-
     #[inline]
     pub fn prev_index(&mut self) -> Option<usize> {
         if self.advance_prev() { self.current_index() } else { None }
     }
-
     #[inline]
     pub fn next(&mut self) -> Option<(&[u8], &T)> {
         if self.advance_next() { self.current() } else { None }
     }
-
     #[inline]
     pub fn prev(&mut self) -> Option<(&[u8], &T)> {
         if self.advance_prev() { self.current() } else { None }
     }
-
     pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &T)> {
         if self.trie.arena.is_empty() {
             self.stack.clear();
             return None;
         }
-
         self.stack.clear();
         let mut node_idx: usize = 0;
         let max_nib = key.len() * 4;
-
         loop {
             let node = &self.trie.arena[node_idx];
             let mask = node.occupancy;
-
             if node.is_terminal() && node.prefix_len.as_usize() >= max_nib {
                 let ki = node.leaf;
                 let (off, len) = self.trie.index[ki.as_usize()];
@@ -1278,14 +1158,12 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
                     return self.current();
                 }
             }
-
             if node.prefix_len.as_usize() >= max_nib {
                 if self.push_next_child(node_idx, mask, 0) {
                     return self.current();
                 }
                 return self.backtrack_to_next();
             }
-
             let nib = key_nib_at(key, node.prefix_len.as_usize()) as usize;
             if !node.is_occupied(nib) {
                 // No child at this nibble — find next higher child, or backtrack
@@ -1294,7 +1172,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
                 }
                 return self.backtrack_to_next();
             }
-
             self.stack.push((node_idx, mask, nib));
             let slot = node.children[nib];
             if node.is_leaf(nib) {
@@ -1310,11 +1187,9 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // CursorMut — lending tree-walk iterator handing out &mut T
 // ---------------------------------------------------------------------------
-
 /// Mutable counterpart to [`Cursor`]: a tree-walk iterator that lends out
 /// `&mut T` borrows over the stored values, in sorted (DFS) key order.
 ///
@@ -1338,12 +1213,11 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> Cursor<'a, T, PTR, LEN> {
 /// the cursor never alters key bytes, node structure, or slot occupancy, so
 /// trie invariants are preserved.
 pub struct CursorMut<'a, T, PTR: TrieIndex, LEN: TrieIndex> {
-    trie: &'a mut NibTrie<T, PTR, LEN>,
+    trie:  &'a mut NibTrie<T, PTR, LEN>,
     /// Stack of (node_index, occupancy_mask, nib_position) tuples — same shape
     /// as [`Cursor::stack`].
     stack: Vec<(usize, u8, usize)>,
 }
-
 impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
     /// Forward mutable cursor parked *before* the first key.
     pub fn new(trie: &'a mut NibTrie<T, PTR, LEN>) -> Self {
@@ -1354,7 +1228,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
         let nib = if trie.arena[0].is_terminal() { TERMINAL_NIB } else { usize::MAX };
         CursorMut { trie, stack: vec![(0, mask, nib)] }
     }
-
     /// Reverse mutable cursor parked *on* the last key (or empty if the trie is
     /// empty).
     pub fn new_last(trie: &'a mut NibTrie<T, PTR, LEN>) -> Self {
@@ -1362,7 +1235,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
         c.last();
         c
     }
-
     fn descend_first(&mut self, mut node_idx: usize) {
         loop {
             let node = &self.trie.arena[node_idx];
@@ -1383,7 +1255,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
             }
         }
     }
-
     fn descend_last(&mut self, mut node_idx: usize) {
         loop {
             let node = &self.trie.arena[node_idx];
@@ -1408,7 +1279,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
             }
         }
     }
-
     #[inline]
     fn push_next_child(&mut self, node_idx: usize, mask: u8, start_nib: usize) -> bool {
         let shifted = if start_nib >= 4 { 0u8 } else { mask >> start_nib };
@@ -1425,7 +1295,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
         }
         true
     }
-
     #[inline]
     fn backtrack_to_next(&mut self) -> Option<(&[u8], &mut T)> {
         loop {
@@ -1435,7 +1304,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
             }
         }
     }
-
     /// The key/value the cursor is parked on, or `None` if not parked (before
     /// first, or exhausted). The key borrows the trie's key buffer and the
     /// `&mut T` reborrows the stored value — both tied to `&mut self`.
@@ -1461,7 +1329,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
         let value = &mut self.trie.values[ki.as_usize() - 1];
         Some((key, value))
     }
-
     /// The key index the cursor is parked on, or `None` if not parked.
     #[inline]
     pub fn current_index(&self) -> Option<usize> {
@@ -1477,7 +1344,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
             node.leaf_key_index(nib).map(|ki| ki.as_usize())
         }
     }
-
     #[inline]
     fn advance_next(&mut self) -> bool {
         loop {
@@ -1485,21 +1351,18 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
                 Some(v) => v,
                 None => return false,
             };
-
             if nib == TERMINAL_NIB {
                 if self.push_next_child(node_idx, mask, 0) {
                     return true;
                 }
                 continue;
             }
-
             let search_start = if nib == usize::MAX { 0 } else { nib + 1 };
             if self.push_next_child(node_idx, mask, search_start) {
                 return true;
             }
         }
     }
-
     #[inline]
     fn advance_prev(&mut self) -> bool {
         loop {
@@ -1507,11 +1370,9 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
                 Some(v) => v,
                 None => return false,
             };
-
             if nib == TERMINAL_NIB {
                 continue;
             }
-
             if nib == 0 || nib == usize::MAX {
                 let node = &self.trie.arena[node_idx];
                 if node.is_terminal() {
@@ -1520,7 +1381,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
                 }
                 continue;
             }
-
             let mask_below = mask & ((1 << nib) - 1);
             if mask_below != 0 {
                 let prev_nib = (mask_below as u32).ilog2() as usize;
@@ -1531,7 +1391,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
                 }
                 return true;
             }
-
             let node = &self.trie.arena[node_idx];
             if node.is_terminal() {
                 self.stack.push((node_idx, mask, TERMINAL_NIB));
@@ -1539,7 +1398,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
             }
         }
     }
-
     /// Jump to the first key (smallest in sorted order). Returns its key/value,
     /// or `None` if the trie is empty.
     pub fn first(&mut self) -> Option<(&[u8], &mut T)> {
@@ -1558,7 +1416,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
         // Before-first sentinel — advance to the first key.
         if self.advance_next() { self.current() } else { None }
     }
-
     /// Jump to the last key (largest in sorted order). Returns its key/value,
     /// or `None` if the trie is empty.
     pub fn last(&mut self) -> Option<(&[u8], &mut T)> {
@@ -1588,41 +1445,33 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
         }
         self.current()
     }
-
     #[inline]
     pub fn next(&mut self) -> Option<(&[u8], &mut T)> {
         if self.advance_next() { self.current() } else { None }
     }
-
     #[inline]
     pub fn prev(&mut self) -> Option<(&[u8], &mut T)> {
         if self.advance_prev() { self.current() } else { None }
     }
-
     #[inline]
     pub fn next_index(&mut self) -> Option<usize> {
         if self.advance_next() { self.current_index() } else { None }
     }
-
     #[inline]
     pub fn prev_index(&mut self) -> Option<usize> {
         if self.advance_prev() { self.current_index() } else { None }
     }
-
     pub fn seek(&mut self, key: &[u8]) -> Option<(&[u8], &mut T)> {
         if self.trie.arena.is_empty() {
             self.stack.clear();
             return None;
         }
-
         self.stack.clear();
         let mut node_idx: usize = 0;
         let max_nib = key.len() * 4;
-
         loop {
             let node = &self.trie.arena[node_idx];
             let mask = node.occupancy;
-
             if node.is_terminal() && node.prefix_len.as_usize() >= max_nib {
                 let ki = node.leaf;
                 let (off, len) = self.trie.index[ki.as_usize()];
@@ -1632,14 +1481,12 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
                     return self.current();
                 }
             }
-
             if node.prefix_len.as_usize() >= max_nib {
                 if self.push_next_child(node_idx, mask, 0) {
                     return self.current();
                 }
                 return self.backtrack_to_next();
             }
-
             let nib = key_nib_at(key, node.prefix_len.as_usize()) as usize;
             if !node.is_occupied(nib) {
                 if self.push_next_child(node_idx, mask, nib + 1) {
@@ -1647,7 +1494,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
                 }
                 return self.backtrack_to_next();
             }
-
             self.stack.push((node_idx, mask, nib));
             let slot = node.children[nib];
             if node.is_leaf(nib) {
@@ -1662,7 +1508,6 @@ impl<'a, T, PTR: TrieIndex, LEN: TrieIndex> CursorMut<'a, T, PTR, LEN> {
         }
     }
 }
-
 #[cfg(test)]
 #[path = "tests/nib_trie.rs"]
 mod tests;

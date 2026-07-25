@@ -1,3 +1,1 @@
-trait TreeNode<IDX,PTR> {
-
-}
+trait TreeNode<IDX, PTR> {}

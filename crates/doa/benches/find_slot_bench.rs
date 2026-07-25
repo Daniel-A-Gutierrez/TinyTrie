@@ -5,33 +5,26 @@
 // //! per-probe overhead differences surface.
 // //!
 // //! Run: `cargo bench -p doa --bench find_slot_bench`
-
 // extern crate test;
-
 // use doa::block::Block;
 // use doa::find_slot::{Bias, Found};
 // use std::collections::VecDeque;
 // use test::{Bencher, black_box};
-
 // /// Element type under test. `u64` = small/SIMD-friendly; `[u64; 8]` ≈ a tree
 // /// node (64 B payload, ~72 B with the `Option` discriminant). Flip this alias
 // /// to compare cache footprints.
 // type Elem = [u64; 8];
 // const SOME: Elem = [0u64; 8];
-
 // const LEN: usize = 4096;
 // const BUDGET: usize = 16;
-
 // /// Args tuple: `(none_mask, v_off_phys, budget, addr_shift, v_offset)`.
 // /// `addr_min`/`addr_max` come from `PTR = i16` inside `Block::find_slot`.
 // fn args(stride: usize) -> (usize, usize, usize, u32, usize) {
 //     (stride - 1, 3, BUDGET, 0, 3)
 // }
-
 // fn blank(len: usize) -> VecDeque<Option<Elem>> {
 //     vec![Some(SOME); len].into()
 // }
-
 // /// Eligible AP around `h`; set `None` at the `rank`-th slot on each side.
 // fn place_none_at_rank(buf: &mut VecDeque<Option<Elem>>,
 //                       h: usize,
@@ -52,7 +45,6 @@
 //         buf[li as usize] = None;
 //     }
 // }
-
 // fn case_internal(stride: usize, rank: usize) -> (VecDeque<Option<Elem>>, usize) {
 //     let (none_mask, v_off_phys, _, _, _) = args(stride);
 //     let mut buf = blank(LEN);
@@ -60,25 +52,21 @@
 //     place_none_at_rank(&mut buf, h, none_mask, v_off_phys, rank);
 //     (buf, h)
 // }
-
 // fn case_append(stride: usize) -> (VecDeque<Option<Elem>>, usize) {
 //     let buf = blank(LEN);
 //     let h = LEN - BUDGET / 2 * stride; // right reaches back in ~budget/2 probes
 //     (buf, h)
 // }
-
 // fn case_prepend(stride: usize) -> (VecDeque<Option<Elem>>, usize) {
 //     let buf = blank(LEN);
 //     let h = BUDGET / 2 * stride; // left reaches front in ~budget/2 probes
 //     (buf, h)
 // }
-
 // fn case_miss(_stride: usize) -> (VecDeque<Option<Elem>>, usize) {
 //     let buf = blank(LEN);
 //     let h = LEN / 2; // no None, ends out of reach -> OutOfBudget
 //     (buf, h)
 // }
-
 // /// Build a `Block<Elem, i16>` from the args tuple's translation fields.
 // fn make_block(buf: VecDeque<Option<Elem>>,
 //               addr_shift: u32,
@@ -87,7 +75,6 @@
 //               -> Block<Elem, i16> {
 //     Block::from_raw_parts(buf, addr_shift, none_mask as u32, v_offset as isize).with_budget(BUDGET)
 // }
-
 // macro_rules! bench_internal {
 //     ($name:ident, $stride:expr, $rank:expr, $bias:expr) => {
 //         #[bench]
@@ -102,7 +89,6 @@
 //         }
 //     };
 // }
-
 // macro_rules! bench_case {
 //     ($name:ident, $case:expr, $stride:expr) => {
 //         #[bench]
@@ -117,7 +103,6 @@
 //         }
 //     };
 // }
-
 // // ---- find_slot: near (rank 1) / far (rank 14) ----
 // bench_internal!(find_slot_near_s2, 2usize, 1, Bias::Right);
 // bench_internal!(find_slot_far_s2, 2usize, 14, Bias::Right);
@@ -129,7 +114,6 @@
 // bench_internal!(find_slot_far_s2_left, 2usize, 14, Bias::Left);
 // bench_internal!(find_slot_near_s8_left, 8usize, 1, Bias::Left);
 // bench_internal!(find_slot_far_s8_left, 8usize, 14, Bias::Left);
-
 // // ---- append / prepend / miss (stride 2 & 8) ----
 // bench_case!(find_slot_append_s2, case_append, 2usize);
 // bench_case!(find_slot_prepend_s2, case_prepend, 2usize);
@@ -137,7 +121,6 @@
 // bench_case!(find_slot_append_s8, case_append, 8usize);
 // bench_case!(find_slot_prepend_s8, case_prepend, 8usize);
 // bench_case!(find_slot_miss_s8, case_miss, 8usize);
-
 // // ---- streaming miss (cold cache, >L3): cheap per-probe when memory-bound? ----
 // macro_rules! bench_stream {
 //     ($name:ident, $stride:expr) => {

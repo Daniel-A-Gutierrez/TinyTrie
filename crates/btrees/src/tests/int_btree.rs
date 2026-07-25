@@ -1,5 +1,4 @@
 use crate::int_btree::*;
-
 // ---------------------------------------------------------------------------
 // FixedLenKey SIMD `find_position` — direct trait tests
 // ---------------------------------------------------------------------------
@@ -7,7 +6,6 @@ use crate::int_btree::*;
 // qualified syntax because `u8/u16/u32/u64` now also implement `StoredKey`,
 // which carries a same-named `find_position` — bare `u64::find_position`
 // would be ambiguous between the two traits.
-
 #[test]
 fn test_fixed_len_key_find_position_u64() {
     let haystack: [u64; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
@@ -20,7 +18,6 @@ fn test_fixed_len_key_find_position_u64() {
     // Empty
     assert_eq!(<u64 as FixedLenKey>::find_position(&1, &haystack[..0]), 0);
 }
-
 #[test]
 fn test_fixed_len_key_find_position_u32() {
     let haystack: [u32; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
@@ -29,7 +26,6 @@ fn test_fixed_len_key_find_position_u32() {
     assert_eq!(<u32 as FixedLenKey>::find_position(&0, &haystack), 0);
     assert_eq!(<u32 as FixedLenKey>::find_position(&16, &haystack), 8);
 }
-
 #[test]
 fn test_fixed_len_key_find_position_u16() {
     let haystack: [u16; 8] = [100, 200, 300, 400, 500, 600, 700, 800];
@@ -38,7 +34,6 @@ fn test_fixed_len_key_find_position_u16() {
     assert_eq!(<u16 as FixedLenKey>::find_position(&800, &haystack), 7);
     assert_eq!(<u16 as FixedLenKey>::find_position(&900, &haystack), 8);
 }
-
 #[test]
 fn test_fixed_len_key_find_position_u8() {
     let haystack: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
@@ -47,11 +42,9 @@ fn test_fixed_len_key_find_position_u8() {
     assert_eq!(<u8 as FixedLenKey>::find_position(&15, &haystack), 15);
     assert_eq!(<u8 as FixedLenKey>::find_position(&16, &haystack), 16);
 }
-
 // ---------------------------------------------------------------------------
 // Fixed CTree (regression guard for the SIMD path — multi-N, varied order)
 // ---------------------------------------------------------------------------
-
 #[test]
 fn test_ctree_insert_and_get() {
     let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
@@ -64,7 +57,6 @@ fn test_ctree_insert_and_get() {
     assert_eq!(tree.get(&40), None);
     assert_eq!(tree.len(), 3);
 }
-
 #[test]
 fn test_ctree_duplicate_insert() {
     let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
@@ -73,18 +65,15 @@ fn test_ctree_duplicate_insert() {
     assert!(err.is_err());
     assert_eq!(tree.get(&10), Some(&100));
 }
-
 #[test]
 fn test_var_len_key_box_u8() {
     let k: Box<[u8]> = Box::new([1u8, 2, 3]);
     assert_eq!(&*k, &[1u8, 2, 3]);
     assert_eq!(k.len(), 3);
 }
-
 // ---------------------------------------------------------------------------
 // Recursive inode split tests (fixed path)
 // ---------------------------------------------------------------------------
-
 /// Insert enough sequential keys to trigger multiple inode splits,
 /// growing the tree to height 2+.
 #[test]
@@ -92,107 +81,71 @@ fn test_ctree_sequential_deep_split() {
     // N=3: each node holds at most 3 keys. This triggers splits quickly.
     let mut tree: CTree<u64, u64, u16, 3, 4> = CTree::new();
     let count = 30;
-
     for i in 0..count {
         tree.insert(i, i * 10).unwrap();
     }
-
     // Verify all lookups
     for i in 0..count {
-        assert_eq!(
-            tree.get(&i),
-            Some(&(i * 10)),
-            "lookup failed for key {i}"
-        );
+        assert_eq!(tree.get(&i), Some(&(i * 10)), "lookup failed for key {i}");
     }
     assert_eq!(tree.get(&count), None);
     assert_eq!(tree.len(), count as usize);
-
     // Height should be > 1 after 30 inserts with N=3
-    assert!(
-        tree.height > 1,
-        "expected height > 1 after many inserts, got {}",
-        tree.height
-    );
+    assert!(tree.height > 1, "expected height > 1 after many inserts, got {}", tree.height);
 }
-
 /// Insert keys in reverse order to stress different split patterns.
 #[test]
 fn test_ctree_reverse_deep_split() {
     let mut tree: CTree<u64, u64, u16, 3, 4> = CTree::new();
     let count = 30;
-
     for i in (0..count).rev() {
         tree.insert(i, i * 10).unwrap();
     }
-
     for i in 0..count {
-        assert_eq!(
-            tree.get(&i),
-            Some(&(i * 10)),
-            "reverse lookup failed for key {i}"
-        );
+        assert_eq!(tree.get(&i), Some(&(i * 10)), "reverse lookup failed for key {i}");
     }
     assert_eq!(tree.len(), count as usize);
 }
-
 /// Insert keys in a shuffled order.
 #[test]
 fn test_ctree_random_deep_split() {
     // Deterministic pseudo-random order
     let order: [u64; 30] = [
-        15, 3, 27, 8, 21, 0, 12, 6, 18, 24, 9, 1, 29, 14, 5, 22, 11, 7, 19, 2, 25, 13, 28,
-        10, 4, 16, 23, 17, 26, 20,
+        15, 3, 27, 8, 21, 0, 12, 6, 18, 24, 9, 1, 29, 14, 5, 22, 11, 7, 19, 2, 25, 13, 28, 10,
+        4, 16, 23, 17, 26, 20,
     ];
-
     let mut tree: CTree<u64, u64, u16, 3, 4> = CTree::new();
     for &i in &order {
         tree.insert(i, i * 10).unwrap();
     }
-
     for i in 0..30u64 {
-        assert_eq!(
-            tree.get(&i),
-            Some(&(i * 10)),
-            "shuffled lookup failed for key {i}"
-        );
+        assert_eq!(tree.get(&i), Some(&(i * 10)), "shuffled lookup failed for key {i}");
     }
     assert_eq!(tree.len(), 30);
 }
-
 /// Even deeper tree with N=2 (smallest meaningful B+ tree order).
 #[test]
 fn test_ctree_tiny_n_deep() {
     let mut tree: CTree<u64, u64, u16, 2, 3> = CTree::new();
     let count = 50;
-
     for i in 0..count {
         tree.insert(i, i * 100).unwrap();
     }
-
     for i in 0..count {
-        assert_eq!(
-            tree.get(&i),
-            Some(&(i * 100)),
-            "tiny N lookup failed for key {i}"
-        );
+        assert_eq!(tree.get(&i), Some(&(i * 100)), "tiny N lookup failed for key {i}");
     }
-
     // With N=2 and 50 keys, height should be significant
     assert!(tree.height >= 3, "expected height >= 3, got {}", tree.height);
 }
-
 // ---------------------------------------------------------------------------
 // Cursor traversal tests (fixed path)
 // ---------------------------------------------------------------------------
-
 #[test]
 fn test_cursor_forward_iteration() {
     let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
     for i in 0..20 {
         tree.insert(i, i * 10).unwrap();
     }
-
     let mut cursor = tree.get_cursor();
     let mut collected = Vec::new();
     while let Some((k, v)) = cursor.current() {
@@ -201,30 +154,22 @@ fn test_cursor_forward_iteration() {
             break;
         }
     }
-
     assert_eq!(collected.len(), 20);
     for (i, (k, v)) in collected.iter().enumerate() {
         assert_eq!(*k, i as u64);
         assert_eq!(*v, i as u64 * 10);
     }
 }
-
 #[test]
 fn test_cursor_backward_iteration() {
     let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
     for i in 0..20 {
         tree.insert(i, i * 10).unwrap();
     }
-
     // Start from last leaf, last position
     let last_leaf = tree.last_leaf();
     let last_pos = tree.leaves[last_leaf].keys.len() - 1;
-    let mut cursor = Cursor {
-        tree: &tree,
-        leaf_idx: last_leaf,
-        position: last_pos,
-    };
-
+    let mut cursor = Cursor { tree: &tree, leaf_idx: last_leaf, position: last_pos };
     let mut collected = Vec::new();
     while let Some((k, v)) = cursor.current() {
         collected.push((*k, *v));
@@ -232,7 +177,6 @@ fn test_cursor_backward_iteration() {
             break;
         }
     }
-
     collected.reverse();
     assert_eq!(collected.len(), 20);
     for (i, (k, v)) in collected.iter().enumerate() {
@@ -240,20 +184,17 @@ fn test_cursor_backward_iteration() {
         assert_eq!(*v, i as u64 * 10);
     }
 }
-
 #[test]
 fn test_cursor_at_seek() {
     let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
     for i in 0..20 {
         tree.insert(i, i * 10).unwrap();
     }
-
     // Seek to key 10 — should land on or just after it
     let mut cursor = tree.cursor_at(&10);
     let (k, v) = cursor.current().expect("cursor should point to a valid entry");
     assert_eq!(*k, 10);
     assert_eq!(*v, 100);
-
     // Iterate forward from there
     let mut collected = vec![(*k, *v)];
     loop {
@@ -263,14 +204,12 @@ fn test_cursor_at_seek() {
         let (k, v) = cursor.current().unwrap();
         collected.push((*k, *v));
     }
-
     assert_eq!(collected.len(), 10); // keys 10..19
     for (i, (k, v)) in collected.iter().enumerate() {
         assert_eq!(*k, 10 + i as u64);
         assert_eq!(*v, (10 + i as u64) * 10);
     }
 }
-
 #[test]
 fn test_cursor_forward_deep_tree() {
     // Use a small N to force multiple levels, then iterate all keys
@@ -279,7 +218,6 @@ fn test_cursor_forward_deep_tree() {
     for i in 0..count {
         tree.insert(i, i * 5).unwrap();
     }
-
     let mut cursor = tree.get_cursor();
     let mut collected = Vec::new();
     while let Some((k, v)) = cursor.current() {
@@ -288,14 +226,12 @@ fn test_cursor_forward_deep_tree() {
             break;
         }
     }
-
     assert_eq!(collected.len(), count as usize);
     for (i, (k, v)) in collected.iter().enumerate() {
         assert_eq!(*k, i as u64, "key mismatch at position {i}");
         assert_eq!(*v, i as u64 * 5, "value mismatch at position {i}");
     }
 }
-
 #[test]
 fn test_cursor_backward_deep_tree() {
     let mut tree: CTree<u64, u64, u16, 3, 4> = CTree::new();
@@ -303,15 +239,9 @@ fn test_cursor_backward_deep_tree() {
     for i in 0..count {
         tree.insert(i, i * 5).unwrap();
     }
-
     let last_leaf = tree.last_leaf();
     let last_pos = tree.leaves[last_leaf].keys.len() - 1;
-    let mut cursor = Cursor {
-        tree: &tree,
-        leaf_idx: last_leaf,
-        position: last_pos,
-    };
-
+    let mut cursor = Cursor { tree: &tree, leaf_idx: last_leaf, position: last_pos };
     let mut collected = Vec::new();
     while let Some((k, v)) = cursor.current() {
         collected.push((*k, *v));
@@ -319,7 +249,6 @@ fn test_cursor_backward_deep_tree() {
             break;
         }
     }
-
     collected.reverse();
     assert_eq!(collected.len(), count as usize);
     for (i, (k, v)) in collected.iter().enumerate() {
@@ -327,7 +256,6 @@ fn test_cursor_backward_deep_tree() {
         assert_eq!(*v, i as u64 * 5, "value mismatch at position {i}");
     }
 }
-
 #[test]
 fn test_cursor_empty_tree() {
     let tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
@@ -336,14 +264,12 @@ fn test_cursor_empty_tree() {
     let cursor = tree.get_cursor();
     assert!(cursor.current().is_none());
 }
-
 #[test]
 fn test_cursor_mut_forward() {
     let mut tree: CTree<u64, u64, u16, 4, 5> = CTree::new();
     for i in 0..10u64 {
         tree.insert(i, i * 10).unwrap();
     }
-
     // Double all values via mutable cursor
     {
         let mut cursor = tree.get_cursor_mut();
@@ -354,13 +280,11 @@ fn test_cursor_mut_forward() {
             }
         }
     }
-
     // Verify
     for i in 0..10u64 {
         assert_eq!(tree.get(&i), Some(&(i * 20)));
     }
 }
-
 // ---------------------------------------------------------------------------
 // Generic test harness — runs the SAME core suite against any instantiation.
 //
@@ -370,7 +294,6 @@ fn test_cursor_mut_forward() {
 // `&` satisfies `Borrow<SK::Needle>` for `get`, and `val` produces the value.
 // Var keys use big-endian byte reps so lexicographic order matches numeric
 // order, letting one index-driven suite exercise both forms uniformly.
-
 macro_rules! gen_tree_tests {
     (
         $modname:ident,
@@ -382,7 +305,6 @@ macro_rules! gen_tree_tests {
     ) => {
         mod $modname {
             use super::*;
-
             #[test]
             fn insert_get_len() {
                 let store = $store;
@@ -402,7 +324,6 @@ macro_rules! gen_tree_tests {
                 assert_eq!(tree.get(&borrow($count)), None);
                 assert_eq!(tree.len(), $count as usize);
             }
-
             #[test]
             fn duplicate_insert() {
                 let store = $store;
@@ -414,7 +335,6 @@ macro_rules! gen_tree_tests {
                 assert!(err.is_err(), "duplicate insert should error");
                 assert_eq!(tree.get(&borrow(1)), Some(&val(1)));
             }
-
             #[test]
             fn deep_split_height() {
                 let store = $store;
@@ -430,7 +350,6 @@ macro_rules! gen_tree_tests {
                     tree.height
                 );
             }
-
             #[test]
             fn cursor_forward() {
                 let store = $store;
@@ -452,7 +371,6 @@ macro_rules! gen_tree_tests {
                     assert_eq!(v, val(i as u64), "value mismatch at position {i}");
                 }
             }
-
             #[test]
             fn cursor_backward() {
                 let store = $store;
@@ -463,11 +381,8 @@ macro_rules! gen_tree_tests {
                 }
                 let last_leaf = tree.last_leaf();
                 let last_pos = tree.leaves[last_leaf].keys.len() - 1;
-                let mut cursor = Cursor {
-                    tree: &tree,
-                    leaf_idx: last_leaf,
-                    position: last_pos,
-                };
+                let mut cursor =
+                    Cursor { tree: &tree, leaf_idx: last_leaf, position: last_pos };
                 let mut collected = Vec::new();
                 while let Some((_, v)) = cursor.current() {
                     collected.push(*v);
@@ -481,7 +396,6 @@ macro_rules! gen_tree_tests {
                     assert_eq!(v, val(i as u64), "value mismatch at position {i}");
                 }
             }
-
             #[test]
             fn cursor_at_seek() {
                 let store = $store;
@@ -493,12 +407,9 @@ macro_rules! gen_tree_tests {
                 }
                 let mid = $count / 2;
                 let cursor = tree.cursor_at(&borrow(mid));
-                let (_, v) = cursor
-                    .current()
-                    .expect("cursor should land on the sought key");
+                let (_, v) = cursor.current().expect("cursor should land on the sought key");
                 assert_eq!(*v, val(mid));
             }
-
             #[test]
             fn cursor_mut_forward() {
                 let store = $store;
@@ -524,7 +435,6 @@ macro_rules! gen_tree_tests {
         }
     };
 }
-
 // Fixed form: K = u64 (SIMD path). Validates the harness is form-agnostic.
 gen_tree_tests!(
     fixed_harness,
@@ -534,7 +444,6 @@ gen_tree_tests!(
     borrow = |i: u64| i,
     val = |i: u64| i * 10,
 );
-
 // Variable form: Box<[u8]> keys (binary-search path). The first real exercise
 // of the var tree — it was a stub before the unification. Big-endian byte reps
 // keep lexicographic key order aligned with numeric index order.
@@ -546,7 +455,6 @@ gen_tree_tests!(
     borrow = |i: u64| i.to_be_bytes(),
     val = |i: u64| i * 10,
 );
-
 // Variable form at N=2 (smallest order) for deeper splits.
 gen_tree_tests!(
     var_harness_n2,
@@ -556,11 +464,9 @@ gen_tree_tests!(
     borrow = |i: u64| i.to_be_bytes(),
     val = |i: u64| i * 100,
 );
-
 // ---------------------------------------------------------------------------
 // Preemptive rebalance (rotate before split) tests
 // ---------------------------------------------------------------------------
-
 /// A full leaf with an underfull sibling absorbs the overflow by rebalancing
 /// instead of splitting: the leaf count does not increase on the insert.
 ///
@@ -576,7 +482,6 @@ fn test_leaf_rebalance_absorbs_overflow() {
         tree.insert(i, i * 10).unwrap();
     }
     assert_eq!(tree.leaves.len(), 2);
-
     let leaves_before = tree.leaves.len();
     tree.insert(6, 60).unwrap();
     assert_eq!(
@@ -584,13 +489,11 @@ fn test_leaf_rebalance_absorbs_overflow() {
         leaves_before,
         "insert 6 should rebalance with the left sibling, not split"
     );
-
     for i in 0..=6u64 {
         assert_eq!(tree.get(&i), Some(&(i * 10)), "lookup failed for key {i}");
     }
     assert_eq!(tree.len(), 7);
 }
-
 /// Same scenario as above but on the variable-key form (`Box<[u8]>`), confirming
 /// the rebalance path works for binary-search keys and `Box<[u8]>` ownership
 /// transfers (clone-on-sep, drain helpers) are sound.
@@ -601,11 +504,9 @@ fn test_leaf_rebalance_absorbs_overflow_var() {
         tree.insert(Box::from(&i.to_be_bytes()[..]), i * 10).unwrap();
     }
     assert_eq!(tree.leaves.len(), 2);
-
     let leaves_before = tree.leaves.len();
     tree.insert(Box::from(&6u64.to_be_bytes()[..]), 60).unwrap();
     assert_eq!(tree.leaves.len(), leaves_before);
-
     for i in 0..=6u64 {
         assert_eq!(
             tree.get(&i.to_be_bytes()),
@@ -615,7 +516,6 @@ fn test_leaf_rebalance_absorbs_overflow_var() {
     }
     assert_eq!(tree.len(), 7);
 }
-
 /// Rebalancing keeps the tree compact: after many sequential inserts the leaf
 /// count is well below the split-only count (splits at mid leave half-empty
 /// leaves; rebalance keeps them near-full).
@@ -641,7 +541,6 @@ fn test_rebalance_packs_tighter() {
     }
     assert_eq!(tree.len(), count as usize);
 }
-
 /// Inode rebalance: when a bottom inode is full and a sibling inode has room, an
 /// insert that descends through it rebalances the inode instead of growing the
 /// tree height.
@@ -674,7 +573,6 @@ fn test_inode_rebalance_absorbs_overflow() {
     }
     assert_eq!(tree.len(), 44);
 }
-
 /// Rebalance must preserve the leaf linked list: forward iteration from the
 /// first leaf visits every key in order, even after many rebalances.
 #[test]
@@ -702,11 +600,9 @@ fn test_rebalance_preserves_leaf_links() {
         assert_eq!(*v, i as u64 * 2, "value broken at {i}");
     }
 }
-
 // ---------------------------------------------------------------------------
 // optimize — reorder the leaf arena into linked-list order
 // ---------------------------------------------------------------------------
-
 /// `optimize` on a single-leaf tree (height 0) is a no-op that still clears
 /// the (already clear) links and keeps lookups working.
 #[test]
@@ -722,7 +618,6 @@ fn test_optimize_single_leaf() {
         assert_eq!(tree.get(&i), Some(&(i * 10)));
     }
 }
-
 /// `optimize` on an empty tree is a no-op.
 #[test]
 fn test_optimize_empty() {
@@ -731,7 +626,6 @@ fn test_optimize_empty() {
     assert_eq!(tree.len(), 0);
     assert_eq!(tree.leaves.len(), 1);
 }
-
 /// After `optimize`, the leaf arena is in linked-list order: `leaves[i].next`
 /// points to `i+1` and `leaves[i].prev` to `i-1`, and every lookup still
 /// resolves. Insert in reverse so splits scatter leaves out of sorted order
@@ -746,9 +640,7 @@ fn test_optimize_linearizes_leaves() {
     // A multi-leaf tree is required for the reorder to be meaningful.
     assert!(tree.leaves.len() > 1, "precondition: need multiple leaves");
     assert!(tree.height >= 1);
-
     tree.optimize();
-
     // With the linked list gone, `optimize` must leave the arena *dense and
     // strictly sorted*: no gaps, every slot live, each leaf's max key below the
     // next leaf's min key — the property that makes gap-skip iteration correct.
@@ -763,18 +655,13 @@ fn test_optimize_linearizes_leaves() {
         let cur = &tree.leaves[i];
         let prev_max = *prev.keys.get(prev.keys.len() - 1);
         let cur_min = *cur.keys.get(0);
-        assert!(
-            prev_max < cur_min,
-            "leaves out of order at {i}: {prev_max} >= {cur_min}"
-        );
+        assert!(prev_max < cur_min, "leaves out of order at {i}: {prev_max} >= {cur_min}");
     }
-
     for i in 0..count {
         assert_eq!(tree.get(&i), Some(&(i * 10)), "lookup broken for key {i}");
     }
     assert_eq!(tree.len(), count as usize);
 }
-
 /// `optimize` preserves full forward and backward iteration order.
 #[test]
 fn test_optimize_preserves_iteration() {
@@ -787,7 +674,6 @@ fn test_optimize_preserves_iteration() {
         tree.insert(i, i * 10).unwrap();
     }
     tree.optimize();
-
     // Forward
     let mut cursor = tree.get_cursor();
     let mut fwd = Vec::new();
@@ -802,7 +688,6 @@ fn test_optimize_preserves_iteration() {
         assert_eq!(*k, i as u64);
         assert_eq!(*v, i as u64 * 10);
     }
-
     // Backward from the largest key
     let mut cursor = tree.cursor_at(&39u64);
     let mut rev = Vec::new();
@@ -818,7 +703,6 @@ fn test_optimize_preserves_iteration() {
         assert_eq!(*v, (39 - i as u64) * 10);
     }
 }
-
 /// `optimize` is idempotent: a second call changes nothing and keeps the tree
 /// valid. Also verifies inserts still work after optimize (the remapped inode
 /// ptrs route new keys correctly).
@@ -830,7 +714,6 @@ fn test_optimize_idempotent_and_insert_after() {
     }
     tree.optimize();
     let leaves_after = tree.leaves.len();
-
     tree.optimize();
     assert_eq!(tree.leaves.len(), leaves_after, "second optimize should not move leaves");
     // Dense + every slot live (no linked list to check; assert the arena state).
@@ -838,7 +721,6 @@ fn test_optimize_idempotent_and_insert_after() {
     for i in 0..leaves_after {
         assert!(tree.leaves[i].keys.len() > 0, "slot {i} empty after second optimize");
     }
-
     // Insert a new key larger than all existing ones — it routes to the last
     // leaf and must be findable.
     tree.insert(100, 1000).unwrap();
@@ -848,7 +730,6 @@ fn test_optimize_idempotent_and_insert_after() {
     }
     assert_eq!(tree.len(), 41);
 }
-
 /// `optimize` works on the variable-length key form too (`Box<[u8]>`), the
 /// instantiation the bench uses.
 #[test]
@@ -862,7 +743,6 @@ fn test_optimize_var_len_keys() {
     }
     assert!(tree.leaves.len() > 1);
     tree.optimize();
-
     // Dense + every slot live (varlen form). Sortedness is covered by the
     // lookup loop below + the generic cursor suites.
     let n = tree.leaves.len();
@@ -875,9 +755,6 @@ fn test_optimize_var_len_keys() {
         assert_eq!(tree.get(key.as_bytes()), Some(&i));
     }
 }
-
-
-
 // ---------------------------------------------------------------------------
 // EXPERIMENT / DIAGNOSTIC: log the leaf arena layout after optimize + grow and
 // trace the forward-iteration visit pattern. The arena is kept in strict sorted
@@ -898,16 +775,16 @@ fn test_optimize_var_len_keys() {
 fn experiment_optimize_layout() {
     type T = CTree<u64, u64, u16, 8, 9>; // N=8
     let mut tree = T::new();
-
     // Deterministic PRNG (xorshift32) so the run is reproducible.
     let mut state: u32 = 0x1234_5678;
     let mut next_key = || -> u64 {
         let mut x = state;
-        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
         state = x;
         x as u64
     };
-
     // Concrete dump for u64 keys.
     fn dump_u64(label: &str, tree: &CTree<u64, u64, u16, 8, 9>, opt_len: usize) {
         let n = tree.leaves.len();
@@ -940,20 +817,15 @@ fn experiment_optimize_layout() {
         for i in 0..n {
             let l = &tree.leaves[i];
             let klen = l.keys.len();
-            let (lo, hi) = if klen > 0 {
-                (*l.keys.get(0), *l.keys.get(klen - 1))
-            } else {
-                (0, 0)
-            };
+            let (lo, hi) =
+                if klen > 0 { (*l.keys.get(0), *l.keys.get(klen - 1)) } else { (0, 0) };
             let region = if i < opt_len { "PREFIX" } else { "sfx" };
             eprintln!(
                 "  [{i:>2}] k{klen} {lo:>5}..{hi:<5} | new={:>2} | {}",
-                new_pos[i],
-                region
+                new_pos[i], region
             );
         }
     }
-
     // Phase 1: build ~80 distinct keys, then optimize. (Scaled up from N=4's
     // 40 because N=8 leaves hold ~2x the keys, to keep the arena a comparable
     // size so the bounce pattern is a fair comparison.)
@@ -968,7 +840,6 @@ fn experiment_optimize_layout() {
     tree.optimize();
     let opt_len = tree.leaves.len();
     dump_u64("AFTER optimize", &tree, opt_len);
-
     // Phase 2: grow with ~160 more distinct keys (triggers splits), do NOT optimize.
     while seen.len() < 240 {
         let k = next_key() % 2400;
@@ -977,7 +848,6 @@ fn experiment_optimize_layout() {
         }
     }
     dump_u64("AFTER growing more (no optimize since)", &tree, opt_len);
-
     // Trace the FORWARD iteration visit order (arena indices the cursor touches,
     // in order) and the per-step jump distance |next - cur|. This is the cache
     // access pattern forward iteration actually pays. Append-at-end splitting
@@ -986,7 +856,6 @@ fn experiment_optimize_layout() {
     trace_visit("RANDOM post-grow, NO re-optimize (forward iteration)", &tree);
     tree.optimize();
     trace_visit("RANDOM post-grow, AFTER re-optimize (forward iteration)", &tree);
-
     // Phase 3: also show a "sequential-insert" control (prefix should stay put).
     let mut tree2 = T::new();
     let mut seen2 = std::collections::HashSet::new();
@@ -1004,7 +873,6 @@ fn experiment_optimize_layout() {
     dump_u64("CONTROL seq AFTER growing (no optimize since)", &tree2, opt_len2);
     trace_visit("CONTROL seq post-grow, NO re-optimize", &tree2);
 }
-
 /// Walk the live leaves in forward arena order (the exact path a forward
 /// cursor takes via gap-skip) and print the arena index visited at each step
 /// plus the jump distance from the previous leaf. Non-contiguous jumps (|d|>1)
@@ -1047,7 +915,6 @@ fn trace_visit(label: &str, tree: &CTree<u64, u64, u16, 8, 9>) {
         tree.leaves.len()
     );
 }
-
 // ---------------------------------------------------------------------------
 // EXPERIMENT: does `Option<LeafNode>` get a *free* discriminant (niche opt)?
 //
@@ -1070,7 +937,6 @@ fn trace_visit(label: &str, tree: &CTree<u64, u64, u16, 8, 9>) {
 #[ignore = "diagnostic only: measures Option<LeafNode> niche optimization"]
 fn experiment_option_leafnode_niche() {
     use std::mem::{align_of, size_of};
-
     // Print one row: LeafNode size, Option<LeafNode> size, alignment, whether free.
     macro_rules! row {
         ($label:expr, $lt:ty) => {
@@ -1089,7 +955,6 @@ fn experiment_option_leafnode_niche() {
             );
         };
     }
-
     // K = u64 (fixed SIMD path), V = u64. Sweep N across small values and the
     // N = 255 edge (where TinyArray's `len` niche vanishes), and PTR across the
     // TrieIndex types. NP1 = N + 1 for LeafNode's sibling KeyNode, but LeafNode
@@ -1100,18 +965,14 @@ fn experiment_option_leafnode_niche() {
     row!("LeafNode<_,_,u16,4>", LeafNode<u64, u64, u16, 4>);
     row!("LeafNode<_,_,u32,4>", LeafNode<u64, u64, u32, 4>);
     row!("LeafNode<_,_,u64,4>", LeafNode<u64, u64, u64, 4>);
-
     eprintln!("-- N = 8 --");
     row!("LeafNode<_,_,u16,8>", LeafNode<u64, u64, u16, 8>);
     row!("LeafNode<_,_,u32,8>", LeafNode<u64, u64, u32, 8>);
-
     eprintln!("-- N = 16 --");
     row!("LeafNode<_,_,u16,16>", LeafNode<u64, u64, u16, 16>);
     row!("LeafNode<_,_,u32,16>", LeafNode<u64, u64, u32, 16>);
-
     eprintln!("-- N = 32 --");
     row!("LeafNode<_,_,u32,32>", LeafNode<u64, u64, u32, 32>);
-
     // The deciding row: N = 255 ⇒ TinyArray `len` has no niche (0..=255 all
     // valid). If Option<LeafNode> is still == LeafNode here, the PTR niche is
     // exploited; if it grows, the niche was `len`-only.
@@ -1120,18 +981,15 @@ fn experiment_option_leafnode_niche() {
     row!("LeafNode<_,_,u16,255>", LeafNode<u64, u64, u16, 255>);
     row!("LeafNode<_,_,u32,255>", LeafNode<u64, u64, u32, 255>);
     row!("LeafNode<_,_,u64,255>", LeafNode<u64, u64, u64, 255>);
-
     // Sanity: the inner Option<NonZero<PTR>> is itself niche-optimized (free).
     eprintln!("-- inner Option<NonZero<PTR>> (should be FREE) --");
     row!("Option<NonZero<u16>>", Option<std::num::NonZero<u16>>);
     row!("Option<NonZero<u32>>", Option<std::num::NonZero<u32>>);
-
     // Bare TinyArray niche check: confirms the `len` field is the niche source
     // for N < 255 and vanishes at N = 255.
     eprintln!("-- bare TinyArray<u64, N> (len niche source) --");
     row!("TinyArray<u64, 4>",   crate::tiny_array::TinyArray<u64, 4>);
     row!("TinyArray<u64, 255>", crate::tiny_array::TinyArray<u64, 255>);
-
     // Isolation controls: why is Option<TinyArray> NOT free despite the `len`
     // niche? Three hand-rolled structs, all 40 bytes, all with a `len: u8`
     // field valid over 0..=4 (so 5..=255 is a niche). The difference is what
@@ -1139,39 +997,43 @@ fn experiment_option_leafnode_niche() {
     // Whichever stays 40 as an Option tells us which payload kills the niche.
     use std::mem::MaybeUninit;
     #[repr(C)]
-    struct LenPlain    { len: u8,        slots: [u64; 4] }
+    struct LenPlain {
+        len:   u8,
+        slots: [u64; 4],
+    }
     #[repr(C)]
-    struct LenMaybe    { len: u8,        slots: [MaybeUninit<u64>; 4] }
+    struct LenMaybe {
+        len:   u8,
+        slots: [MaybeUninit<u64>; 4],
+    }
     #[repr(C)]
-    struct LenOnly    { len: u8,        _pad: [u8; 31] }
+    struct LenOnly {
+        len:  u8,
+        _pad: [u8; 31],
+    }
     eprintln!("-- controls: does MaybeUninit kill the len niche? --");
-    row!("LenPlain  (len + [u64;4])",      LenPlain);
-    row!("LenMaybe  (len + [MU<u64;4])",   LenMaybe);
-    row!("LenOnly   (len + pad)",          LenOnly);
+    row!("LenPlain  (len + [u64;4])", LenPlain);
+    row!("LenMaybe  (len + [MU<u64;4])", LenMaybe);
+    row!("LenOnly   (len + pad)", LenOnly);
 }
-
 // ---------------------------------------------------------------------------
 // KeyRef inline vs buf path tests
 // ---------------------------------------------------------------------------
-
 #[test]
 fn test_keyref_inline_short_keys() {
     // Keys ≤ 14 bytes should be inlined (no key_buf usage).
     let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
-
     // Short keys (1–14 bytes) → all inline
     let short_keys: &[&[u8]] = &[
-        b"a",                   // 1 byte
-        b"ab",                  // 2 bytes
-        b"hello",               // 5 bytes
-        b"fourteen!!",          // 10 bytes
-        b"12345678901234",      // 14 bytes (exactly at threshold)
+        b"a",              // 1 byte
+        b"ab",             // 2 bytes
+        b"hello",          // 5 bytes
+        b"fourteen!!",     // 10 bytes
+        b"12345678901234", // 14 bytes (exactly at threshold)
     ];
-
     for (i, k) in short_keys.iter().enumerate() {
         tree.insert(k.to_vec(), i as u64).unwrap();
     }
-
     // Verify lookups
     for (i, k) in short_keys.iter().enumerate() {
         assert_eq!(
@@ -1181,7 +1043,6 @@ fn test_keyref_inline_short_keys() {
             String::from_utf8_lossy(k)
         );
     }
-
     // key_buf should be empty since all keys are inlined
     assert!(
         tree.key_buf.is_empty(),
@@ -1189,55 +1050,40 @@ fn test_keyref_inline_short_keys() {
         tree.key_buf.len()
     );
 }
-
 #[test]
 fn test_keyref_buf_long_keys() {
     // Keys > 14 bytes should go to key_buf.
     let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
-
     // Long key (> 14 bytes) → goes to key_buf
     let long_key = b"this_is_a_long_key!".to_vec(); // 19 bytes
     tree.insert(long_key.clone(), 42).unwrap();
-
     assert_eq!(tree.get(&long_key), Some(&42));
-    assert!(
-        !tree.key_buf.is_empty(),
-        "key_buf should not be empty for long keys"
-    );
+    assert!(!tree.key_buf.is_empty(), "key_buf should not be empty for long keys");
 }
-
 #[test]
 fn test_keyref_mixed_inline_and_buf() {
     // Mix of inline and buf keys in the same tree.
     let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
-
-    let short_key = b"short".to_vec();    // 5 bytes → inline
+    let short_key = b"short".to_vec(); // 5 bytes → inline
     let long_key = b"a_very_long_key_here!".to_vec(); // 21 bytes → buf
-
     tree.insert(short_key.clone(), 1).unwrap();
     tree.insert(long_key.clone(), 2).unwrap();
-
     assert_eq!(tree.get(&short_key), Some(&1));
     assert_eq!(tree.get(&long_key), Some(&2));
 }
-
 #[test]
 fn test_keyref_inline_ordering() {
     // Verify inline keys maintain correct sort order via cursor.
     let mut tree: CTree<Vec<u8>, u64, u16, 4, 5> = CTree::new();
-
     // Insert in non-sorted order
     tree.insert(b"delta".to_vec(), 4).unwrap();
     tree.insert(b"alpha".to_vec(), 1).unwrap();
     tree.insert(b"echo".to_vec(), 5).unwrap();
     tree.insert(b"bravo".to_vec(), 2).unwrap();
     tree.insert(b"charlie".to_vec(), 3).unwrap();
-
     // Verify sorted order via cursor: alpha(1), bravo(2), charlie(3), delta(4), echo(5)
-    let expected: &[(&[u8], u64)] = &[
-        (b"alpha", 1), (b"bravo", 2), (b"charlie", 3),
-        (b"delta", 4), (b"echo", 5),
-    ];
+    let expected: &[(&[u8], u64)] =
+        &[(b"alpha", 1), (b"bravo", 2), (b"charlie", 3), (b"delta", 4), (b"echo", 5)];
     let mut cursor = tree.get_cursor();
     for (_key_bytes, val) in expected {
         let (_, v) = cursor.current().unwrap();
@@ -1245,10 +1091,9 @@ fn test_keyref_inline_ordering() {
         cursor.next();
     }
 }
-
 #[test]
 fn test_keyref_sizes() {
-    use std::mem::{size_of, align_of};
+    use std::mem::{align_of, size_of};
     // KeyRef should be 16 bytes: Inline variant holds TinyArray<u8,14> (15 bytes)
     // but Rust may pad the enum. Let's just check it's reasonable.
     assert_eq!(size_of::<KeyRef>(), 16, "KeyRef size should be 16 bytes");
@@ -1256,28 +1101,32 @@ fn test_keyref_sizes() {
     // BufKey remains 8 bytes
     assert_eq!(size_of::<BufKey>(), 8, "BufKey size should be 8 bytes");
 }
-
-
-
 #[test]
 #[ignore = "asc vs desc insert timing"]
 fn experiment_asc_vs_desc() {
     use std::time::Instant;
     let n: u64 = 1_000_000;
     let v = |k: u64| k;
-
     let t = Instant::now();
     let mut asc: CTree<u64, u64, u32, 8, 9> = CTree::new();
-    for k in 0..n { asc.insert(k, v(k)).unwrap(); }
+    for k in 0..n {
+        asc.insert(k, v(k)).unwrap();
+    }
     let asc_us = t.elapsed().as_micros();
-
     let t = Instant::now();
     let mut desc: CTree<u64, u64, u32, 8, 9> = CTree::new();
-    for k in (0..n).rev() { desc.insert(k, v(k)).unwrap(); }
+    for k in (0..n).rev() {
+        desc.insert(k, v(k)).unwrap();
+    }
     let desc_us = t.elapsed().as_micros();
-
-    eprintln!("ascending  0..{n}: {asc_us} us ({:.0} keys/sec)", (n as f64)*1e6/(asc_us as f64).max(1.0));
-    eprintln!("descending {n}..0: {desc_us} us ({:.0} keys/sec)", (n as f64)*1e6/(desc_us as f64).max(1.0));
+    eprintln!(
+        "ascending  0..{n}: {asc_us} us ({:.0} keys/sec)",
+        (n as f64) * 1e6 / (asc_us as f64).max(1.0)
+    );
+    eprintln!(
+        "descending {n}..0: {desc_us} us ({:.0} keys/sec)",
+        (n as f64) * 1e6 / (desc_us as f64).max(1.0)
+    );
     // sanity: both trees hold all keys
     assert_eq!(asc.len() as u64, n);
     assert_eq!(desc.len() as u64, n);

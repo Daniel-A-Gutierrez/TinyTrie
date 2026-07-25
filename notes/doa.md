@@ -1,6 +1,193 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Growth Semantics
+I want the block to grow up to its max capacity then stop. 
+Its up to the consumer what they do at that point - split or just reject basically. 
+It requires cross block work the block interface cant do. 
+
+Insert failing on address exhaustion - technically, this is always a choice. we could just bite the bullet and do the shift. Thats an infallible insert. 
+But insert has to be fallible anyway doesnt it? If there's not space? 
+Or do we make the parent guarantee there is space? 
+I guess the lowest level shouldnt make this sort of decision... so we support try_insert with a budget, and force_insert. 
+Or , nah insert just takes a pointer to a None slot, it doesnt grow automatically. looking up a spot happens externally, as does growing, spreading, splitting, etc. 
+
+
+
+# Node semantics
+
+The walker needs to be able to get values and pointers from nodes using a key. 
+a btree as inodes that store N keys , N values, and N+1 ptrs. 
+a binary tree node stores 1 value and 2 ptrs
+a nibble trie stores `Either<Value,Pointer>` in each child slot. 
+
+trying to have 1 walker that works over all of this is a bit naieve maybe? 
+
+maybe ENode, UNode, LNode, and INode suffice? 
+INode : lookup (K) -> P + value(&self) -> (&K,&V)
+ENode : lookup (K) -> `Either<V,P>`
+LNode : lookup (K) -> V
+UNode : lookup (K) -> unsafe impl `Into<P>` + `Into<V>`; 
+
+and then for each of those, a variant with try_lookup that returns `Option<T>` instead. 
+Then theres also self referential nodes, which need updating themselves whenever they move. 
+
+come to think of it , the node is supposed to impl children , parent, prev, next, so that we can 
+update those pointers if the structure holds them. 
+
+stuff for later i guess. This node though, is a UNode. The result of lookup has to be `impl Into<V> + Into<P>`;
+So these are... what, different bounds on the walker? It does the same stuff, it just changes how it does it.
+Also right now it doesnt yield values anyway, it yields nodes which decide what they yield on their own. 
+
+I guess my concern is just, naming and future use? How does that trait structure fanout? 
+
+No actually i think maybe the node shouldnt care about the value at all. 
+The only division is whether lookup is fallible or not. 
+Leaves are already in their own special block, which the walker doesnt care about because its flat.
+
+
+# Ordering
+
+So ,carrying on from where the last left off, orderings. 
+Say we have a case of [ 0(1), 1(2), 2(3) ,4(4) ] . Each node is value(children). 
+This tree is degenerate. 
+If we insert say, -1, [ -1(1), 0(1), 1(2), 2(3) ,4(4) ], all the nodes pointers are self referential except the new node. Lets roll that back. 
+First, we need to repoint the affected nodes parents to where their children *will* be, then we insert.
+So if we know the array is in-order, that means the next node can be either this nodes child, parent if its a left child, or right sibling if our degree is > 2. 
+One path would be to ... look it up. we can get each relation from our current node and get their values, then compare them to see which is least. That could work. 
+Or , we look a them and just see, which one is ptr.next(). or no we cant cuz it sparse. but least ptr works.
+
+actually though our nearest common ancestor could be the root. so we cant do this locally. 
+the walker has to walk by value, for trees that store values in inodes.
+So whats the ordering of b+trees who's nodes dont have values? 
+
+the correct answer in the example given would be to at each node, descend to the child, then yield &mut ptr parent for update. 
+
+so whats that look like for a btree? 
+
+leaf1, leaf2, parent1, leaf3, root, leaf4, parent2, leaf5, leaf6? 
+
+but parent 1's values range from the leftmost of leaf1 to the rightmost of leaf3. 
+ordering only exists between siblings, not between parents and children. tough.
+so.... breadth first? 
+
+root, parent1, parent2, leaf1,leaf2,leaf3,leaf4,leaf5,leaf6 . 
+
+if i were to insert say, parent0, id have to seek to parent1 with the walker, lookup its parent, update the parent1 ptr, then go next in the parent's children - if we run out of parent children, we go to the next sibling, if we run out of siblings, we go to the leftmost sibling of parent's leftmost leaf. 
+
+alternatively if we really wanted in order, we could enforce that the "MIDPOINT" of each node goes back up to the parent. Then i think we get a total ordering. so if N=4 the earlier ordering should have had root at the end. 
+
+preorder puts the parent at 0 in its children, post puts it at the end? 
+
+that works, but now ordering needs to know the degree of the Btree...unless its pre or post. 
+so inorder is more like InOrder(usize) ? where usize is the degree of the nodes. How funny. does degree have to be even? for inorder split half the nodes go left and half right... might cause insertion difficulty but i dont think it invalidates it. 
+
+funnnn.
+
+so if i have a btree node, and i want to insert it as the nth child of a parent node, insert has to look up that nth childs ptr (or the last one if its n==parent.children.len) , or take its siblings and ordinality in the parent. 
+
+in all likelyhood that becomes insert_after(sibling) or if child_idx == N/2 insert_after(parent). 
+
+so in recap :
+- block and walker need to agree on ordering
+- InOrder needs to be InOrder<const DEGREE : usize>
+- walker's insert method needs to be walker.insert(node) -> P. 
+    - which internally maps to insert_before(walker.parent.children[walker.node_iter.position], node) OR if walker.node_iter.position == 0 if preorder, N/2 if inorder, N-1 if postorder, its after walker.parent()
+    - thus, block needs to support insert_before and insert_after for walker, as well as get(P)
+    - walker yields nodes in node ordering on next/prev + current. 
+
+
+# Complicated bounds
+
+Walker, Block, Store, LeafBlock, Node
+
+Inodes.walk_to(key)-> Walker //seeked to current = Node@key or `Option< Node >` if `Node::V = Option<Block::V>`
+
+Consumer holds iblock
+Consumer defines things so TreeBlock is Impl'ed for iBlock
+iBlock provides methods that do ptr fixup insertions internally.
+
+Consumer holds leaf block
+Leaf block has no internal references, no walker needed
+Leaf block *may* have external references, takes a walker to another block and updates references. 
+Special 'out' for insert_raw to just insert and not do any updating. 
+
+Block itself is agnostic but provides to no consumer facing interface? 
+so the specialized forms 
+interfaces can uphold their invariants. 
+
+so if blocks interface is entirely private that works right. only the trait is pub. 
+
+walker for inodes needs to support walking over terminal nodes. 
+for a b+tree it needs to support height based walking. 
+maybe next vs next_leaf? 
+
+idk for a regular ass binary tree if walker is dfo, or in general if values are stored internally,
+its a question of the ordering of visiting and returning a value right ? 
+
+Whats our terminology for this... apparently its index nodes vs data nodes, crossed with internal vs leaf.
+these are ... probably just different styles of walkers?  
+
+b+tree : leaf = data , btree & binary tree : all nodes are both index & data.
+also some intermix them, whereas others store them separately `enum<data,ptr>` vs `struct {val,ptrs}`
+this seems to be the complex part of nav'ing a tree generically or defining one abstractly. 
+
+i guess i should define the 'walk' as ' a walk that visits all stored values in order', distinct from 
+'a walk that visits all stored ptrs in order' or 'a walk that visits all nodes in order' . 
+
+for feeding a walker from the parent to the leaf block to update as the leaves shift, i want a value walk.
+For the parent block itself moving items around internally, i want to visit nodes in the order they physically exist in , and upate their parents. 
+
+OK that helps i think. that distinction. So I was right to enforce an ordering of the nodes in the block. 
+The walker's walk order needs to match the blocks node order. manual and insert order are outright nonfeasible for trees. 
+
+Ok this is coming together, so i need walker to take ordering as a generic arg, as well as a block where the ordering matches. 
+
+the walker needs to have the ability to walk either values or nodes. are those distinct walkers ? 
+
+## Squirrel
+a hybrid s+tree would be neat huh? Would need a side tree for ptr remapping. 
+Keep the internal nodes dense and not storing ptrs, only terminal inode layer stores ptrs, but once the leaves
+exceed a certain occupancy they drop the ptrs and become terminal inodes at a fixed position. 
+
+# Tying things together
+
+Consumer creates a tree node type, impls Node for it, and a NodeIter to read its children/values.
+    Block provides Walker and Probe if T is Node, otherwise it just provides exact iter. 
+    Distinct Signatures if `Block<K,V,T: Node<K,V>>` or `Block <K,V,T: Node<K,Option< V>>` . 
+        The default walker takes advantage of that as a signal that K->V mapping is infallible, making it faster.
+    Block makes a walker from the root, storing a &mut Block
+    Walker's pub interface provides insert_before/after/lookup/remove into the block
+    Blocks private interface has insert_b4/after/lookup/remove(&mut Walker)
+    Walker provides current_node_mut to get a `&mut Block::T` back out.
+    Maybe walker's lookup(K) ... hmm. 
+
+    So how does this fit in with leafblock? I think it just doesnt. leafblock doesnt need it anyway. 
+    Its just a block where T ! Node<K,V> 
+
+    Leafblock is kinda special, if its gonna take in a cursor to correct the parent structure when a leafblock splits or moves, it needs to know that the V type of the walker is a PtrUnion.
+    The walker needs to be able to distinguish its V. 
+    Thats pretty specific to this impl no? 
+
+    Maybe this particular walker type needs to know its terminal nodes values are a union? 
+    also worth noting K isnt necessarily the 'lookup' type. For example, in nibble trie the stored type is K, but the type used for lookups is K::Borrow, whereas in a btree just K is fine. So we need an additional parameter. And node can't assume an inode even stores whole keys (it doesnt now which is good). 
+
+    In other trees that store values at internal nodes as well as ptrs, theyre either mixed in (so map will return them) or it'll be fixed in the node. Idk what itd be like IValueNode. 
+
+# Tree Trait
+my primary interest is b+ and btrees right now but i want to keep the others in mind - look at tree_traits.rs . right now doa provides 'blocks' for storing inodes and leaves in order contiguously.
+
+crosstalk between the two is necessary. The interface im leaning towards is that either the 'parent' lends &mut ptrs to the leaf block for operations that shift elements around, or the leaf block lends a slice to the parent. drawing the line is a bit tricky. I think the final form of this may be a cursor that strides both and can do modifications that require modifying both in tandem. so i need to build the building blocks for that.
+
+navigating the leafblock is easy, its effectively just a big sorted sparse array.
+
+navigating the parent is harder, its a tree like structure. So i need an abstraction over 'a tree in a block' first.
+
+i think just building it first as the btree in lib.rs is a start, but in doing so I'll end up making a cursor and a node type like already exists in all my other trees. So i want to preemptively abstract that , because I know its worth abstracting.
+
+this is what tree_traits.rs is. the idea i guess is that if i can make a cursor that can navigate any generic tree like structure, thats an interface the btree in lib.rs can use by implementing Node for its node struct, and thus itd be able to make use of some default TreeCursor type thing from block.
+
+
 # Node Management
 the consumer holds the 'node header'. 
 internal representation is still a bunch of sparse Option< (K,V) >
@@ -77,9 +264,17 @@ tree.try_insert(&mut self)
         skip to self.leaves.root_mut()
     else: 
         nav inodes to find node to put item in - it either goes between 2 nodes or at an end
-        the tree thus needs to get to the target node, then step forward 1 for between.
-         
+        the tree thus needs to get to the target node, then step forward 1 if its the last. 
+        requires mutable discrete access from block, for ops that take 2 elements. 
+    
+    itd be nice if the inode block supported iter_leaves(). it'll need iter mut. 
+    we can construct a node from 1 sp and 1 next ptr, then use that to insert/measure cap/etc. 
+    node works on a slice so that means it cant be held while the leaf block is mutated. 
+    its a ref to the parent and the child... so basically just a view. 
+    maybe things that cross nodes need to be methods on the block not a individual node. 
+    maybe we just have methods on the block that do this sort of stuff taking in &mut SlicePtr<P>. 
 
+ok so parent job: 
 
 # Bit rotation
 

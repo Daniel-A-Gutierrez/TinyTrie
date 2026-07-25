@@ -1,5 +1,4 @@
 use super::*;
-
 #[test]
 fn dyn_new_insert_get() {
     let mut trie: DynTrie<i32> = DynTrie::new();
@@ -7,13 +6,11 @@ fn dyn_new_insert_get() {
     assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.get(b"world"), None);
 }
-
 #[test]
 fn dyn_starts_as_u8() {
     let trie: DynTrie<i32> = DynTrie::new();
     assert_eq!(trie.ptr_size(), 1);
 }
-
 #[test]
 fn dyn_auto_promote_u8_to_u16() {
     let mut trie: DynTrie<i32> = DynTrie::new();
@@ -24,23 +21,30 @@ fn dyn_auto_promote_u8_to_u16() {
         trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     assert_eq!(trie.ptr_size(), 2); // promoted to u16
-
     // Indices are not stable across inserts/optimize — verify presence + value
     // via the forward-iteration callback.
     for i in 0..300u32 {
         let key = format!("key_{:05}", i);
-        assert!(trie.get(key.as_bytes()).is_some(),
-            "dyn lookup failed after promote for i={}", i);
+        assert!(
+            trie.get(key.as_bytes()).is_some(),
+            "dyn lookup failed after promote for i={}",
+            i
+        );
     }
     let mut seen = std::collections::HashMap::<Vec<u8>, i32>::new();
-    trie.iter_fwd(&mut |k, v| { seen.insert(k.to_vec(), *v); });
+    trie.iter_fwd(&mut |k, v| {
+        seen.insert(k.to_vec(), *v);
+    });
     for i in 0..300u32 {
         let key = format!("key_{:05}", i);
-        assert_eq!(seen.get(key.as_bytes()), Some(&(i as i32)),
-            "dyn value mismatch after promote for i={}", i);
+        assert_eq!(
+            seen.get(key.as_bytes()),
+            Some(&(i as i32)),
+            "dyn value mismatch after promote for i={}",
+            i
+        );
     }
 }
-
 #[test]
 fn dyn_auto_promote_chain() {
     let mut trie: DynTrie<i32> = DynTrie::new();
@@ -53,7 +57,6 @@ fn dyn_auto_promote_chain() {
     assert_eq!(trie.ptr_size(), 2);
     assert_eq!(trie.len(), 260);
 }
-
 #[test]
 fn dyn_len_and_is_empty() {
     let mut trie: DynTrie<i32> = DynTrie::new();
@@ -63,7 +66,6 @@ fn dyn_len_and_is_empty() {
     assert!(!trie.is_empty());
     assert_eq!(trie.len(), 1);
 }
-
 #[test]
 fn dyn_optimize() {
     let mut trie: DynTrie<i32> = DynTrie::new();
@@ -77,42 +79,43 @@ fn dyn_optimize() {
     // that each key still maps to its value via the iteration callback.
     for i in 0..100u32 {
         let key = format!("key_{:03}", i);
-        assert!(trie.get(key.as_bytes()).is_some(),
-            "dyn lookup failed after optimize for i={}", i);
+        assert!(
+            trie.get(key.as_bytes()).is_some(),
+            "dyn lookup failed after optimize for i={}",
+            i
+        );
     }
     let mut seen = std::collections::HashMap::<Vec<u8>, i32>::new();
-    trie.iter_fwd(&mut |k, v| { seen.insert(k.to_vec(), *v); });
+    trie.iter_fwd(&mut |k, v| {
+        seen.insert(k.to_vec(), *v);
+    });
     for i in 0..100u32 {
         let key = format!("key_{:03}", i);
-        assert_eq!(seen.get(key.as_bytes()), Some(&(i as i32)),
-            "dyn value mismatch after optimize for i={}", i);
+        assert_eq!(
+            seen.get(key.as_bytes()),
+            Some(&(i as i32)),
+            "dyn value mismatch after optimize for i={}",
+            i
+        );
     }
 }
-
 #[test]
 fn dyn_callback_iteration() {
     let mut trie: DynTrie<i32> = DynTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut fwd = Vec::new();
-    trie.iter_fwd(&mut |k, v| { fwd.push((k.to_vec(), *v)); });
-    assert_eq!(fwd, vec![
-        (b"abc".to_vec(), 1),
-        (b"abd".to_vec(), 2),
-        (b"abe".to_vec(), 3),
-    ]);
-
+    trie.iter_fwd(&mut |k, v| {
+        fwd.push((k.to_vec(), *v));
+    });
+    assert_eq!(fwd, vec![(b"abc".to_vec(), 1), (b"abd".to_vec(), 2), (b"abe".to_vec(), 3),]);
     let mut rev = Vec::new();
-    trie.iter_rev(&mut |k, v| { rev.push((k.to_vec(), *v)); });
-    assert_eq!(rev, vec![
-        (b"abe".to_vec(), 3),
-        (b"abd".to_vec(), 2),
-        (b"abc".to_vec(), 1),
-    ]);
+    trie.iter_rev(&mut |k, v| {
+        rev.push((k.to_vec(), *v));
+    });
+    assert_eq!(rev, vec![(b"abe".to_vec(), 3), (b"abd".to_vec(), 2), (b"abc".to_vec(), 1),]);
 }
-
 #[test]
 fn dyn_demote_success() {
     let mut trie: DynTrie<i32> = DynTrie::new();
@@ -125,7 +128,6 @@ fn dyn_demote_success() {
     assert_eq!(trie.ptr_size(), 1);
     assert_eq!(trie.demote(), Err(()));
 }
-
 #[test]
 fn dyn_duplicate_key_returns_error() {
     let mut trie: DynTrie<i32> = DynTrie::new();
@@ -134,7 +136,6 @@ fn dyn_duplicate_key_returns_error() {
     assert_eq!(result, Err(()));
     assert_eq!(trie.len(), 1);
 }
-
 #[test]
 fn dyn_prefix_keys() {
     let mut trie: DynTrie<i32> = DynTrie::new();

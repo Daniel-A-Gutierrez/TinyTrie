@@ -1,18 +1,15 @@
+use super::{BenchContext, Benchable, max_key_len, read_allocated, truncate_key};
 use std::collections::HashSet;
 use std::hint::black_box;
-
 use tiny_trie::FixedLenNibbleTrie;
-
-use super::{Benchable, BenchContext, truncate_key, max_key_len, read_allocated};
-
 pub(crate) struct FixedLenBench {
     trie: FixedLenNibbleTrie<usize, u32>,
 }
-
 impl FixedLenBench {
-    pub(crate) fn new() -> Self { Self { trie: FixedLenNibbleTrie::new(1) } }
+    pub(crate) fn new() -> Self {
+        Self { trie: FixedLenNibbleTrie::new(1) }
+    }
 }
-
 impl Benchable<Vec<u8>> for FixedLenBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         let max_len = max_key_len(keys);
@@ -25,7 +22,6 @@ impl Benchable<Vec<u8>> for FixedLenBench {
             }
         }
     }
-
     fn bench_insert(&self, keys: &[Vec<u8>]) -> Option<()> {
         let max_len = max_key_len(keys);
         let mut m = FixedLenNibbleTrie::<usize, u32>::new(max_len);
@@ -39,7 +35,6 @@ impl Benchable<Vec<u8>> for FixedLenBench {
         black_box(&m);
         Some(())
     }
-
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
         let max_len = max_key_len(keys);
         let before = read_allocated();
@@ -55,7 +50,6 @@ impl Benchable<Vec<u8>> for FixedLenBench {
         drop(m);
         Some(bytes as f64 / keys.len() as f64)
     }
-
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,
@@ -65,17 +59,15 @@ impl Benchable<Vec<u8>> for FixedLenBench {
         index_iter: true,
     }
 }
-
 // ── FixedLenOpt ────────────────────────────────────────────────────────
-
 pub(crate) struct FixedLenOptBench {
     trie: FixedLenNibbleTrie<usize, u32>,
 }
-
 impl FixedLenOptBench {
-    pub(crate) fn new() -> Self { Self { trie: FixedLenNibbleTrie::new(1) } }
+    pub(crate) fn new() -> Self {
+        Self { trie: FixedLenNibbleTrie::new(1) }
+    }
 }
-
 impl Benchable<Vec<u8>> for FixedLenOptBench {
     fn build(&mut self, keys: &[Vec<u8>], _ctx: &BenchContext) {
         let max_len = max_key_len(keys);
@@ -89,7 +81,6 @@ impl Benchable<Vec<u8>> for FixedLenOptBench {
         }
         self.trie.optimize();
     }
-
     fn bench_optimize(&self, keys: &[Vec<u8>]) -> Option<()> {
         let max_len = max_key_len(keys);
         let mut m = FixedLenNibbleTrie::<usize, u32>::new(max_len);
@@ -104,7 +95,6 @@ impl Benchable<Vec<u8>> for FixedLenOptBench {
         black_box(&m);
         Some(())
     }
-
     fn bench_memory(&self, keys: &[Vec<u8>]) -> Option<f64> {
         let max_len = max_key_len(keys);
         let before = read_allocated();
@@ -121,7 +111,6 @@ impl Benchable<Vec<u8>> for FixedLenOptBench {
         drop(m);
         Some(bytes as f64 / keys.len() as f64)
     }
-
     bench_query_methods! {
         field: trie,
         ctx: BenchContext,

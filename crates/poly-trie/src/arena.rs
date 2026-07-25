@@ -18,32 +18,38 @@
 //! `T` must be `Copy` — freed slots are overwritten without drop.
 //!
 //! `I` is the index type: `u16` for small tries (≤65K slots), `u32` for large.
-
 // ---------------------------------------------------------------------------
 // Index trait
 // ---------------------------------------------------------------------------
-
 /// A slot index. Must be a trivially-copyable integer that can be
 /// converted to/from `usize` for `Vec` indexing.
 pub trait Idx: Copy + Eq + std::fmt::Debug {
     fn from_usize(n: usize) -> Self;
     fn to_usize(self) -> usize;
 }
-
 impl Idx for u16 {
-    #[inline] fn from_usize(n: usize) -> Self { n as u16 }
-    #[inline] fn to_usize(self) -> usize { self as usize }
+    #[inline]
+    fn from_usize(n: usize) -> Self {
+        n as u16
+    }
+    #[inline]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
 }
-
 impl Idx for u32 {
-    #[inline] fn from_usize(n: usize) -> Self { n as u32 }
-    #[inline] fn to_usize(self) -> usize { self as usize }
+    #[inline]
+    fn from_usize(n: usize) -> Self {
+        n as u32
+    }
+    #[inline]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
 }
-
 // ---------------------------------------------------------------------------
 // Arena
 // ---------------------------------------------------------------------------
-
 /// A slab-style arena allocator with stable indices and inline free lists.
 ///
 /// `T` is the slot type (e.g., `[NodeRef; 2]` for Node2). Must be `Copy`
@@ -63,35 +69,32 @@ impl Idx for u32 {
 ///   zero-waste reuse for fixed-size blocks.
 #[derive(Clone)]
 pub struct Arena<T: Copy, I: Idx = u32> {
-    slots: Vec<T>,
+    slots:      Vec<T>,
     /// Single-slot free list head (LIFO).
-    free_head: Option<I>,
+    free_head:  Option<I>,
     /// Per-block-size free lists. `block_free[n]` is the head of a linked list
     /// of freed contiguous blocks of length `n`. Each block's first slot stores
     /// the next-block index (or a sentinel if end-of-list).
     block_free: Vec<Option<I>>,
-    occupied: usize,
+    occupied:   usize,
 }
-
 impl<T: Copy, I: Idx> Arena<T, I> {
     pub fn new() -> Self {
         Arena {
-            slots: Vec::new(),
-            free_head: None,
+            slots:      Vec::new(),
+            free_head:  None,
             block_free: Vec::new(),
-            occupied: 0,
+            occupied:   0,
         }
     }
-
     pub fn with_capacity(capacity: usize) -> Self {
         Arena {
-            slots: Vec::with_capacity(capacity),
-            free_head: None,
+            slots:      Vec::with_capacity(capacity),
+            free_head:  None,
             block_free: Vec::new(),
-            occupied: 0,
+            occupied:   0,
         }
     }
-
     /// Ensure `block_free` has at least `n` entries so `block_free[n]` is valid.
     #[inline]
     fn ensure_block_free_len(&mut self, n: usize) {
@@ -99,7 +102,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
             self.block_free.resize_with(n + 1, || None);
         }
     }
-
     /// Allocate a slot, returning its stable index.
     ///
     /// Reuses a freed slot if available (LIFO order), otherwise appends.
@@ -128,7 +130,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
         self.slots.push(value);
         idx
     }
-
     /// Free a slot by index. The slot becomes available for reuse.
     ///
     /// # Panics
@@ -150,20 +151,17 @@ impl<T: Copy, I: Idx> Arena<T, I> {
         self.free_head = Some(idx);
         self.occupied -= 1;
     }
-
     /// Access a slot by index. Caller must ensure the index is valid
     /// (i.e., the slot is currently occupied, not freed).
     #[inline]
     pub fn get(&self, idx: I) -> &T {
         &self.slots[idx.to_usize()]
     }
-
     /// Access a slot mutably by index. Caller must ensure the index is valid.
     #[inline]
     pub fn get_mut(&mut self, idx: I) -> &mut T {
         &mut self.slots[idx.to_usize()]
     }
-
     /// Access a contiguous range of `len` slots starting at `start`.
     ///
     /// Returns a slice of `len` elements. Caller must ensure the entire range
@@ -173,7 +171,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
         let s = start.to_usize();
         &self.slots[s..s + len]
     }
-
     /// Access a contiguous range of `len` slots mutably starting at `start`.
     ///
     /// Returns a mutable slice of `len` elements. Caller must ensure the entire
@@ -183,7 +180,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
         let s = start.to_usize();
         &mut self.slots[s..s + len]
     }
-
     /// Allocate `n` contiguous slots, each initialized with `value`.
     ///
     /// Returns the index of the first slot. Subsequent slots occupy
@@ -199,7 +195,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
     /// Panics if `n` is 0 or the resulting index range overflows `I`.
     pub fn alloc_n(&mut self, n: usize, value: T) -> I {
         assert!(n > 0, "alloc_n: cannot allocate 0 slots");
-
         // Try to reuse a freed block of exactly size `n`.
         if n < self.block_free.len() {
             if let Some(head) = self.block_free[n].take() {
@@ -219,20 +214,15 @@ impl<T: Copy, I: Idx> Arena<T, I> {
                 return head;
             }
         }
-
         // No reusable block — append.
         let start = self.slots.len();
         let end = start + n;
         let last = I::from_usize(end - 1);
-        assert!(
-            last.to_usize() == end - 1,
-            "alloc_n: index range overflows Idx capacity"
-        );
+        assert!(last.to_usize() == end - 1, "alloc_n: index range overflows Idx capacity");
         self.slots.resize(end, value);
         self.occupied += n;
         I::from_usize(start)
     }
-
     /// Allocate a contiguous slice, copying from `values`.
     ///
     /// Returns the index of the first slot. Each slot `start + i` is
@@ -247,7 +237,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
     pub fn alloc_slice(&mut self, values: &[T]) -> I {
         assert!(!values.is_empty(), "alloc_slice: cannot allocate 0 slots");
         let n = values.len();
-
         // Try to reuse a freed block of exactly size `n`.
         if n < self.block_free.len() {
             if let Some(head) = self.block_free[n].take() {
@@ -264,21 +253,16 @@ impl<T: Copy, I: Idx> Arena<T, I> {
                 return head;
             }
         }
-
         // No reusable block — append.
         let start = self.slots.len();
         let end = start + n;
         let last = I::from_usize(end - 1);
-        assert!(
-            last.to_usize() == end - 1,
-            "alloc_slice: index range overflows Idx capacity"
-        );
+        assert!(last.to_usize() == end - 1, "alloc_slice: index range overflows Idx capacity");
         // extend_from_slice works because T: Copy (which implies Clone)
         self.slots.extend_from_slice(values);
         self.occupied += n;
         I::from_usize(start)
     }
-
     /// Free a contiguous range of `n` slots starting at `start`.
     ///
     /// The freed block is pushed onto the per-size free list for `n`, so it
@@ -299,11 +283,7 @@ impl<T: Copy, I: Idx> Arena<T, I> {
     pub fn free_n(&mut self, start: I, n: usize) {
         assert!(n > 0, "free_n: cannot free 0 slots");
         let s = start.to_usize();
-        debug_assert!(
-            s + n <= self.slots.len(),
-            "free_n: range exceeds arena bounds"
-        );
-
+        debug_assert!(s + n <= self.slots.len(), "free_n: range exceeds arena bounds");
         // Push this block onto the per-size free list for `n`.
         self.ensure_block_free_len(n);
         // Write the current list head into the first slot of the block.
@@ -314,21 +294,17 @@ impl<T: Copy, I: Idx> Arena<T, I> {
         self.block_free[n] = Some(start);
         self.occupied -= n;
     }
-
     /// Number of occupied (non-freed) slots.
     pub fn len(&self) -> usize {
         self.occupied
     }
-
     /// Total slots including freed ones.
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
-
     pub fn is_empty(&self) -> bool {
         self.occupied == 0
     }
-
     // -----------------------------------------------------------------------
     // Inline free-list pointer I/O
     // -----------------------------------------------------------------------
@@ -337,7 +313,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
     // bytes. Since `size_of::<T>() >= size_of::<I>()` (enforced by the
     // caller — NodeRef arrays are always ≥ 8 bytes, I is ≤ 4 bytes),
     // this fits without truncation.
-
     /// Read the free-list pointer stored in a freed slot.
     ///
     /// # Safety
@@ -357,7 +332,6 @@ impl<T: Copy, I: Idx> Arena<T, I> {
             val
         }
     }
-
     /// Write the free-list pointer into a freed slot.
     ///
     /// # Safety
@@ -375,12 +349,11 @@ impl<T: Copy, I: Idx> Arena<T, I> {
         }
     }
 }
-
 impl<T: Copy, I: Idx> Default for Arena<T, I> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
-
 #[cfg(test)]
 #[path = "tests/arena.rs"]
 mod tests;
-

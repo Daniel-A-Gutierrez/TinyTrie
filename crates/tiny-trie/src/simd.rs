@@ -8,12 +8,10 @@
 //! Uses `core::simd` (portable SIMD), which requires nightly Rust
 //! (`#![feature(portable_simd)]`). The compiler lowers these to SSE2/NEON
 //! instructions on the target platform automatically — no intrinsics needed.
-
 use core::simd::cmp::{SimdPartialEq, SimdPartialOrd};
+use core::simd::u8x16;
 use core::simd::u16x16;
 use core::simd::u32x16;
-use core::simd::u8x16;
-
 /// Load 16 bytes from `ptr` into a SIMD vector (unaligned), zeroing
 /// padding bytes in the range `[valid_end..align_end)` to avoid Miri UB.
 ///
@@ -38,7 +36,6 @@ fn load16_zero_pad(ptr: *const u8, valid_end: usize, align_end: usize) -> u8x16 
     }
     u8x16::from(buf)
 }
-
 /// Load `n` bytes from `ptr` into a SIMD vector, zero-padding the rest.
 ///
 /// Reads `n` bytes from `ptr` and fills the remaining `16 - n` bytes with
@@ -53,7 +50,6 @@ fn load16_partial(ptr: *const u8, n: usize) -> u8x16 {
     unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), n) };
     u8x16::from(buf)
 }
-
 /// Load 16 bytes from `ptr` into a SIMD vector (unaligned).
 ///
 /// Used for contiguous byte arrays (PairVec discriminants) where all 16
@@ -65,7 +61,6 @@ fn load16(ptr: *const u8) -> u8x16 {
     unsafe { core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 16) };
     u8x16::from(buf)
 }
-
 /// Find `byte` in INode symbols using SIMD.
 ///
 /// Loads 16 bytes from the start of the INode struct, masks to the
@@ -88,17 +83,14 @@ pub fn inode_find_child(
     let valid_end = symbols_offset + count;
     // Padding starts at valid_end, ends at next 8-byte boundary.
     let align_end = (valid_end + 7) & !7;
-
     let vec = load16_zero_pad(inode_ptr, valid_end, align_end);
     let byte_vec = u8x16::splat(byte);
     let eq = vec.simd_eq(byte_vec);
     let mask = eq.to_bitmask() as u32;
     let hits = mask & valid_mask;
-
     if hits != 0 {
         return Some(hits.trailing_zeros() as usize - symbols_offset);
     }
-
     // Second load if symbols extend past byte 15 (large INLINE values)
     if symbols_offset + count > 16 {
         let first_in_load1 = 16 - symbols_offset;
@@ -117,10 +109,8 @@ pub fn inode_find_child(
             return Some(first_in_load1 + hits2.trailing_zeros() as usize);
         }
     }
-
     None
 }
-
 /// Find first symbol >= `byte` in INode using SIMD (unsigned >=).
 ///
 /// `u8x16::simd_lt` does unsigned comparison, so we get "symbols[i] < byte"
@@ -140,19 +130,15 @@ pub fn inode_find_child_lower_bound(
     let valid_mask = ((1u32 << count) - 1) << symbols_offset;
     let valid_end = symbols_offset + count;
     let align_end = (valid_end + 7) & !7;
-
     let byte_vec = u8x16::splat(byte);
-
     let vec = load16_zero_pad(inode_ptr, valid_end, align_end);
     // simd_lt on u8x16 is unsigned less-than
     let lt = vec.simd_lt(byte_vec);
     let mask = lt.to_bitmask() as u32;
-
     let ge = (!mask) & valid_mask;
     if ge != 0 {
         return ge.trailing_zeros() as usize - symbols_offset;
     }
-
     // Second load if symbols extend past byte 15
     if symbols_offset + count > 16 {
         let first_in_load1 = 16 - symbols_offset;
@@ -170,10 +156,8 @@ pub fn inode_find_child_lower_bound(
             return first_in_load1 + ge2.trailing_zeros() as usize;
         }
     }
-
     count
 }
-
 /// Find `byte` in HNode discriminants using SIMD.
 ///
 /// Processes the discriminants array in 16-byte chunks.
@@ -185,7 +169,6 @@ pub fn hnode_find_child(disc_ptr: *const u8, len: usize, byte: u8) -> Option<usi
     }
     let byte_vec = u8x16::splat(byte);
     let mut offset = 0usize;
-
     // Full 16-byte chunks
     while offset + 16 <= len {
         let vec = load16(unsafe { disc_ptr.add(offset) });
@@ -196,7 +179,6 @@ pub fn hnode_find_child(disc_ptr: *const u8, len: usize, byte: u8) -> Option<usi
         }
         offset += 16;
     }
-
     // Tail (1..15 bytes) — use partial load to avoid reading uninitialized
     // memory beyond the valid keys (which could be Trie padding in PairVec).
     if offset < len {
@@ -210,10 +192,8 @@ pub fn hnode_find_child(disc_ptr: *const u8, len: usize, byte: u8) -> Option<usi
             return Some(offset + hits.trailing_zeros() as usize);
         }
     }
-
     None
 }
-
 /// Find first discriminant >= `byte` in HNode using SIMD.
 ///
 /// `u8x16::simd_lt` does unsigned comparison directly — no XOR bias needed.
@@ -229,20 +209,17 @@ pub fn hnode_find_child_lower_bound(disc_ptr: *const u8, len: usize, byte: u8) -
     }
     let byte_vec = u8x16::splat(byte);
     let mut offset = 0usize;
-
     // Full 16-byte chunks
     while offset + 16 <= len {
         let vec = load16(unsafe { disc_ptr.add(offset) });
         let lt = vec.simd_lt(byte_vec);
         let mask = lt.to_bitmask() as u32;
-
         if mask != 0xFFFF {
             let ge_mask = (!mask) & 0xFFFF;
             return offset + ge_mask.trailing_zeros() as usize;
         }
         offset += 16;
     }
-
     // Tail (1..15 bytes) — use partial load to avoid reading uninitialized
     // memory beyond the valid keys (which could be Trie padding in PairVec).
     if offset < len {
@@ -256,10 +233,8 @@ pub fn hnode_find_child_lower_bound(disc_ptr: *const u8, len: usize, byte: u8) -
             return offset + ge_mask.trailing_zeros() as usize;
         }
     }
-
     len
 }
-
 /// Compute a 16-bit occupancy mask from a `[u32; 16]` children array.
 ///
 /// Bit N is set if `children[N] != 0`. Used by NibbleTrie iteration to find
@@ -278,7 +253,6 @@ pub fn children_mask(children: &[u32; 16]) -> u16 {
     let empty = eq.to_bitmask() as u16; // bit N = 1 if children[N] == 0
     empty // invert: bit N = 1 if children[N] != 0
 }
-
 /// Compute a 16-bit occupancy mask from a `[u8; 16]` children array.
 ///
 /// Bit N is set if `children[N] != 0`. Same semantics as `children_mask`
@@ -290,7 +264,6 @@ pub fn children_mask_u8(children: &[u8; 16]) -> u16 {
     let ne = vec.simd_ne(zero);
     ne.to_bitmask() as u16
 }
-
 /// Compute a 16-bit occupancy mask from a `[u16; 16]` children array.
 ///
 /// Bit N is set if `children[N] != 0`. Same semantics as `children_mask`
@@ -302,7 +275,6 @@ pub fn children_mask_u16(children: &[u16; 16]) -> u16 {
     let ne = vec.simd_ne(zero);
     ne.to_bitmask() as u16
 }
-
 /// Compute a 16-bit occupancy mask from a `[u64; 16]` children array.
 ///
 /// Bit N is set if `children[N] != 0`. Same semantics as `children_mask`
@@ -322,8 +294,6 @@ pub fn children_mask_u64(children: &[u64; 16]) -> u16 {
     let hi_mask = (hi_ne.to_bitmask() as u16) << 8;
     lo_mask | hi_mask
 }
-
 #[cfg(test)]
 #[path = "tests/simd.rs"]
 mod tests;
-

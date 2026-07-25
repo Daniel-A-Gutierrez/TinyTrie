@@ -2,10 +2,8 @@
 //!
 //! Slots `[0..len)` are always initialized. `TinyArray` owns Drop for those slots.
 //! Designed as a building block for B+ tree node keys/values.
-
 use std::mem::MaybeUninit;
 use std::ptr::drop_in_place;
-
 /// A fixed-capacity array with a stored length.
 ///
 /// Slots `[0..len)` are initialized. `N` is the capacity (max 255 since `len` is `u8`).
@@ -13,15 +11,14 @@ use std::ptr::drop_in_place;
 /// initialized elements are dropped.
 pub struct TinyArray<T, const N: usize>
 where
-    [(); N]:
+    [(); N]:,
 {
-    len: u8,
+    len:   u8,
     slots: [MaybeUninit<T>; N],
 }
-
 impl<T: Clone, const N: usize> Clone for TinyArray<T, N>
 where
-    [(); N]:
+    [(); N]:,
 {
     fn clone(&self) -> Self {
         let mut arr = Self::new();
@@ -31,41 +28,33 @@ where
         arr
     }
 }
-
 impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for TinyArray<T, N>
 where
-    [(); N]:
+    [(); N]:,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.as_slice()).finish()
     }
 }
-
 #[allow(dead_code)]
 impl<T, const N: usize> TinyArray<T, N>
 where
-    [(); N]:
+    [(); N]:,
 {
     /// Create an empty `TinyArray` with `len == 0`.
     pub fn new() -> Self {
-        Self {
-            len: 0,
-            slots: unsafe { MaybeUninit::uninit().assume_init() },
-        }
+        Self { len: 0, slots: unsafe { MaybeUninit::uninit().assume_init() } }
     }
-
     /// Number of initialized elements.
     #[inline]
     pub fn len(&self) -> usize {
         self.len as usize
     }
-
     /// Is the array at capacity?
     #[inline]
     pub fn is_full(&self) -> bool {
         self.len as usize == N
     }
-
     /// Access the initialized region as a slice.
     ///
     /// SAFETY: `slots[..len]` are all initialized.
@@ -73,14 +62,12 @@ where
     pub fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.slots[0].as_ptr(), self.len as usize) }
     }
-
     /// Get a reference to element at `i`. Panics if out of bounds.
     #[inline]
     pub fn get(&self, i: usize) -> &T {
         debug_assert!(i < self.len as usize, "TinyArray::get: index out of bounds");
         unsafe { &*self.slots[i].as_ptr() }
     }
-
     /// Get a reference to element at `i` without bounds check.
     ///
     /// # Safety
@@ -90,14 +77,12 @@ where
     pub unsafe fn get_unchecked(&self, i: usize) -> &T {
         unsafe { &*self.slots[i].as_ptr() }
     }
-
     /// Get a mutable reference to element at `i`. Panics if out of bounds.
     #[inline]
     pub fn get_mut(&mut self, i: usize) -> &mut T {
         debug_assert!(i < self.len as usize, "TinyArray::get_mut: index out of bounds");
         unsafe { &mut *self.slots[i].as_mut_ptr() }
     }
-
     /// Insert `val` at position `pos`, shifting elements `[pos..len)` right by one.
     ///
     /// Panics if the array is full or `pos > len`.
@@ -121,7 +106,6 @@ where
         }
         self.len += 1;
     }
-
     /// Remove element at `pos`, shifting elements `[pos+1..len)` left by one.
     ///
     /// Returns the removed element.
@@ -142,14 +126,12 @@ where
         self.len -= 1;
         val
     }
-
     /// Append `val` to the end of the array.
     ///
     /// Panics if the array is full.
     pub fn push(&mut self, val: T) {
         self.insert_at(self.len as usize, val);
     }
-
     /// Remove and return the last element, or `None` if empty.
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -158,7 +140,6 @@ where
         self.len -= 1;
         Some(unsafe { self.slots[self.len as usize].assume_init_read() })
     }
-
     /// Set `len` to `new_len` without dropping any elements.
     ///
     /// The caller is responsible for ensuring that truncated elements (if any)
@@ -169,7 +150,6 @@ where
         debug_assert!(new_len as usize <= N, "TinyArray::truncate: new_len exceeds capacity");
         self.len = new_len;
     }
-
     /// Reorder the initialized elements so that slot `i` holds what was
     /// originally at slot `perm[i]` — i.e. `self[i] = old_self[perm[i]]`.
     ///
@@ -199,10 +179,7 @@ where
             while p[j] != i {
                 // SAFETY: slots j and p[j] are both < n, hence initialized.
                 unsafe {
-                    std::ptr::swap(
-                        self.slots[j].as_mut_ptr(),
-                        self.slots[p[j]].as_mut_ptr(),
-                    );
+                    std::ptr::swap(self.slots[j].as_mut_ptr(), self.slots[p[j]].as_mut_ptr());
                 }
                 let next = p[j];
                 p[j] = j; // mark position j settled
@@ -211,7 +188,6 @@ where
             p[j] = j;
         }
     }
-
     /// Read element at `pos` without removing it or shifting.
     ///
     /// The slot is left in an uninitialized state. The caller must ensure
@@ -227,7 +203,6 @@ where
         debug_assert!(pos < self.len as usize, "TinyArray::read_slot: index out of bounds");
         unsafe { self.slots[pos].assume_init_read() }
     }
-
     /// Move elements `[from..len)` into `dst`, starting at `dst` index 0.
     ///
     /// After this call:
@@ -264,7 +239,6 @@ where
         dst.len += count as u8;
         self.len = from as u8;
     }
-
     /// Move `self[from..len)` to **dst's front** (prepend), shifting dst's
     /// existing elements right. After this call:
     /// - `dst` has `dst.len + (self.len - from)` elements, with the moved range
@@ -303,7 +277,6 @@ where
         dst.len += count as u8;
         self.len = from as u8;
     }
-
     /// Move `self[0..count)` to **dst's end** (append), then shift self's
     /// remaining elements `[count..len)` left to the front. After this call:
     /// - `dst` has `dst.len + count` elements, with the moved range appended.
@@ -316,7 +289,10 @@ where
     ///
     /// Caller must ensure `count <= self.len` and dst has capacity.
     pub fn drain_front_into(&mut self, count: usize, dst: &mut Self) {
-        debug_assert!(count <= self.len as usize, "TinyArray::drain_front_into: count out of bounds");
+        debug_assert!(
+            count <= self.len as usize,
+            "TinyArray::drain_front_into: count out of bounds"
+        );
         debug_assert!(
             dst.len as usize + count <= N,
             "TinyArray::drain_front_into: dst overflow"
@@ -342,10 +318,9 @@ where
         self.len -= count as u8;
     }
 }
-
 impl<T, const N: usize> Drop for TinyArray<T, N>
 where
-    [(); N]:
+    [(); N]:,
 {
     fn drop(&mut self) {
         for i in 0..self.len as usize {
@@ -355,7 +330,6 @@ where
         }
     }
 }
-
 #[cfg(test)]
 #[path = "tests/tiny_array.rs"]
 mod tests;

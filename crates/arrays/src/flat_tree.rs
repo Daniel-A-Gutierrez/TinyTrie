@@ -19,41 +19,32 @@
 //!   `d > depth` slots. `0xFF` ends a sibling chain.
 
 #![allow(dead_code)]
-
+use crate::tiny_array::TinyArray;
 use std::mem::size_of;
 use std::time::Instant;
-
-use crate::tiny_array::TinyArray;
-
 type Key = Box<[u8]>;
-
 // ============================================================================
 // SortedArray — Vec<(Box<[u8]>, u8)>, sorted
 // ============================================================================
-
 pub struct SortedArray {
     entries: Vec<(Key, u8)>,
 }
-
 impl SortedArray {
     pub fn new() -> Self {
         Self { entries: Vec::new() }
     }
-
     pub fn insert(&mut self, k: &[u8], v: u8) {
         match self.entries.binary_search_by(|(e, _)| e.as_ref().cmp(k)) {
             Ok(_) => {} // duplicate
             Err(pos) => self.entries.insert(pos, (Box::from(k), v)),
         }
     }
-
     pub fn get(&self, k: &[u8]) -> Option<u8> {
         self.entries
             .binary_search_by(|(e, _)| e.as_ref().cmp(k))
             .ok()
             .map(|i| self.entries[i].1)
     }
-
     pub fn iter_count(&self) -> usize {
         let mut sum: u64 = 0;
         for (_, v) in self.entries.iter() {
@@ -62,31 +53,25 @@ impl SortedArray {
         std::hint::black_box(sum);
         self.entries.len()
     }
-
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 }
-
 // ============================================================================
 // FlatTree (fnode) — pre-order (depth, symbol, ptr) slots, depth-tracking scan
 // ============================================================================
-
 const FT_CAP: usize = 256;
-
 #[derive(Clone, Copy)]
 struct FSlot {
-    depth: u8,
+    depth:  u8,
     symbol: u8,
-    ptr: u8, // 0 = no terminal here; else 1-based index into the interned key table
+    ptr:    u8, // 0 = no terminal here; else 1-based index into the interned key table
 }
-
 pub struct FlatTree {
-    slots: TinyArray<FSlot, FT_CAP>,
-    keys: Vec<Key>,   // interned key table; keys[ptr-1] is the key for slot `ptr`
+    slots:  TinyArray<FSlot, FT_CAP>,
+    keys:   Vec<Key>, // interned key table; keys[ptr-1] is the key for slot `ptr`
     values: Vec<u8>,  // parallel to keys
 }
-
 impl FlatTree {
     /// Batch-build the pre-order micro-trie from lexicographically-sorted keys.
     pub fn build(keys: &[Key], values: &[u8]) -> Self {
@@ -94,11 +79,9 @@ impl FlatTree {
         build_flat(0, 0, keys.len(), keys, &mut slots);
         Self { slots, keys: keys.to_vec(), values: values.to_vec() }
     }
-
     pub fn len(&self) -> usize {
         self.keys.len()
     }
-
     /// Depth-tracking linear scan (the fnode scan from the notes). Walks slots in
     /// pre-order, tracking `depth`; the deepest matched `ptr` is the candidate,
     /// verified by a final full-key comparison.
@@ -142,7 +125,6 @@ impl FlatTree {
         }
         None
     }
-
     /// Pre-order slot order == sorted key order; emit terminals (ptr != 0).
     pub fn iter_count(&self) -> usize {
         let n = self.slots.len();
@@ -159,12 +141,17 @@ impl FlatTree {
         count
     }
 }
-
 /// Recursive pre-order builder. `keys[kstart..kend]` all share `bytes[..depth]` and
 /// each has length `> depth`. Group by `keys[i][depth]`; the shortest key in a group
 /// (length `depth+1`, which sorts first) is the terminal for that slot; the rest are
 /// longer and recurse as children at `depth+1`.
-fn build_flat(depth: usize, kstart: usize, kend: usize, keys: &[Key], slots: &mut TinyArray<FSlot, FT_CAP>) {
+fn build_flat(
+    depth: usize,
+    kstart: usize,
+    kend: usize,
+    keys: &[Key],
+    slots: &mut TinyArray<FSlot, FT_CAP>,
+) {
     let mut i = kstart;
     while i < kend {
         let s = keys[i][depth];
@@ -185,39 +172,32 @@ fn build_flat(depth: usize, kstart: usize, kend: usize, keys: &[Key], slots: &mu
         i = j;
     }
 }
-
 // ============================================================================
 // DecisionTree — pre-order (depth, symbol, next, ptr); next skips the subtree
 // ============================================================================
-
 const DT_CAP: usize = 256;
 const END: u8 = 0xFF; // end-of-chain sentinel (index 255 reserved)
-
 #[derive(Clone, Copy)]
 struct DNode {
-    depth: u8,
+    depth:  u8,
     symbol: u8,
-    next: u8, // index of the next sibling (skips this node's child subtree), or END
-    ptr: u8,  // 0 = no terminal here; else 1-based index into the interned key table
+    next:   u8, // index of the next sibling (skips this node's child subtree), or END
+    ptr:    u8, // 0 = no terminal here; else 1-based index into the interned key table
 }
-
 pub struct DecisionTree {
-    nodes: TinyArray<DNode, DT_CAP>,
-    keys: Vec<Key>,
+    nodes:  TinyArray<DNode, DT_CAP>,
+    keys:   Vec<Key>,
     values: Vec<u8>,
 }
-
 impl DecisionTree {
     pub fn build(keys: &[Key], values: &[u8]) -> Self {
         let mut nodes = TinyArray::new();
         build_dt(0, 0, keys.len(), keys, &mut nodes);
         Self { nodes, keys: keys.to_vec(), values: values.to_vec() }
     }
-
     pub fn len(&self) -> usize {
         self.keys.len()
     }
-
     /// Scan: match → descend to the child at `i+1` (verified deeper); mismatch →
     /// follow `next` to the next sibling (skipping the child subtree). On exhausting
     /// the query at a terminal, do a final full-key check.
@@ -260,7 +240,6 @@ impl DecisionTree {
             }
         }
     }
-
     /// Pre-order node order == sorted key order; emit terminals (ptr != 0).
     pub fn iter_count(&self) -> usize {
         let n = self.nodes.len();
@@ -277,7 +256,6 @@ impl DecisionTree {
         count
     }
 }
-
 /// Recursive pre-order builder. Emits node, then its child subtree, then siblings.
 /// `next` of a node = the index of the next sibling (= index after its subtree) if a
 /// sibling exists, else `END`. Returns the node index right after this group's
@@ -309,16 +287,15 @@ fn build_dt(
         } else {
             node_idx + 1
         };
-        nodes.get_mut(node_idx as usize).next = if j < kend { after_children as u8 } else { END };
+        nodes.get_mut(node_idx as usize).next =
+            if j < kend { after_children as u8 } else { END };
         i = j;
     }
     nodes.len() as u32
 }
-
 // ============================================================================
 // Benchmark harness
 // ============================================================================
-
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
@@ -326,7 +303,6 @@ impl Lcg {
         self.0 >> 32
     }
 }
-
 /// Generate `n` distinct interned keys (length 2 or 3, bytes 0..16 for sharing),
 /// returned lexicographically sorted. Deterministic.
 fn gen_keys(n: usize) -> Vec<Key> {
@@ -347,7 +323,6 @@ fn gen_keys(n: usize) -> Vec<Key> {
     out.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
     out
 }
-
 fn gen_miss(keys: &[Key]) -> Vec<Key> {
     keys.iter()
         .map(|k| {
@@ -358,7 +333,6 @@ fn gen_miss(keys: &[Key]) -> Vec<Key> {
         })
         .collect()
 }
-
 fn perm(n: usize) -> Vec<usize> {
     let mut rng = Lcg(0xD1B54A32D192ED03);
     let mut p: Vec<usize> = (0..n).collect();
@@ -368,13 +342,11 @@ fn perm(n: usize) -> Vec<usize> {
     }
     p
 }
-
 struct Timing {
-    build_ns: f64,
+    build_ns:  f64,
     lookup_ns: f64,
-    iter_ns: f64,
+    iter_ns:   f64,
 }
-
 fn time<F: FnMut()>(iters: u64, mut f: F) -> f64 {
     for _ in 0..iters.min(2048) {
         f();
@@ -385,13 +357,11 @@ fn time<F: FnMut()>(iters: u64, mut f: F) -> f64 {
     }
     start.elapsed().as_nanos() as f64 / iters as f64
 }
-
 fn bench_sorted(keys: &[Key], values: &[u8], order: &[usize]) -> Timing {
     let n = keys.len();
     let build_iters = 200_000 / (n.max(1) as u64);
     let lookup_iters = 2_000_000;
     let iter_iters = 1_000_000;
-
     // Incremental insert in random order (realistic per-key insert cost).
     let build_ns = time(build_iters, || {
         let mut a = SortedArray::new();
@@ -400,12 +370,10 @@ fn bench_sorted(keys: &[Key], values: &[u8], order: &[usize]) -> Timing {
         }
         std::hint::black_box(&a);
     }) / n as f64;
-
     let mut a = SortedArray::new();
     for &i in order {
         a.insert(&keys[i], values[i]);
     }
-
     let miss = gen_miss(keys);
     let lookup_ns = time(lookup_iters, || {
         let mut acc = 0u8;
@@ -415,27 +383,22 @@ fn bench_sorted(keys: &[Key], values: &[u8], order: &[usize]) -> Timing {
         }
         std::hint::black_box(acc);
     }) / (2 * n) as f64;
-
     let iter_ns = time(iter_iters, || {
         a.iter_count();
     }) / n.max(1) as f64;
-
     Timing { build_ns, lookup_ns, iter_ns }
 }
-
 fn bench_flat(keys: &[Key], values: &[u8]) -> Timing {
     let n = keys.len();
     let build_iters = 200_000 / (n.max(1) as u64);
     let lookup_iters = 2_000_000;
     let iter_iters = 1_000_000;
-
     // Time only the slot construction (keys are interned once, outside the loop).
     let build_ns = time(build_iters, || {
         let mut slots = TinyArray::new();
         build_flat(0, 0, n, keys, &mut slots);
         std::hint::black_box(&slots);
     }) / n as f64;
-
     let t = FlatTree::build(keys, values);
     let miss = gen_miss(keys);
     let lookup_ns = time(lookup_iters, || {
@@ -446,26 +409,21 @@ fn bench_flat(keys: &[Key], values: &[u8]) -> Timing {
         }
         std::hint::black_box(acc);
     }) / (2 * n) as f64;
-
     let iter_ns = time(iter_iters, || {
         t.iter_count();
     }) / n.max(1) as f64;
-
     Timing { build_ns, lookup_ns, iter_ns }
 }
-
 fn bench_decision(keys: &[Key], values: &[u8]) -> Timing {
     let n = keys.len();
     let build_iters = 200_000 / (n.max(1) as u64);
     let lookup_iters = 2_000_000;
     let iter_iters = 1_000_000;
-
     let build_ns = time(build_iters, || {
         let mut nodes = TinyArray::new();
         build_dt(0, 0, n, keys, &mut nodes);
         std::hint::black_box(&nodes);
     }) / n as f64;
-
     let t = DecisionTree::build(keys, values);
     let miss = gen_miss(keys);
     let lookup_ns = time(lookup_iters, || {
@@ -476,14 +434,11 @@ fn bench_decision(keys: &[Key], values: &[u8]) -> Timing {
         }
         std::hint::black_box(acc);
     }) / (2 * n) as f64;
-
     let iter_ns = time(iter_iters, || {
         t.iter_count();
     }) / n.max(1) as f64;
-
     Timing { build_ns, lookup_ns, iter_ns }
 }
-
 /// Per-node and per-structure memory footprint.
 fn print_sizes() {
     println!("== memory (size_of, 64-bit) ==");
@@ -508,15 +463,13 @@ fn print_sizes() {
     );
     println!();
 }
-
 pub fn run_benchmarks() {
-    println!("Leaf-node comparison (interned Box<[u8]> keys): SortedArray vs FlatTree vs DecisionTree");
+    println!(
+        "Leaf-node comparison (interned Box<[u8]> keys): SortedArray vs FlatTree vs DecisionTree"
+    );
     println!("Keys len 2-3, bytes 0..16. Times in ns (lower better).\n");
-
     print_sizes();
-
     let sizes: &[(&str, usize)] = &[("16 keys", 16), ("32 keys", 32), ("64 keys", 64)];
-
     for &(label, n) in sizes {
         let keys = gen_keys(n);
         let values: Vec<u8> = (0..n as u8).collect();
@@ -524,18 +477,24 @@ pub fn run_benchmarks() {
         let s = bench_sorted(&keys, &values, &order);
         let f = bench_flat(&keys, &values);
         let d = bench_decision(&keys, &values);
-
         println!("─[ {} ]─────────────────────────────────────", label);
         println!("{:<14} {:>14} {:>14} {:>14}", "structure", "build/key", "lookup", "iter/key");
-        println!("{:<14} {:>14.2} {:>14.2} {:>14.2}", "SortedArray", s.build_ns, s.lookup_ns, s.iter_ns);
-        println!("{:<14} {:>14.2} {:>14.2} {:>14.2}", "FlatTree", f.build_ns, f.lookup_ns, f.iter_ns);
-        println!("{:<14} {:>14.2} {:>14.2} {:>14.2}", "DecisionTree", d.build_ns, d.lookup_ns, d.iter_ns);
+        println!(
+            "{:<14} {:>14.2} {:>14.2} {:>14.2}",
+            "SortedArray", s.build_ns, s.lookup_ns, s.iter_ns
+        );
+        println!(
+            "{:<14} {:>14.2} {:>14.2} {:>14.2}",
+            "FlatTree", f.build_ns, f.lookup_ns, f.iter_ns
+        );
+        println!(
+            "{:<14} {:>14.2} {:>14.2} {:>14.2}",
+            "DecisionTree", d.build_ns, d.lookup_ns, d.iter_ns
+        );
         println!();
     }
-
     correctness_check();
 }
-
 fn correctness_check() {
     // Mixed lengths with a key that is a prefix of another (terminal + children).
     let keys_raw: Vec<&[u8]> = vec![b"ab", b"abc", b"ac", b"ba", b"b", b"abd"];
@@ -543,7 +502,6 @@ fn correctness_check() {
     let mut sorted = keys.clone();
     sorted.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
     let values: Vec<u8> = (0..sorted.len() as u8).collect();
-
     let sa_keys = sorted.clone();
     let mut sa = SortedArray::new();
     for (i, k) in sa_keys.iter().enumerate() {
@@ -551,7 +509,6 @@ fn correctness_check() {
     }
     let ft = FlatTree::build(&sorted, &values);
     let dt = DecisionTree::build(&sorted, &values);
-
     for (i, k) in sorted.iter().enumerate() {
         assert_eq!(sa.get(k), Some(values[i]), "SortedArray miss {:?}", k);
         assert_eq!(ft.get(k), Some(values[i]), "FlatTree miss {:?}", k);
@@ -567,7 +524,6 @@ fn correctness_check() {
     assert_eq!(sa.iter_count(), sorted.len());
     assert_eq!(ft.iter_count(), sorted.len());
     assert_eq!(dt.iter_count(), sorted.len());
-
     // randomized cross-check vs SortedArray over many key sets
     let mut rng = Lcg(0xABCDEF1234567890);
     for _ in 0..200 {
@@ -593,6 +549,7 @@ fn correctness_check() {
         assert_eq!(ft.iter_count(), sa.iter_count());
         assert_eq!(dt.iter_count(), sa.iter_count());
     }
-
-    println!("correctness: OK (hand-crafted prefix/children case + 200 randomized cross-checks vs SortedArray)");
+    println!(
+        "correctness: OK (hand-crafted prefix/children case + 200 randomized cross-checks vs SortedArray)"
+    );
 }

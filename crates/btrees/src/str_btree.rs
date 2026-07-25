@@ -4,18 +4,13 @@
 //! Keys are stored in `KeySlots<N>` — a dense layout where each key's
 //! full bytes are stored contiguously with no padding. The sequential scan
 //! walks through packed bytes with a running offset.
-
-use std::num::{NonZero, ZeroablePrimitive};
-
-use smallvec::SmallVec;
-
-pub use crate::key_slots::LengthType;
 use crate::key_slots::KeySlots;
-
+pub use crate::key_slots::LengthType;
+use smallvec::SmallVec;
+use std::num::{NonZero, ZeroablePrimitive};
 // ---------------------------------------------------------------------------
 // TrieIndex
 // ---------------------------------------------------------------------------
-
 /// Index type for arena-based node pointers.
 pub trait TrieIndex:
     Copy + Clone + Default + PartialEq + Eq + std::fmt::Debug + 'static + ZeroablePrimitive
@@ -24,7 +19,6 @@ pub trait TrieIndex:
     fn max_value() -> usize;
     fn from_usize(n: usize) -> Self;
 }
-
 macro_rules! impl_trie_index {
     ($($ty:ty),* $(,)?) => {
         $(
@@ -36,36 +30,37 @@ macro_rules! impl_trie_index {
         )*
     };
 }
-
 impl_trie_index!(u8, u16, u32, u64);
-
 // ---------------------------------------------------------------------------
 // StrBTreeKey trait
 // ---------------------------------------------------------------------------
-
 /// Trait for variable-length key types that can be stored in a StrBTree.
 pub trait StrBTreeKey: Ord + Clone + 'static {
     type Needle: ?Sized + AsRef<[u8]>;
     fn as_needle(&self) -> &Self::Needle;
     fn into_bytes(self) -> Vec<u8>;
 }
-
 impl StrBTreeKey for Vec<u8> {
     type Needle = [u8];
-    fn as_needle(&self) -> &[u8] { self }
-    fn into_bytes(self) -> Vec<u8> { self }
+    fn as_needle(&self) -> &[u8] {
+        self
+    }
+    fn into_bytes(self) -> Vec<u8> {
+        self
+    }
 }
-
 impl StrBTreeKey for Box<[u8]> {
     type Needle = [u8];
-    fn as_needle(&self) -> &[u8] { self }
-    fn into_bytes(self) -> Vec<u8> { Vec::from(self) }
+    fn as_needle(&self) -> &[u8] {
+        self
+    }
+    fn into_bytes(self) -> Vec<u8> {
+        Vec::from(self)
+    }
 }
-
 // ---------------------------------------------------------------------------
 // Node types
 // ---------------------------------------------------------------------------
-
 struct KeyNode<PTR, L, const N: usize, const NP1: usize>
 where
     PTR: TrieIndex,
@@ -76,7 +71,6 @@ where
     keys: KeySlots<L, N>,
     ptrs: [Option<NonZero<PTR>>; NP1],
 }
-
 struct LeafNode<V, PTR, L, const N: usize>
 where
     PTR: TrieIndex,
@@ -84,16 +78,14 @@ where
     V: Sized,
     [(); N]:,
 {
-    keys: KeySlots<L, N>,
+    keys:   KeySlots<L, N>,
     values: Vec<V>,
-    prev: Option<NonZero<PTR>>,
-    next: Option<NonZero<PTR>>,
+    prev:   Option<NonZero<PTR>>,
+    next:   Option<NonZero<PTR>>,
 }
-
 // ---------------------------------------------------------------------------
 // KeyNode impl
 // ---------------------------------------------------------------------------
-
 #[allow(dead_code)]
 impl<PTR, L, const N: usize, const NP1: usize> KeyNode<PTR, L, N, NP1>
 where
@@ -103,14 +95,9 @@ where
     [(); NP1]:,
 {
     const ASSERT_NP1: () = assert!(NP1 == N + 1, "NP1 must equal N + 1");
-
     fn new() -> Self {
-        Self {
-            keys: KeySlots::new(),
-            ptrs: [None; NP1],
-        }
+        Self { keys: KeySlots::new(), ptrs: [None; NP1] }
     }
-
     fn from_parent(from: usize, to: usize, parent: &Self) -> Self {
         let mut node = Self::new();
         for i in from..to {
@@ -122,55 +109,46 @@ where
         }
         node
     }
-
     #[inline]
     fn get_ptr(&self, i: usize) -> Option<usize> {
         debug_assert!(i <= self.keys.len());
         self.ptrs[i].map(|nz| nz.get().as_usize() - 1)
     }
-
     #[inline]
     unsafe fn get_ptr_unchecked(&self, i: usize) -> Option<usize> {
         self.ptrs[i].map(|nz| nz.get().as_usize() - 1)
     }
-
     #[inline]
     fn set_ptr(&mut self, i: usize, idx: usize) {
         self.ptrs[i] = NonZero::new(PTR::from_usize(idx + 1));
     }
-
     #[inline]
     fn clear_ptr(&mut self, i: usize) {
         self.ptrs[i] = None;
     }
-
     #[inline]
     fn find_position(&self, needle: &[u8]) -> usize {
         self.keys.find_position(needle)
     }
-
     #[inline]
     fn find_child(&self, needle: &[u8]) -> usize {
         self.keys.find_upper_bound(needle)
     }
-
     #[inline]
     fn adjacent_sibling_ptrs(&self, child_pos: usize) -> (Option<usize>, Option<usize>) {
         let left = if child_pos > 0 { self.get_ptr(child_pos - 1) } else { None };
-        let right = if child_pos < self.keys.len() { self.get_ptr(child_pos + 1) } else { None };
+        let right =
+            if child_pos < self.keys.len() { self.get_ptr(child_pos + 1) } else { None };
         (left, right)
     }
-
     #[inline]
     fn would_split(&self) -> bool {
         self.keys.is_full()
     }
-
     #[inline]
     fn would_merge(&self) -> bool {
         self.keys.len() == N / 2
     }
-
     fn insert_key_at(&mut self, pos: usize, key: &[u8]) {
         debug_assert!(!self.would_split());
         let l = self.keys.len();
@@ -181,13 +159,11 @@ where
         }
         self.keys.insert_at(pos, key);
     }
-
     fn insert_leaf(&mut self, needle: &[u8], key: &[u8]) -> usize {
         let pos = self.find_position(needle);
         self.insert_key_at(pos, key);
         pos
     }
-
     fn remove(&mut self, pos: usize) -> Vec<u8> {
         let l = self.keys.len();
         let k = self.keys.remove_at(pos);
@@ -198,17 +174,14 @@ where
         }
         k
     }
-
     #[inline]
     fn truncate(&mut self, newlen: u8) {
         self.keys.truncate(newlen);
     }
 }
-
 // ---------------------------------------------------------------------------
 // LeafNode impl
 // ---------------------------------------------------------------------------
-
 #[allow(dead_code)]
 impl<V, PTR, L, const N: usize> LeafNode<V, PTR, L, N>
 where
@@ -218,71 +191,57 @@ where
     [(); N]:,
 {
     fn new() -> Self {
-        Self {
-            keys: KeySlots::new(),
-            values: Vec::new(),
-            prev: None,
-            next: None,
-        }
+        Self { keys: KeySlots::new(), values: Vec::new(), prev: None, next: None }
     }
-
     #[inline]
     fn get_prev(&self) -> Option<usize> {
         self.prev.map(|nz| nz.get().as_usize() - 1)
     }
-
     #[inline]
     fn get_next(&self) -> Option<usize> {
         self.next.map(|nz| nz.get().as_usize() - 1)
     }
-
     #[inline]
     fn set_prev(&mut self, idx: usize) {
         self.prev = NonZero::new(PTR::from_usize(idx + 1));
     }
-
     #[inline]
     fn set_next(&mut self, idx: usize) {
         self.next = NonZero::new(PTR::from_usize(idx + 1));
     }
-
     #[inline]
-    fn clear_prev(&mut self) { self.prev = None; }
-
+    fn clear_prev(&mut self) {
+        self.prev = None;
+    }
     #[inline]
-    fn clear_next(&mut self) { self.next = None; }
-
+    fn clear_next(&mut self) {
+        self.next = None;
+    }
     #[inline]
     fn find_position(&self, needle: &[u8]) -> usize {
         self.keys.find_position(needle)
     }
-
     #[inline]
     fn would_split(&self) -> bool {
         self.keys.is_full()
     }
-
     fn insert(&mut self, pos: usize, key: &[u8], value: V) {
         self.keys.insert_at(pos, key);
         self.values.insert(pos, value);
     }
-
     fn remove(&mut self, pos: usize) -> (Vec<u8>, V) {
         let k = self.keys.remove_at(pos);
         let v = self.values.remove(pos);
         (k, v)
     }
-
     fn truncate(&mut self, newlen: u8) {
         self.keys.truncate(newlen);
         self.values.truncate(newlen as usize);
     }
 }
-
 // ---------------------------------------------------------------------------
 // Cursor navigation macro (reduces duplication between Cursor and CursorMut)
 // ---------------------------------------------------------------------------
-
 /// Generates `next()` and `prev()` methods for cursor types.
 /// Pass `&` for Cursor (returns `&V`) or `& mut` for CursorMut (returns `&mut V`).
 macro_rules! impl_cursor_nav {
@@ -316,11 +275,9 @@ macro_rules! impl_cursor_nav {
         }
     };
 }
-
 // ---------------------------------------------------------------------------
 // two_mut
 // ---------------------------------------------------------------------------
-
 #[inline]
 fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
     debug_assert_ne!(a, b, "two_mut: indices must differ");
@@ -332,11 +289,9 @@ fn two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
         (&mut right[0], &mut left[b])
     }
 }
-
 // ---------------------------------------------------------------------------
 // StrBTree
 // ---------------------------------------------------------------------------
-
 /// B+ tree for variable-length byte keys using packed key storage.
 pub struct StrBTree<K, V, PTR, L, const N: usize, const NP1: usize>
 where
@@ -347,18 +302,16 @@ where
     [(); N]:,
     [(); NP1]:,
 {
-    inodes: Vec<KeyNode<PTR, L, N, NP1>>,
-    leaves: Vec<LeafNode<V, PTR, L, N>>,
-    len: usize,
-    n_leaves: usize,
-    height: usize,
+    inodes:     Vec<KeyNode<PTR, L, N, NP1>>,
+    leaves:     Vec<LeafNode<V, PTR, L, N>>,
+    len:        usize,
+    n_leaves:   usize,
+    height:     usize,
     root_inode: usize,
-    _phantom: std::marker::PhantomData<K>,
+    _phantom:   std::marker::PhantomData<K>,
 }
-
 #[allow(dead_code)]
-impl<K, V, PTR, L, const N: usize, const NP1: usize>
-    StrBTree<K, V, PTR, L, N, NP1>
+impl<K, V, PTR, L, const N: usize, const NP1: usize> StrBTree<K, V, PTR, L, N, NP1>
 where
     K: StrBTreeKey,
     PTR: TrieIndex,
@@ -369,39 +322,37 @@ where
 {
     const ASSERT_N_FITS: () = assert!(N <= 255, "N must be at most 255");
     const ASSERT_NP1: () = assert!(NP1 == N + 1, "NP1 must equal N + 1");
-
     #[inline]
     fn rebalance_target(s: usize) -> usize {
         (N + s) / 2
     }
-
     pub fn new() -> Self {
         let () = Self::ASSERT_NP1;
         let () = Self::ASSERT_N_FITS;
         let root = LeafNode::<V, PTR, L, N>::new();
         Self {
-            inodes: Vec::new(),
-            leaves: vec![root],
-            len: 0,
-            n_leaves: 1,
-            height: 0,
+            inodes:     Vec::new(),
+            leaves:     vec![root],
+            len:        0,
+            n_leaves:   1,
+            height:     0,
             root_inode: 0,
-            _phantom: std::marker::PhantomData,
+            _phantom:   std::marker::PhantomData,
         }
     }
-
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
-
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
     pub fn compact(&mut self) {
         self.relocate(false);
         self.inodes.shrink_to_fit();
     }
-
     pub fn optimize(&mut self) {
         self.relocate(false);
     }
-
     fn relocate(&mut self, gapful: bool) -> Vec<usize> {
         let old_len = self.leaves.len();
         let mut order: Vec<usize> = Vec::with_capacity(self.n_leaves);
@@ -413,14 +364,12 @@ where
         }
         let live = order.len();
         debug_assert_eq!(live, self.n_leaves);
-
         let slot_of = |rank: usize| if gapful { 2 * rank } else { rank };
         let new_slots = slot_of(live);
         let mut new_pos = vec![usize::MAX; old_len];
         for rank in 0..live {
             new_pos[order[rank]] = slot_of(rank);
         }
-
         let mut old = std::mem::take(&mut self.leaves);
         let mut buf: Vec<LeafNode<V, PTR, L, N>> = Vec::with_capacity(new_slots);
         for i in 0..new_slots {
@@ -435,15 +384,19 @@ where
             }
         }
         drop(old);
-
         for rank in 0..live {
             let i = slot_of(rank);
-            if rank > 0 { buf[i].set_prev(slot_of(rank - 1)); }
-            else { buf[i].clear_prev(); }
-            if rank + 1 < live { buf[i].set_next(slot_of(rank + 1)); }
-            else { buf[i].clear_next(); }
+            if rank > 0 {
+                buf[i].set_prev(slot_of(rank - 1));
+            } else {
+                buf[i].clear_prev();
+            }
+            if rank + 1 < live {
+                buf[i].set_next(slot_of(rank + 1));
+            } else {
+                buf[i].clear_next();
+            }
         }
-
         if self.height >= 1 {
             let mut level: Vec<usize> = vec![self.root_inode];
             for _ in 0..self.height - 1 {
@@ -451,7 +404,9 @@ where
                 for &ni in &level {
                     let node = &self.inodes[ni];
                     for ci in 0..=node.keys.len() {
-                        if let Some(c) = node.get_ptr(ci) { next.push(c); }
+                        if let Some(c) = node.get_ptr(ci) {
+                            next.push(c);
+                        }
                     }
                 }
                 level = next;
@@ -466,35 +421,38 @@ where
                 }
             }
         }
-
         self.leaves = buf;
         self.n_leaves = live;
         new_pos
     }
-
-    fn spread(&mut self) -> Vec<usize> { self.relocate(true) }
-
+    fn spread(&mut self) -> Vec<usize> {
+        self.relocate(true)
+    }
     fn claim_slot(&self, after: usize) -> usize {
         let n = self.leaves.len();
         let mut i = after + 1;
         while i < n {
-            if self.leaves[i].keys.len() == 0 { return i; }
+            if self.leaves[i].keys.len() == 0 {
+                return i;
+            }
             i += 1;
         }
         for i in 0..after {
-            if self.leaves[i].keys.len() == 0 { return i; }
+            if self.leaves[i].keys.len() == 0 {
+                return i;
+            }
         }
         unreachable!("claim_slot: no free gap")
     }
-
     /// Maximum depth for recursive rebalance cascading.
     /// When a node is full and its immediate sibling is also full,
     /// we recursively try to make room in the sibling by rebalancing
     /// it with its own sibling in the same direction, up to this depth.
     const REBALANCE_DEPTH: usize = 3;
-
     fn walk_to_leaf(&mut self, needle: &[u8]) -> (usize, SmallVec<[(usize, usize); 8]>) {
-        if self.height == 0 { return (0, SmallVec::new()); }
+        if self.height == 0 {
+            return (0, SmallVec::new());
+        }
         let mut path = SmallVec::new();
         let mut node_idx: usize = self.root_inode;
         for _ in 0..self.height - 1 {
@@ -522,10 +480,11 @@ where
         path.push((node_idx, child));
         (leaf_idx, path)
     }
-
     #[inline]
     fn find_leaf(&self, needle: &[u8]) -> usize {
-        if self.height == 0 { return 0; }
+        if self.height == 0 {
+            return 0;
+        }
         let mut node_idx: usize = self.root_inode;
         for _ in 0..self.height - 1 {
             let child = self.inodes[node_idx].find_child(needle);
@@ -535,30 +494,31 @@ where
         let child = bottom.find_child(needle);
         bottom.get_ptr(child).unwrap()
     }
-
     #[inline]
     fn leaf_has_room_for_two(&self, idx: usize) -> bool {
         self.leaves[idx].keys.len() + 2 <= N
     }
-
     #[inline]
     fn inode_has_room_for_two(&self, idx: usize) -> bool {
         self.inodes[idx].keys.len() + 2 <= N
     }
-
     /// Try to rebalance a full leaf by redistributing keys to a sibling.
     /// If the immediate sibling is also full, recursively try to make room
     /// in it by rebalancing *it* with its own sibling in the same direction,
     /// up to `depth` levels deep. Left keeps checking left; right keeps
     /// checking right — never rebalancing back toward the source node.
-    fn try_rebalance_leaf(&mut self, parent_idx: usize, child_pos: usize, depth: usize) -> bool {
+    fn try_rebalance_leaf(
+        &mut self,
+        parent_idx: usize,
+        child_pos: usize,
+        depth: usize,
+    ) -> bool {
         let leaf_idx = self.inodes[parent_idx].get_ptr(child_pos).unwrap();
         let parent = &self.inodes[parent_idx];
         let left_pos = if child_pos > 0 { Some(child_pos - 1) } else { None };
         let right_pos = if child_pos < parent.keys.len() { Some(child_pos + 1) } else { None };
         let left_idx = left_pos.and_then(|p| parent.get_ptr(p));
         let right_idx = right_pos.and_then(|p| parent.get_ptr(p));
-
         // Decide which direction to try first (prefer the less-full sibling)
         let try_right_first = match (left_idx, right_idx) {
             (Some(l), Some(r)) => self.leaves[r].keys.len() <= self.leaves[l].keys.len(),
@@ -566,18 +526,15 @@ where
             (Some(_), None) => false,
             (None, None) => return false,
         };
-
         // Try directions in priority order
         let directions: [(Option<usize>, Option<usize>, bool); 2] = if try_right_first {
             [(right_idx, right_pos, true), (left_idx, left_pos, false)]
         } else {
             [(left_idx, left_pos, false), (right_idx, right_pos, true)]
         };
-
         for (sib_idx, sib_pos, go_right) in directions {
             let Some(sib_idx) = sib_idx else { continue };
             let Some(sib_pos) = sib_pos else { continue };
-
             if self.leaf_has_room_for_two(sib_idx) {
                 self.redistribute_leaf_dir(parent_idx, child_pos, leaf_idx, sib_idx, go_right);
                 return true;
@@ -586,19 +543,23 @@ where
             if depth > 0 && self.try_rebalance_leaf(parent_idx, sib_pos, depth - 1) {
                 // Sibling may now have room
                 if self.leaf_has_room_for_two(sib_idx) {
-                    self.redistribute_leaf_dir(parent_idx, child_pos, leaf_idx, sib_idx, go_right);
+                    self.redistribute_leaf_dir(
+                        parent_idx, child_pos, leaf_idx, sib_idx, go_right,
+                    );
                     return true;
                 }
             }
         }
-
         false
     }
-
     /// Dispatch to redistribute_leaf_left or redistribute_leaf_right.
     fn redistribute_leaf_dir(
-        &mut self, parent_idx: usize, child_pos: usize,
-        leaf_idx: usize, sib_idx: usize, go_right: bool,
+        &mut self,
+        parent_idx: usize,
+        child_pos: usize,
+        leaf_idx: usize,
+        sib_idx: usize,
+        go_right: bool,
     ) {
         if go_right {
             self.redistribute_leaf_right(parent_idx, child_pos, leaf_idx, sib_idx);
@@ -606,53 +567,61 @@ where
             self.redistribute_leaf_left(parent_idx, child_pos, leaf_idx, sib_idx);
         }
     }
-
     /// Try to rebalance a full inode by redistributing keys to a sibling.
     /// Same recursive cascading logic as try_rebalance_leaf.
-    fn try_rebalance_inode(&mut self, gparent_idx: usize, child_pos: usize, depth: usize) -> bool {
+    fn try_rebalance_inode(
+        &mut self,
+        gparent_idx: usize,
+        child_pos: usize,
+        depth: usize,
+    ) -> bool {
         let l_idx = self.inodes[gparent_idx].get_ptr(child_pos).unwrap();
         let parent = &self.inodes[gparent_idx];
         let left_pos = if child_pos > 0 { Some(child_pos - 1) } else { None };
         let right_pos = if child_pos < parent.keys.len() { Some(child_pos + 1) } else { None };
         let left_idx = left_pos.and_then(|p| parent.get_ptr(p));
         let right_idx = right_pos.and_then(|p| parent.get_ptr(p));
-
         let try_right_first = match (left_idx, right_idx) {
             (Some(l), Some(r)) => self.inodes[r].keys.len() <= self.inodes[l].keys.len(),
             (None, Some(_)) => true,
             (Some(_), None) => false,
             (None, None) => return false,
         };
-
         let directions: [(Option<usize>, Option<usize>, bool); 2] = if try_right_first {
             [(right_idx, right_pos, true), (left_idx, left_pos, false)]
         } else {
             [(left_idx, left_pos, false), (right_idx, right_pos, true)]
         };
-
         for (sib_idx, sib_pos, go_right) in directions {
             let Some(sib_idx) = sib_idx else { continue };
             let Some(sib_pos) = sib_pos else { continue };
-
             if self.inode_has_room_for_two(sib_idx) {
                 self.redistribute_inode_dir(gparent_idx, child_pos, l_idx, sib_idx, go_right);
                 return true;
             }
             if depth > 0 && self.try_rebalance_inode(gparent_idx, sib_pos, depth - 1) {
                 if self.inode_has_room_for_two(sib_idx) {
-                    self.redistribute_inode_dir(gparent_idx, child_pos, l_idx, sib_idx, go_right);
+                    self.redistribute_inode_dir(
+                        gparent_idx,
+                        child_pos,
+                        l_idx,
+                        sib_idx,
+                        go_right,
+                    );
                     return true;
                 }
             }
         }
-
         false
     }
-
     /// Dispatch to redistribute_inode_left or redistribute_inode_right.
     fn redistribute_inode_dir(
-        &mut self, gparent_idx: usize, child_pos: usize,
-        l_idx: usize, sib_idx: usize, go_right: bool,
+        &mut self,
+        gparent_idx: usize,
+        child_pos: usize,
+        l_idx: usize,
+        sib_idx: usize,
+        go_right: bool,
     ) {
         if go_right {
             self.redistribute_inode_right(gparent_idx, child_pos, l_idx, sib_idx);
@@ -660,14 +629,16 @@ where
             self.redistribute_inode_left(gparent_idx, child_pos, l_idx, sib_idx);
         }
     }
-
     /// Move keys from the full node to its right sibling.
     /// Separator in parent is at `child_pos`.
     /// Mirror of `redistribute_leaf_left` (which moves to the left sibling,
     /// separator at `child_pos - 1`).
     fn redistribute_leaf_right(
-        &mut self, parent_idx: usize, child_pos: usize,
-        leaf_idx: usize, sib_idx: usize,
+        &mut self,
+        parent_idx: usize,
+        child_pos: usize,
+        leaf_idx: usize,
+        sib_idx: usize,
     ) {
         let s = self.leaves[sib_idx].keys.len();
         let l_target = Self::rebalance_target(s);
@@ -681,14 +652,16 @@ where
         let new_sep = self.leaves[sib_idx].keys.key_slice(0);
         self.inodes[parent_idx].keys.update_at(child_pos, new_sep);
     }
-
     /// Move keys from the full node to its left sibling.
     /// Separator in parent is at `child_pos - 1`.
     /// Mirror of `redistribute_leaf_right` (which moves to the right sibling,
     /// separator at `child_pos`).
     fn redistribute_leaf_left(
-        &mut self, parent_idx: usize, child_pos: usize,
-        leaf_idx: usize, sib_idx: usize,
+        &mut self,
+        parent_idx: usize,
+        child_pos: usize,
+        leaf_idx: usize,
+        sib_idx: usize,
     ) {
         let s = self.leaves[sib_idx].keys.len();
         let l_target = Self::rebalance_target(s);
@@ -703,10 +676,12 @@ where
         let new_sep = self.leaves[leaf_idx].keys.key_slice(0);
         self.inodes[parent_idx].keys.update_at(child_pos - 1, new_sep);
     }
-
     fn redistribute_inode_right(
-        &mut self, gparent_idx: usize, child_pos: usize,
-        l_idx: usize, r_idx: usize,
+        &mut self,
+        gparent_idx: usize,
+        child_pos: usize,
+        l_idx: usize,
+        r_idx: usize,
     ) {
         let (s, sep0) = {
             let g = &self.inodes[gparent_idx];
@@ -714,7 +689,6 @@ where
         };
         let l_target = Self::rebalance_target(s);
         let m = N - l_target;
-
         let new_sep = {
             let (l, r) = two_mut(&mut self.inodes, l_idx, r_idx);
             r.ptrs.copy_within(0..=s, m);
@@ -729,10 +703,12 @@ where
         };
         self.inodes[gparent_idx].keys.update_at(child_pos, &new_sep);
     }
-
     fn redistribute_inode_left(
-        &mut self, gparent_idx: usize, child_pos: usize,
-        l_idx: usize, sib_idx: usize,
+        &mut self,
+        gparent_idx: usize,
+        child_pos: usize,
+        l_idx: usize,
+        sib_idx: usize,
     ) {
         let (s, sep0) = {
             let g = &self.inodes[gparent_idx];
@@ -740,7 +716,6 @@ where
         };
         let l_target = Self::rebalance_target(s);
         let m = N - l_target;
-
         let new_sep = {
             let (l, sib) = two_mut(&mut self.inodes, l_idx, sib_idx);
             for i in 0..m {
@@ -761,23 +736,22 @@ where
         }
         self.inodes[gparent_idx].keys.update_at(child_pos - 1, &new_sep);
     }
-
     #[inline]
     fn locate_with_offset(&self, needle: &[u8]) -> (usize, usize, usize) {
         let leaf_idx = self.find_leaf(needle);
         let (pos, off) = self.leaves[leaf_idx].keys.find_position_with_offset(needle);
         (leaf_idx, pos, off)
     }
-
     #[inline]
     fn locate(&self, needle: &[u8]) -> (usize, usize) {
         let (leaf_idx, pos, _) = self.locate_with_offset(needle);
         (leaf_idx, pos)
     }
-
     #[inline]
     pub fn get(&self, key: &K::Needle) -> Option<&V> {
-        if self.leaves.is_empty() { return None; }
+        if self.leaves.is_empty() {
+            return None;
+        }
         let needle = key.as_ref();
         let (leaf_idx, pos, off) = self.locate_with_offset(needle);
         let leaf = &self.leaves[leaf_idx];
@@ -788,10 +762,11 @@ where
         }
         None
     }
-
     #[inline]
     pub fn get_mut(&mut self, key: &K::Needle) -> Option<&mut V> {
-        if self.leaves.is_empty() { return None; }
+        if self.leaves.is_empty() {
+            return None;
+        }
         let needle = key.as_ref();
         let (leaf_idx, pos, off) = self.locate_with_offset(needle);
         if pos < self.leaves[leaf_idx].keys.len() {
@@ -801,27 +776,22 @@ where
         }
         None
     }
-
     pub fn insert(&mut self, key: K, value: V) -> Result<(), (K, V)> {
         let _ = Self::ASSERT_N_FITS;
         let needle = key.as_needle();
         let needle_bytes = needle.as_ref();
         let (child_idx, path) = self.walk_to_leaf(needle_bytes);
         let (pos, off) = self.leaves[child_idx].keys.find_position_with_offset(needle_bytes);
-
         // Key already exists?
         if pos < self.leaves[child_idx].keys.len()
             && self.leaves[child_idx].keys.eq_key_with_offset(pos, off, needle_bytes)
         {
             return Err((key, value));
         }
-
         if needle_bytes.len() > <L as LengthType>::max() {
             return Err((key, value));
         }
-
         let key_bytes = key.into_bytes();
-
         if self.leaves[child_idx].keys.len() >= N {
             let mid = N / 2;
             let (parent_idx, new_leaf_idx) = self.split_leaf(child_idx, path);
@@ -833,22 +803,22 @@ where
         } else {
             self.leaves[child_idx].insert(pos, &key_bytes, value);
         }
-
         self.len += 1;
         Ok(())
     }
-
-    fn split_leaf(&mut self, child_idx: usize, mut path: SmallVec<[(usize, usize); 8]>) -> (usize, usize) {
+    fn split_leaf(
+        &mut self,
+        child_idx: usize,
+        mut path: SmallVec<[(usize, usize); 8]>,
+    ) -> (usize, usize) {
         let mid = N / 2;
         let mid_key = self.leaves[child_idx].keys.get_key(mid);
-
         let child_idx = if self.n_leaves == self.leaves.len() {
             let map = self.spread();
             map[child_idx]
         } else {
             child_idx
         };
-
         let old_next = self.leaves[child_idx].get_next();
         let drain_bytes = self.leaves[child_idx].keys.packed_len()
             - self.leaves[child_idx].keys.packed_offset_up_to(mid);
@@ -857,22 +827,26 @@ where
         self.leaves[child_idx].keys.drain_into(mid, &mut new_leaf.keys);
         let drained_values = self.leaves[child_idx].values.split_off(mid);
         new_leaf.values = drained_values;
-
         let new_leaf_idx = self.claim_slot(child_idx);
         new_leaf.set_prev(child_idx);
-        if let Some(ni) = old_next { new_leaf.set_next(ni); }
+        if let Some(ni) = old_next {
+            new_leaf.set_next(ni);
+        }
         self.leaves[child_idx].set_next(new_leaf_idx);
         self.leaves[new_leaf_idx] = new_leaf;
         if let Some(next_idx) = old_next {
             self.leaves[next_idx].set_prev(new_leaf_idx);
         }
-
         self.n_leaves += 1;
         self.insert_separator(&mid_key, new_leaf_idx, &mut path);
         (child_idx, new_leaf_idx)
     }
-
-    fn insert_separator(&mut self, stored: &[u8], new_child_idx: usize, path: &mut SmallVec<[(usize, usize); 8]>) {
+    fn insert_separator(
+        &mut self,
+        stored: &[u8],
+        new_child_idx: usize,
+        path: &mut SmallVec<[(usize, usize); 8]>,
+    ) {
         if path.is_empty() {
             let old_root_idx = self.root_inode;
             let mut root = KeyNode::<PTR, L, N, NP1>::new();
@@ -885,9 +859,7 @@ where
             self.height += 1;
             return;
         }
-
         let (parent_idx, _) = path.pop().unwrap();
-
         if !self.inodes[parent_idx].would_split() {
             let pos = self.find_position_for_stored(&stored, &self.inodes[parent_idx].keys);
             self.inodes[parent_idx].insert_key_at(pos, &stored);
@@ -896,7 +868,6 @@ where
             self.split_inode(parent_idx, stored, new_child_idx, path);
         }
     }
-
     fn split_inode(
         &mut self,
         parent_idx: usize,
@@ -907,7 +878,6 @@ where
         let mid = N / 2;
         let mid_stored = self.inodes[parent_idx].keys.get_key(mid);
         let old_len = self.inodes[parent_idx].keys.len();
-
         let mut new_inode = KeyNode::<PTR, L, N, NP1>::new();
         // Move keys [mid+1..old_len) to new inode.
         if mid + 1 < old_len {
@@ -926,7 +896,6 @@ where
         for i in (mid + 1)..=old_len {
             self.inodes[parent_idx].ptrs[i] = None;
         }
-
         // Insert the new key/child into the appropriate inode.
         // Compare against the separator key that was removed — if new_stored
         // is >= the separator, it goes into the right (new) inode.
@@ -940,12 +909,10 @@ where
             self.inodes[parent_idx].insert_key_at(pos, &new_stored);
             self.inodes[parent_idx].set_ptr(pos + 1, new_child_idx);
         }
-
         let new_inode_idx = self.inodes.len();
         self.inodes.push(new_inode);
         self.insert_separator(&mid_stored, new_inode_idx, path);
     }
-
     fn find_position_for_stored(&self, stored: &[u8], keys: &KeySlots<L, N>) -> usize {
         for i in 0..keys.len() {
             let key = keys.key_slice(i);
@@ -955,9 +922,10 @@ where
         }
         keys.len()
     }
-
     fn descend_to_leaf(&self, rightmost: bool) -> usize {
-        if self.height == 0 { return 0; }
+        if self.height == 0 {
+            return 0;
+        }
         let mut node_idx: usize = self.root_inode;
         for _ in 0..self.height - 1 {
             let ci = if rightmost { self.inodes[node_idx].keys.len() } else { 0 };
@@ -966,31 +934,29 @@ where
         let ci = if rightmost { self.inodes[node_idx].keys.len() } else { 0 };
         self.inodes[node_idx].get_ptr(ci).unwrap()
     }
-
-    fn first_leaf(&self) -> usize { self.descend_to_leaf(false) }
-    fn last_leaf(&self) -> usize { self.descend_to_leaf(true) }
-
+    fn first_leaf(&self) -> usize {
+        self.descend_to_leaf(false)
+    }
+    fn last_leaf(&self) -> usize {
+        self.descend_to_leaf(true)
+    }
     pub fn get_cursor(&self) -> Cursor<'_, K, V, PTR, L, N, NP1> {
         let leaf_idx = self.first_leaf();
         Cursor { tree: self, leaf_idx, position: 0, packed_off: 0 }
     }
-
     pub fn get_cursor_mut(&mut self) -> CursorMut<'_, K, V, PTR, L, N, NP1> {
         let leaf_idx = self.first_leaf();
         CursorMut { tree: self, leaf_idx, position: 0, packed_off: 0 }
     }
-
     pub fn cursor_at(&self, key: &K::Needle) -> Cursor<'_, K, V, PTR, L, N, NP1> {
         let needle = key.as_ref();
         let (leaf_idx, pos, packed_off) = self.locate_with_offset(needle);
         Cursor { tree: self, leaf_idx, position: pos, packed_off }
     }
 }
-
 // ---------------------------------------------------------------------------
 // Cursor impl
 // ---------------------------------------------------------------------------
-
 pub struct Cursor<'a, K, V, PTR, L, const N: usize, const NP1: usize>
 where
     K: StrBTreeKey,
@@ -1000,13 +966,12 @@ where
     [(); N]:,
     [(); NP1]:,
 {
-    tree: &'a StrBTree<K, V, PTR, L, N, NP1>,
-    leaf_idx: usize,
-    position: usize,
+    tree:       &'a StrBTree<K, V, PTR, L, N, NP1>,
+    leaf_idx:   usize,
+    position:   usize,
     /// Cached byte offset into the leaf's packed key buffer.
     packed_off: usize,
 }
-
 pub struct CursorMut<'a, K, V, PTR, L, const N: usize, const NP1: usize>
 where
     K: StrBTreeKey,
@@ -1016,15 +981,13 @@ where
     [(); N]:,
     [(); NP1]:,
 {
-    tree: &'a mut StrBTree<K, V, PTR, L, N, NP1>,
-    leaf_idx: usize,
-    position: usize,
+    tree:       &'a mut StrBTree<K, V, PTR, L, N, NP1>,
+    leaf_idx:   usize,
+    position:   usize,
     packed_off: usize,
 }
-
 #[allow(dead_code)]
-impl<'a, K, V, PTR, L, const N: usize, const NP1: usize>
-    Cursor<'a, K, V, PTR, L, N, NP1>
+impl<'a, K, V, PTR, L, const N: usize, const NP1: usize> Cursor<'a, K, V, PTR, L, N, NP1>
 where
     K: StrBTreeKey,
     PTR: TrieIndex,
@@ -1042,13 +1005,10 @@ where
             None
         }
     }
-
     impl_cursor_nav!(&);
 }
-
 #[allow(dead_code)]
-impl<'a, K, V, PTR, L, const N: usize, const NP1: usize>
-    CursorMut<'a, K, V, PTR, L, N, NP1>
+impl<'a, K, V, PTR, L, const N: usize, const NP1: usize> CursorMut<'a, K, V, PTR, L, N, NP1>
 where
     K: StrBTreeKey,
     PTR: TrieIndex,
@@ -1069,18 +1029,14 @@ where
             None
         }
     }
-
     impl_cursor_nav!(& mut);
 }
-
 // ---------------------------------------------------------------------------
 // Instantiation alias
 // ---------------------------------------------------------------------------
-
 /// Variable-length-key B+ tree with packed key storage.
 pub type StrBTreeMap<K, V, PTR, L, const N: usize, const NP1: usize> =
     StrBTree<K, V, PTR, L, N, NP1>;
-
 #[cfg(test)]
 #[path = "tests/str_btree.rs"]
 mod tests;

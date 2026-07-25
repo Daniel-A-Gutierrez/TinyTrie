@@ -1,19 +1,16 @@
 use super::*;
-
 #[test]
 fn node_size_default() {
     // Default PTR=u32, LEN=u16: 64 children + 2 prefix_len + 2 leaf_mask
     // + 4 leaf + 1 terminal + 3 padding = 76 bytes
     assert_eq!(std::mem::size_of::<Node<u32, u16>>(), 76);
 }
-
 #[test]
 fn node_size_compact() {
     // Compact PTR=u16, LEN=u16: 32 children + 2 prefix_len + 2 leaf_mask
     // + 2 leaf + 1 terminal + 1 padding = 40 bytes
     assert_eq!(std::mem::size_of::<Node<u16, u16>>(), 40);
 }
-
 #[test]
 fn insert_empty_and_get() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -21,7 +18,6 @@ fn insert_empty_and_get() {
     assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.get(b"world"), None);
 }
-
 #[test]
 fn insert_duplicate_returns_error() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -30,7 +26,6 @@ fn insert_duplicate_returns_error() {
     assert_eq!(result, Err(()));
     assert_eq!(trie.len(), 1);
 }
-
 #[test]
 fn insert_null_byte_allowed() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -38,7 +33,6 @@ fn insert_null_byte_allowed() {
     trie.insert(b"hel\0lo".to_vec(), 1).unwrap();
     assert_eq!(trie.get(b"hel\0lo"), Some(&1));
 }
-
 #[test]
 fn insert_two_keys_split_leaf() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -48,7 +42,6 @@ fn insert_two_keys_split_leaf() {
     assert_eq!(trie.get(b"abd"), Some(&2));
     assert_eq!(trie.len(), 2);
 }
-
 #[test]
 fn insert_prefix_key() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -57,7 +50,6 @@ fn insert_prefix_key() {
     assert_eq!(trie.get(b"abc"), Some(&1));
     assert_eq!(trie.get(b"abcd"), Some(&2));
 }
-
 #[test]
 fn insert_reverse_prefix_key() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -70,7 +62,6 @@ fn insert_reverse_prefix_key() {
     assert_eq!(trie.get(b"abc"), Some(&2));
     assert_eq!(trie.len(), 2);
 }
-
 #[test]
 fn insert_no_common_prefix() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -79,7 +70,6 @@ fn insert_no_common_prefix() {
     assert_eq!(trie.get(b"abc"), Some(&1));
     assert_eq!(trie.get(b"xyz"), Some(&2));
 }
-
 #[test]
 fn insert_three_keys() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -90,7 +80,6 @@ fn insert_three_keys() {
     assert_eq!(trie.get(b"abd"), Some(&2));
     assert_eq!(trie.get(b"abe"), Some(&3));
 }
-
 #[test]
 fn insert_single_char_keys() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -103,7 +92,6 @@ fn insert_single_char_keys() {
         assert_eq!(trie.get(&key), Some(&v));
     }
 }
-
 #[test]
 fn insert_many_keys_same_prefix() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -116,7 +104,6 @@ fn insert_many_keys_same_prefix() {
         assert!(trie.get(key.as_bytes()).is_some());
     }
 }
-
 #[test]
 fn insert_deeply_nested() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -127,7 +114,6 @@ fn insert_deeply_nested() {
         assert_eq!(trie.get(&key), Some(&i));
     }
 }
-
 #[test]
 fn len_and_is_empty() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -137,7 +123,6 @@ fn len_and_is_empty() {
     assert!(!trie.is_empty());
     assert_eq!(trie.len(), 1);
 }
-
 #[test]
 fn into_keys_values_roundtrip() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -147,14 +132,12 @@ fn into_keys_values_roundtrip() {
     assert_eq!(keys, vec![b"abc".to_vec(), b"def".to_vec()]);
     assert_eq!(values, vec![1, 2]);
 }
-
 #[test]
 fn iter_empty() {
     let trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut iter = trie.iter();
     assert!(iter.next().is_none());
 }
-
 #[test]
 fn iter_single_key() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -165,14 +148,12 @@ fn iter_single_key() {
     assert_eq!(*v, 42);
     assert!(iter.next().is_none());
 }
-
 #[test]
 fn iter_forward() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut results = Vec::new();
     let mut iter = trie.iter();
     while let Some((k, _)) = iter.next() {
@@ -180,14 +161,12 @@ fn iter_forward() {
     }
     assert_eq!(results, vec![b"abc", b"abd", b"abe"]);
 }
-
 #[test]
 fn iter_backward() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut iter = trie.iter_last();
     let mut results = Vec::new();
     loop {
@@ -201,49 +180,41 @@ fn iter_backward() {
     }
     assert_eq!(results, vec![b"abe", b"abd", b"abc"]);
 }
-
 #[test]
 fn iter_seek_exact() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut iter = trie.iter();
     let (k, _) = iter.seek(b"abd").unwrap();
     assert_eq!(k, b"abd");
 }
-
 #[test]
 fn iter_seek_between() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     // Seek to exact key "abd" works
     let mut iter = trie.iter();
     let (k, _) = iter.seek(b"abd").unwrap();
     assert_eq!(k, b"abd");
-
     // Seek to key between "abc" and "abd" should return "abd"
     let mut iter2 = trie.iter();
     let result = iter2.seek(b"abc\x7f");
     assert!(result.is_some(), "seek to 'abc\\x7f' returned None");
     assert_eq!(result.unwrap().0, b"abd");
 }
-
 #[test]
 fn iter_seek_prefix_key() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abcd".to_vec(), 2).unwrap();
-
     let mut iter = trie.iter();
     let (k, _) = iter.seek(b"abc").unwrap();
     assert_eq!(k, b"abc");
 }
-
 #[test]
 fn get_found_and_missing() {
     let mut trie: NibbleTrie<Vec<u8>, String> = NibbleTrie::new();
@@ -251,7 +222,6 @@ fn get_found_and_missing() {
     assert_eq!(trie.get(b"hello"), Some(&"world".to_string()));
     assert_eq!(trie.get(b"world"), None);
 }
-
 #[test]
 fn iter_backward_large() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -259,7 +229,6 @@ fn iter_backward_large() {
         let key = format!("key_{:03}", i);
         trie.insert(key.into_bytes(), i).unwrap();
     }
-
     let mut iter = trie.iter_last();
     let mut count = 0;
     let mut last_key: Vec<u8> = Vec::new();
@@ -268,14 +237,17 @@ fn iter_backward_large() {
         count += 1;
     }
     while let Some((k, _)) = iter.prev() {
-        assert!(k < &last_key[..], "not descending: {:?} >= {:?}",
-            String::from_utf8_lossy(k), String::from_utf8_lossy(&last_key));
+        assert!(
+            k < &last_key[..],
+            "not descending: {:?} >= {:?}",
+            String::from_utf8_lossy(k),
+            String::from_utf8_lossy(&last_key)
+        );
         last_key = k.to_vec();
         count += 1;
     }
     assert_eq!(count, 100);
 }
-
 #[test]
 fn leaf_and_offset_set_on_creation() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -289,16 +261,13 @@ fn leaf_and_offset_set_on_creation() {
     assert_ne!(off, 0, "root offset should be set");
     assert_eq!(&trie.buf[off..off + len.as_usize()], b"abc");
 }
-
 // ── optimize() tests ──────────────────────────────────────────────
-
 #[test]
 fn optimize_empty() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.optimize();
     assert!(trie.is_empty());
 }
-
 #[test]
 fn optimize_single_key() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -307,7 +276,6 @@ fn optimize_single_key() {
     assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.len(), 1);
 }
-
 #[test]
 fn optimize_preserves_lookups() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -321,12 +289,15 @@ fn optimize_preserves_lookups() {
     // (the semantic lookup) instead.
     for i in 0..100 {
         let key = format!("key_{:03}", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(&i),
-            "lookup failed after optimize for i={}", i);
+        assert_eq!(
+            trie.get(key.as_bytes()),
+            Some(&i),
+            "lookup failed after optimize for i={}",
+            i
+        );
     }
     assert_eq!(trie.len(), 100);
 }
-
 #[test]
 fn optimize_preserves_iteration() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -335,7 +306,6 @@ fn optimize_preserves_iteration() {
         trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     trie.optimize();
-
     // Forward
     let mut it = trie.iter();
     let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -346,7 +316,6 @@ fn optimize_preserves_iteration() {
     for i in 1..keys.len() {
         assert!(keys[i] > keys[i - 1], "not sorted after optimize at index {}", i);
     }
-
     // Backward
     let mut it = trie.iter_last();
     keys.clear();
@@ -355,14 +324,15 @@ fn optimize_preserves_iteration() {
             Some((k, _)) => keys.push(k.to_vec()),
             None => break,
         }
-        if it.prev().is_none() { break; }
+        if it.prev().is_none() {
+            break;
+        }
     }
     assert_eq!(keys.len(), 100);
     for i in 1..keys.len() {
         assert!(keys[i] < keys[i - 1], "not reverse-sorted after optimize at index {}", i);
     }
 }
-
 #[test]
 fn optimize_preserves_seek() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -376,7 +346,6 @@ fn optimize_preserves_seek() {
     assert_eq!(k, b"key_00025");
     assert_eq!(*v, 25);
 }
-
 #[test]
 fn optimize_idempotent() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -394,7 +363,6 @@ fn optimize_idempotent() {
         assert!(trie.get(key.as_bytes()).is_some());
     }
 }
-
 #[test]
 fn optimize_byte_boundary_keys() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -404,11 +372,14 @@ fn optimize_byte_boundary_keys() {
     trie.optimize();
     for b in 1u8..=255 {
         let key = vec![b];
-        assert_eq!(trie.get(&key), Some(&(b as i32)),
-            "lookup failed after optimize for byte {}", b);
+        assert_eq!(
+            trie.get(&key),
+            Some(&(b as i32)),
+            "lookup failed after optimize for byte {}",
+            b
+        );
     }
 }
-
 #[test]
 fn optimize_stress_1000() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -419,11 +390,14 @@ fn optimize_stress_1000() {
     trie.optimize();
     for i in 0..1000u32 {
         let key = format!("key_{:05}", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(&(i as i32)),
-            "lookup failed after optimize at i={}", i);
+        assert_eq!(
+            trie.get(key.as_bytes()),
+            Some(&(i as i32)),
+            "lookup failed after optimize at i={}",
+            i
+        );
     }
 }
-
 #[test]
 fn optimize_deeply_nested() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -438,7 +412,6 @@ fn optimize_deeply_nested() {
         assert_eq!(trie.get(&key), Some(&(i as i32)));
     }
 }
-
 #[test]
 fn optimize_sorts_buf() {
     // After optimize(), keys in buf should appear in contiguous sorted order.
@@ -448,28 +421,35 @@ fn optimize_sorts_buf() {
         trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     trie.optimize();
-
     // Iterate in forward order and verify keys are sorted and contiguous in buf
     let mut it = trie.iter();
     let mut prev_key: Option<Vec<u8>> = None;
     let mut prev_end: usize = 1; // first key starts after dummy byte
     while let Some((k, _)) = it.current() {
         if let Some(ref pk) = prev_key {
-            assert!(pk.as_slice() <= k, "keys not sorted: {:?} > {:?}",
-                std::str::from_utf8(pk), std::str::from_utf8(k));
+            assert!(
+                pk.as_slice() <= k,
+                "keys not sorted: {:?} > {:?}",
+                std::str::from_utf8(pk),
+                std::str::from_utf8(k)
+            );
         }
         let ki = it.current_index().unwrap();
         let (off, len, _) = trie.index[ki].as_ref().unwrap();
         let off = off.get();
-        assert_eq!(off, prev_end,
+        assert_eq!(
+            off,
+            prev_end,
             "key {:?} not contiguous: expected offset {}, got {}",
-            std::str::from_utf8(k), prev_end, off);
+            std::str::from_utf8(k),
+            prev_end,
+            off
+        );
         prev_key = Some(k.to_vec());
         prev_end = off + len.as_usize();
         it.next();
     }
 }
-
 #[test]
 fn optimize_sorts_index_and_values() {
     // After optimize(), index[i] and values[i-1] should be in DFS (sorted) order.
@@ -481,7 +461,6 @@ fn optimize_sorts_index_and_values() {
         trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     trie.optimize();
-
     // Verify that occupied index entries appear in sorted key order (the sparse
     // layout interleaves None gaps, so walk occupied slots in index order).
     let mut prev: Option<&[u8]> = None;
@@ -493,13 +472,15 @@ fn optimize_sorts_index_and_values() {
         let off = off.get();
         let key = &trie.buf[off..off + len.as_usize()];
         if let Some(p) = prev {
-            assert!(p <= key,
+            assert!(
+                p <= key,
                 "index not sorted: {:?} > {:?}",
-                std::str::from_utf8(p), std::str::from_utf8(key));
+                std::str::from_utf8(p),
+                std::str::from_utf8(key)
+            );
         }
         prev = Some(key);
     }
-
     // Verify values match their keys (value == last 5 digits of "key_NNNNN").
     let mut count = 0;
     for slot in trie.index.iter().skip(1) {
@@ -509,15 +490,21 @@ fn optimize_sorts_index_and_values() {
         };
         let off = off.get();
         let key = &trie.buf[off..off + len.as_usize()];
-        let expected_val = std::str::from_utf8(key).unwrap()
-            .strip_prefix("key_").unwrap().parse::<i32>().unwrap();
-        assert_eq!(*val, expected_val,
-            "value mismatch: got {}, expected {}", val, expected_val);
+        let expected_val = std::str::from_utf8(key)
+            .unwrap()
+            .strip_prefix("key_")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            *val, expected_val,
+            "value mismatch: got {}, expected {}",
+            val, expected_val
+        );
         count += 1;
     }
     assert_eq!(count, n);
 }
-
 #[test]
 fn optimize_into_keys_values_sorted() {
     // into_keys_values() should return keys in sorted order after optimize
@@ -527,7 +514,6 @@ fn optimize_into_keys_values_sorted() {
         trie.insert(key.into_bytes(), i as i32).unwrap();
     }
     trie.optimize();
-
     let (keys, values) = trie.into_keys_values();
     assert_eq!(keys.len(), 50);
     for i in 1..keys.len() {
@@ -539,7 +525,6 @@ fn optimize_into_keys_values_sorted() {
         assert_eq!(values[i], expected, "value mismatch at index {}", i);
     }
 }
-
 #[test]
 fn iter_forward_prefix_keys() {
     // "ab" < "abc" in forward order
@@ -547,14 +532,16 @@ fn iter_forward_prefix_keys() {
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"ab".to_vec(), 2).unwrap();
     trie.insert(b"abd".to_vec(), 3).unwrap();
-
     let mut results = Vec::new();
     let mut iter = trie.iter();
-    if let Some((k, _)) = iter.current() { results.push(k.to_vec()); }
-    while let Some((k, _)) = iter.next() { results.push(k.to_vec()); }
+    if let Some((k, _)) = iter.current() {
+        results.push(k.to_vec());
+    }
+    while let Some((k, _)) = iter.next() {
+        results.push(k.to_vec());
+    }
     assert_eq!(results, vec![b"ab".to_vec(), b"abc".to_vec(), b"abd".to_vec()]);
 }
-
 #[test]
 fn iter_backward_prefix_keys() {
     // "abd" > "abc" > "ab" in backward order
@@ -562,7 +549,6 @@ fn iter_backward_prefix_keys() {
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"ab".to_vec(), 2).unwrap();
     trie.insert(b"abd".to_vec(), 3).unwrap();
-
     let mut iter = trie.iter_last();
     let mut results = Vec::new();
     loop {
@@ -570,24 +556,27 @@ fn iter_backward_prefix_keys() {
             Some((k, _)) => results.push(k.to_vec()),
             None => break,
         }
-        if iter.prev().is_none() { break; }
+        if iter.prev().is_none() {
+            break;
+        }
     }
     assert_eq!(results, vec![b"abd".to_vec(), b"abc".to_vec(), b"ab".to_vec()]);
 }
-
 #[test]
 fn iter_forward_empty_key() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"".to_vec(), 0).unwrap();
     trie.insert(b"abc".to_vec(), 1).unwrap();
-
     let mut results = Vec::new();
     let mut iter = trie.iter();
-    if let Some((k, _)) = iter.current() { results.push(k.to_vec()); }
-    while let Some((k, _)) = iter.next() { results.push(k.to_vec()); }
+    if let Some((k, _)) = iter.current() {
+        results.push(k.to_vec());
+    }
+    while let Some((k, _)) = iter.next() {
+        results.push(k.to_vec());
+    }
     assert_eq!(results, vec![b"".to_vec(), b"abc".to_vec()]);
 }
-
 #[test]
 fn optimize_preserves_terminal_flags() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -597,16 +586,18 @@ fn optimize_preserves_terminal_flags() {
     assert_eq!(trie.get(b"ab"), Some(&1), "terminal key 'ab' lost after optimize");
     assert_eq!(trie.get(b"abcd"), Some(&2));
     assert_eq!(trie.len(), 2);
-
     // Also test reverse order
     let mut trie2: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie2.insert(b"abcd".to_vec(), 1).unwrap();
     trie2.insert(b"ab".to_vec(), 2).unwrap();
     trie2.optimize();
     assert_eq!(trie2.get(b"abcd"), Some(&1));
-    assert_eq!(trie2.get(b"ab"), Some(&2), "terminal key 'ab' lost after optimize (reverse insert)");
+    assert_eq!(
+        trie2.get(b"ab"),
+        Some(&2),
+        "terminal key 'ab' lost after optimize (reverse insert)"
+    );
 }
-
 #[test]
 fn null_bytes_in_keys() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -616,16 +607,13 @@ fn null_bytes_in_keys() {
     trie.insert(b"a\0c".to_vec(), 2).unwrap();
     trie.insert(b"\0".to_vec(), 3).unwrap();
     trie.insert(b"\0\0".to_vec(), 4).unwrap();
-
     assert_eq!(trie.get(b"a\0b"), Some(&1));
     assert_eq!(trie.get(b"a\0c"), Some(&2));
     assert_eq!(trie.get(b"\0"), Some(&3));
     assert_eq!(trie.get(b"\0\0"), Some(&4));
     assert_eq!(trie.len(), 4);
 }
-
 // ── Compact mode tests (u16/u16) ──────────────────────────────────
-
 #[test]
 fn compact_insert_and_get() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
@@ -633,7 +621,6 @@ fn compact_insert_and_get() {
     assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.get(b"world"), None);
 }
-
 #[test]
 fn compact_insert_prefix_keys() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
@@ -642,14 +629,12 @@ fn compact_insert_prefix_keys() {
     assert_eq!(trie.get(b"abc"), Some(&1));
     assert_eq!(trie.get(b"abcd"), Some(&2));
 }
-
 #[test]
 fn compact_iter_forward() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut results = Vec::new();
     let mut iter = trie.iter();
     while let Some((k, _)) = iter.next() {
@@ -657,14 +642,12 @@ fn compact_iter_forward() {
     }
     assert_eq!(results, vec![b"abc", b"abd", b"abe"]);
 }
-
 #[test]
 fn compact_iter_backward() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut iter = trie.iter_last();
     let mut results = Vec::new();
     loop {
@@ -672,20 +655,19 @@ fn compact_iter_backward() {
             Some((k, _)) => results.push(k.to_vec()),
             None => break,
         }
-        if iter.prev().is_none() { break; }
+        if iter.prev().is_none() {
+            break;
+        }
     }
     assert_eq!(results, vec![b"abe", b"abd", b"abc"]);
 }
-
 // ── CursorMut tests ──────────────────────────────────────────────
-
 #[test]
 fn iter_mut_forward_updates_values() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     // Increment every value in forward order; the &mut T borrows the cursor,
     // so each must be released before the next next() call.
     {
@@ -698,25 +680,26 @@ fn iter_mut_forward_updates_values() {
     assert_eq!(trie.get(b"abd"), Some(&102));
     assert_eq!(trie.get(b"abe"), Some(&103));
 }
-
 #[test]
 fn iter_mut_backward_updates_values() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     {
         let mut c = trie.iter_mut_last();
         // current() reborrows each call; safe to call repeatedly.
-        if let Some((_, v)) = c.current() { *v *= 10; }
-        while let Some((_, v)) = c.prev() { *v *= 10; }
+        if let Some((_, v)) = c.current() {
+            *v *= 10;
+        }
+        while let Some((_, v)) = c.prev() {
+            *v *= 10;
+        }
     }
     assert_eq!(trie.get(b"abc"), Some(&10));
     assert_eq!(trie.get(b"abd"), Some(&20));
     assert_eq!(trie.get(b"abe"), Some(&30));
 }
-
 #[test]
 fn iter_mut_seek_then_mutate() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -736,7 +719,6 @@ fn iter_mut_seek_then_mutate() {
     assert_eq!(trie.get(b"key_00024"), Some(&24));
     assert_eq!(trie.get(b"key_00026"), Some(&26));
 }
-
 #[test]
 fn iter_mut_empty() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -744,7 +726,6 @@ fn iter_mut_empty() {
     assert!(c.next().is_none());
     assert!(c.current().is_none());
 }
-
 #[test]
 fn iter_mut_current_revisits_same_slot() {
     // The soundness-critical case from the design discussion: calling
@@ -765,7 +746,6 @@ fn iter_mut_current_revisits_same_slot() {
     }
     assert_eq!(trie.get(b"k"), Some(&9));
 }
-
 #[test]
 fn iter_mut_yields_borrowed_key() {
     // CursorMut yields ByteKey::Borrowed<'_> — for Vec<u8> keys that's &mut T
@@ -776,7 +756,6 @@ fn iter_mut_yields_borrowed_key() {
     let (k, _): (&[u8], &mut i32) = c.next().unwrap();
     assert_eq!(k, b"hello");
 }
-
 #[test]
 fn cursor_yields_borrowed_str_for_string_keys() {
     // The payoff of ByteKey::Borrowed: a String-keyed trie yields &str, not
@@ -784,7 +763,6 @@ fn cursor_yields_borrowed_str_for_string_keys() {
     let mut trie: NibbleTrie<String, i32> = NibbleTrie::new();
     trie.insert("hello".to_string(), 1).unwrap();
     trie.insert("world".to_string(), 2).unwrap();
-
     let mut c = trie.iter();
     let (k, v): (&str, &i32) = c.next().unwrap();
     assert_eq!(k, "hello");
@@ -793,7 +771,6 @@ fn cursor_yields_borrowed_str_for_string_keys() {
     assert_eq!(k, "world");
     assert_eq!(*v, 2);
 }
-
 #[test]
 fn cursor_mut_yields_borrowed_str_for_string_keys() {
     // CursorMut on a String-keyed trie yields (&str, &mut T).
@@ -811,7 +788,6 @@ fn cursor_mut_yields_borrowed_str_for_string_keys() {
     assert_eq!(trie.get(b"abc"), Some(&101));
     assert_eq!(trie.get(b"abd"), Some(&102));
 }
-
 #[test]
 fn cursor_yields_borrowed_for_vec_keys() {
     // Immutable cursor yields ByteKey::Borrowed<'a> — for Vec<u8> that's &[u8].
@@ -821,7 +797,6 @@ fn cursor_yields_borrowed_for_vec_keys() {
     let (k, _): (&[u8], &i32) = c.next().unwrap();
     assert_eq!(k, b"hello");
 }
-
 #[test]
 fn iter_mut_compact_mode() {
     // CursorMut works under the u16/u16 compact encoding too.
@@ -830,12 +805,13 @@ fn iter_mut_compact_mode() {
     trie.insert(b"abd".to_vec(), 2).unwrap();
     {
         let mut c = trie.iter_mut();
-        while let Some((_, v)) = c.next() { *v += 1; }
+        while let Some((_, v)) = c.next() {
+            *v += 1;
+        }
     }
     assert_eq!(trie.get(b"abc"), Some(&2));
     assert_eq!(trie.get(b"abd"), Some(&3));
 }
-
 #[test]
 fn iter_mut_first_last() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -850,7 +826,6 @@ fn iter_mut_first_last() {
     assert_eq!(k, b"abe");
     assert_eq!(*v, 3);
 }
-
 #[test]
 fn iter_mut_index_tracking() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -864,9 +839,7 @@ fn iter_mut_index_tracking() {
     assert_ne!(i0, i1);
     assert!(i0 > 0 && i1 > 0);
 }
-
 // ── Range iterator tests ─────────────────────────────────────────
-
 fn range_trie() -> NibbleTrie<Vec<u8>, i32> {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     for s in ["abc", "abd", "abe", "abf", "acd", "ace"] {
@@ -874,16 +847,14 @@ fn range_trie() -> NibbleTrie<Vec<u8>, i32> {
     }
     trie
 }
-
 #[test]
 fn range_inclusive_exclusive_bounds() {
     let trie = range_trie();
     // b"abd"..b"ace" → [abd, abe, abf, acd]  (abd included, ace excluded)
-    let got: Vec<&[u8]> = trie.range(b"abd".as_slice()..b"ace".as_slice())
-        .map(|(k, _)| k).collect();
+    let got: Vec<&[u8]> =
+        trie.range(b"abd".as_slice()..b"ace".as_slice()).map(|(k, _)| k).collect();
     assert_eq!(got, vec![b"abd", b"abe", b"abf", b"acd"].as_slice());
 }
-
 #[test]
 fn range_open_lower() {
     let trie = range_trie();
@@ -891,7 +862,6 @@ fn range_open_lower() {
     let got: Vec<&[u8]> = trie.range(..b"abe".as_slice()).map(|(k, _)| k).collect();
     assert_eq!(got, vec![b"abc", b"abd"]);
 }
-
 #[test]
 fn range_open_upper() {
     let trie = range_trie();
@@ -899,14 +869,12 @@ fn range_open_upper() {
     let got: Vec<&[u8]> = trie.range(b"abe".as_slice()..).map(|(k, _)| k).collect();
     assert_eq!(got, vec![b"abe", b"abf", b"acd", b"ace"]);
 }
-
 #[test]
 fn range_full() {
     let trie = range_trie();
     let got: Vec<&[u8]> = trie.range(..).map(|(k, _)| k).collect();
     assert_eq!(got, vec![b"abc", b"abd", b"abe", b"abf", b"acd", b"ace"]);
 }
-
 #[test]
 fn range_bound_included_excluded() {
     use std::ops::Bound;
@@ -914,15 +882,16 @@ fn range_bound_included_excluded() {
     // (Included(abe), Included(acd)) → [abe, abf, acd]
     let got: Vec<&[u8]> = trie
         .range_bounds(Bound::Included(b"abe".as_slice()), Bound::Included(b"acd".as_slice()))
-        .map(|(k, _)| k).collect();
+        .map(|(k, _)| k)
+        .collect();
     assert_eq!(got, vec![b"abe", b"abf", b"acd"]);
     // (Excluded(abc), Excluded(ace)) → [abd, abe, abf, acd]
     let got: Vec<&[u8]> = trie
         .range_bounds(Bound::Excluded(b"abc".as_slice()), Bound::Excluded(b"ace".as_slice()))
-        .map(|(k, _)| k).collect();
+        .map(|(k, _)| k)
+        .collect();
     assert_eq!(got, vec![b"abd", b"abe", b"abf", b"acd"]);
 }
-
 #[test]
 fn range_empty_and_misses() {
     let trie = range_trie();
@@ -931,10 +900,10 @@ fn range_empty_and_misses() {
     // Empty: lower > upper.
     assert_eq!(trie.range(b"ace".as_slice()..b"abc".as_slice()).count(), 0);
     // Lower bound between keys lands on the ceiling (no phantom element).
-    let got: Vec<&[u8]> = trie.range(b"abx".as_slice()..b"ace".as_slice()).map(|(k, _)| k).collect();
+    let got: Vec<&[u8]> =
+        trie.range(b"abx".as_slice()..b"ace".as_slice()).map(|(k, _)| k).collect();
     assert_eq!(got, vec![b"acd"]); // ceiling of "abx" is "acd"; upper "ace" excluded
 }
-
 #[test]
 fn range_double_ended() {
     let trie = range_trie();
@@ -950,17 +919,15 @@ fn range_double_ended() {
     assert!(it.next().is_none() && it.next_back().is_none());
     assert_eq!(got, vec![b"abd", b"acd", b"abe", b"abf"]);
 }
-
 #[test]
 fn range_values_correct() {
     let trie = range_trie();
     // Values are the key lengths (3 for all these single-segment keys, but the
     // point is the value is yielded alongside, not just keys).
-    let pairs: Vec<(&[u8], i32)> = trie.range(b"abd".as_slice()..b"abf".as_slice())
-        .map(|(k, v)| (k, *v)).collect();
+    let pairs: Vec<(&[u8], i32)> =
+        trie.range(b"abd".as_slice()..b"abf".as_slice()).map(|(k, v)| (k, *v)).collect();
     assert_eq!(pairs, vec![(b"abd".as_slice(), 3), (b"abe".as_slice(), 3)]);
 }
-
 #[test]
 fn range_yields_borrowed_str_for_string_keys() {
     let mut trie: NibbleTrie<String, i32> = NibbleTrie::new();
@@ -970,29 +937,29 @@ fn range_yields_borrowed_str_for_string_keys() {
     // "banana"..="cherry" → [banana, cherry], yielded as &str, no allocation.
     let got: Vec<&str> = trie
         .range((Bound::Included(b"banana".as_slice()), Bound::Included(b"cherry".as_slice())))
-        .map(|(k, _)| k).collect();
+        .map(|(k, _)| k)
+        .collect();
     assert_eq!(got, vec!["banana", "cherry"]);
 }
-
 #[test]
 fn range_after_optimize() {
     // optimize() rebuilds the arena/index; range must still be correct.
     let mut trie = range_trie();
     trie.optimize();
-    let got: Vec<&[u8]> = trie.range(b"abd".as_slice()..b"acd".as_slice()).map(|(k, _)| k).collect();
+    let got: Vec<&[u8]> =
+        trie.range(b"abd".as_slice()..b"acd".as_slice()).map(|(k, _)| k).collect();
     assert_eq!(got, vec![b"abd", b"abe", b"abf"]);
 }
-
 #[test]
 fn range_compact_mode() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     for s in ["abc", "abd", "abe", "abf"] {
         trie.insert(s.as_bytes().to_vec(), s.len() as i32).unwrap();
     }
-    let got: Vec<&[u8]> = trie.range(b"abd".as_slice()..b"abf".as_slice()).map(|(k, _)| k).collect();
+    let got: Vec<&[u8]> =
+        trie.range(b"abd".as_slice()..b"abf".as_slice()).map(|(k, _)| k).collect();
     assert_eq!(got, vec![b"abd", b"abe"]);
 }
-
 #[test]
 fn compact_optimize() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
@@ -1003,38 +970,40 @@ fn compact_optimize() {
     trie.optimize();
     for i in 0..100 {
         let key = format!("key_{:03}", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(&i),
-            "compact lookup failed after optimize for i={}", i);
+        assert_eq!(
+            trie.get(key.as_bytes()),
+            Some(&i),
+            "compact lookup failed after optimize for i={}",
+            i
+        );
     }
 }
-
 #[test]
 fn compact_seek() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut iter = trie.iter();
     let (k, _) = iter.seek(b"abd").unwrap();
     assert_eq!(k, b"abd");
 }
-
 #[test]
 fn compact_empty_key() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
     trie.insert(b"".to_vec(), 0).unwrap();
     trie.insert(b"abc".to_vec(), 1).unwrap();
-
     let mut results = Vec::new();
     let mut iter = trie.iter();
-    if let Some((k, _)) = iter.current() { results.push(k.to_vec()); }
-    while let Some((k, _)) = iter.next() { results.push(k.to_vec()); }
+    if let Some((k, _)) = iter.current() {
+        results.push(k.to_vec());
+    }
+    while let Some((k, _)) = iter.next() {
+        results.push(k.to_vec());
+    }
     assert_eq!(results, vec![b"".to_vec(), b"abc".to_vec()]);
 }
-
 // ── TrieIndex trait tests ─────────────────────────────────────────
-
 #[test]
 fn trie_index_as_usize() {
     assert_eq!(u16::as_usize(42u16), 42);
@@ -1043,37 +1012,30 @@ fn trie_index_as_usize() {
     assert_eq!(u16::as_usize(u16::MAX), u16::MAX as usize);
     assert_eq!(u32::as_usize(u32::MAX), u32::MAX as usize);
 }
-
 #[test]
 fn trie_index_max_value() {
     assert_eq!(<u16 as TrieIndex>::max_value(), u16::MAX as usize);
     assert_eq!(<u32 as TrieIndex>::max_value(), u32::MAX as usize);
     assert_eq!(<u64 as TrieIndex>::max_value(), u64::MAX as usize);
 }
-
 #[test]
 fn trie_index_from_usize() {
     assert_eq!(u16::from_usize(42), 42u16);
     assert_eq!(u32::from_usize(42), 42u32);
     assert_eq!(u64::from_usize(42), 42u64);
 }
-
 // ── Terminal flag tests ──────────────────────────────────────────
-
 #[test]
 fn terminal_flag() {
     let mut node: Node<u32, u16> = Node::new();
     assert!(!node.is_terminal());
     assert_eq!(node.terminal, false);
-
     node.set_terminal(true);
     assert!(node.is_terminal());
     assert_eq!(node.terminal, true);
-
     node.set_terminal(false);
     assert!(!node.is_terminal());
     assert_eq!(node.terminal, false);
-
     // Terminal flag is independent of other node fields
     node.set_leaf_child(3, u32::from_usize(42));
     node.set_terminal(true);
@@ -1081,9 +1043,7 @@ fn terminal_flag() {
     assert!(node.is_occupied(3));
     assert!(node.is_leaf(3));
 }
-
 // ── u8 PTR tests ──────────────────────────────────────────────────────
-
 #[test]
 fn node_size_u8() {
     // Compact PTR=u8, LEN=u16:
@@ -1092,7 +1052,6 @@ fn node_size_u8() {
     // = 16 + 2 + 2 + 1 + 1 = 22 bytes (align to u16)
     assert_eq!(std::mem::size_of::<Node<u8, u16>>(), 22);
 }
-
 #[test]
 fn u8_insert_and_get() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
@@ -1100,7 +1059,6 @@ fn u8_insert_and_get() {
     assert_eq!(trie.get(b"hello"), Some(&42));
     assert_eq!(trie.get(b"world"), None);
 }
-
 #[test]
 fn u8_near_capacity() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
@@ -1113,7 +1071,6 @@ fn u8_near_capacity() {
     }
     assert!(!trie.near_capacity());
 }
-
 #[test]
 fn u8_overflow() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
@@ -1135,14 +1092,15 @@ fn u8_overflow() {
     // After overflow, every inserted key still resolves to its value.
     for i in 0..count {
         let key = format!("k{:05}", i);
-        assert_eq!(trie.get(key.as_bytes()), Some(&(i as i32)),
-            "lookup failed for i={i} after u8 overflow");
+        assert_eq!(
+            trie.get(key.as_bytes()),
+            Some(&(i as i32)),
+            "lookup failed for i={i} after u8 overflow"
+        );
     }
     assert_eq!(trie.len(), count as usize);
 }
-
 // ── promote/demote tests ─────────────────────────────────────────────
-
 #[test]
 fn promote_u8_to_u16() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u8, u16> = NibbleTrie::new();
@@ -1154,12 +1112,15 @@ fn promote_u8_to_u16() {
     // Indices are not stable across inserts/optimize — verify by value.
     for i in 0..50u32 {
         let key = format!("key_{:03}", i);
-        assert_eq!(promoted.get(key.as_bytes()), Some(&(i as i32)),
-            "lookup failed after promote for i={}", i);
+        assert_eq!(
+            promoted.get(key.as_bytes()),
+            Some(&(i as i32)),
+            "lookup failed after promote for i={}",
+            i
+        );
     }
     assert_eq!(promoted.len(), 50);
 }
-
 #[test]
 fn promote_u16_to_u32() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
@@ -1173,7 +1134,6 @@ fn promote_u16_to_u32() {
         assert_eq!(promoted.get(key.as_bytes()), Some(&(i as i32)));
     }
 }
-
 #[test]
 fn demote_u16_to_u8() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
@@ -1190,7 +1150,6 @@ fn demote_u16_to_u8() {
         assert_eq!(demoted.get(key.as_bytes()), Some(&(i as i32)));
     }
 }
-
 #[test]
 fn demote_fails_too_large() {
     let mut trie: NibbleTrie<Vec<u8>, i32, u16, u16> = NibbleTrie::new();
@@ -1202,10 +1161,7 @@ fn demote_fails_too_large() {
     let result = trie.demote::<u8>();
     assert!(result.is_err(), "demote should fail when trie is too large");
 }
-
-
 // ── Generic key type tests ──────────────────────────────────────────
-
 #[test]
 fn string_key_insert_and_get() {
     let mut trie: NibbleTrie<String, i32> = NibbleTrie::new();
@@ -1215,7 +1171,6 @@ fn string_key_insert_and_get() {
     assert_eq!(trie.get(b"world"), Some(&2));
     assert_eq!(trie.get(b"hell"), None);
 }
-
 #[test]
 fn string_key_into_keys_values() {
     let mut trie: NibbleTrie<String, i32> = NibbleTrie::new();
@@ -1225,7 +1180,6 @@ fn string_key_into_keys_values() {
     assert_eq!(keys, vec!["abc".to_string(), "def".to_string()]);
     assert_eq!(values, vec![1, 2]);
 }
-
 // ── Stage B invariant oracle + stress tests ──────────────────────────
 //
 // Insert indices are no longer stable across inserts (shift-based allocation
@@ -1237,9 +1191,7 @@ fn string_key_into_keys_values() {
 //   (3) every arena ref (node.leaf, leaf children) points to an occupied slot,
 //   (4) n_keys == number of occupied slots,
 // plus a BTreeMap cross-check of key/value presence and forward iteration order.
-
 use std::collections::BTreeMap;
-
 /// Deterministic xorshift64 PRNG (avoids a `rand` dev-dependency).
 fn next_u64(state: &mut u64) -> u64 {
     let mut x = *state;
@@ -1249,13 +1201,11 @@ fn next_u64(state: &mut u64) -> u64 {
     *state = x;
     x
 }
-
 /// Random-ish key of length 1..=max_len from `state`.
 fn rand_key(state: &mut u64, max_len: usize) -> Vec<u8> {
     let len = 1 + (next_u64(state) as usize % max_len);
     (0..len).map(|_| (next_u64(state) & 0xFF) as u8).collect()
 }
-
 /// Recompute the leftmost (min key index) of the subtree at `phys` and check
 /// it equals `arena[phys].leaf`. Also checks every leaf-child / terminal ref in
 /// the subtree points to an occupied index slot. Returns `Err(msg)` on violation.
@@ -1284,15 +1234,18 @@ fn recompute_leftmost<PTR: TrieIndex, LEN: TrieIndex>(
     let mut min_ki: Option<usize> = None;
     if node.is_terminal() {
         let ki = node.leaf.get().as_usize();
-        let (_toff, tlen, _tval) = trie.index[ki].as_ref().ok_or_else(|| format!(
-            "terminal node {phys}: leaf -> gap slot {ki}"))?;
+        let (_toff, tlen, _tval) = trie.index[ki]
+            .as_ref()
+            .ok_or_else(|| format!("terminal node {phys}: leaf -> gap slot {ki}"))?;
         // A terminal key ends exactly at this node's depth, so its nibble length
         // must equal prefix_len. This catches a terminal node's `leaf` pointing
         // at a (longer) descendant instead of its own terminal key.
         if tlen.as_usize() * 2 != node.prefix_len.as_usize() {
             return Err(format!(
                 "terminal node {phys}: leaf slot {ki} key len {} != prefix_len {} (not the terminal key)",
-                tlen.as_usize() * 2, node.prefix_len.as_usize()));
+                tlen.as_usize() * 2,
+                node.prefix_len.as_usize()
+            ));
         }
         min_ki = Some(ki);
     }
@@ -1303,8 +1256,7 @@ fn recompute_leftmost<PTR: TrieIndex, LEN: TrieIndex>(
         let child_leftmost = if node.is_leaf(nib) {
             let ki = node.children[nib].get().as_usize();
             if !trie.index[ki].is_some() {
-                return Err(format!(
-                    "node {phys} leaf child nib {nib}: -> gap slot {ki}"));
+                return Err(format!("node {phys} leaf child nib {nib}: -> gap slot {ki}"));
             }
             ki
         } else {
@@ -1316,20 +1268,24 @@ fn recompute_leftmost<PTR: TrieIndex, LEN: TrieIndex>(
     if l != node.leaf.get().as_usize() {
         return Err(format!(
             "leftmost-leaf invariant violated at node {phys}: stored {}, recomputed {}",
-            node.leaf.get().as_usize(), l));
+            node.leaf.get().as_usize(),
+            l
+        ));
     }
     Ok(l)
 }
-
 /// Full structural invariant check. Returns `Err(msg)` on the first violation.
 fn verify_invariants<PTR: TrieIndex, LEN: TrieIndex>(
     trie: &NibbleTrie<Vec<u8>, i32, PTR, LEN>,
 ) -> Result<(), String> {
     if trie.arena.is_empty() {
-        return if trie.n_keys == 0 { Ok(()) } else { Err("empty trie with nonzero n_keys".into()) };
+        return if trie.n_keys == 0 {
+            Ok(())
+        } else {
+            Err("empty trie with nonzero n_keys".into())
+        };
     }
     recompute_leftmost(trie, 0)?;
-
     let mut prev: Option<Vec<u8>> = None;
     let mut occupied = 0usize;
     for (i, slot) in trie.index.iter().enumerate() {
@@ -1337,8 +1293,7 @@ fn verify_invariants<PTR: TrieIndex, LEN: TrieIndex>(
             let k = trie.buf[off.get()..off.get() + len.as_usize()].to_vec();
             if let Some(p) = &prev {
                 if k < *p {
-                    return Err(format!(
-                        "index not sorted: slot {i} key {k:?} < prev {p:?}"));
+                    return Err(format!("index not sorted: slot {i} key {k:?} < prev {p:?}"));
                 }
             }
             prev = Some(k);
@@ -1347,11 +1302,12 @@ fn verify_invariants<PTR: TrieIndex, LEN: TrieIndex>(
     }
     if occupied != trie.n_keys {
         return Err(format!(
-            "n_keys mismatch: {occupied} occupied slots vs n_keys {}", trie.n_keys));
+            "n_keys mismatch: {occupied} occupied slots vs n_keys {}",
+            trie.n_keys
+        ));
     }
     Ok(())
 }
-
 /// Cross-check a trie against a BTreeMap oracle: every key resolves to its
 /// value, no extra keys, and forward iteration matches the oracle's order.
 fn cross_check_oracle<PTR: TrieIndex, LEN: TrieIndex>(
@@ -1360,8 +1316,7 @@ fn cross_check_oracle<PTR: TrieIndex, LEN: TrieIndex>(
 ) {
     assert_eq!(trie.len(), oracle.len());
     for (k, v) in oracle {
-        assert_eq!(trie.get(k), Some(v),
-            "get mismatch for key {:?}", k);
+        assert_eq!(trie.get(k), Some(v), "get mismatch for key {:?}", k);
     }
     // Forward iteration order == oracle order, with matching values.
     let mut it = trie.iter();
@@ -1372,19 +1327,21 @@ fn cross_check_oracle<PTR: TrieIndex, LEN: TrieIndex>(
     while let Some((k, v)) = it.next() {
         ordered.push((k.to_vec(), *v));
     }
-    let expected: Vec<(Vec<u8>, i32)> =
-        oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let expected: Vec<(Vec<u8>, i32)> = oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
     assert_eq!(ordered, expected, "forward iteration order/value mismatch");
 }
-
 fn stress_insert_sequence(keys: &[Vec<u8>]) {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
     for (i, key) in keys.iter().enumerate() {
         // Skip duplicate keys (the trie rejects them); the oracle must too.
         if oracle.contains_key(key) {
-            assert_eq!(trie.insert(key.clone(), i as i32), Err(()),
-                "trie accepted duplicate key {:?}", key);
+            assert_eq!(
+                trie.insert(key.clone(), i as i32),
+                Err(()),
+                "trie accepted duplicate key {:?}",
+                key
+            );
             continue;
         }
         trie.insert(key.clone(), i as i32).unwrap();
@@ -1397,7 +1354,6 @@ fn stress_insert_sequence(keys: &[Vec<u8>]) {
     }
     cross_check_oracle(&trie, &oracle);
 }
-
 #[test]
 fn invariant_random_keys() {
     let mut state = 0x9e3779b97f4a7c15;
@@ -1407,24 +1363,20 @@ fn invariant_random_keys() {
     }
     stress_insert_sequence(&keys);
 }
-
 #[test]
 fn invariant_sorted_keys() {
     // Distinct ascending keys: pure END-case appends + periodic optimize.
-    let keys: Vec<Vec<u8>> = (0..500u32).map(|i| format!("key_{:05}", i).into_bytes()).collect();
+    let keys: Vec<Vec<u8>> =
+        (0..500u32).map(|i| format!("key_{:05}", i).into_bytes()).collect();
     stress_insert_sequence(&keys);
 }
-
 #[test]
 fn invariant_reverse_keys() {
     // Descending: every insert is the new smallest → max shifting + bumping.
-    let keys: Vec<Vec<u8>> = (0..500u32)
-        .rev()
-        .map(|i| format!("key_{:05}", i).into_bytes())
-        .collect();
+    let keys: Vec<Vec<u8>> =
+        (0..500u32).rev().map(|i| format!("key_{:05}", i).into_bytes()).collect();
     stress_insert_sequence(&keys);
 }
-
 #[test]
 fn invariant_prefix_heavy() {
     // Many prefix relationships → Terminal + SplitNode + SplitLeaf cases.
@@ -1437,7 +1389,6 @@ fn invariant_prefix_heavy() {
     }
     stress_insert_sequence(&keys);
 }
-
 #[test]
 fn invariant_mixed_lengths() {
     // Single-byte through long keys; exercises nibble boundary + prefix cases.
@@ -1448,7 +1399,6 @@ fn invariant_mixed_lengths() {
     }
     stress_insert_sequence(&keys);
 }
-
 #[test]
 fn invariant_backwards_iteration_after_shifts() {
     // Reverse insertion produces heavy shifting; verify reverse iteration too.
@@ -1459,7 +1409,9 @@ fn invariant_backwards_iteration_after_shifts() {
         let kb = key.into_bytes();
         trie.insert(kb.clone(), i as i32).unwrap();
         oracle.insert(kb, i as i32);
-        if let Err(msg) = verify_invariants(&trie) { panic!("after inserting #{i}: {msg}"); }
+        if let Err(msg) = verify_invariants(&trie) {
+            panic!("after inserting #{i}: {msg}");
+        }
     }
     assert_eq!(trie.len(), oracle.len());
     let mut it = trie.iter_last();
@@ -1474,7 +1426,6 @@ fn invariant_backwards_iteration_after_shifts() {
         oracle.iter().rev().map(|(k, v)| (k.clone(), *v)).collect();
     assert_eq!(ordered, expected, "reverse iteration mismatch after shifts");
 }
-
 #[test]
 fn invariant_seek_after_shifts() {
     let mut state = 0x123456789abcdef0;
@@ -1485,7 +1436,9 @@ fn invariant_seek_after_shifts() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
     for (i, key) in keys.iter().enumerate() {
-        if oracle.contains_key(key) { continue; }
+        if oracle.contains_key(key) {
+            continue;
+        }
         trie.insert(key.clone(), i as i32).unwrap();
         oracle.insert(key.clone(), i as i32);
         if let Err(msg) = verify_invariants(&trie) {
@@ -1496,8 +1449,12 @@ fn invariant_seek_after_shifts() {
     for (k, _v) in &oracle {
         let mut it = trie.iter();
         it.seek(k);
-        assert_eq!(it.current().map(|(kk, _)| kk.to_vec()), Some(k.clone()),
-            "seek mismatch for key {:?}", k);
+        assert_eq!(
+            it.current().map(|(kk, _)| kk.to_vec()),
+            Some(k.clone()),
+            "seek mismatch for key {:?}",
+            k
+        );
     }
     // Seek to a non-key lands on the first existing key >= it (the ceiling).
     // Construct a probe just past each existing key and compare to the oracle's
@@ -1511,12 +1468,16 @@ fn invariant_seek_after_shifts() {
         let expected = oracle.keys().find(|k| k.as_slice() >= probe.as_slice()).cloned();
         let mut it = trie.iter();
         it.seek(&probe);
-        assert_eq!(it.current().map(|(kk, _)| kk.to_vec()), expected,
+        assert_eq!(
+            it.current().map(|(kk, _)| kk.to_vec()),
+            expected,
             "seek-ceiling mismatch: seek {:?} expected {:?} got {:?}",
-            probe, expected, it.current().map(|(kk, _)| kk.to_vec()));
+            probe,
+            expected,
+            it.current().map(|(kk, _)| kk.to_vec())
+        );
     }
 }
-
 #[test]
 fn invariant_past_optimize_repeatedly() {
     // Force many 90%-trigger re-spreads: dense distinct keys in a narrow space
@@ -1528,15 +1489,15 @@ fn invariant_past_optimize_repeatedly() {
         let kb = key.into_bytes();
         trie.insert(kb.clone(), i as i32).unwrap();
         oracle.insert(kb, i as i32);
-        if let Err(msg) = verify_invariants(&trie) { panic!("after inserting #{i}: {msg}"); }
+        if let Err(msg) = verify_invariants(&trie) {
+            panic!("after inserting #{i}: {msg}");
+        }
     }
     cross_check_oracle(&trie, &oracle);
 }
-
 // ---------------------------------------------------------------------------
 // Cursor — linear-scan iterator over the sparse index
 // ---------------------------------------------------------------------------
-
 #[test]
 fn cursor_empty_trie() {
     let trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -1549,7 +1510,6 @@ fn cursor_empty_trie() {
     assert!(it.last().is_none());
     assert!(it.seek(b"anything").is_none());
 }
-
 #[test]
 fn cursor_forward_before_first() {
     // iter() parks *before* the first key: current() is None, next() yields first.
@@ -1557,7 +1517,6 @@ fn cursor_forward_before_first() {
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut it = trie.iter();
     assert!(it.current().is_none());
     assert_eq!(it.next().unwrap().0, b"abc");
@@ -1569,7 +1528,6 @@ fn cursor_forward_before_first() {
     assert!(it.current().is_none());
     assert_eq!(it.prev().unwrap().0, b"abe");
 }
-
 #[test]
 fn cursor_backward_on_last() {
     // iter_last() parks *on* the last key.
@@ -1577,7 +1535,6 @@ fn cursor_backward_on_last() {
     trie.insert(b"abc".to_vec(), 1).unwrap();
     trie.insert(b"abd".to_vec(), 2).unwrap();
     trie.insert(b"abe".to_vec(), 3).unwrap();
-
     let mut it = trie.iter_last();
     assert_eq!(it.current().unwrap().0, b"abe");
     assert!(it.current_index().is_some()); // parked on a real slot
@@ -1587,14 +1544,12 @@ fn cursor_backward_on_last() {
     // Before-first: next() walks forward again.
     assert_eq!(it.next().unwrap().0, b"abc");
 }
-
 #[test]
 fn cursor_first_last_jump() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     trie.insert(b"mid".to_vec(), 5).unwrap();
     trie.insert(b"aaa".to_vec(), 1).unwrap();
     trie.insert(b"zzz".to_vec(), 9).unwrap();
-
     let mut it = trie.iter();
     assert_eq!(it.first().unwrap().0, b"aaa");
     assert_eq!(it.current().unwrap().0, b"aaa");
@@ -1605,7 +1560,6 @@ fn cursor_first_last_jump() {
     assert_eq!(it.first().unwrap().0, b"aaa");
     assert_eq!(it.next().unwrap().0, b"mid");
 }
-
 #[test]
 fn cursor_seek_then_scan() {
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
@@ -1624,7 +1578,6 @@ fn cursor_seek_then_scan() {
     // Seek before the beginning → lands on first.
     assert_eq!(it.seek(b"").unwrap().0, b"key0");
 }
-
 #[test]
 fn cursor_scan_order_matches_oracle_after_shifts() {
     // Shift-heavy insert sequence (reverse order forces many non-END shifts),
@@ -1638,41 +1591,41 @@ fn cursor_scan_order_matches_oracle_after_shifts() {
         oracle.insert(k, i as i32);
     }
     trie.optimize();
-
     let mut fwd: Vec<(Vec<u8>, i32)> = Vec::new();
     let mut it = trie.iter();
-    if let Some((k, v)) = it.current() { fwd.push((k.to_vec(), *v)); }
-    while let Some((k, v)) = it.next() { fwd.push((k.to_vec(), *v)); }
-    let expected: Vec<(Vec<u8>, i32)> =
-        oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    if let Some((k, v)) = it.current() {
+        fwd.push((k.to_vec(), *v));
+    }
+    while let Some((k, v)) = it.next() {
+        fwd.push((k.to_vec(), *v));
+    }
+    let expected: Vec<(Vec<u8>, i32)> = oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
     assert_eq!(fwd, expected, "forward scan order mismatch after shifts+optimize");
-
     let mut rev: Vec<(Vec<u8>, i32)> = Vec::new();
     let mut it = trie.iter_last();
-    if let Some((k, v)) = it.current() { rev.push((k.to_vec(), *v)); }
-    while let Some((k, v)) = it.prev() { rev.push((k.to_vec(), *v)); }
+    if let Some((k, v)) = it.current() {
+        rev.push((k.to_vec(), *v));
+    }
+    while let Some((k, v)) = it.prev() {
+        rev.push((k.to_vec(), *v));
+    }
     let expected_rev: Vec<(Vec<u8>, i32)> =
         oracle.iter().rev().map(|(k, v)| (k.clone(), *v)).collect();
     assert_eq!(rev, expected_rev, "backward scan order mismatch after shifts+optimize");
 }
-
 // ---------------------------------------------------------------------------
 // THROWAWAY: print a memory breakdown of a random-filled trie (before & after
 // optimize). Run with: cargo test -p tiny-trie mem_print -- --nocapture --ignored
 // ---------------------------------------------------------------------------
-
 #[test]
 #[ignore]
 fn mem_print() {
     use std::mem::{size_of, size_of_val};
-
     type Trie = NibbleTrie<Vec<u8>, i32>; // PTR=u32, LEN=u16
-
     let mut trie: Trie = NibbleTrie::new();
     let mut state: u64 = 0x9e3779b97f4a7c15;
     const N: usize = 50_000;
     const MAX_LEN: usize = 16;
-
     let mut raw_key_bytes: usize = 0;
     let mut inserted = 0usize;
     while inserted < N {
@@ -1685,12 +1638,10 @@ fn mem_print() {
         raw_key_bytes += k.len();
         inserted += 1;
     }
-
     let val_bytes = trie.len() * size_of::<i32>();
     // Node size via the arena element type; slot size via a live Some slot.
     let node_size = size_of_val(&trie.arena[0]);
     let slot_size = size_of_val(&trie.index[1]); // index[1] is a Some slot after first insert
-
     let report = |label: &str, t: &Trie| {
         let n = t.len();
         let idx_len = t.index.len();
@@ -1705,49 +1656,71 @@ fn mem_print() {
         let mut s = String::new();
         s.push_str(&format!("\n=== {label} ===\n"));
         s.push_str(&format!("  n_keys (distinct)      : {n}\n"));
-        s.push_str(&format!("  raw key bytes          : {raw_key_bytes}  ({:.1} B/key avg)\n", raw_key_bytes as f64 / n as f64));
-        s.push_str(&format!("  raw value bytes        : {val_bytes}  ({} B/val)\n", size_of::<i32>()));
+        s.push_str(&format!(
+            "  raw key bytes          : {raw_key_bytes}  ({:.1} B/key avg)\n",
+            raw_key_bytes as f64 / n as f64
+        ));
+        s.push_str(&format!(
+            "  raw value bytes        : {val_bytes}  ({} B/val)\n",
+            size_of::<i32>()
+        ));
         s.push_str(&format!("  raw keys+values        : {}\n", raw_key_bytes + val_bytes));
         s.push_str(&format!("  sizes: Node={node_size} B, Option<Slot>={slot_size} B\n"));
-        s.push_str(&format!("  arena  : len={} cap={} -> {} B\n", t.arena.len(), arena_cap, arena_bytes));
-        s.push_str(&format!("  buf    : len={} cap={} -> {} B\n", t.buf.len(), buf_cap, buf_bytes));
-        s.push_str(&format!("  index  : len={} cap={} -> {} B  (occupied={n}, gaps={gaps})\n", idx_len, idx_cap, index_bytes));
-        s.push_str(&format!("  TOTAL reserved         : {} B  ({:.2} MiB)\n", total, total as f64 / (1 << 20) as f64));
-        s.push_str(&format!("  overhead vs raw        : {:.1}x  ({} B raw -> {} B reserved)\n",
-                 total as f64 / (raw_key_bytes + val_bytes) as f64,
-                 raw_key_bytes + val_bytes, total));
+        s.push_str(&format!(
+            "  arena  : len={} cap={} -> {} B\n",
+            t.arena.len(),
+            arena_cap,
+            arena_bytes
+        ));
+        s.push_str(&format!(
+            "  buf    : len={} cap={} -> {} B\n",
+            t.buf.len(),
+            buf_cap,
+            buf_bytes
+        ));
+        s.push_str(&format!(
+            "  index  : len={} cap={} -> {} B  (occupied={n}, gaps={gaps})\n",
+            idx_len, idx_cap, index_bytes
+        ));
+        s.push_str(&format!(
+            "  TOTAL reserved         : {} B  ({:.2} MiB)\n",
+            total,
+            total as f64 / (1 << 20) as f64
+        ));
+        s.push_str(&format!(
+            "  overhead vs raw        : {:.1}x  ({} B raw -> {} B reserved)\n",
+            total as f64 / (raw_key_bytes + val_bytes) as f64,
+            raw_key_bytes + val_bytes,
+            total
+        ));
         print!("{s}");
         // Also append to a file so token-filtering proxies don't swallow it.
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open("/tmp/nibble_mem.txt").expect("open /tmp/nibble_mem.txt");
+            .create(true)
+            .append(true)
+            .open("/tmp/nibble_mem.txt")
+            .expect("open /tmp/nibble_mem.txt");
         f.write_all(s.as_bytes()).expect("write");
     };
-
     report("BEFORE optimize (post-insert, with 90%-trigger re-spreads)", &trie);
     trie.optimize();
     report("AFTER  optimize (explicit single optimize)", &trie);
-
     // Touch results so the compiler doesn't elide anything.
     std::hint::black_box(&trie);
 }
-
 // ---------------------------------------------------------------------------
 // THROWAWAY: print node-occupancy stats for a random-filled trie. Run with:
 // cargo test -p tiny-trie node_stats -- --nocapture --ignored
 // ---------------------------------------------------------------------------
-
 #[test]
 #[ignore]
 fn node_stats() {
     type Trie = NibbleTrie<Vec<u8>, i32>; // PTR=u32, LEN=u16
-
     let mut trie: Trie = NibbleTrie::new();
     let mut state: u64 = 0x9e3779b97f4a7c15;
     const N: usize = 50_000;
     const MAX_LEN: usize = 16;
-
     let mut inserted = 0usize;
     while inserted < N {
         let k = rand_key(&mut state, MAX_LEN);
@@ -1760,16 +1733,14 @@ fn node_stats() {
     // optimize() doesn't change arena topology, so node stats are the same
     // before/after it — report once, on the post-insert tree.
     trie.optimize();
-
     // occupancy = occupied child slots + (1 if terminal). Range 0..=17.
     let mut hist_incl_term: [usize; 18] = [0; 18];
     // occupied child slots only (0..=16), terminal counted separately.
     let mut hist_children: [usize; 17] = [0; 17];
     let mut terminal_nodes = 0usize;
-    let mut total_leaf_edges = 0usize;   // children[nib] that are leaf key indices
+    let mut total_leaf_edges = 0usize; // children[nib] that are leaf key indices
     let mut total_internal_edges = 0usize; // children[nib] that are arena indices
     let mut total_children = 0usize;
-
     for node in trie.arena.iter() {
         // Step 2: every arena element is an Inode (no Fnodes produced yet).
         // Match the Inode out; Fnode stats land in a later step.
@@ -1783,53 +1754,64 @@ fn node_stats() {
         hist_children[occ] += 1;
         let occ_incl = occ + term as usize;
         hist_incl_term[occ_incl] += 1;
-        if term { terminal_nodes += 1; }
+        if term {
+            terminal_nodes += 1;
+        }
         total_children += occ;
         // Leaf vs internal edges: leaf_mask bit set => leaf child.
         total_leaf_edges += (node.leaf_mask & mask).count_ones() as usize;
         // The rest of the occupied slots are internal (arena) children.
         total_internal_edges += occ - (node.leaf_mask & mask).count_ones() as usize;
     }
-
     let total_nodes = trie.arena.len();
     let avg_children = total_children as f64 / total_nodes as f64;
-
     let mut s = String::new();
     s.push_str(&format!("\n=== node stats (N={N} keys, max_len={MAX_LEN}) ===\n"));
     s.push_str(&format!("  total nodes            : {total_nodes}\n"));
-    s.push_str(&format!("  terminal nodes         : {terminal_nodes}  ({:.1}%)\n",
-        100.0 * terminal_nodes as f64 / total_nodes as f64));
-    s.push_str(&format!("  total child edges      : {total_children}  (avg {avg_children:.2}/node)\n"));
+    s.push_str(&format!(
+        "  terminal nodes         : {terminal_nodes}  ({:.1}%)\n",
+        100.0 * terminal_nodes as f64 / total_nodes as f64
+    ));
+    s.push_str(&format!(
+        "  total child edges      : {total_children}  (avg {avg_children:.2}/node)\n"
+    ));
     s.push_str(&format!("    leaf edges (->key)   : {total_leaf_edges}\n"));
     s.push_str(&format!("    internal edges(->node): {total_internal_edges}\n"));
     s.push_str(&format!("  nodes/key              : {:.3}\n", total_nodes as f64 / N as f64));
-
     s.push_str("\n  occupancy histogram (occupied child slots + terminal flag):\n");
     s.push_str("    occ |  nodes   %\n");
     s.push_str("    ----+----------------\n");
     for (occ, &cnt) in hist_incl_term.iter().enumerate() {
-        if cnt == 0 { continue; }
-        s.push_str(&format!("    {occ:>3} | {cnt:>6}  {:>5.1}%\n",
-            100.0 * cnt as f64 / total_nodes as f64));
+        if cnt == 0 {
+            continue;
+        }
+        s.push_str(&format!(
+            "    {occ:>3} | {cnt:>6}  {:>5.1}%\n",
+            100.0 * cnt as f64 / total_nodes as f64
+        ));
     }
-
     s.push_str("\n  child-count histogram (occupied child slots only):\n");
     s.push_str("    kids |  nodes   %\n");
     s.push_str("    -----+----------------\n");
     for (kids, &cnt) in hist_children.iter().enumerate() {
-        if cnt == 0 { continue; }
-        s.push_str(&format!("    {kids:>4} | {cnt:>6}  {:>5.1}%\n",
-            100.0 * cnt as f64 / total_nodes as f64));
+        if cnt == 0 {
+            continue;
+        }
+        s.push_str(&format!(
+            "    {kids:>4} | {cnt:>6}  {:>5.1}%\n",
+            100.0 * cnt as f64 / total_nodes as f64
+        ));
     }
     print!("{s}");
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
-        .create(true).append(true)
-        .open("/tmp/nibble_nodes.txt").expect("open /tmp/nibble_nodes.txt");
+        .create(true)
+        .append(true)
+        .open("/tmp/nibble_nodes.txt")
+        .expect("open /tmp/nibble_nodes.txt");
     f.write_all(s.as_bytes()).expect("write");
     std::hint::black_box(&trie);
 }
-
 // ── Fnode (FlatNode) read-path tests ──────────────────────────────────
 //
 // Step 4 (revised encoding): read-only Fnodes use `base` + `terminal` +
@@ -1841,7 +1823,6 @@ fn node_stats() {
 // step-3 "subtree root can't be terminal" restriction is LIFTED — the root's
 // own terminal key is pulled out of the array into `base`+`terminal: true` and
 // returned by `flat_get`'s fallback path.
-
 /// Flatten the Inode subtree rooted at `phys` into a [`FlatNode`] using the
 /// pre-order DFS layout consumed by [`NibbleTrie::flat_get`].
 ///
@@ -1877,7 +1858,6 @@ fn flatten_subtree_to_fnode<PTR: TrieIndex, LEN: TrieIndex>(
     }
     trie.build_fnode_subtree(phys)
 }
-
 /// Collapse the `Inode` at `phys` into a `FlatNode` (in place — the parent's
 /// child slot already points at `phys`, now an `Fnode`). Returns `false` if
 /// `phys` is the root (root must stay an `Inode`) or the subtree isn't a
@@ -1895,7 +1875,6 @@ fn collapse_to_fnode<PTR: TrieIndex, LEN: TrieIndex>(
     trie.arena[phys] = ArenaNode::Fnode(fnode);
     true
 }
-
 /// First non-root `Inode` in the arena that is a conservative Fnode candidate.
 fn first_fnode_candidate<PTR: TrieIndex, LEN: TrieIndex>(
     trie: &NibbleTrie<Vec<u8>, i32, PTR, LEN>,
@@ -1910,7 +1889,6 @@ fn first_fnode_candidate<PTR: TrieIndex, LEN: TrieIndex>(
     }
     None
 }
-
 /// The non-root `Inode` candidate whose flattened Fnode has the *most* slots
 /// (ties broken by lowest arena index). Used to pick a deep/chain subtree that
 /// actually exercises `flat_get`'s descent path.
@@ -1931,7 +1909,6 @@ fn best_fnode_candidate<PTR: TrieIndex, LEN: TrieIndex>(
     }
     best.map(|(p, _)| p)
 }
-
 /// Cross-check a (possibly Fnode-containing) trie against a `BTreeMap` oracle:
 /// `get`, `get_index_unchecked`, forward iteration order, and `seek`
 /// lower-bound semantics for every oracle key plus a spread of non-keys.
@@ -1945,8 +1922,14 @@ fn cross_check_fnode<PTR: TrieIndex, LEN: TrieIndex>(
         #[cfg(feature = "unchecked")]
         {
             // SAFETY: `k` is in the trie (just confirmed above).
-            let idx = unsafe { trie.get_index_unchecked(k) }.expect("get_index_unchecked missed a present key");
-            assert_eq!(&trie.index[idx].as_ref().unwrap().2, v, "get_index_unchecked value mismatch for {:?}", k);
+            let idx = unsafe { trie.get_index_unchecked(k) }
+                .expect("get_index_unchecked missed a present key");
+            assert_eq!(
+                &trie.index[idx].as_ref().unwrap().2,
+                v,
+                "get_index_unchecked value mismatch for {:?}",
+                k
+            );
         }
     }
     // No spurious keys.
@@ -1955,31 +1938,42 @@ fn cross_check_fnode<PTR: TrieIndex, LEN: TrieIndex>(
         // a few near-miss probes
         probe.push(k.clone());
         let mut shorter = k.clone();
-        if shorter.len() > 1 { shorter.truncate(shorter.len() - 1); probe.push(shorter); }
-        let mut longer = k.clone(); longer.push(k[0]); probe.push(longer);
+        if shorter.len() > 1 {
+            shorter.truncate(shorter.len() - 1);
+            probe.push(shorter);
+        }
+        let mut longer = k.clone();
+        longer.push(k[0]);
+        probe.push(longer);
     }
     for p in &probe {
         let got = trie.get(p);
         assert_eq!(got.is_some(), oracle.contains_key(p), "get spurious for {:?}", p);
     }
-
     // Forward iteration == oracle order.
     let mut it = trie.iter();
     let mut ordered = Vec::new();
-    if let Some((k, v)) = it.current() { ordered.push((k.to_vec(), *v)); }
-    while let Some((k, v)) = it.next() { ordered.push((k.to_vec(), *v)); }
+    if let Some((k, v)) = it.current() {
+        ordered.push((k.to_vec(), *v));
+    }
+    while let Some((k, v)) = it.next() {
+        ordered.push((k.to_vec(), *v));
+    }
     let expected: Vec<(Vec<u8>, i32)> = oracle.iter().map(|(k, v)| (k.clone(), *v)).collect();
     assert_eq!(ordered, expected, "forward iteration order/value mismatch");
-
     // Seek lower-bound: for every key plus non-keys, seek(k) == first oracle key >= k.
     let mut seek_probes: Vec<Vec<u8>> = oracle.keys().cloned().collect();
     // Insert inter-key gaps and beyond-ends.
     if oracle.len() >= 2 {
         let mid = oracle.keys().nth(oracle.len() / 2).unwrap();
-        let mut gap = mid.clone(); gap[0] = gap[0].wrapping_add(1); seek_probes.push(gap);
+        let mut gap = mid.clone();
+        gap[0] = gap[0].wrapping_add(1);
+        seek_probes.push(gap);
     }
     if let Some(last) = oracle.keys().next_back() {
-        let mut past = last.clone(); past[0] = past[0].wrapping_add(1); seek_probes.push(past);
+        let mut past = last.clone();
+        past[0] = past[0].wrapping_add(1);
+        seek_probes.push(past);
         let _ = last;
     }
     seek_probes.push(Vec::new());
@@ -1991,7 +1985,6 @@ fn cross_check_fnode<PTR: TrieIndex, LEN: TrieIndex>(
         assert_eq!(landed, want, "seek lower-bound mismatch for {:?}", p);
     }
 }
-
 #[test]
 fn fnode_read_single_level() {
     // "a","b","c","d" all share nib0 (0x6_), diverging at nib1 → root child[6]
@@ -1999,7 +1992,9 @@ fn fnode_read_single_level() {
     // Fnode (all leaves, no branches): the flat-scan single-level case.
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle = BTreeMap::new();
-    for (i, k) in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()].iter().enumerate() {
+    for (i, k) in
+        [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()].iter().enumerate()
+    {
         trie.insert(k.clone(), i as i32).unwrap();
         oracle.insert(k.clone(), i as i32);
     }
@@ -2008,7 +2003,6 @@ fn fnode_read_single_level() {
     assert!(matches!(trie.arena[phys], ArenaNode::Fnode(_)), "arena[phys] is now an Fnode");
     cross_check_fnode(&trie, &oracle);
 }
-
 #[test]
 fn fnode_read_multi_level_descent() {
     // The trie path-compresses (each Inode discriminates only at the divergence
@@ -2018,7 +2012,8 @@ fn fnode_read_multi_level_descent() {
     // nib7. The subtree under the nib1 Inode flattens to a 2-branch + 4-leaf
     // (6-slot) Fnode — branch markers followed by deeper leaf entries, which
     // is the layout that exercises flat_get's `can_descend` descent path.
-    let keys: [Vec<u8>; 4] = [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
+    let keys: [Vec<u8>; 4] =
+        [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle = BTreeMap::new();
     for (i, k) in keys.iter().enumerate() {
@@ -2030,11 +2025,16 @@ fn fnode_read_multi_level_descent() {
     if let ArenaNode::Fnode(f) = &trie.arena[phys] {
         let has_branch = f.slots.as_slice().iter().any(|(_, off)| *off == FNODE_OFFSET_NULL);
         assert!(has_branch, "multi-level Fnode must contain a branch marker (descent path)");
-        assert_eq!(f.slots.len(), 6, "multi-level Fnode must be 6 slots (2 branches + 4 leaves)");
-    } else { panic!("not an Fnode"); }
+        assert_eq!(
+            f.slots.len(),
+            6,
+            "multi-level Fnode must be 6 slots (2 branches + 4 leaves)"
+        );
+    } else {
+        panic!("not an Fnode");
+    }
     cross_check_fnode(&trie, &oracle);
 }
-
 #[test]
 fn fnode_read_prefix_key() {
     // "aa" is a prefix of "aaaa"/"aaab" — the node where "aa" ends is terminal
@@ -2049,7 +2049,8 @@ fn fnode_read_prefix_key() {
     // (non-terminal) has child[1] -> the "aa" subtree (terminal+branch a-node)
     // and child[2] -> leaf "b". Collapsing the nib1 subtree captures the "aa"
     // terminal+branch node as an internal (Some-ptr edge) slot.
-    let keys: [Vec<u8>; 4] = [b"aa".to_vec(), b"aaaa".to_vec(), b"aaab".to_vec(), b"b".to_vec()];
+    let keys: [Vec<u8>; 4] =
+        [b"aa".to_vec(), b"aaaa".to_vec(), b"aaab".to_vec(), b"b".to_vec()];
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle = BTreeMap::new();
     for (i, k) in keys.iter().enumerate() {
@@ -2063,13 +2064,19 @@ fn fnode_read_prefix_key() {
     if let ArenaNode::Fnode(f) = &trie.arena[phys] {
         let s = f.slots.as_slice();
         let found_prefix = (0..s.len()).any(|i| {
-            s[i].1 != FNODE_OFFSET_NULL && i + 1 < s.len() && s[i + 1].0.as_usize() > s[i].0.as_usize()
+            s[i].1 != FNODE_OFFSET_NULL
+                && i + 1 < s.len()
+                && s[i + 1].0.as_usize() > s[i].0.as_usize()
         });
-        assert!(found_prefix, "expected a terminal+branch (non-NULL offset followed by a deeper) slot");
-    } else { panic!("not an Fnode"); }
+        assert!(
+            found_prefix,
+            "expected a terminal+branch (non-NULL offset followed by a deeper) slot"
+        );
+    } else {
+        panic!("not an Fnode");
+    }
     cross_check_fnode(&trie, &oracle);
 }
-
 #[test]
 fn fnode_read_branch_then_leaves() {
     // Keys forming a 2-branch subtree: at some depth two internal children each
@@ -2085,8 +2092,10 @@ fn fnode_read_branch_then_leaves() {
     // Use 3-byte keys instead so each pair shares 2 nibbles then diverges:
     //   "aax"/"aay" share nib0..nib3 (a,a), diverge at nib4 (x/y low nibble).
     let pairs: &[(Vec<u8>, i32)] = &[
-        (b"aax".to_vec(), 0), (b"aay".to_vec(), 1),
-        (b"bbx".to_vec(), 2), (b"bby".to_vec(), 3),
+        (b"aax".to_vec(), 0),
+        (b"aay".to_vec(), 1),
+        (b"bbx".to_vec(), 2),
+        (b"bby".to_vec(), 3),
     ];
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle = BTreeMap::new();
@@ -2101,7 +2110,6 @@ fn fnode_read_branch_then_leaves() {
     assert!(has_branch, "expected the collapsed Fnode to contain a branch marker");
     cross_check_fnode(&trie, &oracle);
 }
-
 #[test]
 fn fnode_read_stress() {
     // Random keys, collapse every available candidate one at a time, and
@@ -2127,7 +2135,6 @@ fn fnode_read_stress() {
     }
     assert!(collapses > 0, "stress never collapsed any subtree");
 }
-
 #[test]
 fn fnode_read_terminal_root() {
     // A subtree whose ROOT is itself terminal (a prefix key with children below)
@@ -2137,7 +2144,8 @@ fn fnode_read_terminal_root() {
     // is non-root (collapsable). Collapsing it yields a `terminal=true` Fnode
     // whose array holds only the two longer keys (offsets >= 1) — exercising the
     // fallback path that the step-3 root-not-terminal restriction forbade.
-    let keys: [Vec<u8>; 4] = [b"baaa".to_vec(), b"baab".to_vec(), b"ba".to_vec(), b"c".to_vec()];
+    let keys: [Vec<u8>; 4] =
+        [b"baaa".to_vec(), b"baab".to_vec(), b"ba".to_vec(), b"c".to_vec()];
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle = BTreeMap::new();
     for (i, k) in keys.iter().enumerate() {
@@ -2156,16 +2164,19 @@ fn fnode_read_terminal_root() {
             // `base` is pulled out of the array (returned by the fallback), so no
             // array slot may carry offset 0 — every slot is either a branch marker
             // (0xFF) or a descendant with offset 1..=254.
-            assert!(f.slots.as_slice().iter().all(|(_, off)| *off != 0),
-                "terminal-rooted Fnode must not duplicate `base` as an offset-0 slot");
-            assert!(f.slots.as_slice().iter().any(|(_, off)| *off != FNODE_OFFSET_NULL),
-                "terminal-rooted Fnode must have at least one descendant terminal");
+            assert!(
+                f.slots.as_slice().iter().all(|(_, off)| *off != 0),
+                "terminal-rooted Fnode must not duplicate `base` as an offset-0 slot"
+            );
+            assert!(
+                f.slots.as_slice().iter().any(|(_, off)| *off != FNODE_OFFSET_NULL),
+                "terminal-rooted Fnode must have at least one descendant terminal"
+            );
         }
         _ => panic!("not an Fnode"),
     }
     cross_check_fnode(&trie, &oracle);
 }
-
 // ── flatten() — the trie produces Fnodes itself ──────────────────────
 //
 // `flatten()` rebuilds the arena, collapsing qualifying non-root subtrees
@@ -2173,14 +2184,14 @@ fn fnode_read_terminal_root() {
 // stays an Inode; key indices are unchanged (arena-only rebuild). These tests
 // exercise the real production path (vs the hand-built `collapse_to_fnode`
 // read-path tests above) and check idempotence + structural invariants.
-
 #[test]
 fn flatten_basic() {
     // {aaaa,aaab,baaa,baab}: the trie path-compresses into a ≥3-Inode subtree
     // (the layout `fnode_read_multi_level_descent` flattens to 6 slots), so
     // `flatten` must emit at least one Fnode, keep the root an Inode, shrink the
     // arena (the subtree's child Inodes are consumed), and stay correct.
-    let keys: [Vec<u8>; 4] = [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
+    let keys: [Vec<u8>; 4] =
+        [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle = BTreeMap::new();
     for (i, k) in keys.iter().enumerate() {
@@ -2190,20 +2201,26 @@ fn flatten_basic() {
     trie.optimize();
     let arena_after_opt = trie.arena.len();
     trie.flatten();
-    assert!(trie.arena.iter().any(|n| matches!(n, ArenaNode::Fnode(_))),
-        "flatten produced no Fnodes");
+    assert!(
+        trie.arena.iter().any(|n| matches!(n, ArenaNode::Fnode(_))),
+        "flatten produced no Fnodes"
+    );
     assert!(matches!(trie.arena[0], ArenaNode::Inode(_)), "root must stay an Inode");
-    assert!(trie.arena.len() < arena_after_opt,
-        "arena did not shrink after flatten: {} vs {}", trie.arena.len(), arena_after_opt);
+    assert!(
+        trie.arena.len() < arena_after_opt,
+        "arena did not shrink after flatten: {} vs {}",
+        trie.arena.len(),
+        arena_after_opt
+    );
     verify_invariants(&trie).expect("invariants hold after flatten");
     cross_check_fnode(&trie, &oracle);
 }
-
 #[test]
 fn flatten_idempotent() {
     // Re-flattening an already-flat trie is a no-op topology copy: no new Fnodes
     // appear (existing Fnode children block re-flatten), and correctness holds.
-    let keys: [Vec<u8>; 4] = [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
+    let keys: [Vec<u8>; 4] =
+        [b"aaaa".to_vec(), b"aaab".to_vec(), b"baaa".to_vec(), b"baab".to_vec()];
     let mut trie: NibbleTrie<Vec<u8>, i32> = NibbleTrie::new();
     let mut oracle = BTreeMap::new();
     for (i, k) in keys.iter().enumerate() {
@@ -2225,7 +2242,6 @@ fn flatten_idempotent() {
     verify_invariants(&trie).expect("invariants hold after re-flatten");
     cross_check_fnode(&trie, &oracle);
 }
-
 #[test]
 fn flatten_stress() {
     // 200 random variable-length keys → optimize → flatten → cross-check. Then
@@ -2235,19 +2251,22 @@ fn flatten_stress() {
     let mut oracle: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
     for _ in 0..200 {
         let k = rand_key(&mut state, 6);
-        if oracle.contains_key(&k) { continue; }
+        if oracle.contains_key(&k) {
+            continue;
+        }
         trie.insert(k.clone(), oracle.len() as i32).unwrap();
         oracle.insert(k, oracle.len() as i32);
     }
     trie.optimize();
     let arena_after_opt = trie.arena.len();
     trie.flatten();
-    assert!(trie.arena.iter().any(|n| matches!(n, ArenaNode::Fnode(_))),
-        "stress flatten produced no Fnodes");
+    assert!(
+        trie.arena.iter().any(|n| matches!(n, ArenaNode::Fnode(_))),
+        "stress flatten produced no Fnodes"
+    );
     assert!(trie.arena.len() < arena_after_opt, "stress arena did not shrink");
     verify_invariants(&trie).expect("invariants hold after stress flatten");
     cross_check_fnode(&trie, &oracle);
-
     // Re-optimize over the Fnode-containing arena, then re-flatten. `walk_optimize`
     // remaps Fnode `base`+offsets to fresh `2i+1` slots, so this converges and
     // stays correct. (Wiring `flatten` into `optimize` itself is deferred until
@@ -2257,7 +2276,6 @@ fn flatten_stress() {
     verify_invariants(&trie).expect("invariants hold after re-optimize+flatten");
     cross_check_fnode(&trie, &oracle);
 }
-
 #[test]
 #[ignore = "memory-footprint sanity; run directly (cargo stdout is filtered)"]
 fn flatten_memory_footprint() {
@@ -2269,7 +2287,9 @@ fn flatten_memory_footprint() {
     let mut oracle: BTreeMap<Vec<u8>, i32> = BTreeMap::new();
     for _ in 0..2000 {
         let k = rand_key(&mut state, 6);
-        if oracle.contains_key(&k) { continue; }
+        if oracle.contains_key(&k) {
+            continue;
+        }
         trie.insert(k.clone(), oracle.len() as i32).unwrap();
         oracle.insert(k, oracle.len() as i32);
     }
@@ -2281,14 +2301,30 @@ fn flatten_memory_footprint() {
     let after_nodes = trie.arena.len();
     let after_bytes = after_nodes * std::mem::size_of::<ArenaNode<u32, u16>>();
     let fnodes = trie.arena.iter().filter(|n| matches!(n, ArenaNode::Fnode(_))).count();
-    let leaves = trie.arena.iter().filter(|n| matches!(n, ArenaNode::Inode(n) if n.children_mask() == 0)).count();
+    let leaves = trie
+        .arena
+        .iter()
+        .filter(|n| matches!(n, ArenaNode::Inode(n) if n.children_mask() == 0))
+        .count();
     eprintln!(
         "flatten_memory_footprint: keys={} arena {}->{} nodes ({}B->{}B, {:.1}%), Fnodes {}->{}, leaf-Inodes={}",
-        oracle.len(), before_nodes, after_nodes, before_bytes, after_bytes,
-        100.0 * after_bytes as f64 / before_bytes as f64, fnodes_before, fnodes, leaves
+        oracle.len(),
+        before_nodes,
+        after_nodes,
+        before_bytes,
+        after_bytes,
+        100.0 * after_bytes as f64 / before_bytes as f64,
+        fnodes_before,
+        fnodes,
+        leaves
     );
     assert!(fnodes > 0, "flatten produced no Fnodes");
-    assert!(after_bytes < before_bytes, "arena bytes did not drop: {} -> {}", before_bytes, after_bytes);
+    assert!(
+        after_bytes < before_bytes,
+        "arena bytes did not drop: {} -> {}",
+        before_bytes,
+        after_bytes
+    );
     verify_invariants(&trie).expect("invariants hold");
     cross_check_fnode(&trie, &oracle);
 }
