@@ -1,6 +1,11 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Pluripotent shift & rotate
+Complex! only works right if max_cap = p::half::MAX() 
+then we'd have to get tz, shift right by it, do the rotation, then shift left by it. 
+i could be wrong though. 
+
 # Growth Semantics
 I want the block to grow up to its max capacity then stop. 
 Its up to the consumer what they do at that point - split or just reject basically. 

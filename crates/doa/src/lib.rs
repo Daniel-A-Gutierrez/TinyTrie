@@ -13,6 +13,8 @@ use std::{cmp::Ordering::{Equal, Greater, Less},
           collections::VecDeque,
           marker::PhantomData,
           ops::Range};
+
+enum RelTo<T> { Before(T), After(T) }
 type BPtr = i32;
 type IPtr = u32;
 type LPtr = u16;
