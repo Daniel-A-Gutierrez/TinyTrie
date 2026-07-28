@@ -1,26 +1,28 @@
 #![feature(test)]
-//! `Store::find_slot` vs a naive forward `Vec<Option>` scan, at 1M slots and
-//! {37.5, 50, 75, 90}% occupancy. find_slot is bidirectional-outward (nearest
-//! None); the control is a one-directional `position(is_none)` from a random
-//! index — the naive insert's cost. budget is unbounded (== N) so find_slot
-//! always finds the nearest None; the scan length is then set by occupancy.
+//! `find_slot` bidirectional vs DIR-biased, at 1M slots, 128-byte `Option<T>`
+//! (niche: None ⇒ first u64 0; 128 MiB working set ≫ L3 ⇒ memory-bound).
+//! 37.5% (floor) and 90% (search-dominated) occupancy, DIR=true (right/forward —
+//! where biased shines). combo = find + slide + undo-slide (store-invariant) ⇒
+//! find + 2×slide; find+slide = (find_only + combo)/2.
 //!
-//! store.rs is pulled in via #[path] (its items are pub(crate)); same source,
-//! identical codegen, no doa API change.
-//!
+//! store.rs pulled in via #[path] (items are pub(crate)); same source, no API change.
 //! Run: cargo +nightly bench -p doa --bench find_slot_bench
 extern crate test;
 #[path = "../src/store.rs"]
 mod store;
-use store::{MinSlide, Store};
+use store::{NoneSlide, Store};
+use std::num::NonZeroU64;
 use test::{Bencher, black_box};
 
-const N: usize = 1 << 20; // 1,048,576 slots
-const BUDGET: usize = N; // unbounded: find the nearest None, not budget-capped
-const INNER: usize = 256; // finds per timed iter
-const PROBES: usize = 4096; // precomputed random positions (pow2 for &-mask)
+struct Elem(NonZeroU64, [u64; 15]);
+const _: () = assert!(std::mem::size_of::<Option<Elem>>() == 128);
+fn some() -> Elem { Elem(NonZeroU64::new(1).unwrap(), [0; 15]) }
 
-//splitmix64 — deterministic, no dep.
+const N: usize = 1 << 20;
+const BUDGET: usize = N;
+const INNER: usize = 256;
+const PROBES: usize = 4096;
+
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E3779B97F4A7C15);
     let mut z = *state;
@@ -29,12 +31,9 @@ fn splitmix(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-//N slots, `n_some` occupied at pseudo-random positions (fisher-yates).
 fn flags(n_some: usize) -> Vec<bool> {
     let mut f = vec![false; N];
-    for i in 0..n_some {
-        f[i] = true;
-    }
+    for i in 0..n_some { f[i] = true; }
     let mut s = 0xDEAD_BEEF_CAFE_BABE;
     for i in (1..N).rev() {
         let j = (splitmix(&mut s) % (i as u64 + 1)) as usize;
@@ -48,30 +47,23 @@ fn positions() -> Vec<usize> {
     (0..PROBES).map(|_| (splitmix(&mut s) % N as u64) as usize).collect()
 }
 
-//build a Store from a flag pattern by appending Some (push_back) / None (grow_back).
-fn build_store<'a, S: Store<'a, u64>>(fl: &[bool]) -> S {
+fn build_store<'a, S: Store<'a, Elem>>(fl: &[bool]) -> S {
     let mut st = S::new();
     for &on in fl {
-        if on {
-            st.push_back(0u64);
-        } else {
-            st.grow_back(1);
-        }
+        if on { st.push_back(some()); } else { st.grow_back(1); }
     }
     st
 }
 
-fn build_vec(fl: &[bool]) -> Vec<Option<u64>> {
-    fl.iter().map(|&on| if on { Some(0u64) } else { None }).collect()
+fn build_vec(fl: &[bool]) -> Vec<Option<Elem>> {
+    fl.iter().map(|&on| if on { Some(some()) } else { None }).collect()
 }
 
-//occupancy permille: 375 / 500 / 750 / 900.
 macro_rules! bench_control {
     ($name:ident, $permille:expr) => {
         #[bench]
         fn $name(b: &mut Bencher) {
-            let n_some = N * $permille / 1000;
-            let buf = build_vec(&flags(n_some));
+            let buf = build_vec(&flags(N * $permille / 1000));
             let pos = positions();
             let mut i = 0usize;
             b.iter(|| {
@@ -89,12 +81,12 @@ macro_rules! bench_control {
     };
 }
 
+// `$method` is the Store method to call: find_slot (bidirectional) or find_slot_biased.
 macro_rules! bench_find {
-    ($name:ident, $permille:expr, $sty:ty, $dir:literal) => {
+    ($name:ident, $permille:expr, $sty:ty, $method:ident) => {
         #[bench]
         fn $name(b: &mut Bencher) {
-            let n_some = N * $permille / 1000;
-            let st: $sty = build_store(&flags(n_some));
+            let st: $sty = build_store(&flags(N * $permille / 1000));
             let pos = positions();
             let mut i = 0usize;
             b.iter(|| {
@@ -102,8 +94,8 @@ macro_rules! bench_find {
                 for _ in 0..INNER {
                     let p = black_box(pos[i]);
                     i = (i + 1) & (PROBES - 1);
-                    let r = st.find_slot::<$dir>(p, black_box(BUDGET), black_box(None));
-                    acc = acc.wrapping_add(r.map_or(0, |ms: MinSlide| ms.from as u64));
+                    let r = st.$method(p, black_box(true), black_box(BUDGET), black_box(None));
+                    acc = acc.wrapping_add(r.map_or(0, |ms: NoneSlide| ms.from as u64));
                     black_box(acc);
                 }
                 acc
@@ -112,28 +104,53 @@ macro_rules! bench_find {
     };
 }
 
-// ---- control: naive forward Vec<Option> scan for first None after pos ----
+//find + slide + undo-slide: store-invariant ⇒ measures find + 2×slide on a stable dist.
+macro_rules! bench_combo {
+    ($name:ident, $permille:expr, $sty:ty, $method:ident) => {
+        #[bench]
+        fn $name(b: &mut Bencher) {
+            let mut st: $sty = build_store(&flags(N * $permille / 1000));
+            let pos = positions();
+            let mut i = 0usize;
+            b.iter(|| {
+                let mut acc = 0u64;
+                for _ in 0..INNER {
+                    let p = black_box(pos[i]);
+                    i = (i + 1) & (PROBES - 1);
+                    let r = st.$method(p, black_box(true), black_box(BUDGET), black_box(None));
+                    if let Some(ms) = r {
+                        let (f, t) = (ms.from, ms.to);
+                        st.slide_none(ms, black_box(None));
+                        st.slide_none(NoneSlide { from: t, to: f }, black_box(None));
+                        acc = acc.wrapping_add(f as u64);
+                    }
+                    black_box(acc);
+                }
+                acc
+            });
+        }
+    };
+}
+
 bench_control!(control_375, 375);
-bench_control!(control_500, 500);
-bench_control!(control_750, 750);
 bench_control!(control_900, 900);
 
-// ---- VecStore::find_slot, right(after) / left(before) ----
-bench_find!(vec_r_375, 375, store::VecStore<u64, N>, true);
-bench_find!(vec_r_500, 500, store::VecStore<u64, N>, true);
-bench_find!(vec_r_750, 750, store::VecStore<u64, N>, true);
-bench_find!(vec_r_900, 900, store::VecStore<u64, N>, true);
-bench_find!(vec_l_375, 375, store::VecStore<u64, N>, false);
-bench_find!(vec_l_500, 500, store::VecStore<u64, N>, false);
-bench_find!(vec_l_750, 750, store::VecStore<u64, N>, false);
-bench_find!(vec_l_900, 900, store::VecStore<u64, N>, false);
+bench_find!(vec_bi_375, 375, store::VecStore<Elem, N>, find_nearest_slot);
+bench_find!(vec_bi_900, 900, store::VecStore<Elem, N>, find_nearest_slot);
+bench_find!(vec_bia_375, 375, store::VecStore<Elem, N>, find_slot);
+bench_find!(vec_bia_900, 900, store::VecStore<Elem, N>, find_slot);
 
-// ---- DequeStore::find_slot, right / left ----
-bench_find!(deq_r_375, 375, store::DequeStore<u64, N>, true);
-bench_find!(deq_r_500, 500, store::DequeStore<u64, N>, true);
-bench_find!(deq_r_750, 750, store::DequeStore<u64, N>, true);
-bench_find!(deq_r_900, 900, store::DequeStore<u64, N>, true);
-bench_find!(deq_l_375, 375, store::DequeStore<u64, N>, false);
-bench_find!(deq_l_500, 500, store::DequeStore<u64, N>, false);
-bench_find!(deq_l_750, 750, store::DequeStore<u64, N>, false);
-bench_find!(deq_l_900, 900, store::DequeStore<u64, N>, false);
+bench_find!(deq_bi_375, 375, store::DequeStore<Elem, N>, find_nearest_slot);
+bench_find!(deq_bi_900, 900, store::DequeStore<Elem, N>, find_nearest_slot);
+bench_find!(deq_bia_375, 375, store::DequeStore<Elem, N>, find_slot);
+bench_find!(deq_bia_900, 900, store::DequeStore<Elem, N>, find_slot);
+
+bench_combo!(combo_vec_bi_375, 375, store::VecStore<Elem, N>, find_nearest_slot);
+bench_combo!(combo_vec_bi_900, 900, store::VecStore<Elem, N>, find_nearest_slot);
+bench_combo!(combo_vec_bia_375, 375, store::VecStore<Elem, N>, find_slot);
+bench_combo!(combo_vec_bia_900, 900, store::VecStore<Elem, N>, find_slot);
+
+bench_combo!(combo_deq_bi_375, 375, store::DequeStore<Elem, N>, find_nearest_slot);
+bench_combo!(combo_deq_bi_900, 900, store::DequeStore<Elem, N>, find_nearest_slot);
+bench_combo!(combo_deq_bia_375, 375, store::DequeStore<Elem, N>, find_slot);
+bench_combo!(combo_deq_bia_900, 900, store::DequeStore<Elem, N>, find_slot);

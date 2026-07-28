@@ -35,6 +35,11 @@ pub trait Num:
     /// Signed: `0`. Unsigned: range midpoint `(MAX >> 1) + 1` = `1 << (bit_width - 1)`.
     const MIDPOINT: Self;
 
+    const ONE: Self;
+    const MIN: Self;
+    const MAX: Self;
+    const BIT_WIDTH: u8;
+
     fn rotate_left(self, n: u32) -> Self;
 
     fn rotate_right(self, n: u32) -> Self;
@@ -46,12 +51,6 @@ pub trait Num:
     fn wrapping_shl(self, n: u32) -> Self;
 
     fn wrapping_shr(self, n: u32) -> Self;
-
-    fn MIN() -> Self;
-
-    fn MAX() -> Self;
-
-    fn bit_width() -> u8;
 }
 
 /// Signed `Num` — adds negation and `isize` conversion. Signed addresses
@@ -94,6 +93,10 @@ macro_rules! impl_num {
     ($(($t:ty, $midpoint:expr)),* $(,)?) => {
         $( impl Num for $t {
             const MIDPOINT: Self = $midpoint;
+            const ONE: Self = 1;
+            const MIN: Self = <$t>::MIN;
+            const MAX: Self = <$t>::MAX;
+            const BIT_WIDTH: u8 = (std::mem::size_of::<$t>() * 8) as u8;
 
             #[inline] fn rotate_left(self, n: u32) -> Self { <$t>::rotate_left(self, n) }
             #[inline] fn rotate_right(self, n: u32) -> Self { <$t>::rotate_right(self, n) }
@@ -101,9 +104,6 @@ macro_rules! impl_num {
             #[inline] fn wrapping_sub(self, rhs: Self) -> Self { <$t>::wrapping_sub(self, rhs) }
             #[inline] fn wrapping_shl(self, n: u32) -> Self { <$t>::wrapping_shl(self, n) }
             #[inline] fn wrapping_shr(self, n: u32) -> Self { <$t>::wrapping_shr(self, n) }
-            #[inline] fn MIN() -> Self { <$t>::MIN }
-            #[inline] fn MAX() -> Self { <$t>::MAX }
-            #[inline] fn bit_width() -> u8 { (std::mem::size_of::<$t>() * 8) as u8 }
         } )*
     };
 }

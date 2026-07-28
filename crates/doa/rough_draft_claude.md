@@ -1,197 +1,111 @@
 # doa — Dense Ordered Arenas
 
-Consider a btree that mallocs each node. Three costs: 8-byte pointers between
-nodes; nodes scattered across RAM (cache-hostile, no prefetch); and
-serializing to/from disk is painful — no clean node→offset mapping unless you
-page-align, and even then deciding which node goes where in the file is
-non-trivial.
+An alternative to malloc-per-node trees: store an ordered sequence **contiguously
+in blocks, addressable by custom width pointers** (i8..isize), as [Option<T>].  
+Contiguous storage — even with `None` gaps — means iteration is a
+prefetch-friendly linear scan and serialization is writing the bytes. The crate
+preserves the **ordering** of the sequence through mutations. A contiguous run of Some
+items may be shifted left or right 1 to make space for a new T in the arena.
+Two tiers: **Block** (a fixed-width run the that surfaces address / capacity exhaustion as `Result`) 
+and **Arena** (automatic, adaptive, effectively infallible insert).
+An arena pointer and a block pointer both must impl BlockIndex, (arena_p, block_p) uniquely identify an item
+in the arena, while block_p (usually P) semi-stably uniquely identifies an item in a block.
+items may be shifted by neighboring inserts but space is freed between them or before them by adjusting the block's translator params
+which map virtual addresses handed out by the block to physical indeces into the underlying storage.
 
-doa is an alternative: store an ordered sequence **contiguously in blocks,
-addressable by small pointers** (i8+). A subtree is one `block_id` (a `usize`)
-containing nodes that reference each other with i8/i16 internal pointers; a node's
-value can itself be a `block_id` forwarding to another block/tree. Contiguous
-storage — even with `None` gaps between elements — means iteration is a linear
-scan the CPU prefetches aggressively, and stays fast at large sizes;
-serialization is writing the contiguous bytes.
+## Architecture
 
-The crate preserves the **ordering** of the sequence through mutations, not the
-*pointers*. Pointers move when a block reorganizes (spread/split on exhaustion);
-that change is **reported via `InsertDelta`**, not hidden, so the consumer can
-remap. The consumer enforces whatever structure-level invariant it needs
-(preorder for a binary tree so leftmost-descent is a sequential scan;
-prefix-chasing for a radix trie) on top of the stable ordering. Even with no
-tree at all — "node" = key — the stable ordering makes this a sorted array with
-~O(log n) insert instead of O(n).
+Module map of `src/`; only `index`/`translator`/`store`/`block` are realized,
+`tree_traits` is mid-refactor, the rest are stubs or sketches.
 
-It exposes two tiers:
+- `index.rs` — numeric trait ladder (`Num`/`SignedNum`/`UnsignedNum`/`BlockIndex`/`SignedBlockIndex`) + const facts (`MIN`/`MAX`/`MIDPOINT`/`ONE`/`BIT_WIDTH`) + wrapping/rotate/halfptr ops. Macro-impl'd for i8–i64, u8–u64; `BlockIndex` (the unsigned in-block ptr trait, with an associated `Half` type for overprovisioning) impl'd for u16 and u32 (u32 on 64-bit only).
+- `translator.rs` — `Translator<P>`: virtual↔physical address math via fn-ptr specialization.
+- `store.rs` — `Store` trait + `VecStore`/`DequeStore`: the bounded `Option<T>` slot backends.
+- `block.rs` — `AllocStrat` (four strategies) + `RawBlock`: a store + translator upholding no structural invariant; the `BlockTrait`/`BlockMutTrait` surface.
+- `tree_traits.rs` — tree-tier abstractions (`TreeOrdering`/`Node`/`TreeWalker`/`Tree`/`TreeBlock`); mid-refactor, the `impl Tree` is commented out.
+- `leafblock.rs` / `inline_leafblock.rs` / `abstract_tree.rs` — leaf-block experiments; stubs.
+- `lib.rs` — module wiring + `FractalForest`/`BTree`/`INode` sketches (unused) + the `InsertDelta` enum (placeholder) + `RelTo` + `BPtr`/`IPtr`/`LPtr` aliases.
+- `tests/` — `src/tests/{store,block}.rs`, pulled in via `#[cfg(test)] #[path = "tests/…"] mod tests;` at the end of each source file (in-crate, so `pub(crate)` internals are visible).
 
-- **Block** — a fixed-width-addressable run of the sequence. `try_insert_*` /
-  `remove` return a `Result` / `InsertDelta` describing what moved or what
-  failed; the *consumer* decides how to respond to exhaustion. A block will not
-  split or shove items onto other blocks on its own — by design. A consumer may
-  use blocks directly, keeping their own `Vec<Block>` as their arena.
-- **Arena** — automatic block management. The arena runs adaptive **strategies**
-  so blocks optimize for the workload at runtime, dodging n² insertion and
-  address exhaustion; `arena.insert_*` is effectively infallible. This is where
-  log(n) insert lives — the block layer alone can't promise it.
+## Address model
 
-**Status — work in progress, currently does not compile.** `block.rs` is
-mid-refactor of the address model (`addr_range` / `ptr_root`); `strategy.rs`
-and tests still call removed functions (`max_magnitude` / `half_ptr` /
-`assert_capacity` / `Block::new`). `strategy.rs` is in particular malformed —
-the description below is the **intended design**, not always the current code.
-Fix the seam before trusting any signature.
+How a virtual address (the `PTR` a consumer holds) maps to a physical slot
+(`usize` index into the store), and the three knobs that move without
+invalidating vaddrs.
 
-## The block
+- **Translation.** `v2p(v) = ((v + offset) >> shift) rotate_left(rotation)`; `p2v` is the inverse. `v2p` is the hot lookup path; `p2v` runs on remap/insert. Round-trip is exact on occupied slots (vaddrs the block handed out are canonical).
+- **`offset`** slides the window; `push_front` bumps it by `1 << shift` to cancel the physical shift the store's `push_front` causes — vaddrs stay stable for *all* `shift`, not just 0. Do not "simplify" the bump to `+1`; a regression test locks it (`Pluripotent` at `shift>0`).
+- **`shift`** spreads physical slots across the address range (stride `1<<shift`). Spreading does **not** increase capacity (an i8 addresses 256 positions regardless); it trades dense packing for headroom at the ends so appends/prepends have addresses to grow into before a reorg.
+- **`rotation`** is the split-remap primitive (bit-rotation, not shift); `split_and_rotate` bumps it. Currently only exercised by the block-level split stubs.
+- **Bounds are the full type range.** Unsigned `MIN=0..=MAX`. `push_front`'s offset walks up through `MAX` and wraps to `MIN` via `wrapping_add` — `MIN` is the exhaustion sentinel (the reserved range is spent). Never compute `-addr`; derive the low bound from `MIN`.
+- **`Translator` specialization.** `v2p`/`p2v` are fn pointers picked from 8 combos of (offset, shift, rotation) zero/nonzero, so a steady param is straight-line with no per-lookup branch. `set_offset`/`set_shift`/`set_rotation` re-specialize only on a zero↔nonzero flip; otherwise just write the field.
 
-A `Block<T, PTR = i16, const OVERP = false>` is one contiguous run of the
-sequence, addressed by `PTR` (i8..isize). Storage is `VecDeque<Option<T>>` — a
-slot per addressable position, `None` where a gap sits.
+## Stores
 
-### Address layout
+`Store<'a, T>` — the bounded `Option<T>` slot backend, `MAX_CAP` const (power of
+two, const-asserted) bounding logical capacity. Two backends with identical
+surfaces; `DequeStore` adds wrap-aware logic.
 
-A virtual address maps to a physical slot by `phys = (virt + virt_offset)
->> addr_shift`; inverse `virt = (phys << addr_shift) - virt_offset`. Two knobs:
+- **Capacity.** `occupied` = #Some, `len` = #slots (Some+None), `cap` = allocated. `occupied ≤ len ≤ cap ≤ MAX_CAP`. `push_*`/`grow_*`/`spread` assert against `MAX_CAP`; capacity doubles up to `MAX_CAP`.
+- **Slot primitives.** `push_back` returns the new index; `push_front` shifts existing up by 1 (store-tier addrs move — the translator hides it). `insert(v,i)`/`remove(i)` require None/Some respectively (panic otherwise); both keep `len`, change `occupied` by ±1. `pop_front`/`pop_back` take an end slot, leave a gap.
+- **`spread`** doubles `len`, element at `i` → `2i`, slot `2i+1` = `None`; `occupied` stable. `VecStore`: one reverse move + `set_len(2len)`. `DequeStore`: phase1 (upper half → tail) + phase2 (lower half → `2j`) for even `len`; **odd `len`** (the `len==1` pow2 base, and any non-pow2 `grow_and_spread` could hit) takes a direct reverse-move path — the phase split is invalid at `mid==0`.
+- **`split` / `split_and_rotate`.** `split(at)`: `[at,len)` → new store, `occupied` partitioned. `split_and_rotate(at)`: odds-gaps both halves — left `p→2p+1`, right `k→2k+1` in a new same-cap store; evens `None`; both `len` double. Both assert the doubled lengths fit `MAX_CAP`; the block tier additionally calls these only when full.
+- **`slide_none`** rotates the run `[lo,hi]` so the `None` at `from` lands at `to`; elements shift one toward `from`. `from==to` is a no-op. `VecStore`: slice rotate. `DequeStore`: in-slice rotate, or per-step swaps when the run straddles the deque's wrap boundary. A pinned slot must not be inside the run (debug-asserted; `find_slot` keeps slides off it).
+- **`find_slot`** is DIR-biased (preferred side first), budget-bounded, pin-clamped (`pin<pos` raises `min`; `pin>pos` lowers `max`; `pin==pos` restricts to the DIR side only). Returns a `NoneSlide{from,to}` whose `to` is adjacent on the inserting side when the `None` is there, else `pos`. `find_nearest_slot` is the bidirectional outward variant (minimizes slide distance, dir tie-break). `DequeStore` handles the front/back slice boundary (`pos` Less/Equal/Greater than `flen`) with cross-slice fallbacks that respect the same pin clamp.
+- **Iteration.** `iter` is a forward `ExactSizeIterator` over `Some` refs (`len == occupied`, skips `None`s), double-ended. `cursor` is a positioned reader (`seek` O(1), `next`/`prev`/`first`/`last` scan across gaps; `seek` to `None`/OOB panics; `position==None` at-end, from which `prev` is a no-op).
 
-- **`addr_shift`** spreads physical slots across the signed address space
-  (`PTR::MIN..=PTR::MAX`) — stride `1 << addr_shift`. **Spreading does not
-  increase capacity** — an i8 addresses 256 positions regardless. It trades
-  dense packing for *headroom* at the ends, so appends/prepends have addresses
-  to grow into before the block must reorganize.
-- **`virt_offset`** slides the window — the mechanism that keeps existing
-  addresses stable when the physical buffer shifts (notably `push_front`).
-- **Address bounds are the full type range** (`PTR::MIN()..=PTR::MAX()`, e.g.
-  i8 = `-128..=127`). The range includes `MIN`, so negatives are *generated* (by
-  `push_front` negating a positive offset) and **never mirrored**: never compute
-  `-addr` for an address — `i8::MIN` isn't negatable. Derive the low bound from
-  `MIN()` directly, not `-MAX()`.
+## Block & strategies
 
-### The sparse AP — aligned positions
+`RawBlock<'a, T, P, A, S>` = a `Store` + a `Translator`, carrying an `AllocStrat`
+by type. It upholds **no** structural/tree invariant — only the address-model
+invariants. `BlockTrait` is the read surface; `BlockMutTrait` the mutation
+surface. A strategy is a **bet on a workload**; each optimizes one insert pattern
+and loses on another. `AllocStrat` carries const params: `INIT_SHIFT`,
+`INIT_OFFSET` (the anchor), `INSERT_BUDGET`, `CAP_LIMIT`, `REVERSED`.
 
-The **AP** (*aligned positions*) is the stride-spaced grid of slots `find_slot`
-walks when looking for a reusable `None`. A slot is on the AP iff
-`(phys + v_off_phys) & none_mask == 1`; its stride is `none_stride = none_mask
-+ 1`, independent of the address stride `1 << addr_shift`. `None` gaps are
-pre-stocked on the AP so the walk is a short bounded stride-hop, not a scan.
-**The gaps are the whole mechanism** separating O(n) `Vec`-insert from cheap
-mid-insert: a mid-insert reuses a nearby AP `None` instead of shifting a tail.
+- **`Uniform`** (random-optimized): `INIT_SHIFT = BIT_WIDTH` (full range), anchor `MIDPOINT`, `VecStore`. `try_insert_back/front` always `Err` — random-only. `find_slot` + `insert` is the path; `insert` auto-spreads at `occupied*3 > len*4` to keep gaps stocked. `len` stays a power of two. The win: a mid-insert reuses a nearby `None` within budget — O(budget), not O(n).
+- **`Pluripotent`** ("don't know the workload yet"): `INIT_SHIFT = Half::BIT_WIDTH - 1`, `CAP_LIMIT = half range`, `DequeStore`. Dense `try_insert_back/front` into the free half; `push_front` bumps offset by `1<<shift` (stable for all shift). Buys time before graduating to a concrete strategy.
+- **`Append`**: `INIT_SHIFT = 0`, offset `(1<<width) - half_range` (low `half_range` addresses reserved for prepend), `VecStore`. Hot `push_back` hands out dense vaddrs from `half_range` up to `MAX`; every `BUDGET`-th push pads a `None` so a stray mid-insert reaches a gap within budget. Cold `push_front` into the reserved low range via `wrapping_add`, `Err` when offset wraps to `MIN` (reservation spent).
+- **`Prepend`**: `Append` mirrored — `REVERSED = true`. Hot `push_front` is physical `push_back` (front = high end); iteration is high→low; `find_slot`'s dir is flipped. Cold `push_back` into the reserved range.
+- **Mutation contract.** `insert_root` lands at phys 0 = the anchor vaddr. `find_slot(pos,dir,pin)` finds a free slot or grows: on a budget miss it calls `grow_and_spread` then **re-translates** `pos`/`pin` (spread shifts phys `i→2i`; vaddrs are stable so re-translation yields the new phys). `grow_and_spread` fails at `shift==0` or `len*2 > max_capacity`; `find_slot` returns `None` at `len == max_capacity`. `Uniform::insert` computes the new vaddr **before** its auto-spread (the vaddr is stable across the spread; computing it after would point at a gap). `remove` frees a slot for reuse.
+- **What the block does *not* do.** It will not split or shove items to another block on its own — exhaustion is surfaced (`Result`/`None`), the consumer/arena decides. Displaced elements' vaddrs change on a slide; only the **pin** is guaranteed stable. The remap info for displaced elements is not yet surfaced at this tier (`InsertDelta` is a placeholder in `lib.rs`).
 
-### Mutation surface and the `InsertDelta` contract
+## Testing
 
-- `push_back` / `push_front` are address-stable. `push_front` bumps
-  `virt_offset` by `1 << addr_shift`, which cancels the physical shift
-  `VecDeque::push_front` causes — stable for *all* `addr_shift`, not just 0.
-  (Don't "simplify" to `+= 1`; a regression test locks it.)
-- `try_insert_before` / `try_insert_after` go through `find_slot` + the
-  strategy; `remove` takes a slot and may shift the resulting `None` to a nearby
-  aligned position. All return an **`InsertDelta`**:
-  - `Free` — placed in a pre-existing `None` (or pushed); address-stable, no remap.
-  - `Move` — elements shifted; carries `addr_delta` (`minus << addr_shift`),
-    the remap the caller applies to its pointers.
-  - `BlockSplit` — placeholder (see Arena).
-- The consumer reads the delta to fix up its pointers. **The block does not
-  shift-to-create a gap on insert, and does not split** — those are the
-  consumer's / arena's job.
+71 tests (`cargo test`), in `src/tests/{store,block}.rs`. They encode the
+address-model and per-strategy invariants, and a reference-comparison harness
+for the store's `find_*`/`slide_none`.
 
-### Returns a `Result` by design
+- **Store (VecStore + DequeStore).** Capacity/pow2 bounds; slot primitives; `spread`; `split`/`split_and_rotate`; `slide_none` compared against a reference rotation over **all** `(from,to)` pairs, contiguous and wrapped (exercises the wrap-crossing swap path); `find_slot`/`find_nearest_slot` compared against a reference over pos×dir×budget×pin, contiguous and wrapped (exercises the `flen` Less/Equal/Greater keypoints and cross-slice fallbacks); iter/cursor; a fuzz loop checking `occupied≤len≤cap≤MAX_CAP` after every mutation.
+- **Block per strategy.** `new`/empty params; `insert_root` at the anchor; hot/cold paths and their vaddrs; **vaddr stability across grow/spread** (round-trip `v2p∘p2v` + `get` consistency on every occupied slot); **pin root never moves** (root vaddr and phys constant through a 30-insert sequence); `len` pow2 (`Uniform`); exhaustion returns `None`/`Err` at `max_capacity`/`MIN`; `Pluripotent` `push_front` stability (u16 **and** u32 — the `+1<<shift` regression); `Append`/`Prepend` cold-path exhaustion at 256 reserved inserts; `Prepend` iter reversed.
+- **Bugs the suite caught and locked.** `find_slot` re-translate after `grow_and_spread`; `Uniform::insert` vaddr-before-spread; `Pluripotent` `push_front` `+1<<shift` (was `+1`); `Append`/`Prepend` cold-path `wrapping_add` (was debug-overflow at `MAX`); `DequeStore::spread` odd-`len` direct path (phase split invalid at `mid==0`); `DequeStore::find_slot` cross-slice pin clamp (`scan_left` lower-bounds the back scan at `min-fl`; `scan_right` falls through `front`→`back` within budget).
 
-`try_insert_*` / `push_*` can fail with `NotFound::OutOfBudget` (no gap within
-stride-budget) or `AddressExhaustion` (next address not representable in `PTR`).
-A bare block surfaces the failure and lets the caller decide — it will not
-overstep into a split or a shove. A consumer using blocks directly is the one
-who knows the structure's semantics, so the decision is theirs.
+## Status
 
-### Strategies — why they exist
+Compiles; 71 tests pass. The block + store + translator + index tiers are
+realized. Not built / stubbed: the **arena tier** (auto-split, adaptive strategy
+switching, infallible insert — `Arena` is not implemented), `tree_traits`
+(`impl Tree` commented out mid-refactor), `leafblock`/`inline_leafblock`/
+`abstract_tree`, and `lib.rs`'s `FractalForest`/`BTree`/`INode` sketches. The
+`InsertDelta` enum in `lib.rs` is a placeholder — block `insert` returns the new
+vaddr directly, and remap info for slide-displaced elements is not yet surfaced.
+Historical (do not revive): `circular_array.rs` is gone; the `MAX` const generic
+is gone (replaced by `MAX_CAP` on stores + `CAP_LIMIT` on strategies); the
+`OVERP: bool` block generic is gone (overprovisioning is now `BlockIndex::Half`);
+`BlockIndex::sqrt_max` is gone, and the old signed `BlockIndex` split into
+unsigned `BlockIndex` (with an associated `Half` type) and `SignedBlockIndex`
+(the signed seam).
 
-A block's address layout is a **bet on its workload**. The four strategies are
-four bets; each optimizes for one insertion pattern and loses on another. The
-arena (at the arena tier) picks the bet per block and changes it when proven
-wrong.
+# Future Work 
+Explicit TODO list:
+- spread / split — block-level primitives and the arena's auto-split.
+- graduation — pluripotent → concrete strategy at len == half_ptr; post_insert_check is a no-op stub.
+- Block cursor_mut / iter_mut.
+- trie integration.
 
-**Random — the intended case.** A random-optimized block spreads its elements
-across the *whole* address range so `None` gaps sit throughout. A mid-block
-insert then reuses the nearest gap with a short stride-walk (`find_slot`,
-budget-bounded) — O(budget), not O(n). This is the win: insert anywhere without
-shifting a tail.
-
-> *State:* i8 block, cap 8, len 4, stride 32 (`addr_shift 5`, `v_off = 128`).
-> Spread from a dense 4-element block left the elements at the **even** phys
-> slots — `Some` at `[-128, -64, 0, 64]` (phys 0,2,4,6; phys 0 stays put since
-> `2*0 = 0`) — and opened the **odd** phys slots as AP gaps — `None` at
-> `[-96, -32, 32, 96]` (phys 1,3,5,7). Insert near `0` (phys 4): `find_slot`
-> walks the AP outward, finds the `None` at `-32` (phys 3) or `32` (phys 5)
-> within budget → places there. Cheap; no tail shifted.
-
-**The flaw that motivates *append*.** The spread that makes mid-inserts cheap
-spends the address range on gaps throughout, leaving **less than a stride of
-headroom at the back**. So an append-heavy workload on a random block hits the
-wall almost immediately:
-
-> *State:* i8 block, random, cap 4, len 4, stride 64, addresses `[-128, -64, 0,
-> 64]` (spread across the range; top at 64). *Operation:* `push_back`. Full →
-> grow + spread (stride 64→32); existing addresses preserved, one new back slot
-> appears at `96` (64 + 32). **One** usable append. The next `push_back` would
-> need `128` — not representable in i8 (max `127`) — so the block must grow +
-> spread *again* (stride 32→16), an O(n) redistribution, to free one more end-slot
-> (`112`). Each subsequent append hits the same wall and pays the same O(n)
-> reorg: **O(n²) for a push_back sequence.** The layout was shaped for random
-> inserts, but the workload was appends → mismatch → quadratic.
-
-*Append's bet:* `addr_shift = 0` — elements dense at consecutive low addresses
-`[0,1,2,3]`, the **entire** upper range free. Append just takes the next address
-up to `PTR::MAX`; no spread, no shift, no wall. *Blind spot:* a mid-block insert
-has no pre-stocked gap nearby (small budget) → `OutOfBudget` fast → expensive
-mid-insert.
-
-**Prepend** is the mirror — dense at the top, the lower range free for sustained
-`push_front`. Same mid-insert blind spot as append.
-
-**Pluripotent** is "I don't know the workload yet." A conservatively *small*
-block (`cap ≤ half_ptr`) kept under the address ceiling so it can serve *either*
-appends or mid-inserts for a while without reorganizing — and once the pattern is
-clear it **graduates** into the matching concrete strategy. Its reason for
-existing: committing early to the wrong concrete strategy costs you (the
-quadratic above, or the append-block's mid-insert penalty), so it buys time to
-find out.
-
-## The arena
-
-`Arena<T, U, I>` owns `VecDeque<Block>` (blocks linked `prev` / `next` for
-ordered iteration) plus a small queue of recent insert hints. It exists to take
-the decisions a bare block refuses.
-
-- **Infallible insert.** `arena.insert_before` / `insert_after` are
-  effectively infallible: when a block would return `NotFound` or
-  `AddressExhaustion`, the arena responds — spread, split, or readdress — so the
-  caller never has to. (Skeleton today; `insert_*` are `todo!()`.)
-- **Adaptive strategies at runtime.** The arena assigns each block a strategy
-  at birth and *changes it* when the workload proves the bet wrong — a random
-  block getting hammered with appends is reshaped before the quadratic bites.
-  This is how the arena targets log(n) insert, which the block layer alone
-  cannot promise.
-- **Overprovisioning.** `OVERP = true` widens `PTR` beyond the address space the
-  block needs (e.g. i32 ptrs for an i8-scale block), making log(n) insert *easy*
-  — but it can double the size of pointer-heavy structures (every internal
-  pointer widens). A memory/insert-speed trade the arena-level consumer makes.
-- **Subtrees and forwarding.** A subtree stores one `block_id: usize` and uses
-  small `PTR`s *within* the block for node-to-node references; a node's *value*
-  can itself be a `block_id` forwarding to another block/tree. The small-pointer
-  payoff: an 8-byte malloc pointer becomes an i8 within a subtree, with one
-  `usize` at the root.
-- **Ordering across splits.** A split partitions the ordered run into adjacent
-  blocks linked `prev` / `next`; iteration is a contiguous *logical* scan across
-  the linked list even though storage is now several physical buffers. The
-  linked list is the ordering-stability mechanism across splits, not just an
-  iteration convenience.
-
-## Not built / historical
-
-**TODO:** spread / split (block-level primitives and the arena's auto-split),
-graduation (`pluripotent` → concrete at `len == half_ptr`; `post_insert_check` is
-a no-op stub), prepend gap-insertion, Block `iter` / `iter_mut`, trie integration.
-
-**Historical (do not revive):** `circular_array.rs` is gone (`Block.buf` =
-`VecDeque<Option<T>>`). The `MAX` const generic is gone (replaced by `OVERP:
-bool`). `BlockIndex::sqrt_max` and the `BlockIndex` trait name are gone (→
-`SignedBlockIndex`). Any claim spread/split or the arena are "done" describes a
-prior, now-divergent session.
+Arena tier (intended, currently skeleton / todo!()):
+- Infallible insert — arena.insert_before / insert_after that absorb NotFound/AddressExhaustion via spread/split/readdress so the caller never handles failure.
+- Adaptive runtime strategy switching — assign a strategy per block at birth and reshape when the workload proves the bet wrong (this is where log(n) insert lives).
+- Overprovisioning — OVERP = true widening PTR.
+- Subtrees & forwarding — block_id: usize roots with small internal PTRs; a node's value can be a block_id forwarding to another block.
+- Ordering across splits — prev/next linked list so iteration is a contiguous logical scan across split blocks.

@@ -1,0 +1,446 @@
+use super::*;
+use crate::index::BlockIndex;
+use crate::store::{Cursor, NoneSlide, Store, VecStore, DequeStore};
+
+///for every occupied phys slot, v2p(p2v(p))==p and get(vaddr) matches the cursor.
+fn roundtrip<P, A, S>(b: &RawBlock<'static, u64, P, A, S>)
+where
+    P: BlockIndex,
+    A: AllocStrat<P>,
+    S: Store<'static, u64> + 'static,
+{
+    let mut c = b.cursor();
+    c.first();
+    while let Some(p) = c.position() {
+        let v = b.p2v(p);
+        assert_eq!(b.v2p(v), p, "v2p(p2v(p)) != p at phys {p}");
+        assert_eq!(*b.get(v), *c.current().unwrap(), "get(v) != cursor at phys {p}");
+        if !c.next() {
+            break;
+        }
+    }
+}
+
+///all recorded (vaddr,value) pairs still resolve.
+fn stable<P, A, S>(b: &RawBlock<'static, u64, P, A, S>, pairs: &[(P, u64)])
+where
+    P: BlockIndex,
+    A: AllocStrat<P>,
+    S: Store<'static, u64> + 'static,
+{
+    for (v, val) in pairs {
+        assert_eq!(*b.get(*v), *val, "vaddr {:?} not stable", v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Uniform (u16, VecStore)
+// ---------------------------------------------------------------------------
+mod uniform {
+    use super::*;
+    type Blk = RawBlock<'static, u64, u16, Uniform, VecStore<u64, 4096>>;
+
+    #[test]
+    fn new_empty() {
+        let b: Blk = BlockMutTrait::new();
+        assert_eq!(b.len(), 0);
+        assert_eq!(b.occupied(), 0);
+        assert!(b.first_vaddr().is_none());
+        assert_eq!(b.translator().shift(), 16);
+        assert_eq!(b.translator().offset(), 32768);
+    }
+
+    #[test]
+    fn insert_root_at_midpoint() {
+        let mut b: Blk = BlockMutTrait::new();
+        let v = b.insert_root(42);
+        assert_eq!(v, 32768);
+        assert_eq!(*b.get(v), 42);
+        assert_eq!(b.first_vaddr(), Some(v));
+        assert_eq!(b.last_vaddr(), Some(v));
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn pushes_rejected() {
+        let mut b: Blk = BlockMutTrait::new();
+        assert!(b.try_insert_back(1).is_err());
+        assert!(b.try_insert_front(1).is_err());
+        assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn mid_insert_after_root_preserves_root() {
+        let mut b: Blk = BlockMutTrait::new();
+        let root = b.insert_root(100);
+        let ms = b.find_slot(root, true, Some(root)).expect("slot");
+        let slot = b.slide_none(ms, Some(root));
+        let new = b.insert(200, slot);
+        assert_eq!(*b.get(root), 100);
+        assert_eq!(*b.get(new), 200);
+        assert!(b.len().is_power_of_two());
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn vaddr_stable_across_growth() {
+        let mut b: Blk = BlockMutTrait::new();
+        let root = b.insert_root(0);
+        //insert after the last each time, pinning the root. spread/grow preserve all
+        //vaddrs; slides preserve only the pin, so check root + roundtrip (v2p/p2v/get
+        //consistency) per step, not every recorded vaddr (displaced ones remap).
+        for i in 1..40 {
+            let last = b.last_vaddr().unwrap();
+            let ms = b.find_slot(last, true, Some(root)).expect("slot");
+            let slot = b.slide_none(ms, Some(root));
+            b.insert(i, slot);
+            assert_eq!(*b.get(root), 0, "root moved at i={i}");
+            roundtrip(&b);
+        }
+        assert!(b.len().is_power_of_two());
+    }
+
+    #[test]
+    fn len_pow2_throughout() {
+        let mut b: Blk = BlockMutTrait::new();
+        let _ = b.insert_root(0);
+        for i in 1..20 {
+            let last = b.last_vaddr().unwrap();
+            let ms = b.find_slot(last, true, Some(b.first_vaddr().unwrap())).expect("slot");
+            let slot = b.slide_none(ms, Some(b.first_vaddr().unwrap()));
+            b.insert(i, slot);
+            assert!(b.len().is_power_of_two(), "len {} not pow2", b.len());
+        }
+    }
+
+    #[test]
+    fn remove_then_reuse() {
+        let mut b: Blk = BlockMutTrait::new();
+        let root = b.insert_root(0);
+        let ms = b.find_slot(root, true, Some(root)).unwrap();
+        let slot = b.slide_none(ms, Some(root));
+        let v = b.insert(1, slot);
+        let removed = b.remove(v);
+        assert_eq!(removed, 1);
+        assert_eq!(b.occupied(), 1);
+        // root still intact
+        assert_eq!(*b.get(root), 0);
+        roundtrip(&b);
+    }
+
+    type Small = RawBlock<'static, u64, u16, Uniform, VecStore<u64, 4>>;
+
+    #[test]
+    fn exhaustion_returns_none() {
+        let mut b: Small = BlockMutTrait::new();
+        let root = b.insert_root(0);
+        for i in 1..4 {
+            let last = b.last_vaddr().unwrap();
+            let ms = b.find_slot(last, true, Some(root)).expect("slot");
+            let slot = b.slide_none(ms, Some(root));
+            b.insert(i, slot);
+        }
+        assert_eq!(b.occupied(), 4);
+        assert_eq!(b.len(), b.max_capacity());
+        let last = b.last_vaddr().unwrap();
+        assert!(b.find_slot(last, true, Some(root)).is_none(), "should be exhausted");
+    }
+
+    #[test]
+    fn pin_root_never_moves() {
+        let mut b: Blk = BlockMutTrait::new();
+        let root = b.insert_root(0);
+        let root_phys = b.v2p(root);
+        for i in 1..30 {
+            let last = b.last_vaddr().unwrap();
+            let ms = b.find_slot(last, true, Some(root)).expect("slot");
+            let slot = b.slide_none(ms, Some(root));
+            b.insert(i, slot);
+            // root vaddr still resolves to the same value AND phys
+            assert_eq!(*b.get(root), 0);
+            assert_eq!(b.v2p(root), root_phys, "root phys moved at i={i}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pluripotent (u16 + u32, DequeStore)
+// ---------------------------------------------------------------------------
+mod pluripotent {
+    use super::*;
+    type Blk16 = RawBlock<'static, u64, u16, Pluripotent, DequeStore<u64, 256>>;
+    type Blk32 = RawBlock<'static, u64, u32, Pluripotent, DequeStore<u64, 256>>;
+
+    #[test]
+    fn new_empty_u16() {
+        let b: Blk16 = BlockMutTrait::new();
+        assert_eq!(b.translator().shift(), 7); // Half(u8)::BIT_WIDTH - 1
+        assert_eq!(b.translator().offset(), 32768);
+    }
+
+    #[test]
+    fn new_empty_u32() {
+        let b: Blk32 = BlockMutTrait::new();
+        assert_eq!(b.translator().shift(), 15); // Half(u16)::BIT_WIDTH - 1
+        assert_eq!(b.translator().offset(), 1 << 31);
+    }
+
+    #[test]
+    fn back_dense_stride() {
+        let mut b: Blk16 = BlockMutTrait::new();
+        let mut pairs = Vec::new();
+        for i in 0..10 {
+            let v = b.try_insert_back(i).unwrap();
+            pairs.push((v, i));
+        }
+        assert_eq!(pairs[0].0, 32768);
+        assert_eq!(pairs[1].0, 32768 + (1 << 7)); // stride 128
+        stable(&b, &pairs);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn back_dense_stride_u32() {
+        let mut b: Blk32 = BlockMutTrait::new();
+        let mut pairs = Vec::new();
+        for i in 0..10 {
+            let v = b.try_insert_back(i).unwrap();
+            pairs.push((v, i));
+        }
+        assert_eq!(pairs[0].0, 1 << 31);
+        assert_eq!(pairs[1].0, (1 << 31) + (1 << 15));
+        stable(&b, &pairs);
+        roundtrip(&b);
+    }
+
+    ///regression: push_front must keep existing vaddrs stable for all addr_shift,
+    ///not just 0. The offset bump is `1<<shift`, not `+1`.
+    #[test]
+    fn front_stable_across_push() {
+        let mut b: Blk16 = BlockMutTrait::new();
+        let back = b.try_insert_back(10).unwrap();
+        let front1 = b.try_insert_front(20).unwrap();
+        assert_eq!(*b.get(back), 10, "back vaddr moved after push_front");
+        let front2 = b.try_insert_front(30).unwrap();
+        assert_eq!(*b.get(back), 10);
+        assert_eq!(*b.get(front1), 20, "front1 moved after second push_front");
+        assert_eq!(*b.get(front2), 30);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn front_stable_across_push_u32() {
+        let mut b: Blk32 = BlockMutTrait::new();
+        let back = b.try_insert_back(10).unwrap();
+        let front = b.try_insert_front(20).unwrap();
+        assert_eq!(*b.get(back), 10);
+        assert_eq!(*b.get(front), 20);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn back_exhaustion() {
+        let mut b: Blk16 = BlockMutTrait::new();
+        for i in 0..256 {
+            assert!(b.try_insert_back(i).is_ok(), "failed at {i}");
+        }
+        assert!(b.try_insert_back(999).is_err());
+        assert!(b.len() <= b.max_capacity());
+    }
+
+    #[test]
+    fn mid_insert_after_two_backs() {
+        let mut b: Blk16 = BlockMutTrait::new();
+        let r0 = b.try_insert_back(0).unwrap();
+        let r1 = b.try_insert_back(1).unwrap();
+        // mid-insert after r0 with r0 pinned
+        let ms = b.find_slot(r0, true, Some(r0)).expect("slot");
+        let slot = b.slide_none(ms, Some(r0));
+        let v = b.insert(50, slot);
+        assert_eq!(*b.get(r0), 0);
+        assert_eq!(*b.get(r1), 1);
+        assert_eq!(*b.get(v), 50);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn grow_and_spread_preserves_vaddr_even_len() {
+        let mut b: Blk16 = BlockMutTrait::new();
+        // start from len 2 (even) so spread's mid>0 path is exercised
+        let a = b.try_insert_back(1).unwrap();
+        let _ = b.try_insert_back(2).unwrap();
+        b.grow_and_spread().unwrap();
+        assert_eq!(b.len(), 4);
+        assert_eq!(*b.get(a), 1, "vaddr not stable across spread");
+        roundtrip(&b);
+    }
+
+    ///spread on len 1: element must remain at its vaddr, len becomes 2.
+    #[test]
+    fn grow_and_spread_len1() {
+        let mut b: Blk16 = BlockMutTrait::new();
+        let root = b.insert_root(7);
+        b.grow_and_spread().unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(*b.get(root), 7, "root not stable across spread(len1)");
+        roundtrip(&b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Append (u16, VecStore)
+// ---------------------------------------------------------------------------
+mod append {
+    use super::*;
+    type Blk = RawBlock<'static, u64, u16, Append, VecStore<u64, 512>>;
+
+    #[test]
+    fn new_empty() {
+        let b: Blk = BlockMutTrait::new();
+        assert_eq!(b.translator().shift(), 0);
+        assert_eq!(b.translator().offset(), 65280);
+    }
+
+    #[test]
+    fn back_dense_low_addrs() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut pairs = Vec::new();
+        for i in 0..20 {
+            let v = b.try_insert_back(i).unwrap();
+            pairs.push((v, i));
+        }
+        assert_eq!(pairs[0].0, 256); // p2v(0) = 0 - 65280 (mod) = 256
+        assert_eq!(pairs[1].0, 257);
+        stable(&b, &pairs);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn back_stable_across_pad() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut pairs = Vec::new();
+        for i in 0..20 {
+            let v = b.try_insert_back(i).unwrap();
+            pairs.push((v, i));
+        }
+        // crossing the BUDGET=16 boundary inserts a None pad; old vaddrs must hold
+        for i in 0..40 {
+            let v = b.try_insert_back(100 + i).unwrap();
+            pairs.push((v, 100 + i));
+            stable(&b, &pairs);
+        }
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn front_cold_into_reserved() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut pairs = Vec::new();
+        for i in 0..5 {
+            let v = b.try_insert_back(i).unwrap();
+            pairs.push((v, i));
+        }
+        let f0 = b.try_insert_front(100).unwrap();
+        assert_eq!(f0, 255);
+        stable(&b, &pairs);
+        let f1 = b.try_insert_front(101).unwrap();
+        assert_eq!(f1, 254);
+        stable(&b, &pairs);
+        assert_eq!(*b.get(f0), 100);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn front_exhaustion_at_min_offset() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut count = 0;
+        loop {
+            match b.try_insert_front(1) {
+                Ok(_) => count += 1,
+                Err(_) => break,
+            }
+        }
+        // offset starts 65280; each prepend +1; Err when offset wraps to MIN (0)
+        assert_eq!(count, 256);
+    }
+
+    #[test]
+    fn back_respects_max_cap() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut ok = 0;
+        for i in 0..2000 {
+            match b.try_insert_back(i) {
+                Ok(_) => ok += 1,
+                Err(_) => break,
+            }
+        }
+        assert!(ok > 0);
+        assert!(b.len() <= b.max_capacity(), "len {} > max {}", b.len(), b.max_capacity());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prepend (u16, VecStore) — Append reversed
+// ---------------------------------------------------------------------------
+mod prepend {
+    use super::*;
+    type Blk = RawBlock<'static, u64, u16, Prepend, VecStore<u64, 512>>;
+
+    #[test]
+    fn new_empty() {
+        let b: Blk = BlockMutTrait::new();
+        assert_eq!(b.translator().shift(), 0);
+        assert_eq!(b.translator().offset(), 65280);
+    }
+
+    #[test]
+    fn front_hot_high_addrs() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut pairs = Vec::new();
+        for i in 0..10 {
+            let v = b.try_insert_front(i).unwrap();
+            pairs.push((v, i));
+        }
+        assert_eq!(pairs[0].0, 256);
+        stable(&b, &pairs);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn iter_is_reverse_insertion_order() {
+        let mut b: Blk = BlockMutTrait::new();
+        for i in 0..5 {
+            b.try_insert_front(i).unwrap();
+        }
+        let vals: Vec<u64> = b.iter().copied().collect();
+        assert_eq!(vals, vec![4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn back_cold_into_reserved() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut pairs = Vec::new();
+        for i in 0..5 {
+            let v = b.try_insert_front(i).unwrap();
+            pairs.push((v, i));
+        }
+        let b0 = b.try_insert_back(100).unwrap();
+        assert_eq!(b0, 255);
+        stable(&b, &pairs);
+        assert_eq!(*b.get(b0), 100);
+        roundtrip(&b);
+    }
+
+    #[test]
+    fn back_exhaustion_at_min_offset() {
+        let mut b: Blk = BlockMutTrait::new();
+        let mut count = 0;
+        loop {
+            match b.try_insert_back(1) {
+                Ok(_) => count += 1,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(count, 256);
+    }
+}

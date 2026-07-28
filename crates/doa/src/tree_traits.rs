@@ -1,15 +1,12 @@
 use crate::RelTo;
-use crate::block::{AllocStrat, BlockBase, RawBlock};
+use crate::block::{AllocStrat, BlockMutTrait, BlockTrait, RawBlock};
 use crate::{index::BlockIndex, store::Store, translator::Translator};
 use std::marker::PhantomData;
 
-///tree layout + root placement. RawBlock carries no ordering; this is a tree-tier
-///concern. root_position picks the root vaddr given the block's first/last occupied
-///vaddrs (supplied by BlockBase); the block owns them.
-pub trait TreeOrdering: 'static {
-
-    fn root_position<P: BlockIndex>(first: P, last: P) -> P;
-}
+///tree layout. RawBlock carries no ordering; this is a tree-tier concern. the root
+///vaddr is stored on the block (set at construction / split), not derived — bit
+///rotation in the translator makes first/last insufficient to recover it.
+pub trait TreeOrdering: 'static {}
 
 pub struct BFO;
 
@@ -19,25 +16,21 @@ pub struct PreOrder;
 
 pub struct PostOrder;
 
-///fast for iterating over leaves, splitting is difficult.
-///ordering requires node receiving child to already have at least 1 child, except for the root.
-//impl TreeOrdering for BFO {}
-///like preorder but reversed
-//impl TreeOrdering for PostOrder {}
 ///easiest to split, iteration OK
-impl TreeOrdering for InOrder {
+impl TreeOrdering for InOrder {}
 
-    //in-order: root sits at the address anchor.
-    fn root_position<P: BlockIndex>(_first: P, _last: P) -> P {
-        P::MIDPOINT
-    }
+trait OrderedBlock<'a, T: Sized + 'a, P: BlockIndex, O: TreeOrdering, S: Store<'a, T> + 'a>:
+    BlockTrait<'a, T, P, S>
+{
+    fn root_vaddr(&self) -> P;
 }
 
-///lookup only goes forward, next element is child or sibling, can be fast for chains.
-//impl TreeOrdering for PreOrder {}
+trait OrderedNode<P: BlockIndex, O: TreeOrdering> {
+    ///vaddr the new child at child_idx should be placed before/after.
+    fn insert_position(&self, this: P, child_idx: usize) -> RelTo<P>;
+}
+
 /// blocks that store a type that impls Node support automatic internal navigation by default.
-///
-/// for a b+tree, only the cursor knows which discriminant V is so we have to be 'dumb'.
 /// D = DEGREE , the maximum number of children of a node.
 trait Node<'a, O: TreeOrdering>: Sized + 'a + OrderedNode<Self::P, O> {
     type K: Sized + 'a;
@@ -67,6 +60,13 @@ trait Node<'a, O: TreeOrdering>: Sized + 'a + OrderedNode<Self::P, O> {
     fn remove(&mut self, k: &Self::K, child_idx: usize); //if node has no keys afterward it should be removed.
 
     fn degree() -> usize; //the max degree of the node type, how many children it can possibly have.
+
+    ///usize->P slot write: set the child ptr at child_idx. the only setter the
+    ///block-tier needs; parent/sibling rewiring uses the NodeIter<&mut P> accessors.
+    fn update_child(&mut self, child_idx: usize, new_p: Self::P);
+
+    ///drop the child ptr at child_idx (for remove).
+    fn clear_child(&mut self, child_idx: usize);
 }
 
 ///node may store its elements sparse, next/prev isnt necessarily position +- 1;
@@ -98,11 +98,14 @@ trait NodeIterMut<'a, T>: NodeIter<'a, T> {
 ///tree walker owns a &mut Block<T : Node, O : Ordering .etc>
 trait TreeWalker<'a, B: Tree<'a>>: TreeProbe<'a, B> {
 
-    fn pop(&mut self) -> Option<(usize, usize)>; //take the parent position off the ancestor stack.
+    ///take the ancestor stack: (parent vaddr, child_idx taken).
+    fn pop(&mut self) -> Option<(B::P, usize)>;
 
-    fn push(&mut self, position: usize); //put a new physical position in the ancestor stack.
+    ///push (parent vaddr, child_idx) onto the ancestor stack.
+    fn push(&mut self, parent: B::P, child_idx: usize);
 
-    fn parent(&self) -> Option<(usize, usize)>; //view the top of the ancestor stack (parent, child_idx).
+    ///view the top of the ancestor stack (parent vaddr, child_idx).
+    fn parent(&self) -> Option<(B::P, usize)>;
 
     fn ascend(&mut self); //goto parent
 
@@ -110,7 +113,7 @@ trait TreeWalker<'a, B: Tree<'a>>: TreeProbe<'a, B> {
 
     fn prev(&mut self); //go to prev node in the defined ordering
 
-    fn right(&mut self); //go to prev sibling/cousin, skipping parent. 
+    fn right(&mut self); //go to prev sibling/cousin, skipping parent.
 
     fn left(&mut self); //go to next sibling/cousin, skipping parent
 }
@@ -127,11 +130,11 @@ trait TreeWalkerMut<'a, B: Tree<'a>>: TreeProbeMut<'a, B> + TreeWalker<'a, B> {
 
 trait TreeProbe<'a, B: Tree<'a>> {
 
-    fn position(&self) -> usize; // physical position of current node
+    fn position(&self) -> B::P; //current node vaddr
 
     fn current(&self) -> Option<&B::V>; //current node
 
-    fn descend(&mut self, child_idx: usize); //goto current.vals[child_idx];
+    fn descend(&mut self, child_idx: usize); //goto current.children[child_idx];
 }
 
 trait TreeProbeMut<'a, B: Tree<'a>>: TreeProbe<'a, B> {
@@ -139,13 +142,14 @@ trait TreeProbeMut<'a, B: Tree<'a>>: TreeProbe<'a, B> {
     fn current_mut(&mut self) -> &mut B::V;
 }
 
-/// type that the block stores, key type, value type, ptrs type, address translator, ordering, store
+/// type that the block stores, ptrs type, address translator, ordering, store.
+/// K/V come from T (Node); no separate K/V params.
 trait Tree<'a>: Sized + OrderedBlock<'a, Self::T, Self::P, Self::O, Self::S> {
     type T: Node<'a, Self::O>;
     type K: Sized;
     type V: Sized;
     type P: BlockIndex;
-    type A: AllocStrat;
+    type A: AllocStrat<Self::P>;
     type O: TreeOrdering;
     type S: Store<'a, Self::T> + 'a;
 
@@ -168,91 +172,70 @@ trait Tree<'a>: Sized + OrderedBlock<'a, Self::T, Self::P, Self::O, Self::S> {
     where W: TreeWalker<'a, Self>;
 }
 
-trait OrderedBlock<'a, T: Sized + 'a, P: BlockIndex, O: TreeOrdering, S: Store<'a, T>>:
-    BlockBase<'a, T, P, S>
-{
-
-    //block supplies first/last (its occupied vaddrs); O picks among them / midpoint.
-    //empty block → midpoint (the anchor, where the root will live).
-    fn root_vaddr(&self) -> P {
-        O::root_position(
-            self.first_vaddr().unwrap_or(P::MIDPOINT),
-            self.last_vaddr().unwrap_or(P::MIDPOINT),
-        )
-    }
-}
-
-trait OrderedNode<P: BlockIndex, O: TreeOrdering> {
-
-    fn insert_position(&self, child_idx: usize) -> RelTo<usize>;
-}
-
-struct TreeBlock<'a, T, K, V, P, A, O, S>
+struct TreeBlock<'a, T, A, O, S, B>
 where
     T: Node<'a, O>,
-    K: Sized,
-    V: Sized,
-    P: BlockIndex,
-    A: AllocStrat,
+    A: AllocStrat<T::P>,
     O: TreeOrdering,
     S: Store<'a, T> + 'a,
+    B : BlockMutTrait<'a,T,T::P,A,S> +'a,
 {
 
-    ///private: callers must go through TreeBlock so rewiring can't be bypassed.
-    raw: RawBlock<'a, T, P, A, S>,
-    _p:  PhantomData<(K, V, O)>,
+    ///private: callers go through TreeBlock.
+    inner:  B,
+    ///root vaddr. stored; rotation makes it underivable from first/last.
+    root: T::P,
+    _p:   PhantomData<(O,A,S)>,
 }
 
-//BlockBase via the two accessors — the read surface forwards through raw's impl.
-impl<'a, T, K, V, P, A, O, S> BlockBase<'a, T, P, S> for TreeBlock<'a, T, K, V, P, A, O, S>
+//BlockTrait via the two accessors — the read surface forwards through raw's impl.
+impl<'a, T, A, O, S, B> BlockTrait<'a, T, T::P, S> for TreeBlock<'a, T, A, O, S, B>
 where
     T: Node<'a, O>,
-    K: Sized + 'a,
-    V: Sized + 'a,
-    P: BlockIndex,
-    A: AllocStrat,
+    A: AllocStrat<T::P>,
     O: TreeOrdering,
     S: Store<'a, T> + 'a,
+    B : BlockMutTrait<'a,T,T::P,A,S> +'a,
+
 {
 
     fn store<'b>(&'b self) -> &'b S
     where 'a: 'b {
-        self.raw.store()
+        self.inner.store()
     }
 
-    fn translator<'b>(&'b self) -> &'b Translator<P> {
-        self.raw.translator()
+    fn translator<'b>(&'b self) -> &'b Translator<T::P> {
+        self.inner.translator()
     }
 }
 
-impl<'a, T, K, V, P, A, O, S> OrderedBlock<'a, T, P, O, S>
-    for TreeBlock<'a, T, K, V, P, A, O, S>
+impl<'a, T, A, O, S, B> OrderedBlock<'a, T, T::P, O, S>
+    for TreeBlock<'a, T, A, O, S, B>
 where
     T: Node<'a, O>,
-    K: Sized + 'a,
-    V: Sized + 'a,
-    P: BlockIndex,
-    A: AllocStrat,
+    A: AllocStrat<T::P>,
     O: TreeOrdering,
     S: Store<'a, T> + 'a,
+    B : BlockMutTrait<'a,T,T::P,A,S> +'a,
 {
+    fn root_vaddr(&self) -> T::P {
+        self.root
+    }
 }
 
-// impl<'a, T, K, V, P, A, O, S> Tree<'a> for TreeBlock<'a, T, K, V, P, A, O, S>
+// impl<'a, T, A, O, S, B> Tree<'a> for TreeBlock<'a, T, A, O, S, B>
 // where
 //     T: Node<'a, O>,
-//     K: Sized + 'a,
-//     V: Sized + 'a,
-//     P: BlockIndex,
-//     A: AllocStrat,
+//     A: AllocStrat<T::P>,
 //     O: TreeOrdering,
 //     S: Store<'a, T> + 'a,
+//     B : BlockMutTrait<'a,T,T::P,A,S> +'a,
 // {
 //     type A = A;
 //     type T = T;
-//     type K = K;
-//     type V = V;
-//     type P = P;
+//     type K = T::K;
+//     type V = T::V;
+//     type P = T::P;
 //     type O = O;
 //     type S = S;
 
@@ -265,23 +248,49 @@ where
 //     where
 //         W: TreeWalker<'a, Self>,
 //     {
-//         todo!()
-//     }
-
-//     fn probe(&self, k: Self::K) -> impl TreeProbe<'a, Self> {
-//         todo!()
+//         let parent_v = walker.position();
+//         let rel = self.inner.get(parent_v).insert_position(parent_v, child_idx);
+//         let (anchor, dir) = match rel {
+//             RelTo::Before(p) => (p, false),
+//             RelTo::After(p) => (p, true),
+//         };
+//         //only the root is pinned; the parent may displace.
+//         let pin = Some(self.root);
+//         let ms = match self.inner.find_insert_slot(anchor, dir, pin) {
+//             Some(ms) => ms,
+//             None => return Err(node),
+//         };
+//         let new_p = self.p2v(ms.to);
+//         //fixup(parent_v, child_idx, new_p): rewire inbound ptrs BEFORE slide_none.
+//         //  parent.update_child(child_idx, new_p); new child's parent/sibling via
+//         //  the NodeIter<&mut P> accessors. TODO: remap children displaced by the
+//         //  slide (their vaddrs change) — needs the slide range; deferred.
+//         let slot = self.inner.slide_none(ms, pin);
+//         self.inner.insert(node, slot);
+//         Ok(new_p)
 //     }
 
 //     fn remove<W>(&mut self, walker: W) -> Option<Self::T>
-//     where W: TreeWalker<'a, Self> {
-//         todo!()
+//     where
+//         W: TreeWalker<'a, Self>,
+//     {
+//         let cur_v = walker.position();
+//         //None => removing the root; caller handles (no parent to clear).
+//         let (parent_v, child_idx) = walker.parent()?;
+//         let v = self.inner.remove(cur_v);
+//         self.inner.get_mut(parent_v).clear_child(child_idx);
+//         Some(v)
 //     }
 
-//     fn root(&self) -> impl TreeWalker<'a, Self> {
-//         todo!()
-//     }
+//     // fn probe(&self, k: Self::K) -> impl TreeProbe<'a, Self> {
+//     //     todo!()
+//     // }
 
-//     fn walk_to(&self, k: Self::K) -> impl TreeWalker<'a, Self> {
-//         todo!()
-//     }
+//     // fn root(&self) -> impl TreeWalker<'a, Self> {
+//     //     todo!()
+//     // }
+
+//     // fn walk_to(&self, k: Self::K) -> impl TreeWalker<'a, Self> {
+//     //     todo!()
+//     // }
 // }

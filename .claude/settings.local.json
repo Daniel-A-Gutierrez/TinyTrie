@@ -14,7 +14,8 @@
       "Bash(rtk cargo check *)",
       "Bash(git mv *)",
       "WebFetch(domain:github.com)",
-      "Bash(awk *)"
+      "Bash(awk *)",
+      "mcp__ide__getDiagnostics"
     ]
   }
 }

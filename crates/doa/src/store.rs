@@ -1,6 +1,6 @@
 use std::cmp::Ordering::*;
 use std::{collections::VecDeque,
-          ops::{Index, Range}};
+          ops::Index};
 
 ///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that limits max cap and provides
 ///access/shift semantics
@@ -17,19 +17,34 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///slot whose element must not move.
     ///Precondition: `to != pin` (a pinned `to` can't open). Fastpath rotates (memmove) the run;
     ///the rare pin-in-range, and for the deque a wrap-crossing range, fall back to per-step swaps.
-    fn slide_none(&mut self, ms: MinSlide, pin: Option<usize>) -> usize;
+    fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize;
 
-    ///nearest None to `pos` within `budget`, as a min slide opening a slot for direction `DIR`
-    ///(false=before/left, true=after/right). `to` is adjacent on the inserting side (`pos-1`/`pos+1`,
-    ///pos elem unmoved) when the None is on that side, else `pos` (pos elem shifts toward the None).
-    ///`pin`, if set, is a slot the search must not cross: a slide never spans it. `pos==pin`
-    ///restricts the search to the `DIR` side only (after⇒right, before⇒left).
-    fn find_slot<const DIR: bool>(
+    ///DIR-biased: scan the DIR side first (forward for after, backward for before),
+    ///1 read/step sequential, fall to the other side only on exhaustion. `to` is
+    ///adjacent on the inserting side (`pos-1`/`pos+1`) when the None is on the DIR
+    ///side, else `pos` (pos elem shifts toward the None). `pin`, if set, is a slot
+    ///the search must not cross: a slide never spans it. `pos==pin` restricts the
+    ///search to the `DIR` side only. pos occupied by contract. Not nearest-None —
+    ///may pick a farther None on the opposite side ⇒ larger slide_none.
+    fn find_slot(
         &self,
         pos: usize,
+        dir: bool,
         budget: usize,
         pin: Option<usize>,
-    ) -> Option<MinSlide>;
+    ) -> Option<NoneSlide>;
+
+    ///nearest None to `pos` within `budget` (bidirectional outward). `to` is
+    ///adjacent on the inserting side (`pos-1`/`pos+1`, pos unmoved) when the None
+    ///is on that side, else `pos` (pos shifts toward the None). `pin`/`pos==pin` as
+    ///find_slot. Minimizes slide distance; slower than find_slot (two-stream scan).
+    fn find_nearest_slot(
+        &self,
+        pos: usize,
+        dir: bool,
+        budget: usize,
+        pin: Option<usize>,
+    ) -> Option<NoneSlide>;
 
     fn swap(&mut self, a: usize, b: usize);
 
@@ -81,7 +96,7 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///take slot len-1 if Some (set None), else None. occupancy -1 when Some.
     fn pop_back(&mut self) -> Option<T>;
 
-    fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
+    fn iter<'b>(&'b self) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
     where 'a: 'b;
 
     fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
@@ -104,7 +119,7 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
 }
 
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
-pub struct MinSlide {
+pub struct NoneSlide {
     pub(crate) from: usize,
     pub(crate) to:   usize,
 }
@@ -274,51 +289,49 @@ impl<'b, T: 'b, S: Index<usize, Output = Option<T>>> Cursor<'b, T> for SlotCurso
     }
 }
 
-///caller guarantees ranges are in bounds of their respective slices
-///scan 2 ranges in 2 slices, returning the index of the first found None wrapped in which slice it belongs to, biased left.
-///left/down is scanned in reverse.
-///D tie breaks equidistant hits: false for left, true for right.
+///outward nearest-None scan: `left` at `l0, l0-1, …` (lcnt slots, decreasing) and
+///`right` at `r0, r0+1, …` (rcnt slots, increasing). D tie-breaks equidistant hits
+///(false⇒left, true⇒right). the caller checks the anchor slot separately, so l0/r0
+///are the first real candidates and neither equals the anchor.
+///
+/// SAFETY: every accessed left index is in `[0, left.len())` and every right index
+/// in `[0, right.len())`. accessed left = `l0-k` for k in `[0,lcnt)` ⇒ in
+/// `[l0-lcnt+1, l0]`; accessed right = `r0+k` for k in `[0,rcnt)` ⇒ in `[r0, r0+rcnt-1]`.
 #[inline]
 fn dual_scan_outward<T: Sized, const D: bool>(
     left: &[Option<T>],
     right: &[Option<T>],
-    down: Range<usize>,
-    up: Range<usize>,
+    l0: usize,
+    r0: usize,
+    lcnt: usize,
+    rcnt: usize,
 ) -> NearestNone {
-    let mut lefti = down.end;
-    let mut righti = up.start;
-    let rlen = up.end - (up.start);
-    let llen = down.end - (down.start);
-    let mlen = rlen.min(llen);
-    for _i in 0..mlen {
-        let l = &left[lefti];
-        let r = &right[righti];
-        match (l.is_none(), r.is_none()) {
-            (true, true) => {
-
-                //equidistant: tie-break by D. false=>left, true=>right.
-                return if D { NearestNone::Right(righti) } else { NearestNone::Left(lefti) };
-            }
-            (true, false) => return NearestNone::Left(lefti),
-            (false, true) => return NearestNone::Right(righti),
-            (false, false) => {}
+    let m = lcnt.min(rcnt);
+    for k in 0..m {
+        // SAFETY: see function-level invariant; l0-k and r0+k are in-bounds.
+        let l_none = unsafe { left.get_unchecked(l0 - k).is_none() };
+        let r_none = unsafe { right.get_unchecked(r0 + k).is_none() };
+        if l_none & r_none {
+            return if D { NearestNone::Right(r0 + k) } else { NearestNone::Left(l0 - k) };
         }
-        lefti -= 1;
-        righti += 1;
-    }
-    for _ in mlen..llen {
-        if let None = left[lefti] {
-            return NearestNone::Left(lefti);
+        if l_none {
+            return NearestNone::Left(l0 - k);
         }
-        lefti -= 1;
-    }
-    for _ in mlen..rlen {
-        if let None = right[righti] {
-            return NearestNone::Right(righti);
+        if r_none {
+            return NearestNone::Right(r0 + k);
         }
-        righti += 1;
     }
-    return NearestNone::NotFound;
+    for k in m..lcnt {
+        if unsafe { left.get_unchecked(l0 - k).is_none() } {
+            return NearestNone::Left(l0 - k);
+        }
+    }
+    for k in m..rcnt {
+        if unsafe { right.get_unchecked(r0 + k).is_none() } {
+            return NearestNone::Right(r0 + k);
+        }
+    }
+    NearestNone::NotFound
 }
 
 ///bounded Vec-backed store. MAX_CAP bounds logical capacity.
@@ -348,7 +361,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         self.buf[ptr].as_mut().expect("store: None at occupied ptr")
     }
 
-    fn slide_none(&mut self, ms: MinSlide, pin: Option<usize>) -> usize {
+    fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
         let (from, to) = (ms.from, ms.to);
         debug_assert!(pin != Some(to), "slide_none: pinned target slot");
         if from == to {
@@ -367,12 +380,13 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         to
     }
 
-    fn find_slot<const DIR: bool>(
+    fn find_nearest_slot(
         &self,
         pos: usize,
+        dir: bool,
         budget: usize,
         pin: Option<usize>,
-    ) -> Option<MinSlide> {
+    ) -> Option<NoneSlide> {
         let buf = self.buf.as_slice();
         let max = (u32::MAX as usize).min(self.buf.len()).min(pos + budget);
         let min = pos.saturating_sub(budget);
@@ -381,28 +395,78 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         let (min, max) = match pin {
             Some(p) if p == pos => {
 
-                //pos pinned: search DIR side only. after(DIR=true)⇒right, before⇒left.
-                if DIR { (pos, max) } else { (min, pos) }
+                //pos pinned: search DIR side only. after(dir=true)⇒right, before⇒left.
+                if dir { (pos, max) } else { (min, pos) }
             }
             Some(p) if p < pos => (min.max(p + 1), max), //pin left: left None can't cross it
             Some(p) => (min, max.min(p)),                //pin right: right None can't cross it
             None => (min, max),
         };
-        match dual_scan_outward::<_, DIR>(buf, buf, min..pos, pos..max) {
+
+        //pos is occupied by contract (the insert anchor); no anchor-None case.
+        debug_assert!(buf[pos].is_some());
+        //outward scan over [min, pos) down and (pos, max) up.
+        let lcnt = pos - min;
+        let rcnt = max.saturating_sub(pos + 1);
+        match if dir { dual_scan_outward::<_, true>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt) }
+              else { dual_scan_outward::<_, false>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt) }
+        {
             NearestNone::Left(l) => {
-                Some(MinSlide { from: l, to: if !DIR { pos - 1 } else { pos } })
+                Some(NoneSlide { from: l, to: if !dir { pos - 1 } else { pos } })
             }
-            NearestNone::Right(r) => Some(MinSlide {
+            NearestNone::Right(r) => Some(NoneSlide {
                 from: r,
-                to:   if r == pos {
-                    pos
-                } else if DIR {
-                    pos + 1
-                } else {
-                    pos
-                },
+                to:   if dir { pos + 1 } else { pos },
             }),
             NearestNone::NotFound => None,
+        }
+    }
+
+    fn find_slot(
+        &self,
+        pos: usize,
+        dir: bool,
+        budget: usize,
+        pin: Option<usize>,
+    ) -> Option<NoneSlide> {
+        let buf = self.buf.as_slice();
+        let max = (u32::MAX as usize).min(self.buf.len()).min(pos + budget);
+        let min = pos.saturating_sub(budget);
+        let (min, max) = match pin {
+            Some(p) if p == pos => {
+                if dir { (pos, max) } else { (min, pos) }
+            }
+            Some(p) if p < pos => (min.max(p + 1), max),
+            Some(p) => (min, max.min(p)),
+            None => (min, max),
+        };
+        debug_assert!(buf[pos].is_some());
+        let lcnt = pos - min;
+        let rcnt = max.saturating_sub(pos + 1);
+        if dir {
+            if rcnt > 0
+                && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
+            {
+                return Some(NoneSlide { from: pos + 1 + r, to: pos + 1 });
+            }
+            if lcnt > 0
+                && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
+            {
+                return Some(NoneSlide { from: min + l, to: pos });
+            }
+            None
+        } else {
+            if lcnt > 0
+                && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
+            {
+                return Some(NoneSlide { from: min + l, to: pos - 1 });
+            }
+            if rcnt > 0
+                && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
+            {
+                return Some(NoneSlide { from: pos + 1 + r, to: pos });
+            }
+            None
         }
     }
 
@@ -415,7 +479,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         assert!(len < MAX_CAP, "max capacity");
         if len == self.buf.capacity() {
             let c = self.buf.capacity();
-            let target = (c * 2).min(MAX_CAP).max(c + 1);
+            let target = (c * 2).max(1).min(MAX_CAP);
             self.buf.reserve(target - c);
         }
         self.buf.insert(0, Some(v));
@@ -427,7 +491,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         assert!(len < MAX_CAP, "max capacity");
         if len == self.buf.capacity() {
             let c = self.buf.capacity();
-            let target = (c * 2).min(MAX_CAP).max(c + 1);
+            let target = (c * 2).max(1).min(MAX_CAP);
             self.buf.reserve(target - c);
         }
         self.buf.push(Some(v));
@@ -575,7 +639,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         v
     }
 
-    fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
+    fn iter<'b>(&'b self) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
     where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
     }
@@ -646,7 +710,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         self.buf[ptr].as_mut().expect("store: None at occupied ptr")
     }
 
-    fn slide_none(&mut self, ms: MinSlide, pin: Option<usize>) -> usize {
+    fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
         let (from, to) = (ms.from, ms.to);
         debug_assert!(pin != Some(to), "slide_none: pinned target slot");
         if from == to {
@@ -694,20 +758,21 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         to
     }
 
-    fn find_slot<const DIR: bool>(
+    fn find_nearest_slot(
         &self,
         pos: usize,
+        dir: bool,
         budget: usize,
         pin: Option<usize>,
-    ) -> Option<MinSlide> {
+    ) -> Option<NoneSlide> {
         let (front, back) = self.buf.as_slices();
         let max = (u32::MAX as usize).min(self.buf.len()).min(pos + budget);
         let min = pos.saturating_sub(budget);
 
-        //clamp to keep the slide off the pin (see VecStore::find_slot).
+        //clamp to keep the slide off the pin (see VecStore::find_nearest_slot).
         let (min, max) = match pin {
             Some(p) if p == pos => {
-                if DIR {
+                if dir {
                     (pos, max)
                 } else {
                     (min, pos)
@@ -719,91 +784,190 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         };
 
         //keypoints - min , boundary, pos,pos+1, max . boundary can lie at any relative position.
-        match pos.cmp(&front.len()) {
+        let fl = front.len();
+        match pos.cmp(&fl) {
             Less => {
-                let fmax = max.min(front.len());
-                match dual_scan_outward::<_, DIR>(front, front, min..pos, pos..fmax) {
+                //pos occupied by contract; outward scan within front, fallback to back.
+                debug_assert!(front[pos].is_some());
+                let fmax = max.min(fl);
+                let scan = |front, back| match dir {
+                    true => dual_scan_outward::<_, true>(front, back, pos.wrapping_sub(1), pos + 1, pos - min, fmax.saturating_sub(pos + 1)),
+                    false => dual_scan_outward::<_, false>(front, back, pos.wrapping_sub(1), pos + 1, pos - min, fmax.saturating_sub(pos + 1)),
+                };
+                match scan(front, front) {
                     NearestNone::Left(l) => {
-                        Some(MinSlide { from: l, to: if !DIR { pos - 1 } else { pos } })
+                        Some(NoneSlide { from: l, to: if !dir { pos - 1 } else { pos } })
                     }
-                    NearestNone::Right(r) => Some(MinSlide {
+                    NearestNone::Right(r) => Some(NoneSlide {
                         from: r,
-                        to:   if r == pos {
-                            pos
-                        } else if DIR {
-                            pos + 1
-                        } else {
-                            pos
-                        },
+                        to:   if dir { pos + 1 } else { pos },
                     }),
 
                     //front exhausted within budget: any None in back is right of pos.
                     NearestNone::NotFound => {
-                        back[0..max.saturating_sub(front.len())].iter().position(|i| i.is_none()).map(|x| {
-                            let r = x + front.len();
-                            MinSlide { from: r, to: if DIR { pos + 1 } else { pos } }
+                        back[0..max.saturating_sub(fl)].iter().position(|i| i.is_none()).map(|x| {
+                            let r = x + fl;
+                            NoneSlide { from: r, to: if dir { pos + 1 } else { pos } }
                         })
                     }
                 }
             }
-            Equal => match dual_scan_outward::<_, DIR>(
-                front,
-                back,
-                min..front.len(),
-                0..max - front.len(),
-            ) {
-                NearestNone::Left(p) => {
-                    Some(MinSlide { from: p, to: if !DIR { pos - 1 } else { pos } })
+            Equal => {
+                //pos = fl, occupied by contract (buf[fl] = back[0]); left = front
+                //[min, fl), right = back (0, max-fl).
+                debug_assert!(!back.is_empty() && back[0].is_some());
+                let bcnt = max.saturating_sub(fl);
+                let scan = |front, back| match dir {
+                    true => dual_scan_outward::<_, true>(front, back, fl.wrapping_sub(1), 1, fl - min, bcnt.saturating_sub(1)),
+                    false => dual_scan_outward::<_, false>(front, back, fl.wrapping_sub(1), 1, fl - min, bcnt.saturating_sub(1)),
+                };
+                match scan(front, back) {
+                    NearestNone::Left(p) => {
+                        Some(NoneSlide { from: p, to: if !dir { pos - 1 } else { pos } })
+                    }
+                    NearestNone::Right(p) => {
+                        let r = p + fl;
+                        Some(NoneSlide { from: r, to: if dir { pos + 1 } else { pos } })
+                    }
+                    NearestNone::NotFound => None,
                 }
-                NearestNone::Right(p) => {
-                    let r = p + front.len();
-                    Some(MinSlide {
-                        from: r,
-                        to:   if r == pos {
-                            pos
-                        } else if DIR {
-                            pos + 1
-                        } else {
-                            pos
-                        },
-                    })
-                }
-                NearestNone::NotFound => None,
-            },
+            }
             Greater => {
-                let fmin = min.saturating_sub(front.len());
-                let fmax = max - front.len();
-                let fpos = pos - front.len();
-                match dual_scan_outward::<_, DIR>(back, back, fmin..fpos, fpos..fmax) {
+                //pos occupied by contract; outward scan within back, fallback to front.
+                let fpos = pos - fl;
+                debug_assert!(back[fpos].is_some());
+                let fmin = min.saturating_sub(fl);
+                let fmax = max.saturating_sub(fl);
+                let scan = |front, back| match dir {
+                    true => dual_scan_outward::<_, true>(front, back, fpos.wrapping_sub(1), fpos + 1, fpos - fmin, fmax.saturating_sub(fpos + 1)),
+                    false => dual_scan_outward::<_, false>(front, back, fpos.wrapping_sub(1), fpos + 1, fpos - fmin, fmax.saturating_sub(fpos + 1)),
+                };
+                match scan(back, back) {
                     NearestNone::Left(l) => {
-                        let abs = l + front.len();
-                        Some(MinSlide { from: abs, to: if !DIR { pos - 1 } else { pos } })
+                        let abs = l + fl;
+                        Some(NoneSlide { from: abs, to: if !dir { pos - 1 } else { pos } })
                     }
                     NearestNone::Right(r) => {
-                        let abs = r + front.len();
-                        Some(MinSlide {
-                            from: abs,
-                            to:   if abs == pos {
-                                pos
-                            } else if DIR {
-                                pos + 1
-                            } else {
-                                pos
-                            },
-                        })
+                        let abs = r + fl;
+                        Some(NoneSlide { from: abs, to: if dir { pos + 1 } else { pos } })
                     }
 
                     //back exhausted within budget: any None in front is left of pos.
-                    NearestNone::NotFound => front[min.min(front.len())..front.len()]
+                    NearestNone::NotFound => front[min.min(fl)..fl]
                         .iter()
                         .rev()
                         .position(|o| o.is_none())
                         .map(|p| {
-                            let abs = front.len() - p - 1;
-                            MinSlide { from: abs, to: if !DIR { pos - 1 } else { pos } }
+                            let abs = fl - p - 1;
+                            NoneSlide { from: abs, to: if !dir { pos - 1 } else { pos } }
                         }),
                 }
             }
+        }
+    }
+
+    fn find_slot(
+        &self,
+        pos: usize,
+        dir: bool,
+        budget: usize,
+        pin: Option<usize>,
+    ) -> Option<NoneSlide> {
+        let (front, back) = self.buf.as_slices();
+        let fl = front.len();
+        let max = (u32::MAX as usize).min(self.buf.len()).min(pos + budget);
+        let min = pos.saturating_sub(budget);
+        let (min, max) = match pin {
+            Some(p) if p == pos => {
+                if dir { (pos, max) } else { (min, pos) }
+            }
+            Some(p) if p < pos => (min.max(p + 1), max),
+            Some(p) => (min, max.min(p)),
+            None => (min, max),
+        };
+
+        //forward (right) scan: increasing logical index — front[pos+1..fl] then back[..max-fl].
+        //returns the absolute index of the first None right of pos within [pos+1, max).
+        let scan_right = || -> Option<usize> {
+            if pos < fl {
+                let fmax = max.min(fl);
+                if let Some(r) =
+                    front.get(pos + 1..fmax).and_then(|s| s.iter().position(|o| o.is_none()))
+                {
+                    return Some(pos + 1 + r);
+                }
+                //front exhausted within budget; continue rightward into back [0, max-fl).
+                if max > fl
+                    && let Some(r) =
+                        back.get(0..max - fl).and_then(|s| s.iter().position(|o| o.is_none()))
+                {
+                    return Some(fl + r);
+                }
+                None
+            } else if pos == fl {
+                //anchor = back[0]; right starts at back[1]
+                back.get(1..max.saturating_sub(fl))
+                    .and_then(|s| s.iter().position(|o| o.is_none()))
+                    .map(|r| fl + 1 + r)
+            } else {
+                let bp = pos - fl;
+                back.get(bp + 1..max.saturating_sub(fl))
+                    .and_then(|s| s.iter().position(|o| o.is_none()))
+                    .map(|r| fl + bp + 1 + r)
+            }
+        };
+
+        //backward (left) scan: decreasing logical index — wraps back→front.
+        //returns the absolute index of the nearest None left of pos within [min, pos-1].
+        let scan_left = || -> Option<usize> {
+            if pos == 0 {
+                return None;
+            }
+            if pos <= fl {
+                //left starts at front[pos-1] (pos==fl ⇒ front[fl-1]; back[0] is the anchor/right)
+                let start = pos - 1;
+                front
+                    .get(min..=start)
+                    .and_then(|s| s.iter().rposition(|o| o.is_none()))
+                    .map(|l| min + l)
+            } else {
+                //pos in back: back[blo..bp] reversed, then front[min..fl] reversed.
+                //blo=min-fl keeps the slide off a left pin (pin==pos ⇒ min=pos ⇒ blo=bp ⇒ empty).
+                let bp = pos - fl;
+                let blo = min.saturating_sub(fl);
+                if bp > blo
+                    && let Some(l) =
+                        back.get(blo..bp).and_then(|s| s.iter().rposition(|o| o.is_none()))
+                {
+                    return Some(fl + l);
+                }
+                if min < fl {
+                    front
+                        .get(min..fl)
+                        .and_then(|s| s.iter().rposition(|o| o.is_none()))
+                        .map(|l| min + l)
+                } else {
+                    None
+                }
+            }
+        };
+
+        if dir {
+            if let Some(r) = scan_right() {
+                return Some(NoneSlide { from: r, to: pos + 1 });
+            }
+            if let Some(l) = scan_left() {
+                return Some(NoneSlide { from: l, to: pos });
+            }
+            None
+        } else {
+            if let Some(l) = scan_left() {
+                return Some(NoneSlide { from: l, to: pos - 1 });
+            }
+            if let Some(r) = scan_right() {
+                return Some(NoneSlide { from: r, to: pos });
+            }
+            None
         }
     }
 
@@ -874,6 +1038,16 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
     fn spread(&mut self) {
         let len = self.buf.len();
         assert!(len * 2 <= MAX_CAP, "spread: exceeds max cap");
+        //odd len (e.g. len==1, the pow2 base): the mid=len/2 phase split is invalid
+        //(it would move the lone element into the upper half). direct i->2i move instead.
+        if len % 2 != 0 {
+            self.buf.resize_with(len * 2, || None);
+            for i in (0..len).rev() {
+                let v = self.buf[i].take();
+                self.buf[2 * i] = v;
+            }
+            return;
+        }
         let mid = len / 2;
 
         // phase1: take upper half [mid,len), push each then a None. upper half lands
@@ -979,7 +1153,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         v
     }
 
-    fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
+    fn iter<'b>(&'b self) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
     where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
     }
@@ -1009,3 +1183,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         MAX_CAP
     }
 }
+
+#[cfg(test)]
+#[path = "tests/store.rs"]
+mod tests;
