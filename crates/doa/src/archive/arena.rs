@@ -29,9 +29,11 @@ const TAG_STEP: u64 = 1 << 32;
 
 pub struct Arena<T, U: UnsignedIndex, I: SignedBlockIndex> {
     blocks:   VecDeque<Block<T, I>>,
+
     /// Order-maintenance tag per block_id. Append-only -> block_id is a stable
     /// index. Tag order == block linked-list order (NOT block_id order).
     tags:     Vec<u64>,
+
     /// Last ~16 insert hints: `(block_id, addr)` — a Ptr.
     requests: VecDeque<(U, I)>,
 }
@@ -41,6 +43,7 @@ fn x() {
 }
 
 impl<T, U: UnsignedIndex, I: SignedBlockIndex> Arena<T, U, I> {
+
     pub fn new() -> Self {
         Self { blocks: VecDeque::new(), tags: Vec::new(), requests: VecDeque::new() }
     }
@@ -106,12 +109,14 @@ impl<T, U: UnsignedIndex, I: SignedBlockIndex> Arena<T, U, I> {
     pub fn insert_before(&mut self, _at: (U, I), _val: T) {
         todo!("GP4: block-level insert_before with auto-split/grow + RemapSet")
     }
+
     pub fn insert_after(&mut self, _at: (U, I), _val: T) {
         todo!("GP4: block-level insert_after with auto-split/grow + RemapSet")
     }
 }
 
 impl<T, U: UnsignedIndex, I: SignedBlockIndex> Default for Arena<T, U, I> {
+
     fn default() -> Self {
         Self::new()
     }

@@ -78,6 +78,7 @@ pub(crate) fn assert_cap_pow2(cap: usize) {
 /// only produces `Free`; `Move`/`BlockSplit` are fixed here for Step 3/4.
 #[derive(Debug)]
 pub enum InsertDelta<T> {
+
     /// Placed into a pre-existing `None` slot (or appended/prepended) — no
     /// other elements moved. `new_virt` is the new element's virtual address
     /// (insert) or the freed slot's address (removal no-op). Address-stable: no
@@ -111,6 +112,7 @@ pub enum InsertDelta<T> {
 }
 
 impl<T> InsertDelta<T> {
+
     /// The new element's virtual address, if any. `Free { new_virt }` →
     /// `Some(new_virt)`; `Move { new_virt, .. }` → `Some(new_virt)`; `BlockSplit`
     /// → `None` (Step 4 will define its own extraction).
@@ -131,15 +133,19 @@ impl<T> InsertDelta<T> {
 /// [`Block`] so dispatch doesn't infer strategy from `(addr_shift, none_mask)`
 /// (ambiguous: append & prepend both have `addr_shift == 0`).
 pub(crate) enum BlockStrategy {
+
     /// Balanced growth. Budget = `cap` (the whole block —
     /// per notes, "budget is the entire block so it can't fail"). Graduates to
     /// a concrete strategy at `len == half_ptr` (Step 3 `post_insert_check`).
     Pluripotent(PluripotentStrategy),
+
     /// End-optimized for `push_back`. Budget = `INSERT_BUDGET` (small —
     /// end-optimized blocks quickly reach the viable back end).
     Append(AppendStrategy),
+
     /// End-optimized for `push_front`. Budget = `INSERT_BUDGET` (small).
     Prepend(PrependStrategy),
+
     /// Full-range addressing. Budget = `cap` (conservative default — a generous
     /// budget avoids premature `OutOfBudget` on sparse blocks).
     Random(RandomStrategy),
@@ -156,12 +162,14 @@ pub(crate) enum BlockStrategy {
 /// (raw-parts blocks are bench/test scaffolding, not the strategy-initialized
 /// path) — don't assume `Default` == `new_random`.
 impl Default for BlockStrategy {
+
     fn default() -> Self {
         BlockStrategy::Random(RandomStrategy { budget: INSERT_BUDGET })
     }
 }
 
 impl BlockStrategy {
+
     /// Per-strategy scan budget: stride-steps scanned per direction by
     /// `find_slot` before giving up. Pluripotent/random use `cap` (whole
     /// block); append/prepend use `INSERT_BUDGET` (small). The single source
@@ -255,6 +263,7 @@ impl BlockStrategy {
 ///
 /// See the [module-level docs](self) for the AP-maintenance invariant.
 pub(crate) trait GrowthStrategy<T, PTR: SignedBlockIndex, const OP: bool> {
+
     /// Handle a successful `find_slot` result: place the value. `hint_phys` is
     /// the anchor the caller wanted to insert near (unused at the block layer —
     /// the directional bias is in `find_slot` itself; no insert-shift here).
@@ -281,6 +290,7 @@ pub(crate) trait GrowthStrategy<T, PTR: SignedBlockIndex, const OP: bool> {
     /// aligned, no AP, or no `Some` aligned target). This is the shared default
     /// — all strategies use it.
     fn handle_removal(&mut self, block: &mut Block<T, PTR, OP>, phys: usize) -> InsertDelta<T> {
+
         // Step 3b (removal shift-to-AP): after `Block::remove` `None`'d `phys`,
         // shift elements so the `None` moves to the nearest aligned (AP) slot
         // — IF cheap-and-easy (always short: the nearest aligned slot is ≤
@@ -316,10 +326,12 @@ pub(crate) trait GrowthStrategy<T, PTR: SignedBlockIndex, const OP: bool> {
         let left_in = first_left >= 0;
         let right_none = right_in && block.buf[first_right as usize].is_none();
         let left_none = left_in && block.buf[first_left as usize].is_none();
+
         // Only an in-range `Some` aligned slot is a valid shift target.
         let right_target = right_in && !right_none;
         let left_target = left_in && !left_none;
         if !right_target && !left_target {
+
             // No `Some` aligned slot to absorb the shift (both flanking `None`
             // or out-of-range) → tolerate the unaligned `None`. No-op.
             return InsertDelta::Free { new_virt: block.phys_to_virt(phys) };
@@ -331,6 +343,7 @@ pub(crate) trait GrowthStrategy<T, PTR: SignedBlockIndex, const OP: bool> {
         let go_right = right_target && (!left_target || right_dist <= left_dist);
 
         if go_right {
+
             // Move the `None` RIGHT to `first_right`: elements phys+1..A shift
             // left by 1 (each phys -= 1 → virt -= 1<<addr_shift). The `None`
             // propagates phys → A via adjacent swaps.
@@ -346,6 +359,7 @@ pub(crate) trait GrowthStrategy<T, PTR: SignedBlockIndex, const OP: bool> {
                                 minus,
                                 addr_delta }
         } else {
+
             // Move the `None` LEFT to `first_left`: elements A..phys-1 shift
             // right by 1 (each phys += 1 → virt += 1<<addr_shift). The `None`
             // propagates phys → A via adjacent swaps (reversed order).
@@ -411,6 +425,7 @@ pub(crate) struct RandomStrategy {
 // -----------------------------------------------------------------------
 
 impl PluripotentStrategy {
+
     /// Construct a new pluripotent block with capacity `cap`.
     ///
     /// `addr_shift = log2(half_ptr) - log2(cap)` so `cap * 2^addr_shift =
@@ -435,6 +450,7 @@ impl PluripotentStrategy {
 }
 
 impl AppendStrategy {
+
     /// Construct a new append block with capacity `cap`.
     ///
     /// `addr_shift = 0` (dense). `none_mask = 15` (stride 16). Front at
@@ -456,6 +472,7 @@ impl AppendStrategy {
 }
 
 impl PrependStrategy {
+
     /// Construct a new prepend block with capacity `cap`.
     ///
     /// `addr_shift = 0` (dense). `none_mask = 15` (stride 16). Front at
@@ -476,6 +493,7 @@ impl PrependStrategy {
 }
 
 impl RandomStrategy {
+
     /// Construct a new random block with capacity `cap`.
     ///
     /// `addr_shift = log2(MAX) - log2(cap)` so `cap * 2^addr_shift = MAX`: the
@@ -516,6 +534,7 @@ fn default_handle_insertion<T, PTR: SignedBlockIndex, const OP: bool>(
     -> Result<InsertDelta<T>, NotFound> {
     match found {
         Found::At(phys) => {
+
             // Reuse the on-AP `None` `find_slot` found within budget — place
             // directly, no shift. (Block layer doesn't shift-to-create on
             // insert; `NotFound` → caller/arena splits, Step 4.)
@@ -523,6 +542,7 @@ fn default_handle_insertion<T, PTR: SignedBlockIndex, const OP: bool>(
             Ok(InsertDelta::Free { new_virt: block.phys_to_virt(phys) })
         }
         Found::Append => {
+
             // Gap-insertion: keep the AP stocked. If the next back slot
             // (`buf.len()`) is an aligned (AP) position, push a `None` vacancy
             // there first so values never occupy aligned slots — one `None`
@@ -540,6 +560,7 @@ fn default_handle_insertion<T, PTR: SignedBlockIndex, const OP: bool>(
                 return match block.push_back(value) {
                     Ok(new_virt) => Ok(InsertDelta::Free { new_virt }),
                     Err(e) => {
+
                         // Roll back the gap so `Err` = no mutation.
                         if gapped {
                             block.buf.pop_back();
@@ -552,6 +573,7 @@ fn default_handle_insertion<T, PTR: SignedBlockIndex, const OP: bool>(
             Ok(InsertDelta::Free { new_virt })
         }
         Found::Prepend => {
+
             // TODO Step 3b (prepend gap-insertion): mirror of the Append arm.
             // Subtle: `push_front` always lands the value at phys 0, which may
             // itself be the aligned slot (its spread-frame coord is
@@ -568,12 +590,14 @@ fn default_handle_insertion<T, PTR: SignedBlockIndex, const OP: bool>(
 }
 
 impl<T, PTR: SignedBlockIndex, const OP: bool> GrowthStrategy<T, PTR, OP> for PluripotentStrategy {
+
     fn handle_insertion(&mut self,
                         block: &mut Block<T, PTR, OP>,
                         found: Found,
                         hint_phys: usize,
                         value: T)
                         -> Result<InsertDelta<T>, NotFound> {
+
         // No gap-insertion (stride-4 AP — gap would waste 25% of capacity).
         // Step 3: spread/split on NotFound is the arena's job (Step 4).
         default_handle_insertion(block, found, hint_phys, value, false)
@@ -588,12 +612,14 @@ impl<T, PTR: SignedBlockIndex, const OP: bool> GrowthStrategy<T, PTR, OP> for Pl
 }
 
 impl<T, PTR: SignedBlockIndex, const OP: bool> GrowthStrategy<T, PTR, OP> for AppendStrategy {
+
     fn handle_insertion(&mut self,
                         block: &mut Block<T, PTR, OP>,
                         found: Found,
                         hint_phys: usize,
                         value: T)
                         -> Result<InsertDelta<T>, NotFound> {
+
         // Gap-insertion on Append (stride-16 AP, ~6% vacancy — keeps the AP
         // stocked). No insert shift; NotFound → arena splits (Step 4).
         default_handle_insertion(block, found, hint_phys, value, true)
@@ -604,12 +630,14 @@ impl<T, PTR: SignedBlockIndex, const OP: bool> GrowthStrategy<T, PTR, OP> for Ap
 }
 
 impl<T, PTR: SignedBlockIndex, const OP: bool> GrowthStrategy<T, PTR, OP> for PrependStrategy {
+
     fn handle_insertion(&mut self,
                         block: &mut Block<T, PTR, OP>,
                         found: Found,
                         hint_phys: usize,
                         value: T)
                         -> Result<InsertDelta<T>, NotFound> {
+
         // Gap-insertion flag set (prepend gap-insertion symmetry is TODO in
         // default_handle_insertion's Prepend arm; the flag is honored once
         // that lands). No insert shift; NotFound → arena splits (Step 4).
@@ -621,12 +649,14 @@ impl<T, PTR: SignedBlockIndex, const OP: bool> GrowthStrategy<T, PTR, OP> for Pr
 }
 
 impl<T, PTR: SignedBlockIndex, const OP: bool> GrowthStrategy<T, PTR, OP> for RandomStrategy {
+
     fn handle_insertion(&mut self,
                         block: &mut Block<T, PTR, OP>,
                         found: Found,
                         hint_phys: usize,
                         value: T)
                         -> Result<InsertDelta<T>, NotFound> {
+
         // No gap-insertion (stride-2 AP — gap would waste 50% of capacity).
         // NotFound → arena splits (Step 4).
         default_handle_insertion(block, found, hint_phys, value, false)

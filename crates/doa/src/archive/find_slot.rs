@@ -24,20 +24,25 @@ pub enum Bias {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Found {
+
     /// Physical index of a `None` slot to reuse. Elements between `anchor` and
     /// `phys` shift to make room.
     At(usize),
+
     /// Front reached; a `push_front` address is representable.
     Prepend,
+
     /// Back reached; a `push_back` address is representable.
     Append,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotFound {
+
     /// Both directions spent their stride budget without reaching an end or a
     /// `None` slot.
     OutOfBudget,
+
     /// At least one direction hit a nonviable end (address not representable)
     /// while the other found nothing.
     AddressExhaustion,
@@ -53,6 +58,7 @@ pub enum NotFound {
 /// delegate here.
 #[inline]
 pub(crate) fn virt_of(phys: usize, addr_shift: u32, v_offset: usize) -> isize {
+
     // `wrapping_sub` on `usize` then `as isize` is bit-identical to
     // `(phys << addr_shift) as isize - virt_offset`, giving correct negative
     // addresses (the `push_front` case) without a sign-related panic.
@@ -90,20 +96,25 @@ pub(crate) fn front_viable(addr_shift: u32, v_offset: usize, addr_min: isize) ->
 /// AP geometry around `anchor` produced by [`align`].
 #[derive(Clone, Copy)]
 pub(crate) struct ScanParameters {
+
     /// First eligible index `>= anchor` (right side of the AP).
     pub(crate) first_right: isize,
+
     /// First eligible index `< anchor` (`first_right - stride`; left side).
     pub(crate) first_left:  isize,
     pub(crate) stride:      isize,
+
     /// `first_right - anchor`: distance to the first right-side eligible slot.
     /// `0` means `anchor` is aligned. 
     pub(crate) right_delta: usize,
+
     /// True when the right side is probed first in the shared loop (ties →
     /// right). `Bias::Left` makes ties go left, so this is false at ties.
     pub(crate) right_first: bool,
 }
 
 impl ScanParameters {
+
     /// In-range eligible-slot counts per side, uncapped. End resolution needs
     /// the uncapped count to know whether an end was actually reached.
     #[inline]
@@ -127,6 +138,7 @@ impl ScanParameters {
         let right_delta = (1usize.wrapping_sub(residue)) & none_mask;
         let mut first_right = anchor as isize + right_delta as isize;
         if right_delta == 0 { first_right += stride };
+
         // `right_first` tie break - we scan right first if the element is closer to a right aligned spot
         //  than a left, but if theyre equidistant we go with bias.
         let right_first = right_delta * 2 < stride as usize || 
@@ -135,15 +147,16 @@ impl ScanParameters {
     }
 }
 
-
-
 /// Outcome of exhausting one direction's probes without finding a `None`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum End {
+
     /// Reached the physical end with a representable push address.
     Viable,
+
     /// Reached the physical end but the push address is not representable.
     AddrLimit,
+
     /// Spent the stride budget before reaching any end.
     BudgetOut,
 }
@@ -206,6 +219,7 @@ pub(crate) struct Slots<'a, T> {
 }
 
 impl<'a, T> Slots<'a, T> {
+
     /// Lookup logical index `i`. Caller guarantees `i < len`
     /// (`front.len() + back.len()`): every probe in `Block::find_slot`/`scan`
     /// is bounded by the in-range eligible-slot count, so positions stay in

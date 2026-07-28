@@ -2,10 +2,13 @@ use crate::index::*;
 use std::{collections::VecDeque,
           marker::PhantomData,
           ops::{Index, IndexMut}};
+
 ///max node cap = 256
 const MAX_NODE_CAP: usize = 16;
+
 ///block cap = full P range. u16 -> 65536 slots.
 const MAX_BLOCK_CAP: usize = 65536;
+
 ///ptr into a leafblock + the leaf's len/cap. header lives in the consumer
 ///(btree inode's terminal PtrUnion), NOT in the block. cap slots starting at
 ///ptr form the leaf; len of them are occupied.
@@ -14,17 +17,22 @@ pub struct SlicePtr<P: BlockIndex> {
     pub ptr: P,
     pub len: P,
 }
+
 impl<P: BlockIndex> SlicePtr<P> {
+
     fn new(ptr: P, len: P) -> Self {
         Self { ptr, len }
     }
+
     fn get_ptr(&self) -> P {
         self.ptr
     }
+
     fn get_len(&self) -> P {
         self.len
     }
 }
+
 ///inode child pointer. internal -> another inode (in the inode block);
 ///terminal -> a leaf SlicePtr in the leafblock. PtrUnion<u32,u16> is 4 bytes
 ///either way: u32 internal, SlicePtr<u16> = 2+1+1.
@@ -36,6 +44,7 @@ where
     pub internal: P1,
     pub terminal: SlicePtr<P2>,
 }
+
 ///random leafblock: leaves scattered across the address space with None gaps
 ///between them so a leaf can grow by claiming adjacent gaps. no append/prepend
 ///optimization (the btree forest doesn't need them). block-level reorg on
@@ -53,16 +62,20 @@ where
     rotate:      u32,
     _phantom:    PhantomData<P>,
 }
+
 // phys = (virt + virt_offset).rotate_left(rotate) >> addr_shift
 // virt = (phys << addr_shift).rotate_right(rotate) - virt_offset
 // steady state: addr_shift=0, rotate=0 -> consecutive virt = consecutive phys,
 // so a leaf's [ptr, ptr+cap) is a contiguous phys run (may wrap the deque -> 2 slices).
 pub enum GrowErr {
+
     ///no adjacent gap within budget; caller may spread or split.
     NoBudget,
+
     ///next address not representable in P; caller must split_and_rotate.
     AddressExhaustion,
 }
+
 //implicitly in-order, root is at phys_to_virt(MIDPOINT) insert cant cross it or shift it.
 ///root node has some special cases to consider.
 ///theyre all leaves so im only calling it a root.
@@ -73,6 +86,7 @@ where
     P: BlockIndex,
 {
     /*
+
     //new empty random block, addr_shift=ptr::bit_width rotate=0 , v_offset=0
     fn new();
 
@@ -142,6 +156,7 @@ where
     fn node_insert(&mut self, &mut sp, next : p)
     */
 }
+
 //borrowed window over a leaf's [ptr, ptr+cap). the run may wrap the VecDeque,
 //so it's two slices: logical index 0..a.len() in `a`, the rest in `b`.
 //cap = a.len() + b.len(). read-only; indexes directly, no per-index translation.

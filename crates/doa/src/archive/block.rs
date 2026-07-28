@@ -22,6 +22,7 @@ pub struct Block<T, PTR: SignedBlockIndex = i16, const OVERP: bool = false>
 ///don't have to care about allocation strategies for efficient address space usage.
 impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: Sized
 {
+
     /// `PTR` must be strictly narrower than `isize` (the address-arithmetic
     /// type): reaching `-PTR::MIN` requires `v_offset = PTR::MAX + 1`, which
     /// must not overflow the arithmetic. `isize`/`i64`/`i128` are therefore not
@@ -46,6 +47,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
 
     //max value of a pointer half the size of PTR
     pub(crate) fn ptr_root() -> usize {
+
         //i8::MAX=127 , >> 1 = 63, + 1 = 64, >>3 = 8, -1 = 7
         return (PTR::MAX().as_isize() >> 1 + 1 >> (PTR::bit_width() as u32 / 2 - 1) - 1) as usize;
     }
@@ -144,6 +146,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
     /// phase 2 drains the longer side's remainder.
     pub fn find_slot(&self, anchor: usize, bias: Bias) -> Result<Found, NotFound> {
         let budget = self.strategy.budget();
+
         // `v_offset` is the canonical conversion (wrapping `as usize`);
         // `v_off_phys` derives from it by an UNSIGNED shift. The scan hot path
         // touches only the low `none_mask` bits of `v_off_phys`
@@ -161,6 +164,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
         let stride = scanp.stride;
 
         let (count_right, count_left) = scanp.counts(len_isize);
+
         // Probes actually performed per side, capped at budget.
         let probes_right = count_right.min(budget);
         let probes_left = count_left.min(budget);
@@ -195,6 +199,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
                 pos_right += stride;
             }
         }
+
         // Phase 2: drain whichever side still has probes left (at most one —
         // `shared` is the smaller cap, so only the larger side has a remainder; the
         // other call gets a zero count and compiles away).
@@ -232,6 +237,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
                       self.buf.len());
         let slot = &self.buf[phys];
         debug_assert!(slot.is_some(), "get: address {virt} is stale (slot unoccupied)");
+
         // SAFETY: occupied by the debug_assert above.
         unsafe { slot.as_ref().unwrap_unchecked() }
     }
@@ -247,6 +253,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
                       self.buf.len());
         let slot = &mut self.buf[phys];
         debug_assert!(slot.is_some(), "get_mut: address {virt} is stale (slot unoccupied)");
+
         // SAFETY: occupied by the debug_assert above.
         unsafe { slot.as_mut().unwrap_unchecked() }
     }
@@ -290,6 +297,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
             return Err(NotFound::AddressExhaustion);
         }
         self.buf.push_back(Some(value));
+
         // SAFETY: `buf.len()` was `>= 0` before push; now `>= 1`.
         Ok(self.phys_to_virt(self.buf.len() - 1))
     }
@@ -362,8 +370,10 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
                       self.buf.len());
         debug_assert!(self.buf[phys].is_some(),
                       "remove: double free at v_address {virt}");
+
         // SAFETY: occupied by the debug_assert above.
         let value = unsafe { self.buf[phys].take().unwrap_unchecked() };
+
         // Swap the strategy out to avoid the split-borrow (&mut strategy +
         // &mut Block), dispatch the removal seam, then swap back. The strategy
         // is a standalone value during the call; the block's `strategy` field
@@ -388,6 +398,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
         let found = self.find_slot(anchor_phys, bias)?;
         let mut strategy = std::mem::take(&mut self.strategy);
         let result = strategy.handle_insertion(self, found, anchor_phys, value);
+
         // Graduation seam (no-op Step 2). TODO Step 3 — three coupled gaps to
         // solve before graduation works:
         // (a) Variant change: graduation flips the `BlockStrategy` variant, but
@@ -403,6 +414,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
         let _graduation_delta =
             if result.is_ok() { strategy.post_insert_check(self) } else { None };
         self.strategy = strategy;
+
         // TODO Step 3: consume `_graduation_delta` (install graduated variant +
         // fix up `result`). Discarded for Step 2 (always `None`).
         result
@@ -439,6 +451,7 @@ impl<T, PTR: SignedBlockIndex, const OVERP: bool> Block<T, PTR, OVERP> where T: 
 
 impl<T, PTR: SignedBlockIndex, const OVERP: bool> Default for Block<T, PTR, OVERP> where T: Sized
 {
+
     fn default() -> Self {
         Self::new()
     }
@@ -616,6 +629,7 @@ mod tests {
         let len_isize = len as isize;
         let stride = (none_mask as isize) + 1;
         let nm = none_mask as isize;
+
         // Arithmetic shift — the conceptually-signed frame shift.
         let frame = virt_offset >> addr_shift;
 
@@ -640,6 +654,7 @@ mod tests {
             if pos >= len_isize {
                 break;
             }
+
             // Independent eligibility sanity (skipped for degenerate none_mask==0
             // where the mask formula and AP geometry disagree by design).
             if none_mask != 0 {
@@ -663,6 +678,7 @@ mod tests {
             }
             candidates.push(((rank * stride - right_delta as isize) as usize, pos));
         }
+
         // sort by dist asc; tie-break by bias: Right → greater pos (right
         // side) first, Left → lesser pos (left side) first.
         match bias {
@@ -691,6 +707,7 @@ mod tests {
         // Append: phys_to_virt(len) = (len << addr_shift) - virt_offset <= addr_max.
         let back_virt = ((len as isize) << addr_shift).wrapping_sub(virt_offset);
         let back_viable = back_virt <= addr_max;
+
         // Prepend: new front address = -(virt_offset + (1 << addr_shift)) >= addr_min.
         // push_front bumps virt_offset by one slot's worth of virt addresses, so
         // it's stable for all addr_shift (not just 0).
@@ -734,6 +751,7 @@ mod tests {
         for _ in 0..12_000 {
             let addr_shift = (rng() % 4) as u32; // 0..=3
             let none_mask = *[0u32, 1, 3, 7, 15].get((rng() % 5) as usize).unwrap();
+
             // Span NEGATIVE and positive virt_offset (split-off-block case).
             let virt_offset = (rng() % 513) as isize - 256; // -256..=256
             let budget = 1 + (rng() % 20) as usize; // 1..=20
@@ -789,6 +807,7 @@ mod tests {
 
     #[test]
     fn empty_buf_anchor_zero_returns_append() {
+
         // len==0, anchor==0, default-ish block: back_virt = 0 - 0 = 0 <= i16::MAX.
         let buf_vec: Vec<Option<u64>> = Vec::new();
         let block: Block<u64, i16> = Block::test_new(VecDeque::from(buf_vec.clone()), 0, 0, 0);
@@ -799,6 +818,7 @@ mod tests {
 
     #[test]
     fn anchor_equals_len_returns_append_when_back_viable() {
+
         // Non-empty block, anchor at the append-at-end hint. back_virt = len <= i16::MAX.
         let len = 8usize;
         let buf_vec: Vec<Option<u64>> = vec![Some(0); len];
@@ -810,6 +830,7 @@ mod tests {
 
     #[test]
     fn anchor_greater_than_len_does_not_ub() {
+
         // Regression: `anchor > len` left `count_left` uncapped (`Align::counts`
         // only caps `count_right` at `>= len`), so `first_left = len` and the
         // phase-2 left scan started at `pos_left = len` → `at_unchecked(len)`
@@ -819,6 +840,7 @@ mod tests {
         assert_eq!(block.find_slot(9, Bias::Right),
                    Err(NotFound::OutOfBudget),
                    "anchor > len must be rejected at the API boundary, not UB");
+
         // Wrap-prone: none_mask=0 makes right_delta==0 for every anchor, the
         // exact geometry that exposed the bug.
         assert_eq!(block.find_slot(100, Bias::Right), Err(NotFound::OutOfBudget),);
@@ -826,6 +848,7 @@ mod tests {
 
     #[test]
     fn none_mask_zero_dense_does_not_panic() {
+
         // Degenerate stride-1 block: right_delta==0 for every anchor. A None in
         // the buffer should be located without panicking, and end resolution
         // should yield a valid variant.
@@ -833,9 +856,11 @@ mod tests {
         buf_vec[5] = None;
         let block: Block<u64, i16> = Block::test_new(VecDeque::from(buf_vec.clone()), 0, 0, 0);
         let res = block.find_slot(0, Bias::Right);
+
         // Must be a sane variant (At the None, or Append/Prepend) — never panic.
         assert!(matches!(res, Ok(Found::At(_)) | Ok(Found::Append) | Ok(Found::Prepend)),
                 "none_mask==0 dense block must return a sane variant, got {res:?}");
+
         // Concretely: the None at index 5 is the nearest eligible-slot candidate
         // (stride 1, every slot on the AP), so find_slot locates it.
         assert_eq!(res, Ok(Found::At(5)));
@@ -854,6 +879,7 @@ mod tests {
             0,
             0, // virt_offset = 0
         );
+
         // Existing addresses (shift=1, virt_offset=0): phys 0→0, 1→2, 2→4.
         assert_eq!(block.phys_to_virt(0), 0);
         assert_eq!(block.phys_to_virt(1), 2);
@@ -883,6 +909,7 @@ mod tests {
 
     #[test]
     fn push_back_and_push_front_return_representable_addresses() {
+
         // addr_shift=0, virt_offset=0: dense, address-stable-for-all-ops config.
         let mut block: Block<u64, i16> = Block::test_new(VecDeque::new(), 0, 0, 0);
 
@@ -892,9 +919,11 @@ mod tests {
         assert_eq!(block.get(v1), &200);
 
         let f0 = block.push_front(50).unwrap();
+
         // After push_front, virt_offset becomes 1; new front addr = -virt_offset = -1.
         assert_eq!(f0, -1);
         assert_eq!(block.get(f0), &50);
+
         // Address stability: previously-inserted elements still resolve.
         assert_eq!(block.get(v0), &100);
         assert_eq!(block.get(v1), &200);
@@ -902,10 +931,12 @@ mod tests {
 
     #[test]
     fn push_front_refuses_when_front_not_viable() {
+
         // shift=0, virt_offset=32768: a push_front would hand out
         // -(32768 + 1) = -32769, below i16::MIN → not representable → refuse.
         let mut block: Block<u64, i16> = Block::test_new(VecDeque::new(), 0, 0, 32768);
         assert_eq!(block.push_front(1), Err(NotFound::AddressExhaustion));
+
         // push_back still works on the same block (back is viable on empty buf).
         assert!(block.push_back(1).is_ok());
     }
@@ -965,6 +996,7 @@ mod tests {
             InsertDelta::BlockSplit { .. } => unreachable!("BlockSplit is Step 4"),
             InsertDelta::Move { new_virt, addr_delta, .. } => {
                 let a = block.virt_to_phys(*new_virt);
+
                 // Shifted phys range (OLD phys): the slots strictly between the
                 // vacated `phys` and the aligned target `a`.
                 let (lo, hi) = if a > phys { (phys + 1, a) } else { (a, phys - 1) };
@@ -975,6 +1007,7 @@ mod tests {
                                                         })
                                                         .map(|(v, val)| (*v, *val))
                                                         .collect();
+
                 // Two-pass rekey: remove ALL shifted entries first, then insert
                 // ALL rekeyed entries. A single-pass remove-then-insert can land
                 // a rekeyed virt (`v + addr_delta`) on a not-yet-removed old virt
@@ -1040,6 +1073,7 @@ mod tests {
             let op = rng() % 4;
             match op {
                 0 => {
+
                     // push_back
                     let value = rng();
                     if let Ok(virt) = block.push_back(value) {
@@ -1052,6 +1086,7 @@ mod tests {
                     }
                 }
                 1 => {
+
                     // push_front — exercises the `1 << addr_shift` v_offset bump
                     // stability for nonzero shift.
                     let value = rng();
@@ -1065,6 +1100,7 @@ mod tests {
                     }
                 }
                 2 => {
+
                     // try_insert_before with anchor derived from a random live virt —
                     // exercises find_slot walking the eligible AP under none_mask.
                     if !shadow.is_empty() {
@@ -1085,6 +1121,7 @@ mod tests {
                     }
                 }
                 3 => {
+
                     // remove a random live virt — value must match the shadow.
                     if !shadow.is_empty() {
                         let live: Vec<isize> = shadow.keys().copied().collect();
@@ -1131,6 +1168,7 @@ mod tests {
 
     #[test]
     fn gp1_address_stability() {
+
         // Dense config: addr_shift=0, none_mask=0, virt_offset=0 — every slot
         // eligible, push_front legal, address-stable-for-all-ops baseline.
         run_stability_workload(0, 0, 0, 0xb10c_4dd5_5555_dead);
@@ -1138,6 +1176,7 @@ mod tests {
 
     #[test]
     fn gp1_address_stability_spread() {
+
         // Spread config: addr_shift=1 (translation drops the low bit),
         // none_mask=1 (stride 2 — half the slots are None-eligible gaps, so
         // find_slot walks a real AP), virt_offset=100 (nonzero, exercises
@@ -1161,6 +1200,7 @@ mod tests {
         assert!(<i32 as SignedBlockIndex>::max().as_isize() > 32767,
                 "i32::max ({}) must exceed addr_max (32767) — the overprovisioning headroom",
                 <i32 as SignedBlockIndex>::max().as_isize(),);
+
         // Sanity: half_ptr tracks MAX (not PTR) — both tight i16 and
         // overprovisioned i32 give sqrt(65536) = 256.
         assert_eq!(Block::<u64, i32, true>::half_ptr(), 256);
@@ -1294,6 +1334,7 @@ mod tests {
         let half = Block::<u64, i16>::half_ptr();
 
         let mut block = Block::<u64, i16>::new_append(16);
+
         // push_back N values — addresses strictly increase, all <= addr_max.
         const N: usize = 32;
         let mut prev = isize::MIN;
@@ -1308,6 +1349,7 @@ mod tests {
             }
             prev = virt;
         }
+
         // First push_back near addr_min + half_ptr (the front_virt).
         let expected_front = addr_min + half as isize;
         let first = first.unwrap();
@@ -1335,6 +1377,7 @@ mod tests {
         let half = Block::<u64, i16>::half_ptr();
 
         let mut block = Block::<u64, i16>::new_prepend(16);
+
         // push_front N values — addresses strictly decrease, all >= addr_min.
         const N: usize = 32;
         let mut prev = isize::MAX;
@@ -1349,6 +1392,7 @@ mod tests {
             }
             prev = virt;
         }
+
         // First push_front is deterministically `front_virt - 1`: `push_front`
         // bumps `v_offset` by `1 << addr_shift` (= 1 here) before returning the
         // new front address, so the first pushed element lands one address
@@ -1381,6 +1425,7 @@ mod tests {
         // cap=1: one slot at front_virt = -128 (centered window [-128, 128)).
         let mut block = Block::<u64, i16>::new_pluripotent(1);
         let v0 = block.push_back(0u64).expect("pluripotent push_back");
+
         // |v0| < half_ptr: window is centered around 0.
         assert!(v0.abs() < half as isize,
                 "pluripotent cap=1 first push_back {v0} not near 0 (|addr| < {half})",);
@@ -1399,6 +1444,7 @@ mod tests {
         let half = Block::<u64, i16>::half_ptr();
 
         let mut block = Block::<u64, i16>::new_pluripotent(16);
+
         // First push_back near 0 (window centered).
         let v0 = block.push_back(0u64).expect("pluripotent cap=16 push_back");
         assert!(v0.abs() < half as isize, "pluripotent cap=16 first push_back {v0} not near 0",);
@@ -1437,6 +1483,7 @@ mod tests {
         let (addr_min, addr_max) = Block::<u64, i16>::addr_range();
 
         let mut block = Block::<u64, i16>::new_random(16);
+
         // push_back N values — strictly increasing, all in range. First push
         // at addr_min (front of the full range). cap=16 → 16 addressable slots.
         const N: usize = 16;
@@ -1500,6 +1547,7 @@ mod tests {
         let mut block: Block<u64, i16> = Block::new_append(64);
         let none_mask = block.none_mask as usize;
         let v_off_phys = (block.virt_offset as usize) >> block.addr_shift;
+
         // `try_insert_after(0, _)` routes to `Found::Append` while the block is
         // near-empty (the back is the nearest viable end; no on-AP `None` yet).
         block.try_insert_after(0, 100).unwrap(); // next=0 (residue 0, non-AP) → phys 0
@@ -1516,9 +1564,11 @@ mod tests {
     /// the shifted element's address changes by `addr_delta`.
     #[test]
     fn removal_shift_moves_none_to_aligned_slot() {
+
         // stride 4 (none_mask 3), v_offset 0 → AP slots at phys 1,5 (residue 1).
         let buf: VecDeque<Option<u64>> = (0..8u64).map(Some).collect();
         let mut block: Block<u64, i16> = Block::from_raw_parts(buf, 0, 3, 0).with_budget(8);
+
         // Remove phys 2 (residue 2, unaligned). Flanking AP: phys 1 (dist 1,
         // nearer) and phys 5 (dist 3); both Some → shift left toward phys 1.
         let (got, delta) = block.remove(2);
@@ -1535,6 +1585,7 @@ mod tests {
         }
         assert!(block.buf[1].is_none(), "phys 1 (AP) is now the vacancy");
         assert_eq!(block.buf[2], Some(1), "old phys 1 shifted right to phys 2");
+
         // The shifted element's address changed by addr_delta: old virt 1 → 2.
         // (virt 1 is now the vacancy — check via the buffer, not `get`, which
         // panics on the unoccupied slot.)
@@ -1579,6 +1630,7 @@ mod tests {
     /// addr_shift and front_virt).
     #[test]
     fn overprovisioned_append_behavioral() {
+
         // Same address space as tight i16 — the MAX-keyed formulas guarantee it.
         assert_eq!(<Block<u64, i32, true>>::addr_range(),
                    (-32768, 32767),
@@ -1589,6 +1641,7 @@ mod tests {
         let (addr_min, addr_max) = Block::<u64, i32, true>::addr_range();
 
         let mut block = Block::<u64, i32, true>::new_append(8);
+
         // First push_back at addr_min + half_ptr (same as tight i16).
         let v0 = block.push_back(0u64).expect("overprovisioned append push_back");
         assert_eq!(v0,

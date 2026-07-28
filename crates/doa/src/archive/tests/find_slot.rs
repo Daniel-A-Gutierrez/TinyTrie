@@ -21,6 +21,7 @@ mod tests {
                           none_mask: usize,
                           v_off_phys: usize,
                           rank: usize) {
+
         // Bias doesn't affect geometry (first_right/first_left/stride) — only
         // right_first, which this helper doesn't use. Pass Right arbitrarily.
         let aligned = align(anchor, none_mask, v_off_phys, Bias::Right);
@@ -72,6 +73,7 @@ mod tests {
 
     #[test]
     fn tie_goes_right_exact() {
+
         // right_delta == stride/2: equidistant tie at the nearest rank.
         let stride = 4;
         let (none_mask, v_off_phys, budget, addr_shift, v_offset) = base_args(stride);
@@ -89,6 +91,7 @@ mod tests {
 
     #[test]
     fn tie_goes_left_exact() {
+
         // right_delta == stride/2: equidistant tie at the nearest rank, left bias.
         let stride = 4;
         let (none_mask, v_off_phys, budget, addr_shift, v_offset) = base_args(stride);
@@ -108,6 +111,7 @@ mod tests {
 
     #[test]
     fn tie_goes_left_when_anchor_eligible() {
+
         // right_delta == 0: anchor eligible → it's skipped (excluded as a
         // candidate), and the paired loop probes left first under Left bias.
         // Place Nones at rank 2 on both sides (equidistant) — left bias must
@@ -132,17 +136,20 @@ mod tests {
 
     #[test]
     fn bias_does_not_change_strictly_nearest() {
+
         // When one side is strictly closer (not a tie), bias is irrelevant:
         // the strictly-nearer slot wins regardless of bias.
         let stride = 4;
         let (none_mask, v_off_phys, budget, addr_shift, v_offset) = base_args(stride);
         let anchor = 32;
         let aligned = align(anchor, none_mask, v_off_phys, Bias::Right);
+
         // Place None only on the right at rank 1 (dist right_delta + stride).
         let right_idx = (aligned.first_right + aligned.stride) as usize;
         let mut buf = blank(128);
         buf[right_idx] = None;
         let block = make_block_budget(buf, addr_shift, none_mask, v_offset, budget);
+
         // Both biases must return the same strictly-nearer right slot.
         assert_eq!(block.find_slot(anchor, Bias::Right), Ok(Found::At(right_idx)));
         let mut buf2 = blank(128);
@@ -153,6 +160,7 @@ mod tests {
 
     #[test]
     fn both_ends_viable_follows_bias() {
+
         // Both ends viable, no None within budget → end resolution picks by
         // bias. This is the case the slot-differential CAN'T validate: impl +
         // oracle agreed on it whether right or wrong, so the 40k assertions
@@ -162,6 +170,7 @@ mod tests {
         let (none_mask, _v_off_phys, budget, addr_shift, v_offset) = base_args(stride);
         let len = 12;
         let anchor = 6; // (6 + v_off_phys=3) & 3 == 1 → eligible; first_right=6, first_left=2
+
         // blank = all Some → scan finds no None → falls to end resolution.
         // Both ends viable (back: 12-3=9 <= 32767; front: -(3+1)=-4 >= -32768)
         // and both sides have slots (count_right=2, count_left=1, budget=8).
@@ -177,11 +186,13 @@ mod tests {
 
     #[test]
     fn tie_goes_right_when_anchor_eligible() {
+
         // right_delta == 0: anchor itself eligible → every R_k/L_k pair ties;
         // tie→right must pick the +j side. This is the case the old alternation
         // got wrong.
         let stride = 8;
         let (none_mask, _, budget, addr_shift, _) = base_args(stride);
+
         // v_off_phys = 1 → (anchor+1)&7==1 → anchor eligible at anchor=24.
         // With addr_shift=0, v_offset = v_off_phys = 1.
         let v_offset = 1usize;
@@ -189,6 +200,7 @@ mod tests {
         let anchor = 24;
         let aligned = align(anchor, none_mask, v_off_phys, Bias::Right);
         assert_eq!(aligned.first_right as usize, anchor, "anchor must be eligible");
+
         // Nones equidistant at rank 2: first_right+2s (right) and first_right-2s
         // (left), both dist 16.
         let mut buf = blank(128);
@@ -245,6 +257,7 @@ mod tests {
 
     #[test]
     fn address_exhaustion() {
+
         // With `PTR = i16` the address range is fixed at `[i16::MIN, i16::MAX]`.
         // To make an end non-viable we push `virt_offset` to a near-boundary
         // value: `virt_offset = i16::MIN` makes `phys_to_virt(len) = (len <<
@@ -271,6 +284,7 @@ mod tests {
 
     #[test]
     fn budget_zero_does_not_underflow() {
+
         // Regression: the anchor-skip path did `probes_right -= 1` without
         // checking `budget`, so `budget == 0` underflowed `probes_right` to
         // `usize::MAX` (release) and sent `scan`'s `get_unchecked` past the
@@ -284,6 +298,7 @@ mod tests {
         let buf = blank(64); // slot 0 is Some
         let anchor = 0;
         let block = make_block_budget(buf, addr_shift, none_mask, v_offset, budget);
+
         // With zero probe budget no scan runs, so `resolve_ends` decides: the
         // left side has 0 in-range eligible slots (not budget-out) and
         // `push_front` is viable → `Prepend`. The assertion's real point is
@@ -331,6 +346,7 @@ mod tests {
         let first_right = aligned.first_right;
         let right_delta = aligned.right_delta as isize;
         let mut candidates: Vec<(usize, isize)> = Vec::new(); // (dist, pos)
+
         // `right_delta == 0` → anchor sits at right rank 0; excluded by
         // contract (occupied), so start right ranks at 1.
         let mut rank_right = (right_delta == 0) as isize;
@@ -351,6 +367,7 @@ mod tests {
             candidates.push(((rank_left * stride - right_delta) as usize, pos));
             rank_left += 1;
         }
+
         // sort by dist asc; tie-break by bias: Right → greater pos first
         // (right side), Left → lesser pos first (left side).
         match bias {
@@ -416,6 +433,7 @@ mod tests {
                     buf[idx] = None;
                 }
             }
+
             // Test BOTH biases against a bias-aware oracle.
             for bias in [Bias::Right, Bias::Left] {
                 let expected = find_ref(&buf, anchor, none_mask, v_off_phys, budget, addr_shift,
