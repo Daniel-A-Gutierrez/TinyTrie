@@ -12,9 +12,7 @@ use std::simd::{u64x4, u64x8, u64x16};
 use test::{Bencher, black_box};
 // ---- AoS: array of (K, V) tuples ----
 fn lookup_aos<'a, K, V, const N: usize>(arr: &'a [(K, V); N], key: &K) -> Option<&'a V>
-where
-    K: Eq,
-{
+where K: Eq {
     for (k, v) in arr {
         if k == key {
             return Some(v);
@@ -29,9 +27,7 @@ struct Soa<K, V, const N: usize> {
     vals: [V; N],
 }
 fn lookup_soa<'a, K, V, const N: usize>(s: &'a Soa<K, V, N>, key: &K) -> Option<&'a V>
-where
-    K: Eq,
-{
+where K: Eq {
     for i in 0..N {
         if &s.keys[i] == key {
             return Some(&s.vals[i]);

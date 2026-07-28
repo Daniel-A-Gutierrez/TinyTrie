@@ -1,6 +1,32 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Trait Structure
+interfaces
+RawBlock(Block(Store,Translator))
+TreeBlock(RawBlock(Store,Translator)),<->TreeWalker(TreeBlock)
+
+Block impls BlockTrait
+BlockTrait
+Store, Translator, BlockIndex, Strategy, Ordering
+
+Theres also 
+Node, Walker, Probe
+
+I don't know that ordering belongs on block. 
+Also divided on composition vs extension , making block just a struct or trait + struct.
+
+the goal is to provide a TreeBlock that a consumer can just plug their node and walker into, as well as
+a raw block interface they can use to define a data-structure-specialized block. 
+
+the raw block methods for insertion can violate treeblocks invariants. 
+but stuff that cant should be fine to expose - that goes in the block trait. 
+
+wrapping treeblock up into a trait + struct lets other traits build in top of it without the trait itself caring so long as the impl does. 
+
+so traits only have to carry a generic when their inputs/outputs depend on that? ok...
+well we can use the associated types of another trait we take as a bound too. 
+
 # Pluripotent shift & rotate
 Complex! only works right if max_cap = p::half::MAX() 
 then we'd have to get tz, shift right by it, do the rotation, then shift left by it. 

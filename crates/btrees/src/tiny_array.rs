@@ -10,15 +10,13 @@ use std::ptr::drop_in_place;
 /// Owns the Drop for initialized slots — when a `TinyArray` is dropped, all
 /// initialized elements are dropped.
 pub struct TinyArray<T, const N: usize>
-where
-    [(); N]:,
+where [(); N]:
 {
     len:   u8,
     slots: [MaybeUninit<T>; N],
 }
 impl<T: Clone, const N: usize> Clone for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     fn clone(&self) -> Self {
         let mut arr = Self::new();
@@ -29,8 +27,7 @@ where
     }
 }
 impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.as_slice()).finish()
@@ -38,8 +35,7 @@ where
 }
 #[allow(dead_code)]
 impl<T, const N: usize> TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     /// Create an empty `TinyArray` with `len == 0`.
     pub fn new() -> Self {
@@ -319,8 +315,7 @@ where
     }
 }
 impl<T, const N: usize> Drop for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     fn drop(&mut self) {
         for i in 0..self.len as usize {

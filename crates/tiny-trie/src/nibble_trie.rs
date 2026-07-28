@@ -606,8 +606,7 @@ impl<PTR: TrieIndex, LEN: TrieIndex> ArenaNode<PTR, LEN> {
 // ---------------------------------------------------------------------------
 #[derive(Clone)]
 pub struct NibbleTrie<K, T, PTR: TrieIndex = u32, LEN: TrieIndex = u16>
-where
-    K: ByteKey,
+where K: ByteKey
 {
     pub(crate) arena:  Vec<ArenaNode<PTR, LEN>>,
     pub(crate) buf:    Vec<u8>, // all keys concatenated (no null terminators)

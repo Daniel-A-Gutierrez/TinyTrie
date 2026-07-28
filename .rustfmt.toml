@@ -6,4 +6,4 @@ indent_style = "Block"
 use_small_heuristics = "Max"
 unstable_features = true
 single_line_if_else_max_width = 96
-blank_lines_upper_bound=0
+where_single_line = true 

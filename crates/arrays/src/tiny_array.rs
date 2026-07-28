@@ -4,15 +4,13 @@
 //! Slots `[0..len)` are always initialized. `Copy` when `T: Copy` (no heap).
 use std::mem::MaybeUninit;
 pub struct TinyArray<T, const N: usize>
-where
-    [(); N]:,
+where [(); N]:
 {
     len:   u8,
     slots: [MaybeUninit<T>; N],
 }
 impl<T: Copy, const N: usize> Clone for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -21,8 +19,7 @@ where
 }
 impl<T: Copy, const N: usize> Copy for TinyArray<T, N> where [(); N]: {}
 impl<T, const N: usize> TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     pub fn new() -> Self {
         Self { len: 0, slots: unsafe { MaybeUninit::uninit().assume_init() } }
@@ -75,8 +72,7 @@ where
     }
 }
 impl<T, const N: usize> Default for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     fn default() -> Self {
         Self::new()

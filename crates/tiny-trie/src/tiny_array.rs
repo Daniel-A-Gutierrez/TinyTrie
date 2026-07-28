@@ -16,15 +16,13 @@ use std::mem::MaybeUninit;
 /// `T: Copy`, so deriving `Clone` would force `T: Copy` onto unrelated method impls.
 /// The manual impls gate only on `T: Copy`.
 pub struct TinyArray<T, const N: usize>
-where
-    [(); N]:,
+where [(); N]:
 {
     len:   u8,
     slots: [MaybeUninit<T>; N],
 }
 impl<T: Copy, const N: usize> Clone for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -34,8 +32,7 @@ where
 }
 impl<T: Copy, const N: usize> Copy for TinyArray<T, N> where [(); N]: {}
 impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.as_slice()).finish()
@@ -43,8 +40,7 @@ where
 }
 #[allow(dead_code)]
 impl<T, const N: usize> TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     /// Create an empty `TinyArray` with `len == 0`.
     pub fn new() -> Self {
@@ -257,8 +253,7 @@ where
     }
 }
 impl<T, const N: usize> Default for TinyArray<T, N>
-where
-    [(); N]:,
+where [(); N]:
 {
     fn default() -> Self {
         Self::new()

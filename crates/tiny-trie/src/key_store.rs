@@ -188,8 +188,7 @@ pub trait ByteKey: TrieKey {
     /// is already guaranteed by this trait's byte-order invariant and is not
     /// re-imposed as a bound here; the trie compares raw `buf` bytes directly.
     type Borrowed<'a>: AsRef<[u8]> + 'a
-    where
-        Self: 'a;
+    where Self: 'a;
     /// Return the byte representation of this key.
     fn bytes(&self) -> &[u8];
     /// Reconstruct an *owned* key from its byte representation. Allocates.
@@ -211,8 +210,7 @@ pub trait ByteKey: TrieKey {
 impl ByteKey for Vec<u8> {
     type Borrowed<'a>
         = &'a [u8]
-    where
-        Self: 'a;
+    where Self: 'a;
     fn bytes(&self) -> &[u8] {
         self
     }
@@ -226,8 +224,7 @@ impl ByteKey for Vec<u8> {
 impl ByteKey for String {
     type Borrowed<'a>
         = &'a str
-    where
-        Self: 'a;
+    where Self: 'a;
     fn bytes(&self) -> &[u8] {
         self.as_bytes()
     }

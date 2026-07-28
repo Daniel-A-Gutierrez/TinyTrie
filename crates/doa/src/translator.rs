@@ -84,9 +84,15 @@ impl<P: UnsignedNum> Translator<P> {
         Self { offset, shift, rotation, v2p: v2p_id::<P>, p2v: p2v_id::<P> }
             .specialize(offset, shift, rotation)
     }
-    pub(crate) fn offset(&self) -> P { self.offset }
-    pub(crate) fn shift(&self) -> u32 { self.shift }
-    pub(crate) fn rotation(&self) -> u32 { self.rotation }
+    pub(crate) fn offset(&self) -> P {
+        self.offset
+    }
+    pub(crate) fn shift(&self) -> u32 {
+        self.shift
+    }
+    pub(crate) fn rotation(&self) -> u32 {
+        self.rotation
+    }
     ///re-point the specialized bodies after a param change (one indirect call
     ///per lookup thereafter, no per-iter branch).
     pub(crate) fn set_params(&mut self, offset: P, shift: u32, rotation: u32) {

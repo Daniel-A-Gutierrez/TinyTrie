@@ -1,12 +1,13 @@
 use std::cmp::Ordering::*;
-use std::{collections::VecDeque, ops::{Index, Range}};
+use std::{collections::VecDeque,
+          ops::{Index, Range}};
 ///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that limits max cap and provides
 ///access/shift semantics
 ///address translation
 ///dumb insertion
-pub(crate) trait Store<'a, T: Sized + 'a>: Sized {
+pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///in-bounds occupied slot. bounds-checks; panics if the slot is None (contract violation).
-    fn get(&self, ptr: usize) -> &T;
+    fn get<'b>(&'b self, ptr: usize) -> &'b T;
     fn get_mut(&mut self, ptr: usize) -> &mut T;
     ///slide the None at `from` to `to`; returns `to`. `from==to` => no slide. `pin`, if set, is a
     ///slot whose element must not move — the slide jumps over it (order of the rest preserved).
@@ -18,7 +19,12 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized {
     ///pos elem unmoved) when the None is on that side, else `pos` (pos elem shifts toward the None).
     ///`pin`, if set, is a slot the search must not cross: a slide never spans it. `pos==pin`
     ///restricts the search to the `DIR` side only (after⇒right, before⇒left).
-    fn find_slot<const DIR: bool>(&self, pos: usize, budget: usize, pin: Option<usize>) -> Option<MinSlide>;
+    fn find_slot<const DIR: bool>(
+        &self,
+        pos: usize,
+        budget: usize,
+        pin: Option<usize>,
+    ) -> Option<MinSlide>;
     fn swap(&mut self, a: usize, b: usize);
     ///increases occupancy, may not increase cap beyond max
     fn push_front(&mut self, v: T);
@@ -54,21 +60,18 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized {
     ///take slot len-1 if Some (set None), else None. occupancy -1 when Some.
     fn pop_back(&mut self) -> Option<T>;
     fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
-    where
-        T: 'b;
+    where 'a: 'b;
     fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
-    where
-        T: 'b;
+    where 'a: 'b;
     fn slots<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where
-        T: 'b;
+    where 'a: 'b;
     fn slice_iter<'b>(
         &'b self,
         from: usize,
         to: usize,
     ) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
     where
-        T: 'b;
+        'a: 'b;
     fn max_capacity() -> usize; //the maximum capacity of the store type.
     fn new() -> Self;
 }
@@ -110,7 +113,9 @@ impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> ExactSizeIterator for SomeIte
         self.remaining
     }
 }
-impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterator for SomeIter<'b, T, I> {
+impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterator
+    for SomeIter<'b, T, I>
+{
     fn next_back(&mut self) -> Option<&'b T> {
         for slot in self.inner.by_ref().rev() {
             if let Some(v) = slot {
@@ -295,7 +300,12 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         }
         to
     }
-    fn find_slot<const DIR: bool>(&self, pos: usize, budget: usize, pin: Option<usize>) -> Option<MinSlide> {
+    fn find_slot<const DIR: bool>(
+        &self,
+        pos: usize,
+        budget: usize,
+        pin: Option<usize>,
+    ) -> Option<MinSlide> {
         let buf = self.buf.as_slice();
         let max = (u32::MAX as usize).min(self.buf.len()).min(pos + budget);
         let min = pos.saturating_sub(budget);
@@ -310,10 +320,18 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
             None => (min, max),
         };
         match dual_scan_outward::<_, DIR>(buf, buf, min..pos, pos..max) {
-            NearestNone::Left(l) => Some(MinSlide { from: l, to: if !DIR { pos - 1 } else { pos } }),
+            NearestNone::Left(l) => {
+                Some(MinSlide { from: l, to: if !DIR { pos - 1 } else { pos } })
+            }
             NearestNone::Right(r) => Some(MinSlide {
                 from: r,
-                to:  if r == pos { pos } else if DIR { pos + 1 } else { pos },
+                to:   if r == pos {
+                    pos
+                } else if DIR {
+                    pos + 1
+                } else {
+                    pos
+                },
             }),
             NearestNone::NotFound => None,
         }
@@ -467,21 +485,15 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         v
     }
     fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
-    where
-        T: 'b,
-    {
+    where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
     }
     fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
-    where
-        T: 'b,
-    {
+    where T: 'b {
         SlotCursor::new(&self.buf, self.buf.len())
     }
     fn slots<'b>(&self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where
-        T: 'b,
-    {
+    where T: 'b {
         std::iter::empty::<&'b Option<T>>()
     }
     fn slice_iter<'b>(
@@ -559,22 +571,39 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
             }
         } else if hi < flen {
             let front = self.buf.as_mut_slices().0;
-            if from > to { front[lo..=hi].rotate_right(1) } else { front[lo..=hi].rotate_left(1) }
+            if from > to {
+                front[lo..=hi].rotate_right(1)
+            } else {
+                front[lo..=hi].rotate_left(1)
+            }
         } else {
             let back = self.buf.as_mut_slices().1;
             let (blo, bhi) = (lo - flen, hi - flen);
-            if from > to { back[blo..=bhi].rotate_right(1) } else { back[blo..=bhi].rotate_left(1) }
+            if from > to {
+                back[blo..=bhi].rotate_right(1)
+            } else {
+                back[blo..=bhi].rotate_left(1)
+            }
         }
         to
     }
-    fn find_slot<const DIR: bool>(&self, pos: usize, budget: usize, pin: Option<usize>) -> Option<MinSlide> {
+    fn find_slot<const DIR: bool>(
+        &self,
+        pos: usize,
+        budget: usize,
+        pin: Option<usize>,
+    ) -> Option<MinSlide> {
         let (front, back) = self.buf.as_slices();
         let max = (u32::MAX as usize).min(self.buf.len()).min(pos + budget);
         let min = pos.saturating_sub(budget);
         //clamp to keep the slide off the pin (see VecStore::find_slot).
         let (min, max) = match pin {
             Some(p) if p == pos => {
-                if DIR { (pos, max) } else { (min, pos) }
+                if DIR {
+                    (pos, max)
+                } else {
+                    (min, pos)
+                }
             }
             Some(p) if p < pos => (min.max(p + 1), max),
             Some(p) => (min, max.min(p)),
@@ -590,16 +619,21 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                     }
                     NearestNone::Right(r) => Some(MinSlide {
                         from: r,
-                        to:  if r == pos { pos } else if DIR { pos + 1 } else { pos },
+                        to:   if r == pos {
+                            pos
+                        } else if DIR {
+                            pos + 1
+                        } else {
+                            pos
+                        },
                     }),
                     //front exhausted within budget: any None in back is right of pos.
-                    NearestNone::NotFound => back[0..max - front.len()]
-                        .iter()
-                        .position(|i| i.is_none())
-                        .map(|x| {
+                    NearestNone::NotFound => {
+                        back[0..max - front.len()].iter().position(|i| i.is_none()).map(|x| {
                             let r = x + front.len();
                             MinSlide { from: r, to: if DIR { pos + 1 } else { pos } }
-                        }),
+                        })
+                    }
                 }
             }
             Equal => match dual_scan_outward::<_, DIR>(
@@ -613,7 +647,16 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                 }
                 NearestNone::Right(p) => {
                     let r = p + front.len();
-                    Some(MinSlide { from: r, to: if r == pos { pos } else if DIR { pos + 1 } else { pos } })
+                    Some(MinSlide {
+                        from: r,
+                        to:   if r == pos {
+                            pos
+                        } else if DIR {
+                            pos + 1
+                        } else {
+                            pos
+                        },
+                    })
                 }
                 NearestNone::NotFound => None,
             },
@@ -630,7 +673,13 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                         let abs = r + front.len();
                         Some(MinSlide {
                             from: abs,
-                            to:  if abs == pos { pos } else if DIR { pos + 1 } else { pos },
+                            to:   if abs == pos {
+                                pos
+                            } else if DIR {
+                                pos + 1
+                            } else {
+                                pos
+                            },
                         })
                     }
                     //back exhausted within budget: any None in front is left of pos.
@@ -798,21 +847,15 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         v
     }
     fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
-    where
-        T: 'b,
-    {
+    where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
     }
     fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
-    where
-        T: 'b,
-    {
+    where T: 'b {
         SlotCursor::new(&self.buf, self.buf.len())
     }
     fn slots<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where
-        T: 'b,
-    {
+    where T: 'b {
         std::iter::empty::<&'b Option<T>>()
     }
     fn slice_iter<'b>(
