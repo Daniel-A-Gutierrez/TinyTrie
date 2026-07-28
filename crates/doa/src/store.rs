@@ -14,7 +14,7 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     fn get_mut(&mut self, ptr: usize) -> &mut T;
 
     ///slide the None at `from` to `to`; returns `to`. `from==to` => no slide. `pin`, if set, is a
-    ///slot whose element must not move — the slide jumps over it (order of the rest preserved).
+    ///slot whose element must not move.
     ///Precondition: `to != pin` (a pinned `to` can't open). Fastpath rotates (memmove) the run;
     ///the rare pin-in-range, and for the deque a wrap-crossing range, fall back to per-step swaps.
     fn slide_none(&mut self, ms: MinSlide, pin: Option<usize>) -> usize;
@@ -167,7 +167,7 @@ impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterato
 ///positioned reader over a store's `Some` slots — distinct from `iter()` (a forward
 ///`ExactSizeIterator`). `seek` is O(1) (direct index); `next`/`prev`/first-positioning scan
 ///across `None` gaps. `pos == None` means at-end (no current element).
-pub(crate) trait Cursor<'b, T: 'b> {
+pub trait Cursor<'b, T: 'b> {
 
     ///physical slot of the current element, or `None` if at-end.
     fn position(&self) -> Option<usize>;
@@ -739,7 +739,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
 
                     //front exhausted within budget: any None in back is right of pos.
                     NearestNone::NotFound => {
-                        back[0..max - front.len()].iter().position(|i| i.is_none()).map(|x| {
+                        back[0..max.saturating_sub(front.len())].iter().position(|i| i.is_none()).map(|x| {
                             let r = x + front.len();
                             MinSlide { from: r, to: if DIR { pos + 1 } else { pos } }
                         })

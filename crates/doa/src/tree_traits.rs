@@ -238,50 +238,50 @@ where
 {
 }
 
-impl<'a, T, K, V, P, A, O, S> Tree<'a> for TreeBlock<'a, T, K, V, P, A, O, S>
-where
-    T: Node<'a, O>,
-    K: Sized + 'a,
-    V: Sized + 'a,
-    P: BlockIndex,
-    A: AllocStrat,
-    O: TreeOrdering,
-    S: Store<'a, T> + 'a,
-{
-    type A = A;
-    type T = T;
-    type K = K;
-    type V = V;
-    type P = P;
-    type O = O;
-    type S = S;
+// impl<'a, T, K, V, P, A, O, S> Tree<'a> for TreeBlock<'a, T, K, V, P, A, O, S>
+// where
+//     T: Node<'a, O>,
+//     K: Sized + 'a,
+//     V: Sized + 'a,
+//     P: BlockIndex,
+//     A: AllocStrat,
+//     O: TreeOrdering,
+//     S: Store<'a, T> + 'a,
+// {
+//     type A = A;
+//     type T = T;
+//     type K = K;
+//     type V = V;
+//     type P = P;
+//     type O = O;
+//     type S = S;
 
-    fn insert<W>(
-        &mut self,
-        walker: W,
-        child_idx: usize,
-        node: Self::T,
-    ) -> Result<Self::P, Self::T>
-    where
-        W: TreeWalker<'a, Self>,
-    {
-        todo!()
-    }
+//     fn insert<W>(
+//         &mut self,
+//         walker: W,
+//         child_idx: usize,
+//         node: Self::T,
+//     ) -> Result<Self::P, Self::T>
+//     where
+//         W: TreeWalker<'a, Self>,
+//     {
+//         todo!()
+//     }
 
-    fn probe(&self, k: Self::K) -> impl TreeProbe<'a, Self> {
-        todo!()
-    }
+//     fn probe(&self, k: Self::K) -> impl TreeProbe<'a, Self> {
+//         todo!()
+//     }
 
-    fn remove<W>(&mut self, walker: W) -> Option<Self::T>
-    where W: TreeWalker<'a, Self> {
-        todo!()
-    }
+//     fn remove<W>(&mut self, walker: W) -> Option<Self::T>
+//     where W: TreeWalker<'a, Self> {
+//         todo!()
+//     }
 
-    fn root(&self) -> impl TreeWalker<'a, Self> {
-        todo!()
-    }
+//     fn root(&self) -> impl TreeWalker<'a, Self> {
+//         todo!()
+//     }
 
-    fn walk_to(&self, k: Self::K) -> impl TreeWalker<'a, Self> {
-        todo!()
-    }
-}
+//     fn walk_to(&self, k: Self::K) -> impl TreeWalker<'a, Self> {
+//         todo!()
+//     }
+// }
