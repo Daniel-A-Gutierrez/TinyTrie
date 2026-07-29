@@ -1,6 +1,7 @@
 use crate::RelTo;
 use crate::block::{AllocStrat, BlockMutTrait, BlockTrait, RawBlock};
-use crate::{index::BlockIndex, store::Store, translator::Translator};
+use crate::{index::*, store::Store, translator::Translator};
+use std::cmp::Ordering::{Equal, Greater, Less};
 use std::marker::PhantomData;
 
 ///tree layout. RawBlock carries no ordering; this is a tree-tier concern. the root
@@ -37,9 +38,7 @@ trait Node<'a, O: TreeOrdering>: Sized + 'a + OrderedNode<Self::P, O> {
     type V: Sized + 'a;
     type P: BlockIndex;
 
-    fn lookup(&self, query: &Self::K) -> impl NodeIter<'a, Self::P>;
-
-    fn try_lookup(&self, query: &Self::K) -> impl NodeIter<'a, Option<Self::P>>;
+    fn lookup(&self, query: &Self::K) -> Option<impl NodeIter<'a, Self::P>>;
 
     fn keys(&self) -> impl NodeIter<'a, &'a Self::K>;
 
@@ -96,7 +95,7 @@ trait NodeIterMut<'a, T>: NodeIter<'a, T> {
 }
 
 ///tree walker owns a &mut Block<T : Node, O : Ordering .etc>
-trait TreeWalker<'a, B: Tree<'a>>: TreeProbe<'a, B> {
+trait TreeWalker<'a, B: Tree<'a>>  : TreeProbe<'a,B> {
 
     ///take the ancestor stack: (parent vaddr, child_idx taken).
     fn pop(&mut self) -> Option<(B::P, usize)>;
@@ -116,9 +115,12 @@ trait TreeWalker<'a, B: Tree<'a>>: TreeProbe<'a, B> {
     fn right(&mut self); //go to prev sibling/cousin, skipping parent.
 
     fn left(&mut self); //go to next sibling/cousin, skipping parent
+
+    fn position(&self) -> B::P; //current node vaddr
+
 }
 
-trait TreeWalkerMut<'a, B: Tree<'a>>: TreeProbeMut<'a, B> + TreeWalker<'a, B> {
+trait TreeWalkerMut<'a, B: Tree<'a>>:TreeWalker<'a, B> + TreeProbeMut<'a,B>{
 
     ///insert a new node in the arena as a child of current.
     ///does not modify current, aside from pointer maintenance.
@@ -126,20 +128,23 @@ trait TreeWalkerMut<'a, B: Tree<'a>>: TreeProbeMut<'a, B> + TreeWalker<'a, B> {
 
     ///remove current from the arena. It must not have children.
     fn remove(&mut self) -> B::T;
+
+    fn current_mut(&mut self) -> &'a mut B::V;
 }
 
-trait TreeProbe<'a, B: Tree<'a>> {
 
-    fn position(&self) -> B::P; //current node vaddr
-
-    fn current(&self) -> Option<&B::V>; //current node
-
-    fn descend(&mut self, child_idx: usize); //goto current.children[child_idx];
+trait TreeProbe<'a,B> : Sized where B: Tree<'a> {
+    fn new(tree : &'a B) -> Self { Self::from_root(tree, tree.root()) }
+    fn from_root(tree : &'a B, root: B::P) -> Self;
+    fn try_route(&self, k : &B::K)->Option<usize>;
+    fn descend(&mut self, child_idx : usize);
+    fn current(&self) -> &'a B::T;
 }
 
-trait TreeProbeMut<'a, B: Tree<'a>>: TreeProbe<'a, B> {
-
-    fn current_mut(&mut self) -> &mut B::V;
+trait TreeProbeMut<'a,B> : Sized + TreeProbe<'a,B> where B: Tree<'a> {
+    fn new(tree : &'a mut B) -> Self{ Self::from_root_mut(tree, tree.root()) }
+    fn from_root_mut(tree : &'a mut B, root: B::P) -> Self;
+    fn current_mut(&mut self) -> &'a mut B::T;
 }
 
 /// type that the block stores, ptrs type, address translator, ordering, store.
@@ -153,11 +158,11 @@ trait Tree<'a>: Sized + OrderedBlock<'a, Self::T, Self::P, Self::O, Self::S> {
     type O: TreeOrdering;
     type S: Store<'a, Self::T> + 'a;
 
-    fn root(&self) -> impl TreeWalker<'a, Self>;
+    fn root(&self)  -> Self::P;
 
-    fn walk_to(&self, k: Self::K) -> impl TreeWalker<'a, Self>;
+    fn walk_to<W>(&'a self, k: &Self::K) -> W where W : TreeWalker<'a, Self>;
 
-    fn probe(&self, k: Self::K) -> impl TreeProbe<'a, Self>;
+    fn probe<Probe : TreeProbe<'a,Self>>(&'a self, k: &Self::K) -> Probe;
 
     fn insert<W>(
         &mut self,
@@ -223,74 +228,100 @@ where
     }
 }
 
-// impl<'a, T, A, O, S, B> Tree<'a> for TreeBlock<'a, T, A, O, S, B>
-// where
-//     T: Node<'a, O>,
-//     A: AllocStrat<T::P>,
-//     O: TreeOrdering,
-//     S: Store<'a, T> + 'a,
-//     B : BlockMutTrait<'a,T,T::P,A,S> +'a,
-// {
-//     type A = A;
-//     type T = T;
-//     type K = T::K;
-//     type V = T::V;
-//     type P = T::P;
-//     type O = O;
-//     type S = S;
+impl<'a, T, A, O, S, B> Tree<'a> for TreeBlock<'a, T, A, O, S, B>
+where
+    T: Node<'a, O>,
+    A: AllocStrat<T::P>,
+    O: TreeOrdering,
+    S: Store<'a, T> + 'a,
+    B : BlockMutTrait<'a,T,T::P,A,S> +'a,
+    Self : 'a,
+{
+    type A = A;
+    type T = T;
+    type K = T::K;
+    type V = T::V;
+    type P = T::P;
+    type O = O;
+    type S = S;
 
-//     fn insert<W>(
-//         &mut self,
-//         walker: W,
-//         child_idx: usize,
-//         node: Self::T,
-//     ) -> Result<Self::P, Self::T>
-//     where
-//         W: TreeWalker<'a, Self>,
-//     {
-//         let parent_v = walker.position();
-//         let rel = self.inner.get(parent_v).insert_position(parent_v, child_idx);
-//         let (anchor, dir) = match rel {
-//             RelTo::Before(p) => (p, false),
-//             RelTo::After(p) => (p, true),
-//         };
-//         //only the root is pinned; the parent may displace.
-//         let pin = Some(self.root);
-//         let ms = match self.inner.find_insert_slot(anchor, dir, pin) {
-//             Some(ms) => ms,
-//             None => return Err(node),
-//         };
-//         let new_p = self.p2v(ms.to);
-//         //fixup(parent_v, child_idx, new_p): rewire inbound ptrs BEFORE slide_none.
-//         //  parent.update_child(child_idx, new_p); new child's parent/sibling via
-//         //  the NodeIter<&mut P> accessors. TODO: remap children displaced by the
-//         //  slide (their vaddrs change) — needs the slide range; deferred.
-//         let slot = self.inner.slide_none(ms, pin);
-//         self.inner.insert(node, slot);
-//         Ok(new_p)
-//     }
+    fn insert<W>(
+        &mut self,
+        mut walker: W,
+        child_idx: usize,
+        node: Self::T,
+    ) -> Result<Self::P, Self::T>
+    where
+        W: TreeWalker<'a, Self>,
+    {
+        let parent_v = walker.position();
+        let rel = self.inner.get(parent_v).insert_position(parent_v, child_idx);
+        let (anchor, dir) = match rel {
+            RelTo::Before(p) => (p, false),
+            RelTo::After(p) => (p, true),
+        };
+        //the root is pinned
+        let pin = Some(self.root);
+        let slide = match self.inner.find_slot(anchor, dir, pin) {
+            Some(slide) => slide,
+            None => return Err(node),
+        };
+        if slide.from != slide.to {
+            //fixup(parent_v, child_idx, new_p): rewire inbound ptrs BEFORE slide_none.
+            //  parent.update_child(child_idx, new_p); new child's parent/sibling via
+            //  the NodeIter<&mut P> accessors.
+            let mut anchor_p = self.v2p(anchor);
+            let count = slide.from.abs_diff(slide.to);
+            let skip = if (slide.from > slide.to) == dir {0} else {1}; //0 if anchor is not moving
+            let walker_step = if slide.from > anchor_p { |walker : &mut W| walker.next() } else { |walker : &mut W| walker.prev() }; //right = true
+            let delta = if slide.from < slide.to { usize::MAX } else { 1 };
+            
+            anchor_p = anchor_p.wrapping_add(delta); 
+            if skip==1 { 
+                walker_step(&mut walker);
+                anchor_p = anchor_p.wrapping_add(delta);
+            }
+            for _ in skip..count {
+                anchor_p = anchor_p.wrapping_add(delta);
+                let new_v = self.p2v(anchor_p);
+                let (vaddr,ci) = walker.parent().unwrap();
+                let parent = self.inner.get_mut(vaddr);
+                parent.update_child(ci, new_v);
+                walker_step(&mut walker);
+            }
+            
+        }
+        
+        let slot = self.inner.slide_none(slide, pin);
+        let new_v = self.inner.insert(node, slot);
+        Ok(new_v)
+    }
 
-//     fn remove<W>(&mut self, walker: W) -> Option<Self::T>
-//     where
-//         W: TreeWalker<'a, Self>,
-//     {
-//         let cur_v = walker.position();
-//         //None => removing the root; caller handles (no parent to clear).
-//         let (parent_v, child_idx) = walker.parent()?;
-//         let v = self.inner.remove(cur_v);
-//         self.inner.get_mut(parent_v).clear_child(child_idx);
-//         Some(v)
-//     }
+    fn remove<W>(&mut self, walker: W) -> Option<Self::T>
+    where
+        W: TreeWalker<'a, Self>,
+    {
+        let cur_v = walker.position();
+        //None => removing the root; caller handles (no parent to clear).
+        let (parent_v, child_idx) = walker.parent()?;
+        let v = self.inner.remove(cur_v);
+        self.inner.get_mut(parent_v).clear_child(child_idx);
+        Some(v)
+    }
 
-//     // fn probe(&self, k: Self::K) -> impl TreeProbe<'a, Self> {
-//     //     todo!()
-//     // }
+    fn probe<Probe : TreeProbe<'a,Self>>(&'a self, k: &Self::K) -> Probe{
+        let mut probe = Probe::new(self);
+        while let Some(child_idx) = probe.try_route(&k) {probe.descend(child_idx)}
+        return probe;
+    }
 
-//     // fn root(&self) -> impl TreeWalker<'a, Self> {
-//     //     todo!()
-//     // }
+    fn root(&self)  -> Self::P {
+        self.root
+    }
 
-//     // fn walk_to(&self, k: Self::K) -> impl TreeWalker<'a, Self> {
-//     //     todo!()
-//     // }
-// }
+    fn walk_to<W>(&'a self, k : &Self::K)  -> W where W : TreeWalker<'a,Self>  {
+        let mut walker = W::new(&self);
+        while let Some(child_idx) = walker.try_route(&k) {walker.descend(child_idx)}
+        return walker;
+    }
+}
