@@ -1,100 +1,72 @@
-use crate::{index::*, store::{Cursor, NoneSlide, Store, VecStore, DequeStore}, translator::{AddressTranslator, Translator}};
+use crate::{InOrder, Ordering, PostOrder, PreOrder, index::*, store::{Cursor, DequeStore, NoneSlide, Store, VecStore}, translator::{AddressTranslator, Translator}};
+use std::fmt;
+use std::fmt::Write as _;
 use std::marker::PhantomData;
+use crate::alloc_strat::*;
 
 
-pub trait AllocStrat<P: BlockIndex>: 'static {
-    ///initial shift for an empty block. Uniform = P::BIT_WIDTH (full range);
-    ///Pluripotent = P::Half::BIT_WIDTH; Append/Prepend = 0 (dense).
-    const INIT_SHIFT: u32;
 
-    ///initial offset (as usize; new_block wraps into P). Anchor so growth has
-    ///headroom on the non-dominant side. Uniform/Pluripotent = MIDPOINT;
-    ///Append/Prepend = -K (K = Half-range) so the low K addresses stay free.
-    const INIT_OFFSET: usize;
+///per-strategy concrete block aliases. `BlockMutTrait` is only impl'd for these four
+///(strategy, store) combos, so these are the only `RawBlock` family members that are
+///tree-usable as `Inner`. `pub(crate)` because the stores are `pub(crate)`.
+pub(crate) type UniformBlock<'a, T, O : Ordering, P, const CAP: usize> =
+    RawBlock<'a, T, P, Uniform<O>, VecStore<T, CAP>>;
+pub(crate) type PluripotentBlock<'a, T, O : Ordering, P, const CAP: usize> =
+    RawBlock<'a, T, P, Pluripotent<O>, DequeStore<T, CAP>>;
+pub(crate) type AppendBlock<'a, T, P, const CAP: usize> =
+    RawBlock<'a, T, P, Append, VecStore<T, CAP>>;
+pub(crate) type PrependBlock<'a, T, P, const CAP: usize> =
+    RawBlock<'a, T, P, Prepend, VecStore<T, CAP>>;
 
-    ///budget for the find_slot walk before triggering a spread. Append/Prepend
-    ///also use this as the None-padding period (one None per BUDGET pushes),
-    ///so a mid-insert always reaches a gap within budget.
-    const INSERT_BUDGET: usize;
 
-    ///max legal store CAP.
-    const CAP_LIMIT: usize;
-
-    ///logical direction reversed (front = high end). Prepend only.
-    const REVERSED: bool;
+///debug rendering aid for a block-stored item. debug-only. the item carries its own
+///debug height (`INode::debug_height`); `debug_render` reads it to pick the right
+///interpretation of each leaf slot (terminal SlicePtr vs internal child vaddr -> phys).
+///carrying the height on the node (rather than walking the tree) keeps debug working
+///when the tree is broken mid-fixup — a walk would OOB-panic on an orphaned node.
+pub(crate) trait SlotDebug<P: BlockIndex> {
+    fn debug_render(&self, tr: &Translator<P>) -> Vec<String>;
 }
 
-pub struct Uniform;
-pub struct Pluripotent;
-pub struct Append;
-pub struct Prepend;
+///read-only block surface. `T`/`P`/`S` are associated (derived from the impl, i.e.
+///from the concrete `RawBlock` family member), so the tree tier can recover them as
+///`Inner::T`/`Inner::P`/`Inner::S` without restating them as params.
+pub trait BlockTrait<'a>: 'a {
+    type T: Sized + 'a;
+    type P: BlockIndex;
+    type S: Store<'a, Self::T> + 'a;
 
-impl<P: BlockIndex> AllocStrat<P> for Uniform {
-    const INIT_SHIFT: u32 = P::BIT_WIDTH as u32;
-    const INIT_OFFSET: usize = 1 << (P::BIT_WIDTH - 1);
-    const INSERT_BUDGET: usize = P::BIT_WIDTH as usize;
-    const CAP_LIMIT: usize = 1 << P::BIT_WIDTH;
-    const REVERSED: bool = false;
-}
-
-impl<P: BlockIndex> AllocStrat<P> for Pluripotent {
-    const INIT_SHIFT: u32 = P::Half::BIT_WIDTH as u32 - 1;
-    const INIT_OFFSET: usize = 1 << (P::BIT_WIDTH - 1);
-    const INSERT_BUDGET: usize = P::Half::BIT_WIDTH as usize;
-    const CAP_LIMIT: usize = 1 << P::Half::BIT_WIDTH;
-    const REVERSED: bool = false;
-}
-
-impl<P: BlockIndex> AllocStrat<P> for Append {
-    const INIT_SHIFT: u32 = 0;
-    const INIT_OFFSET: usize = (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH);
-    const INSERT_BUDGET: usize = 16;
-    const CAP_LIMIT: usize = (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH);
-    const REVERSED: bool = false;
-}
-
-impl<P: BlockIndex> AllocStrat<P> for Prepend {
-    const INIT_SHIFT: u32 = 0;
-    const INIT_OFFSET: usize = (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH);
-    const INSERT_BUDGET: usize = 16;
-    const CAP_LIMIT: usize = (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH);
-    const REVERSED: bool = true;
-}
-
-///read-only block surface
-pub trait BlockTrait<'a, T: Sized + 'a, P: BlockIndex, S: Store<'a, T> + 'a>: 'a {
-
-    fn store<'b>(&'b self) -> &'b S
+    fn store<'b>(&'b self) -> &'b Self::S
     where 'a: 'b;
 
-    fn translator<'b>(&'b self) -> &'b Translator<P>;
+    fn translator<'b>(&'b self) -> &'b Translator<Self::P>;
 
-    fn get<'b>(&'b self, ptr: P) -> &'b T
+    fn get<'b>(&'b self, ptr: Self::P) -> &'b Self::T
     where 'a: 'b {
         self.store().get(self.translator().v2p(ptr))
     }
 
     ///vaddr of first occupied slot, None if empty.
-    fn first_vaddr<'b>(&'b self) -> Option<P>
+    fn first_vaddr<'b>(&'b self) -> Option<Self::P>
     where 'a: 'b {
         self.store().cursor().first().map(|p| self.translator().p2v(p))
     }
 
     ///vaddr of last occupied slot, None if empty.
-    fn last_vaddr<'b>(&'b self) -> Option<P>
+    fn last_vaddr<'b>(&'b self) -> Option<Self::P>
     where 'a: 'b {
         self.store().cursor().last().map(|p| self.translator().p2v(p))
     }
 
-    fn v2p<'b>(&'b self, virt: P) -> usize {
+    fn v2p(&self, virt: Self::P) -> usize {
         self.translator().v2p(virt)
     }
 
-    fn p2v<'b>(&'b self, phys: usize) -> P {
+    fn p2v(&self, phys: usize) -> Self::P {
         self.translator().p2v(phys)
     }
 
-    fn vdist<'b>(&'b self, v1: P, v2: P) -> usize {
+    fn vdist(&self, v1: Self::P, v2: Self::P) -> usize {
         self.translator().vdist(v1, v2)
     }
 
@@ -114,36 +86,37 @@ pub trait BlockTrait<'a, T: Sized + 'a, P: BlockIndex, S: Store<'a, T> + 'a>: 'a
     }
 
     fn max_capacity(&self) -> usize {
-        S::max_capacity()
+        Self::S::max_capacity()
     }
 
-    fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
+    fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Self::T> + 'b
     where 'a: 'b {
         self.store().iter()
     }
 
-    fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
+    fn cursor<'b>(&'b self) -> impl Cursor<'b, Self::T> + 'b
     where 'a: 'b {
         self.store().cursor()
     }
 }
 
-///mutation surface. blocks of different alloc strats implement a common interface but failures must be handled at runtime. 
-pub trait BlockMutTrait<'a, T: Sized + 'a, P: BlockIndex, A : AllocStrat<P>, S: Store<'a, T> + 'a>:
-    BlockTrait<'a, T, P, S>
-{
+///mutation surface. blocks of different alloc strats implement a common interface but failures must be handled at runtime.
+///`A` (the strategy) is associated; `T`/`P`/`S` come from the `BlockTrait` supertrait.
+pub trait BlockMutTrait<'a>: BlockTrait<'a> {
+    type A: AllocStrat<Self::P>;
+
     fn new() -> Self;
-    fn store_mut(&mut self) -> &mut S;
+    fn store_mut(&mut self) -> &mut Self::S;
 
-    fn translator_mut(&mut self) -> &mut Translator<P>;
+    fn translator_mut(&mut self) -> &mut Translator<Self::P>;
 
-    fn get_mut<'b>(&'b mut self, ptr: P) -> &'b mut T where 'a:'b{
+    fn get_mut<'b>(&'b mut self, ptr: Self::P) -> &'b mut Self::T where 'a:'b{
         let p = self.translator().v2p(ptr);
         self.store_mut().get_mut(p)
     }
 
     ///slide the None `ms.from` -> `ms.to`; returns the opened slot. `pin` must not move.
-    fn slide_none(&mut self, ms: NoneSlide, pin: Option<P>) -> OpenSlot {
+    fn slide_none(&mut self, ms: NoneSlide, pin: Option<Self::P>) -> OpenSlot {
         let pin = {
             let tr = self.translator();
             pin.map(|p| tr.v2p(p))
@@ -151,11 +124,16 @@ pub trait BlockMutTrait<'a, T: Sized + 'a, P: BlockIndex, A : AllocStrat<P>, S: 
         OpenSlot(self.store_mut().slide_none(ms, pin))
     }
 
-    ///first insert into an empty block (lands at phys 0 = the anchor vaddr).
-    fn insert_root(&mut self, v: T) -> P {
-        debug_assert!(self.store().len() == 0, "insert_first: block not empty");
-        self.store_mut().push_back(v);
-        self.translator().p2v(0)
+    ///first insert into an empty block. grows to `INIT_CAP` Nones and lands the root at
+    ///the midpoint phys (`INIT_CAP/2`): for in-order (`INIT_CAP=2`) that's phys 1 — the
+    ///physical midpoint of the len-2 block, so the root vaddr is the fixed MIDPOINT.
+    fn insert_root(&mut self, v: Self::T) -> Self::P {
+        debug_assert!(self.store().len() == 0, "insert_root: block not empty");
+        let cap = Self::A::INIT_CAP as usize;
+        self.store_mut().grow_back(cap);
+        let mid = cap / 2;
+        self.store_mut().insert(v, mid);
+        self.translator().p2v(mid)
     }
 
     ///manually grow + spread; fails if shift==0 or would exceed max capacity.
@@ -164,21 +142,21 @@ pub trait BlockMutTrait<'a, T: Sized + 'a, P: BlockIndex, A : AllocStrat<P>, S: 
         if shift == 0 {
             return Err(());
         }
-        if self.store().len() * 2 > S::max_capacity() {
+        if self.store().len() * 2 > Self::S::max_capacity() {
             return Err(());
         }
-        self.translator_mut().set_shift(shift - 1);
-        self.store_mut().spread();
+        Self::A::on_grow(self.translator_mut());
+        self.store_mut().spread(Self::A::SPREAD_OFFSET);
         Ok(())
     }
 
     ///find free slot or make space if possible. dir is logical (true=after);
     ///REVERSED strategies flip it to phys.
-    fn find_slot(&mut self, pos: P, dir: bool, pin: Option<P>) -> Option<NoneSlide> {
-        let dir = dir ^ A::REVERSED;
+    fn find_slot(&mut self, pos: Self::P, dir: bool, pin: Option<Self::P>) -> Option<NoneSlide> {
+        let dir = dir ^ Self::A::REVERSED;
         let pp = self.translator().v2p(pos);
         let pinp = pin.map(|p| self.translator().v2p(p));
-        if let Some(ms) = self.store().find_slot(pp, dir, A::INSERT_BUDGET, pinp) {
+        if let Some(ms) = self.store().find_slot(pp, dir, Self::A::INSERT_BUDGET, pinp) {
             return Some(ms);
         }
         if self.len()==self.max_capacity() { return None }
@@ -190,15 +168,22 @@ pub trait BlockMutTrait<'a, T: Sized + 'a, P: BlockIndex, A : AllocStrat<P>, S: 
     }
 
     ///place `v` at the opened slot. returns its vaddr.
-    fn insert(&mut self, v: T, slot: OpenSlot) -> P ;
+    fn insert(&mut self, v: Self::T, slot: OpenSlot) -> Self::P ;
 
-    fn remove(&mut self, ptr: P) -> T {
+    fn remove(&mut self, ptr: Self::P) -> Self::T {
         let p = self.translator().v2p(ptr);
         self.store_mut().remove(p)
     }
 
+    ///swap the contents at two vaddrs (translates both to phys, swaps the store slots).
+    fn swap(&mut self, a: Self::P, b: Self::P) {
+        let pa = self.translator().v2p(a);
+        let pb = self.translator().v2p(b);
+        self.store_mut().swap(pa, pb);
+    }
+
     //none of the split stuff is really in use or correct or working.
-    
+
     ///split at P::MIDPOINT: [MIDPOINT,len) move into a new block; self keeps [0,MIDPOINT).
     ///precondition: len == P::MAX.as_usize() + 1 (block full).
     fn split(&mut self) -> Self;
@@ -209,11 +194,11 @@ pub trait BlockMutTrait<'a, T: Sized + 'a, P: BlockIndex, A : AllocStrat<P>, S: 
 
     ///failure is a signal to use a different block or block type.
     ///will not move elements
-    fn try_insert_back(&mut self, v: T) -> Result<P,T>;
+    fn try_insert_back(&mut self, v: Self::T) -> Result<Self::P, Self::T>;
 
     ///failure is a signal to use a different block or block type.
     ///will not move elements
-    fn try_insert_front(&mut self, v: T) -> Result<P,T>;
+    fn try_insert_front(&mut self, v: Self::T) -> Result<Self::P, Self::T>;
 }
 
 ///raw ordered arena run: owns a store + translator, upholds no structural
@@ -253,13 +238,16 @@ impl<F: ExactSizeIterator, R: ExactSizeIterator<Item = F::Item>> ExactSizeIterat
     for DirIter<F, R>
 {}
 
-impl<'a, T, P, A, S> BlockTrait<'a, T, P, S> for RawBlock<'a, T, P, A, S>
+impl<'a, T, P, A, S> BlockTrait<'a> for RawBlock<'a, T, P, A, S>
 where
     T: Sized + 'a,
     P: BlockIndex,
     A: AllocStrat<P>,
     S: Store<'a, T> + 'a,
 {
+    type T = T;
+    type P = P;
+    type S = S;
 
     fn store<'b>(&'b self) -> &'b S
     where 'a: 'b {
@@ -278,6 +266,55 @@ where
     }
 }
 
+///`Debug` view: translator params + physical slot layout (`[i:[child_phys,...], j:X, ...]`).
+///the layout is rebuilt from the store cursor — Nones are inserted up to the cursor's
+///position so the full sparse physical layout (gaps included) is visible. each Some's
+///child vaddrs (`SlotDebug::debug_children`) are mapped to physical slots via `v2p`.
+impl<'a, T, P, A, S> fmt::Debug for RawBlock<'a, T, P, A, S>
+where
+    T: Sized + 'a + SlotDebug<P>,
+    P: BlockIndex,
+    A: AllocStrat<P>,
+    S: Store<'a, T> + 'a,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tr = &self.translator;
+        writeln!(
+            f,
+            "RawBlock {{\n  tr(inner={:?}, outer={:?}, shift={}, rot={})",
+            tr.inner_offset(),
+            tr.outer_offset(),
+            tr.shift(),
+            tr.rotation()
+        )?;
+        let len = self.store.len();
+        let mut buf = String::new();
+        buf.push_str("  slots: [");
+        let mut cur = self.store.cursor();
+        let mut next_some = cur.first();
+        let mut phys = 0usize;
+        while phys < len {
+            if next_some == Some(phys) {
+                {
+                    let item = cur.current().expect("cursor at Some");
+                    if phys > 0 { buf.push_str(", "); }
+                    let parts = item.debug_render(tr);
+                    let _ = write!(buf, "{phys}:[{}]", parts.join(","));
+                }
+                cur.next();
+                next_some = cur.position();
+            } else {
+                if phys > 0 { buf.push_str(", "); }
+                let _ = write!(buf, "{phys}:X");
+            }
+            phys += 1;
+        }
+        buf.push(']');
+        f.write_str(&buf)?;
+        f.write_str("\n}")
+    }
+}
+
 
 ///strategy-agnostic Self-construction: new + split + split_and_rotate. one copy
 ///(behavior varies via A for `new`); the per-strategy BlockMutTrait impls delegate
@@ -289,8 +326,8 @@ where
     A: AllocStrat<P>,
     S: Store<'a, T> + 'a,
 {
-    ///empty block: offset = A::INIT_OFFSET (anchor w/ headroom on the non-dominant
-    ///side); shift = A::INIT_SHIFT; rotation 0.
+    ///empty block: inner_offset = A::INIT_INNER_OFFSET (anchor w/ headroom on the
+    ///non-dominant side); outer_offset = A::INIT_OUTER_OFFSET; shift = A::INIT_SHIFT; rotation 0.
     pub(crate) fn new_block() -> Self {
         let shift = A::INIT_SHIFT;
         debug_assert!(
@@ -300,7 +337,12 @@ where
         Self {
             _strategy:  PhantomData,
             store:      S::new(),
-            translator: Translator::new(P::from_usize(A::INIT_OFFSET), shift, 0),
+            translator: Translator::new(
+                P::from_usize(A::INIT_INNER_OFFSET),
+                P::from_usize(A::INIT_OUTER_OFFSET),
+                shift,
+                0,
+            ),
             _phantom:   PhantomData,
         }
     }
@@ -315,7 +357,8 @@ where
             _strategy:  PhantomData,
             store:      right,
             translator: Translator::new(
-                self.translator.offset(),
+                self.translator.inner_offset(),
+                self.translator.outer_offset(),
                 self.translator.shift(),
                 self.translator.rotation(),
             ),
@@ -334,7 +377,8 @@ where
             _strategy:  PhantomData,
             store:      right,
             translator: Translator::new(
-                self.translator.offset(),
+                self.translator.inner_offset(),
+                self.translator.outer_offset(),
                 self.translator.shift(),
                 self.translator.rotation(),
             ),
@@ -343,14 +387,21 @@ where
     }
 }
 
-impl<'a, T, P, const CAP : usize> BlockMutTrait<'a, T, P, Uniform, VecStore<T, CAP>>
-for RawBlock<'a, T, P, Uniform, VecStore<T,CAP>>
+//one generic BlockMutTrait impl for Uniform<O>: per-ordering differences live in the
+//AllocStrat consts (SPREAD_OFFSET, GROW_*) read by on_grow/spread, so the body is
+//ordering-agnostic. the `const` cap-assert monomorphizes per O under the bound.
+
+impl<'a, T, P, O: Ordering, const CAP: usize> BlockMutTrait<'a>
+for RawBlock<'a, T, P, Uniform<O>, VecStore<T, CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
+    Uniform<O>: AllocStrat<P>,
 {
+    type A = Uniform<O>;
+
     fn new() -> Self {
-        const { assert!(CAP <= <Uniform as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Uniform::CAP_LIMIT"); }
+        const { assert!(CAP <= <Uniform<O> as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Uniform::CAP_LIMIT"); }
         Self::new_block()
     }
     fn store_mut(&mut self) -> &mut VecStore<T, CAP> { &mut self.store }
@@ -359,37 +410,32 @@ where
     fn split(&mut self) -> Self { self.split_block() }
     fn split_and_rotate(&mut self) -> Self { self.split_and_rotate_block() }
 
-    ///dense append into the free half.
-    fn try_insert_back(&mut self, v: T) -> Result<P,T> {
-        return Err(v);
-    }
-
-    ///dense append into the free half.
-    fn try_insert_front(&mut self, v: T) -> Result<P,T> {
-        return Err(v)
-    }
+    fn try_insert_back(&mut self, v: T) -> Result<P, T> { Err(v) }
+    fn try_insert_front(&mut self, v: T) -> Result<P, T> { Err(v) }
 
     fn insert(&mut self, v: T, slot: OpenSlot) -> P {
-        //vaddr is stable across the spread below (i->2i, shift-1); compute it first.
+        //vaddr stable across the spread below (i->2i+SPREAD_OFFSET, on_grow); compute first.
         let vaddr = self.translator().p2v(slot.0);
         self.store_mut().insert(v, slot.0);
         let shift = self.translator().shift();
         if self.occupied() * 3 > self.len() * 4 && shift > 0 {
-            self.translator_mut().set_shift(shift - 1);
-            self.store_mut().spread();
+            Self::A::on_grow(self.translator_mut());
+            self.store_mut().spread(Self::A::SPREAD_OFFSET);
         }
         vaddr
     }
 }
 
-impl<'a, T, P, const CAP : usize> BlockMutTrait<'a, T, P, Pluripotent, DequeStore<T,CAP>>
-for RawBlock<'a, T, P, Pluripotent, DequeStore<T,CAP>>
+impl<'a, T, P, O: Ordering, const CAP : usize> BlockMutTrait<'a>
+for RawBlock<'a, T, P, Pluripotent<O>, DequeStore<T,CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
+    type A = Pluripotent<O>;
+
     fn new() -> Self {
-        const { assert!(CAP <= <Pluripotent as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Pluripotent::CAP_LIMIT"); }
+        const { assert!(CAP <= <Pluripotent<O> as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Pluripotent::CAP_LIMIT"); }
         Self::new_block()
     }
     fn store_mut(&mut self) -> &mut DequeStore<T, CAP> { &mut self.store }
@@ -410,12 +456,9 @@ where
     ///dense append into the free half.
     fn try_insert_front(&mut self, v: T) -> Result<P,T> {
         if self.len() < self.max_capacity() {
-            //+1<<shift cancels the phys shift push_front causes (stable for all shift,
-            //not just 0 — a regression test locks it). NOT `+ P::ONE`.
-            let bump = P::from_usize(1usize << self.translator.shift());
-            let new_offset = self.translator.offset() + bump;
+            //on_push_front bumps inner_offset to cancel the phys shift push_front causes.
             self.store.push_front(v);
-            self.translator_mut().set_offset(new_offset);
+            Self::A::on_push_front(self.translator_mut());
             return Ok(self.translator.p2v(0));
         }
         return Err(v);
@@ -429,12 +472,14 @@ where
 
 ///Append: dense push_back (front=low). shift 0, offset=-K (low K reserved for the
 ///rare prepend). one None per BUDGET pushes stocks mid-insert gaps.
-impl<'a, T, P, const CAP: usize> BlockMutTrait<'a, T, P, Append, VecStore<T, CAP>>
+impl<'a, T, P, const CAP: usize> BlockMutTrait<'a>
 for RawBlock<'a, T, P, Append, VecStore<T, CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
+    type A = Append;
+
     fn new() -> Self {
         const { assert!(CAP <= <Append as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Append::CAP_LIMIT"); }
         Self::new_block()
@@ -455,14 +500,12 @@ where
         Ok(self.translator().p2v(p))
     }
 
-    ///cold: push_front into the reserved low range; offset+1 cancels the phys shift
-    ///so existing addrs stay stable. refuses once the K reservation is spent (offset
-    ///wraps to MIN). wrapping_add — offset passes through MAX before reaching MIN.
+    ///cold: push_front into the reserved low range; on_push_front bumps inner_offset
+    ///to cancel the phys shift. refuses once the K reservation is spent (offset==MIN).
     fn try_insert_front(&mut self, v: T) -> Result<P, T> {
-        let offset = self.translator().offset();
-        if offset == P::MIN { return Err(v); }
+        if self.translator().inner_offset() == P::MIN { return Err(v); }
         self.store_mut().push_front(v);
-        self.translator_mut().set_offset(offset.wrapping_add(P::ONE));
+        Self::A::on_push_front(self.translator_mut());
         Ok(self.translator().p2v(0))
     }
 
@@ -475,12 +518,14 @@ where
 ///Prepend: Append's layout reversed — push_back is the hot front insert (front=high),
 ///iteration is high→low, find_slot dir flipped (REVERSED). cold push_front hits the
 ///reserved low range as the back.
-impl<'a, T, P, const CAP: usize> BlockMutTrait<'a, T, P, Prepend, VecStore<T, CAP>>
+impl<'a, T, P, const CAP: usize> BlockMutTrait<'a>
 for RawBlock<'a, T, P, Prepend, VecStore<T, CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
+    type A = Prepend;
+
     fn new() -> Self {
         const { assert!(CAP <= <Prepend as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Prepend::CAP_LIMIT"); }
         Self::new_block()
@@ -501,13 +546,12 @@ where
         Ok(self.translator().p2v(p))
     }
 
-    ///cold: push_front into the reserved low range (the back, for Prepend). wrapping
-    ///add — offset passes MAX before reaching MIN (exhaustion).
+    ///cold: physical push_front into the reserved low range (the back, for Prepend);
+    ///on_push_front bumps inner_offset to cancel the phys shift. refuses at offset==MIN.
     fn try_insert_back(&mut self, v: T) -> Result<P, T> {
-        let offset = self.translator().offset();
-        if offset == P::MIN { return Err(v); }
+        if self.translator().inner_offset() == P::MIN { return Err(v); }
         self.store_mut().push_front(v);
-        self.translator_mut().set_offset(offset.wrapping_add(P::ONE));
+        Self::A::on_push_front(self.translator_mut());
         Ok(self.translator().p2v(0))
     }
 

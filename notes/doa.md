@@ -1,6 +1,181 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# In order tree maintenance
+
+    i seeee yes insert_position needs subtree awareness, insert before child 2 doesnt mean insert before parent.children[2] , it needs to traverse to the leftmost child
+    of parent.children[2] and insert before that. likewise, after means after the rightmost child at index. it also means the fixed ' parent goes after DEGREE/2 ' the
+    child is probably bunk... say we have a big tree with degree and height 8, and a node at height 7 splits its 4th child to make its 5th, in our existing paradigm
+    half of the subtree of child 4 needs to move to the right of parent, and the new child gets inserted directly after parent, before that entire subtree.
+
+    instead, i suppose the parent has to hop over to be before its 5th child's leftmost descendant.
+
+    tldr though - inserting a child can move the parent over other nodes. if child 4 splits into child 4 and 5 and the parent is supposed to be between those, it needs to jump from being after 4s rightmost descendant to after 4s new rightmost descendant after splitting off its own 5-8 children. 5 can take the parents old position as the new children occupy slots 1-4, so 5 has to go after them. so really this is just free space for insert after 4s rightmost descendant, move parent there, new child takes parents old spot.
+# append and prepend
+I think these can be useful / have fixed roots if they grow by doubling. 
+[0]
+[0,1,2]
+[0,1,2,3,4,5,6,7]
+
+items arent moved or spread, we append len+1 new nodes on grow. 
+128 isnt the same root node being moved around, its a new node that has the old root as a child.
+so growth is equivalent to splitting a root...
+so prepend/append dont guarantee a fixed root. 
+Tree block wants that though, a fixed root position. it also assumes it can just insert in the middle, and tries to preserve root positioning.
+Do pluripotent and uniform have to be split off from append/prepend somehow? 
+
+
+# spread math fix
+for in order on a uniform block using u8s, i want the vaddrs to look like this across growth
+[128]
+[0,128]
+[0,64,128,192]
+[0,32,64,96,128,160,192,224]
+
+if 128 is the root that works. its physical index goes 0,1,2,4. 
+so not 2i+1, just 2i, but the initial case is wrong (0->1 is not 2x!). 
+so then , is our initial offset 128? since 128 has to map to that. 
+128<<1 = 0 yes , but shift=1 at cap=1 isnt the earlier formula. 
+
+wait the store starts completely empty, spread doubles len and reserves that space but 2*0=0. 
+our init cap needs to be 1.
+the default params for uniform rn are spread=bit_width, offset=1<<(bit_width-1), rotate=0. 
+
+Fix : 
+initial offset is 0.
+initial cap is 1.
+initial shift is 7 (for u8)! 
+translator shifts left for p->v and right for v->p so 1p->128v. 
+But to get a virtual 128 from phys 0 we need offset=1. 
+(0+1)<<7 = 128. 
+then after spreading to 2p+1, shift decreases to 6? 
+(1+1)<<6 = 128, (0+1)<<6 = 64. we lose 0 as an address. 
+[64,128]
+shift decreases to 5
+[32,64,96,128]. root isnt in the middle its at the end. 
+
+i think the pattern i wanted has n=1 as an exception. yikes. logically the first item should be 0.
+128 as the offset with wrapping would mean offset has to come after shift? 
+
+p=0 << 7 + 128 = 128
+then at cap=2
+p=0 << 6 + 128 =  128
+
+[128] , [0,128], [0,64,128,192] 
+maybe if offset is stored in physical space
+(0+1)<<7 = 128 , 
+(0+2)<<6 = 0 , (1+2)<<6 = 192 ? 
+(0+4)<<5 = 0, (1+4)<<5 = 160, 192, 224
+
+no dice. i think i need to rely on wrapping then
+
+offset=128, shift= 8 [128 = 0<<8+128]
+[0<<7+128 %256 = 128! , 1<<7 + 128 = 0]
+[0<<6+128 %256 = 128! , 1<<6 + 128 = 192, 0, 64] 
+
+weird ah sequence. 
+0,1,3,7,15,31 2i+1
+1,2,4,8,16,32 2i
+that works if our initial cap is 2 instead of 1
+midpoint_pos : 0,1,3,7,15,31    2i+1
+capacity     : 2,4,8,16,32,64   2i
+midpoint_v   : 128,128,...
+so i need a fn p2v_n ( p, n ) = p2v_n( (2p+1) , n+1 )
+this seems like 2^n -1. 
+so offset = P::MAX? 
+so if cap is 1<< (n+1) , midpoint is 1 << (n) - 1, definitionally
+phys is ( pos + ( 1 << n - 1 ) ) ? 
+wait do i just apply 2i+1 to the offset too when we grow
+128,1,3,7 etc. 
+[0<<8 + 128] 
+[0+1 << 7=128, (1+1)<<7  = 0] eh nah
+[ (0+3) << 6 = 192 ??
+what if we start offset at 0
+[0+0 << 8 = 0]
+needs to start at 1? 
+[0+1 << 7 = 128]
+[0+3 << 6 = 192] nope but 2i maybe? 
+[0+2 << 6 = 128, 1+2<<6=192]
+[0+4 << 5 = 128... nope]
+
+i think the only way it works is if 0+offset << shift always stays 0, so offset needs to be 0 at shift=0, 
+1 at shift=1
+2 at shift=2
+4 at shift=4
+256 at shift=8. 
+
+[0+256=0]
+[0+128 << 7, 1 + 128 << 7 = 128]
+[0 + 64 << 6 = 0, (1+64)<<6 = 128?]
+[0 + 32 << 5 = 0, (1+32)<<5 = 32, 2+32<<5 = 64, 96, 128 ]
+closer i guess? 
+
+what if its one up ? 
+
+[ 0+1 << 7 = 128]
+[0+2 << 7=0, 1 + 2 << 7 = 128]
+[0 + 4 << 6 = 0, (1+4)<<6 = 64, (2+4)<<6 = 128, 3+4 << 6 = 192]
+ok based thats it. 
+offset starts at 1, it doubles as shift decreases by 1. 
+our initial capacity is 2. otherwise it doesnt work for in order. 
+offset has to happen inside the shift. 
+
+notably this growth strategy for preserving root position works differently across orderings. 
+preorder with Root always at 0 favors the current offset=0 , translation is pure shift, init cap =1
+postorder with root always at len likes offset = fixed (maybe ptr::MAX), offset decreases as shift increases. 
+[0=(0)<<8 + 255]
+[ 127 = 0 << 7 + 127, 1 << 7  + 127= 255]
+[ 63, 127, 191, 255 ] (offset  = 63, shift = 6) but this only really works if we pull offset out to after the shift.
+
+maybe this works if we use rotate? 
+( (0+255).rl(6) lol no ).
+
+so preorder then wants
+[0]
+[0,128]
+[0,64,128,192]
+so each phys = 2i
+each virt is just shifted right one less
+offset is 0
+pretty dead simple
+no inner or outer offset, shift is bit_width, init_cap=1. 
+on grow : 
+shift -= 1;
+
+for postorder, 
+[255]
+[127,255]
+[63,127,191,255]
+outer_offset=p::max
+inner = 0
+shift = bit_width
+spread_offset = 1
+on grow: 
+outer_offset >>=1;
+shift -= 1; 
+
+for in order
+[0,128]
+[0,64,128,192]
+[0,32,64,96,128,160,192,224]
+outer_offset = 0
+inner_offset = 2
+shift = bit_width-1
+init_cap = 2
+spread_offset = 0
+on grow we : 
+inner_offset <<= 1;
+shift -= 1;
+
+I think the AllocStrategy needs to own the
+mutations to a translator based on the event. on_grow, on_push_front,
+on_push_back, split (left translator, right translator) (todo that split one
+for now) .
+
+uniform doesnt do anything on push_front and back but pluripotent
+does. Also, pluripotent has gotta be generic over ordering as well. increments
+inner_offset by 1 on push_front, i think thats the only real difference.
+
 # Trait Structure
 interfaces
 RawBlock(Block(Store,Translator))

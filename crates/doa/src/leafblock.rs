@@ -36,6 +36,7 @@ impl<P: BlockIndex> SlicePtr<P> {
 ///inode child pointer. internal -> another inode (in the inode block);
 ///terminal -> a leaf SlicePtr in the leafblock. PtrUnion<u32,u16> is 4 bytes
 ///either way: u32 internal, SlicePtr<u16> = 2+1+1.
+#[derive(Copy, Clone)]
 pub union PtrUnion<P1, P2>
 where
     P1: BlockIndex,

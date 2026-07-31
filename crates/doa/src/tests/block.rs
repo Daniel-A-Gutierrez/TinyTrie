@@ -38,7 +38,7 @@ where
 // ---------------------------------------------------------------------------
 mod uniform {
     use super::*;
-    type Blk = RawBlock<'static, u64, u16, Uniform, VecStore<u64, 4096>>;
+    type Blk = RawBlock<'static, u64, u16, Uniform<InOrder>, VecStore<u64, 4096>>;
 
     #[test]
     fn new_empty() {
@@ -47,7 +47,7 @@ mod uniform {
         assert_eq!(b.occupied(), 0);
         assert!(b.first_vaddr().is_none());
         assert_eq!(b.translator().shift(), 16);
-        assert_eq!(b.translator().offset(), 32768);
+        assert_eq!(b.translator().inner_offset(), 32768);
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod uniform {
         roundtrip(&b);
     }
 
-    type Small = RawBlock<'static, u64, u16, Uniform, VecStore<u64, 4>>;
+    type Small = RawBlock<'static, u64, u16, Uniform<InOrder>, VecStore<u64, 4>>;
 
     #[test]
     fn exhaustion_returns_none() {
@@ -168,21 +168,21 @@ mod uniform {
 // ---------------------------------------------------------------------------
 mod pluripotent {
     use super::*;
-    type Blk16 = RawBlock<'static, u64, u16, Pluripotent, DequeStore<u64, 256>>;
-    type Blk32 = RawBlock<'static, u64, u32, Pluripotent, DequeStore<u64, 256>>;
+    type Blk16 = RawBlock<'static, u64, u16, Pluripotent<InOrder>, DequeStore<u64, 256>>;
+    type Blk32 = RawBlock<'static, u64, u32, Pluripotent<InOrder>, DequeStore<u64, 256>>;
 
     #[test]
     fn new_empty_u16() {
         let b: Blk16 = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 7); // Half(u8)::BIT_WIDTH - 1
-        assert_eq!(b.translator().offset(), 32768);
+        assert_eq!(b.translator().inner_offset(), 32768);
     }
 
     #[test]
     fn new_empty_u32() {
         let b: Blk32 = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 15); // Half(u16)::BIT_WIDTH - 1
-        assert_eq!(b.translator().offset(), 1 << 31);
+        assert_eq!(b.translator().inner_offset(), 1 << 31);
     }
 
     #[test]
@@ -298,7 +298,7 @@ mod append {
     fn new_empty() {
         let b: Blk = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 0);
-        assert_eq!(b.translator().offset(), 65280);
+        assert_eq!(b.translator().inner_offset(), 65280);
     }
 
     #[test]
@@ -390,7 +390,7 @@ mod prepend {
     fn new_empty() {
         let b: Blk = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 0);
-        assert_eq!(b.translator().offset(), 65280);
+        assert_eq!(b.translator().inner_offset(), 65280);
     }
 
     #[test]

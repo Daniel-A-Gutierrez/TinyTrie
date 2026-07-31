@@ -74,8 +74,9 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///doubles cap
     fn grow(&mut self);
 
-    ///doubles len, moves elements at i to 2*i
-    fn spread(&mut self);
+    ///doubles len, moves element at i to 2*i + offset (offset 0 or 1: 0 = evens,
+    ///1 = odds). the gap slot is the other of the {2i, 2i+1} pair.
+    fn spread(&mut self, offset: usize);
 
     ///The space at i must be None or panic.
     fn insert(&mut self, v: T, i: usize);
@@ -532,20 +533,24 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         }
     }
 
-    fn spread(&mut self) {
+    fn spread(&mut self, offset: usize) {
         let len = self.buf.len();
+        debug_assert!(offset < 2, "spread: offset must be 0 or 1");
         assert!(len * 2 <= MAX_CAP, "spread: exceeds max cap");
         if self.buf.capacity() < len * 2 {
             self.buf.reserve(len * 2 - self.buf.capacity());
         }
 
-        // one pass: take src i -> value to dst=2i, None to dst+1.
+        // one pass: take src i -> value to dst=2i+offset, None to the pair gap.
+        // reverse so dst (>i, or ==i for the i=0,offset=0 self-take) is vacated first.
         let base = self.buf.as_mut_ptr();
         for i in (0..len).rev() {
-            let dst = 2 * i;
+            let dst = 2 * i + offset;
+            let gap = 2 * i + (1 - offset);
 
             // SAFETY: i in [0,len) init. dst<len is init (None, take'd by an earlier higher-i
-            // iter); dst>=len is uninit spare. dst+1>=len is uninit spare. ~2.5*len writes.
+            // iter); dst>=len is uninit spare. gap>=len is uninit spare (write None); gap<len
+            // is init and already None (vacated earlier, or our own take at i=0,offset=1).
             let v = unsafe { (*base.add(i)).take() };
             unsafe {
                 if dst < len {
@@ -553,8 +558,8 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
                 } else {
                     base.add(dst).write(v);
                 }
-                if dst + 1 >= len {
-                    base.add(dst + 1).write(None);
+                if gap >= len {
+                    base.add(gap).write(None);
                 }
             }
         }
@@ -1035,44 +1040,51 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         }
     }
 
-    fn spread(&mut self) {
+    fn spread(&mut self, offset: usize) {
         let len = self.buf.len();
+        debug_assert!(offset < 2, "spread: offset must be 0 or 1");
         assert!(len * 2 <= MAX_CAP, "spread: exceeds max cap");
         //odd len (e.g. len==1, the pow2 base): the mid=len/2 phase split is invalid
-        //(it would move the lone element into the upper half). direct i->2i move instead.
+        //(it would move the lone element into the upper half). direct i->2i+offset move.
         if len % 2 != 0 {
             self.buf.resize_with(len * 2, || None);
             for i in (0..len).rev() {
                 let v = self.buf[i].take();
-                self.buf[2 * i] = v;
+                self.buf[2 * i + offset] = v;
             }
             return;
         }
         let mid = len / 2;
 
-        // phase1: take upper half [mid,len), push each then a None. upper half lands
-        // in final [len,2*len) (evens=value, odds=None, no wasted even-slot None-init);
-        // [mid,len) becomes None (space for phase2). ~1.5*len writes.
+        // phase1: take upper half [mid,len), push the pair so value lands at 2i+offset
+        // and None at 2i+(1-offset) within the new tail [len,2*len). offset 0 -> (v,None);
+        // offset 1 -> (None,v). [mid,len) becomes None (space for phase2). ~1.5*len writes.
         for i in mid..len {
             let v = self.buf[i].take();
-            self.buf.push_back(v);
-            self.buf.push_back(None);
+            if offset == 0 {
+                self.buf.push_back(v);
+                self.buf.push_back(None);
+            } else {
+                self.buf.push_back(None);
+                self.buf.push_back(v);
+            }
         }
 
-        // phase2: spread lower half [0,mid) over [0,len); space [mid,len) is None.
-        // reverse: 2*j>=j so slot 2*j is vacated (2*j<mid) or None (>=mid). safe.
+        // phase2: spread lower half [0,mid) over [0,len); element j -> 2j+offset. space
+        // [mid,len) is None. reverse: 2j+offset>j so slot 2j+offset is vacated (lower) or
+        // None (upper); gap 2j+(1-offset) likewise (==j only at j=0,offset=1, our own take).
         // contig -> index the slice (skips deque's per-access (head+i)%cap); wrapped
         // -> make_contiguous's O(n) linearize is a net loss, so eat the deque-index cost.
         if self.buf.as_mut_slices().1.is_empty() {
             let s = self.buf.as_mut_slices().0;
             for j in (0..mid).rev() {
                 let v = s[j].take();
-                s[2 * j] = v;
+                s[2 * j + offset] = v;
             }
         } else {
             for j in (0..mid).rev() {
                 let v = self.buf[j].take();
-                self.buf[2 * j] = v;
+                self.buf[2 * j + offset] = v;
             }
         }
     }

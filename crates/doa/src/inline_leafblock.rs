@@ -1,5 +1,3 @@
-use crate::InsertDelta;
-
 ///a structure for storing leaves pointed at by another structure
 ///a pluripotent block of inodes may need to store PTR::MAX()*FANOUT leaves
 ///instead of being forced into using a wider ptr type, the leafblock provides a solution
@@ -128,9 +126,9 @@ where
     ///split a block in 2, with the right half getting the elements from idx..end
     ///panics if idx is out of bounds, err if there isnt enough space around the partition to split
     ///right partition
-    fn split(&mut self, ptr: P, idx: usize) -> Result<InsertDelta<T>, PartSplitErr> {
-        todo!();
-    }
+    // fn split(&mut self, ptr: P, idx: usize) -> Result<InsertDelta<T>, PartSplitErr> {
+    //     todo!();
+    // }
 
     ///look around for nearby space between self and prev/next, grow up to amount.
     fn grow(&mut self, amount: usize, budget: usize) {

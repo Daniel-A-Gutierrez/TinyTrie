@@ -225,7 +225,7 @@ mod vec {
         for i in 0..4 {
             s.push_back(i);
         }
-        s.spread();
+        s.spread(0);
         assert_eq!(s.len(), 8);
         assert_eq!(s.occupied(), 4);
         for i in 0..4 {
@@ -566,7 +566,7 @@ mod deq {
         for i in 0..4 {
             s.push_back(i);
         }
-        s.spread();
+        s.spread(0);
         assert_eq!(s.len(), 8);
         assert_eq!(s.occupied(), 4);
         let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
@@ -581,7 +581,7 @@ mod deq {
         // force a wrapped deque then spread — exercises the deque-index branch.
         let mut s = wrapped();
         let len_before = s.len();
-        s.spread();
+        s.spread(0);
         assert_eq!(s.len(), len_before * 2);
         assert_eq!(s.occupied(), s.occupied()); // tautology guard; real check below
         // logical content: original Somes in order at even slots, None at odds.
