@@ -11,6 +11,13 @@ The most recent top level entries are towards the top.
     instead, i suppose the parent has to hop over to be before its 5th child's leftmost descendant.
 
     tldr though - inserting a child can move the parent over other nodes. if child 4 splits into child 4 and 5 and the parent is supposed to be between those, it needs to jump from being after 4s rightmost descendant to after 4s new rightmost descendant after splitting off its own 5-8 children. 5 can take the parents old position as the new children occupy slots 1-4, so 5 has to go after them. so really this is just free space for insert after 4s rightmost descendant, move parent there, new child takes parents old spot.
+
+      also worth noting - we cant walk the tree or do fixups while the tree's in an invalid state. Also, node.split should drain off half the items in a node into a new one so those setters are a
+  bit extra, just insert should be enough.
+  whats tripping me up is that a root split is 2 new nodes that need inserting - a new root, a new right node, and the left node needs to hop between its median children's subtrees.
+  recursive splitting does even more. the tree needs to not be in an invalid state to be able to walk itself to do fixups. if we insert 2 nodes at child medians before touching the root, we risk
+  fixup running over the unwired nodes, which is ... a special case we have to plan for. instead of updating parent we'd have to update our handles if either insert's fixup walked over the
+  other.
 # append and prepend
 I think these can be useful / have fixed roots if they grow by doubling. 
 [0]

@@ -82,8 +82,8 @@ type InodeTree = TreeBlock<'static, Blk, InOrder>;
 
 fn inode(nchildren: u8, debug_height: u32) -> INode<u32, u32, u16> {
     INode {
-        keys:      [0u32; 1],
-        leaves:    [PtrUnion { internal: 0u32 }; 2],
+        keys:      [0u32; 2],
+        leaves:    [PtrUnion { internal: 0u32 }; 3],
         nchildren,
         debug_height,
     }
@@ -143,6 +143,40 @@ fn ubtree_root_split_only() {
     }
 }
 
+///subtree extremity walks: from a height-2 root, leftmost/rightmost of the root's
+///only (internal) child must resolve to that child's two terminal children, not the
+///child itself. pure reads — the walker stays at the root.
+#[test]
+fn leftmost_rightmost_desc() {
+    let mut tree: InodeTree = TreeBlock::new(inode(0, 2), 2u32);
+    // root(h2) -> internal(h1) -> term_l, term_r (h0). insert_child anchors After(parent)
+    // for a fresh (nc=0) parent, so neither insert triggers a slide/fixup.
+    let internal_v = {
+        let mut w = InodeWalker::new(&mut tree);
+        w.insert_child(0, inode(0, 1)).ok().expect("internal")
+    };
+    tree.inner.get_mut(tree.root).leaves[0] = PtrUnion { internal: internal_v };
+    tree.inner.get_mut(tree.root).nchildren = 1;
+    let (term_l, term_r) = {
+        let mut w = InodeWalker::new(&mut tree);
+        w.descend(0);
+        let tl = w.insert_child(0, inode(0, 0)).ok().expect("tl");
+        let tr = w.insert_child(1, inode(0, 0)).ok().expect("tr");
+        (tl, tr)
+    };
+    tree.inner.get_mut(internal_v).leaves[0] = PtrUnion { internal: term_l };
+    tree.inner.get_mut(internal_v).leaves[1] = PtrUnion { internal: term_r };
+    tree.inner.get_mut(internal_v).nchildren = 2;
+    let root_v = tree.root;
+    let (lm, rm, pos) = {
+        let w = InodeWalker::new(&mut tree);
+        (w.leftmost_desc(internal_v), w.rightmost_desc(internal_v), w.position())
+    };
+    assert_eq!(lm, term_l, "leftmost desc");
+    assert_eq!(rm, term_r, "rightmost desc");
+    assert_eq!(pos, root_v, "extremity walk moved the walker");
+}
+
 ///debug-layout demo: successive in-block inserts of INodes, printing the block's
 ///`Debug` view after each. watch the translator (shift ticks down, len doubles on
 ///spread) and each inode's child vaddr mapped to its physical slot (`i:[phys,...]`).
@@ -154,8 +188,8 @@ fn debug_layout_demo() {
     //CAP 16 keeps the layout readable; I=L=u16 so children_array holds in-block vaddrs.
     type Blk = UniformBlock<'static, INode<u32, u16, u16>, InOrder, u16, 16>;
     let mk_inode = |child: u16, nchildren: u8| INode::<u32, u16, u16> {
-        keys:      [0u32; 1],
-        leaves:    [PtrUnion { internal: child }; 2],
+        keys:      [0u32; 2],
+        leaves:    [PtrUnion { internal: child }; 3],
         nchildren,
         debug_height: 1, //these are internal nodes pointing at a child
     };

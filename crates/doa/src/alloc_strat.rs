@@ -45,19 +45,22 @@ pub struct Pluripotent<O : Ordering> ( PhantomData<O> );
 pub struct Append;
 pub struct Prepend;
 
-///emits the on_push_front override only when a dense prepend bumps inner_offset.
+///emits the on_push_front override for Append/Prepend (shift=0): inner_offset -= 1
+///lowers vaddr by 1<<shift (=1) and walks inner down to MIN (the exhaustion sentinel).
+///Pluripotent overrides on_push_front separately (outer -= 1<<shift; see below).
 macro_rules! strat_push_front {
     (false) => {};
     (true) => {
         fn on_push_front(t: &mut Translator<P>) {
-            t.set_inner_offset(t.inner_offset().wrapping_add(P::ONE));
+            t.set_inner_offset(t.inner_offset().wrapping_sub(P::ONE));
         }
     };
 }
 
 ///one AllocStrat impl per row. `$g` is the impl generics (`P: BlockIndex`, plus
 ///`O: Ordering` for Pluripotent). push_front_grows: false (Uniform — no-op) / true
-///(Pluripotent/Append/Prepend — inner_offset += 1 cancels a physical push_front's shift).
+///(Pluripotent/Append/Prepend — inner_offset -= 1 cancels a physical push_front's
+///vaddr shift: inner is pre-shift physical space, so -=1 lowers vaddr by 1<<shift).
 macro_rules! strat {
     (
         ($($g:tt)*) => $ty:ty,
@@ -107,17 +110,30 @@ strat!((P: BlockIndex) => Uniform<PostOrder>, {
     push_front_grows: false,
 });
 
-strat!((P: BlockIndex, O: Ordering) => Pluripotent<O>, {
-    shift: P::Half::BIT_WIDTH as u32 - 1, cap: 1,
-    inner: 1 << (P::BIT_WIDTH - 1), outer: 0, spread: 0,
-    inner_grows: false, outer_shrinks: false,
-    budget: P::Half::BIT_WIDTH as usize, cap_limit: 1 << P::Half::BIT_WIDTH, reversed: false,
-    push_front_grows: true,
-});
+// Pluripotent written by hand (not via strat!) because its on_push_front lives in
+// OUTER (virtual) space, not inner: shift>0 means (p+inner)<<shift overflows when
+// inner goes negative (wrapping), breaking v2p round-trip on the new front slot.
+// outer -= 1<<shift lowers vaddr by the same amount without overflow; inner stays 0
+// so all slots stay canonical.
+impl<P: BlockIndex, O: Ordering> AllocStrat<P> for Pluripotent<O> {
+    const INIT_SHIFT: u32 = P::Half::BIT_WIDTH as u32 - 1;
+    const INIT_CAP: u32 = 1;
+    const INIT_INNER_OFFSET: usize = 0;
+    const INIT_OUTER_OFFSET: usize = 1 << (P::BIT_WIDTH - 1);
+    const SPREAD_OFFSET: usize = 0;
+    const INNER_OFFSET_GROWS: bool = false;
+    const OUTER_OFFSET_SHRINKS: bool = false;
+    const INSERT_BUDGET: usize = P::Half::BIT_WIDTH as usize;
+    const CAP_LIMIT: usize = 1 << P::Half::BIT_WIDTH;
+    const REVERSED: bool = false;
+    fn on_push_front(t: &mut Translator<P>) {
+        t.set_outer_offset(t.outer_offset().wrapping_sub(P::from_usize(1 << t.shift())));
+    }
+}
 
 strat!((P: BlockIndex) => Append, {
     shift: 0, cap: 1,
-    inner: (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH), outer: 0, spread: 0,
+    inner: 1 << P::Half::BIT_WIDTH, outer: 0, spread: 0,
     inner_grows: false, outer_shrinks: false,
     budget: 16, cap_limit: (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH), reversed: false,
     push_front_grows: true,
@@ -125,7 +141,7 @@ strat!((P: BlockIndex) => Append, {
 
 strat!((P: BlockIndex) => Prepend, {
     shift: 0, cap: 1,
-    inner: (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH), outer: 0, spread: 0,
+    inner: 1 << P::Half::BIT_WIDTH, outer: 0, spread: 0,
     inner_grows: false, outer_shrinks: false,
     budget: 16, cap_limit: (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH), reversed: true,
     push_front_grows: true,

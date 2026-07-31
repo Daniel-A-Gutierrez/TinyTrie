@@ -1,185 +1,203 @@
-# doa — subtree-aware placement & block-level split (plan)
+# doa — bottom-up tree split (plan)
 
-Picks up from a debugging session on `tree_traits::tests::ubtree_single_node`.
-Read `crates/doa/CLAUDE.md` first (architecture, address model, testing). The
-relevant source: `src/tree_traits.rs` (Walker/Probe/TreeBlock, `insert_child`,
-`insert_root`), `src/lib.rs` (`UBTree`, `INode`, `split_root`, `split_child`,
-`insert`), `src/block.rs` (`RawBlock`, `find_slot`, `slide_none`, block
-`insert_root`), `src/store.rs` (`NoneSlide`, `find_slot`, `slide_none`).
+Read `crates/doa/CLAUDE.md` first (esp. "Tree split invariants"). Source:
+`src/tree_traits.rs` (`Node`/`Walker`/`TreeRoute`/`TreeNav`, `Payload`/`Overflow`,
+`Node::split`/`Node::insert` (done), `Walker::fixup_moved_run` (done),
+`Walker::insert_2`/`split_leaf`/`split_internal`/`insert` — to fill; legacy
+`insert_child`/`insert_root` fixup), `src/lib.rs` (`INode`, `split_off`/`insert_bucket`,
+`Default`, legacy `split_child`/`split_root`/`UBTree::insert`), `src/block.rs`
+(`find_slot`, `slide_none`, `insert`, `remove`, `swap`), `src/store.rs` (`NoneSlide`).
 
-## Invariants we are upholding (do not violate these)
+## Invariants (do not violate)
 
-1. **No sentinel values.** `P::MIN` (0 for unsigned) is a *valid* handed-out
-   vaddr. Never treat 0 as null/reserved/exhausted in the address model.
-   (`INode::empty` initializes child ptrs to `I::MIN` as an INode-level null
-   convention — that is a node-field convention, NOT an address reservation.
-   Don't confuse the two.) A node legitimately living at vaddr 0 is fine.
+1. **No sentinel values.** `P::MIN` (0 unsigned) is a valid handed-out vaddr.
+   `INode::empty`/`Default` uses `I::MIN` as a node-field null convention, NOT an
+   address reservation.
+2. **Root at its traversal position, invariant under promotion.** InOrder → phys
+   `len/2` (vaddr `MIDPOINT`). `tree.root` does NOT change when a new root is
+   promoted — the new root ADOPTS the root vaddr (placed at the freed old-root
+   slot). Spread doubles len so root phys moves `1→2→4` (= `len/2`); the vaddr is
+   the stable thing.
+3. **Physical slot order == traversal (walk) order.** THE invariant the slide-fixup
+   relies on. The moved physical run is a contiguous in-order run, so `next()`/
+   `prev()` enumerate it and `parent()` yields each moved node's parent.
+4. **Root pinned during placement.** `find_slot`/`slide_none` pin-clamped to
+   `self.root()`; a slide never covers the root. The root is freed only by
+   `split_internal`'s root branch (`block.remove`), never by a child's slide.
+5. **Bottom-up split; split-on-overflow.** A node splits only when an insert
+   overflows it (full + gains a key/child). Propagation goes up the parent stack;
+   can reach the root. The old proactive top-down ≤1-level guarantee is RETIRED —
+   bottom-up splits only when actually needed (better space utilization). DEGREE
+   ≥ 3 (a full node needs ≥2 keys to split into two non-degenerate halves + a
+   separator; DEGREE=2 can't split). **DEGREE is now 3.**
+6. **The tree must be walkable when a fixup runs.** `fixup_moved_run` cursor-walks
+   the tree (`next()`/`prev()` + the ancestor stack), so every WIRED node must be
+   linked when it runs. The only disconnected nodes allowed are FLOATING nodes
+   (placed but not yet wired into their parent) — handled via handles, not
+   traversal.
 
-2. **Root at its traversal-order position.** The root's physical slot is its
-   position in the chosen ordering: InOrder → `MIDPOINT` (phys `len/2`), PreOrder
-   → phys 0 (vaddr `MIN`), PostOrder → `MAX`. The root's traversal position is
-   **invariant under promotion**: when a new root is promoted, it takes the old
-   root's vaddr — `tree.root` does not change. The block spreads symmetrically
-   (`i → 2i`), so for InOrder the root stays at phys `len/2`.
+## The clone mechanism (resolves the orphaned-children problem)
 
-3. **Physical slot order == traversal (walk) order.** THE invariant the moved-ptr
-   fixup relies on. The moved physical run is a contiguous in-order run, so
-   `next()`/`prev()` enumerate it and `parent()` yields each moved node's
-   parent. If this breaks, the fixup's `next()` ascends into/past the root,
-   the ancestor stack empties, and `parent().unwrap()` panics (the symptom).
-   Splits that create new internal nodes over existing subtrees currently break
-   this — that is the open problem this plan solves.
+`Node::split` (`split_off`) shrinks self to the left half, which ORPHANS the
+right-half children: they're in the block but no placed node references them
+(their only inbound ptrs are in the owned right half, not in the block). If we
+then slide to open the right half's median slot, the slide moves those orphaned
+children and `fixup_moved_run` can't update their inbound ptrs (no placed parent)
+→ mis-fire `parent()` on a wired node → corruption.
 
-4. **Root is pinned during `insert_child`.** `find_slot`/`slide_none` are
-   pin-clamped (`pin` keeps slides off the root slot), so a slide never covers
-   the root and the fixup's `next()`/`parent()` ascent is bounded below the
-   root. This only holds if `self.root()` is the *actual* root vaddr — which
-   invariant 2 (insert_root keeps `tree.root` put) guarantees.
+**Solution: CLONE the internal node before splitting.** The original X stays in
+the block, intact, still wired to all its children — so the tree stays walkable
+and `fixup_moved_run`'s `parent()` works on the moved (wired) nodes. The clone is
+split (clone becomes n1, returns (n2, sep)); n1 and n2 are the only NEW floating
+nodes. After `insert_2` places them (X still intact), `block.remove(X)` frees X's
+slot, and the parent is rewired to `[p1, p2]`. X's children stay referenced
+throughout (by X, then by n1/n2).
 
-5. **Proactive top-down split; non-root nodes are non-full when visited.** Every
-   non-root node was split by its parent before descent, so only the root can be
-   full when the walker sits at it. Overflow therefore never propagates more
-   than one level per insert.
+**LEAF nodes (terminal, height MIN) have no in-block children** (only external
+`SlicePtr`s), so there's nothing to orphan — `split_leaf` skips the clone:
+`L.split()` makes L into n1 in place, no remove.
 
-6. **Split-on-overflow for the root.** The root splits only when it *gains a
-   child this insert*: (a) terminal root full + a new separator would be added,
-   or (b) internal root full + the immediate child we'd descend into is full
-   (its split would push a separator into the full root). A full root that gains
-   no child this insert (overwrite, or descent into a non-full child) is left
-   alone. (With DEGREE=2 a freshly-split root is full again, so the old
-   unconditional `if root.is_full() split_root()` fired every insert and never
-   converged — see bug #1.)
+## Two split routines (dispatched by height)
 
-## Bugs fixed this session (already in the working tree)
+### `split_leaf(L)` — L terminal (height MIN)
+- ask `parent.insert_position(parent_v, L_idx+1)` for the anchor; `n2` is
+  terminal so its subtree extremity is itself → anchor resolves to `After(L)`.
+- `let (n2, sep) = L.split();` — L becomes n1 in place (left half). No clone, no
+  remove.
+- place `n2` after L (single insert: `find_slot(anchor, After, pin=root)` →
+  `fixup_moved_run(slide, &mut [])` → `slide_none` → `insert`). L stays wired so
+  the fixup's `parent()` works on moved siblings.
+- return `(sep, n2_v)` for the driver to insert into the parent.
 
-1. **`UBTree::insert` split every insert (DEGREE=2 self-defeat).** Was
-   `if root.is_full() { split_root() }` unconditionally at the top. With
-   `DEGREE=2` a split root holds 2 children = full, so every insert re-split.
-   Fixed to split-on-overflow (invariant 6): an outer `'split` loop re-creates
-   the walker after a `split_root`; the inner loop is the persistent-walker
-   descent. `split_root` is called only in the two overflow cases above, then
-   `continue 'split` re-routes from the new root.
+### `split_internal(Y, sep_in, child_in)` — Y internal (height > MIN)
+- `clone = Y.clone();`
+- `(n2, sep) = clone.split();` — clone = n1 (left half). Y stays in the block,
+  intact, wired to its children.
+- route `(sep_in, child_in)` into n1 or n2 (whichever key range contains
+  `sep_in`). both halves have room (DEGREE≥3).
+- `insert_2((anchor1,dir1), n1, (anchor2,dir2), n2)`:
+  anchors = `target_gap` (`rightmost_desc(c[mid-1])`, After). place n1 (floating =
+  `[child_in_v]`), then place n2 (floating = `[n1_v, child_in_v]`). one slide may
+  pass over n1 or child_in → its handle updates (floating branch of
+  `fixup_moved_run`).
+- `block.remove(Y);` — free Y's slot (block primitive, NOT walker `remove`).
+- rewire:
+  - **root** (Y had no parent): place new root (`Node::default()`) at Y's freed
+    slot (= `tree.root`, inv 2) over `[p1, p2]` + `sep`, bump height; return None.
+  - **non-root**: `grandparent.children[Y_idx] = p1`; return `(sep, p2)` for the
+    driver to insert into the grandparent.
 
-2. **`Walker::insert_root` `skip==1` off-by-one.** The branch did
-   `set_root(p2v(anchor_p.wrapping_add(delta)))` — a double step. `anchor_p` is
-   already `anchor_p0 + delta` (the anchor/old-root's new phys after sliding one
-   slot toward `from`); the extra `+delta` tracked the old root to the wrong
-   vaddr (and, in the first configuration encountered, to `P::MIN`, which we
-   initially misread as a sentinel — see invariant 1). Now `p2v(anchor_p)`.
+### `insert_2` — two sequential placements
+place n1 (floating = `[child_in_v]`), then place n2 (floating = `[n1_v,
+child_in_v]`). each placement = `find_slot` + `fixup_moved_run` + `slide_none` +
+`insert`. the second placement's slide may pass over n1 (placed-but-unwired) or
+`child_in` (placed-but-unwired) → `fixup_moved_run` updates those handles
+(floating branch) instead of a parent. NO combined slide; reuse
+`fixup_moved_run` as-is.
 
-3. **`Walker::insert_root` was missing the `skip==0` pre-advance branch.**
-   `insert_child`'s fixup has a `skip==0` branch (`next`/`prev` +
-   `anchor_p += delta`) before the loop; `insert_root` lacked it and advanced
-   at the top of the loop instead, mis-indexing the moved run when the anchor
-   didn't move. Mirrored `insert_child`'s structure (skip==0 and skip==1
-   branches both pre-advance to `anchor_p0 + 2*delta`; loop advances at the
-   bottom).
+### `target_gap(X) = phys(in_order_predecessor(X)) + 1`
+- leaf: predecessor = left sibling.
+- internal: predecessor = `rightmost_desc(c[mid-1])`, `mid = child_count >> 1`.
 
-4. **`Walker::insert_root` moved `tree.root` and reversed the new root off the
-   root slot.** It `set_root`-tracked the old root (so `tree.root` left the root
-   vaddr) and unconditionally `swap(open_v, root_v)`-ed, which in the
-   None-left case swapped the new root (already at MIDPOINT) back to the old
-   root's Before slot. Rewrote per the agreed recipe:
-   - new root takes the old root's vaddr — `tree.root` **unchanged** (invariant 2);
-   - old root tracked in a **local** `old_root_new_v` (NOT via `set_root`), returned for the caller to wire as child 0;
-   - `if open_v == root()` → insert the new root directly (the slide freed the root slot); else insert at the open slot then `swap(new_v, root())`, and `old_root_new_v = open_v`.
+Median placement is an ORDERING property (node sits between its two median
+children's subtrees), not an exact address — slides preserve in-order so they
+can't break it. The median rule is the TARGET when a node is placed, not a
+perpetual invariant on every node.
 
-   Result: `split_root` #1 (terminal root → height 1) now produces a correct
-   in-order layout: `slots: [0:[L0:0], 1:X, 2:[0,3], 3:[L10:1,L50:1]]`, root at
-   MIDPOINT (phys 2 = len/2, vaddr unchanged), child 0 before, child 1 after.
-
-## The open problem (what this plan implements)
-
-When a split creates a **new internal node that adopts already-placed children**,
-`insert_child` today places the new node at a free slot found relative to its
-*parent* (`insert_position` → `After(parent_v)`), not relative to its *own
-subtree*. The new parent and its adopted child end up separated → physical !=
-in-order (invariant 3 breaks) → the next `split_child`'s `next()`/`parent()`
-fixup walks into the root and panics.
-
-Proof layout after `split_root` #2 (insert 30, genuine overflow), `shift=29`:
+### Driver (bottom-up)
 ```
-slots: [0:[L0:0], 1:[6], 2:[0], 3:X, 4:[2,1], 5:X, 6:[L10:1,L50:1], 7:X]
-root phys 4 (MIDPOINT, len/2) keys=[10]
-child0 = phys 2 ([0], h1) -> child [L0:0] at phys 0      in-order: 0, 2  (contiguous, ok)
-child1 = phys 1 ([6], h1) -> child [L10:1,L50:1] at phys 6  in-order: 6, 1  (PARENT phys 1 BEFORE its child phys 6 — broken)
-full in-order = 0,2,4,6,1   but physical = 0,1,2,4,6
+descend to leaf L (no pre-split); stack = path
+if L has room: L.insert_bucket(k, v); return
+ov = split_leaf(L)                                  // (sep, n2_v)
+while let Some((parent_v, Y_idx)) = stack.pop():
+    parent = block.get(parent_v)
+    if parent has room:
+        parent.insert(sep, Payload::Child(child)); return
+    else:
+        ov2 = split_internal(parent, sep, child)     // Y = parent
+        match ov2:
+            None    => return                        // parent was root → new root placed
+            Some(ov) => { (sep, child) = ov }         // propagate to grandparent
 ```
-The new internal node (child1, the split sibling) is at phys 1 but its adopted
-child is at phys 6 — placed by parent-relative anchor, not subtree-relative.
+`split_internal` does the p1-replacement (`grandparent.children[Y_idx]=p1`,
+child-count-neutral) internally and returns `(sep, p2)` — the +1 that may
+overflow the grandparent (handled by the next loop iteration).
 
-## Design (agreed)
+## Status
 
-**Subtree-aware `insert_position`.** "before child[i]" means before the
-**leftmost descendant** of child[i]; "after child[i]" means after the
-**rightmost descendant** of child[i]. The anchor is the subtree boundary, not
-the immediate child. The old fixed "parent after `DEGREE/2`" rule is dead —
-placement is determined by actual subtree extremities.
+- **Foundation GREEN.** Translator `inner_offset`/`outer_offset` split;
+  `alloc_strat.rs` remapped (Pluripotent hand-written `outer=MIDPOINT` +
+  `on_push_front outer -= 1<<shift`; Append/Prepend `inner=1<<Half` +
+  `on_push_front inner -= 1`; Uniform\<InOrder\> `shift=width-1, inner=0`,
+  root p2v(1)=MIDPOINT). 74 block/store tests pass. Tree path: u32 root vaddr
+  `1<<31`.
+- **Step 2 DONE.** `TreePos::height()` + `TreeRoute` defaults
+  `leftmost_desc`/`rightmost_desc`/`extremity_at`. Test `leftmost_rightmost_desc`
+  passes.
+- **DEGREE 2→3 DONE.** `INode::DEGREE=3`; `keys[K;2]`, `leaves[PtrUnion;3]`,
+  `children_array`'s `[Option<I>;3]` + const assert; test helpers `inode`/`mk_inode`
+  resized. `cargo check --lib` 0 errors.
+- **`Node::split`/`Node::insert` DONE.** `split` wraps `split_off` (tuple-swap to
+  `(right, sep)`); `insert` maps `Payload`→`PtrUnion`, split-when-full, routes
+  into the owning half, returns `Overflow`. (`Node::insert` is NOT used on the
+  split path — the driver uses `insert_bucket` + `split_leaf`/`split_internal`;
+  `Node::insert` stays as a trait method, may be used by consumers.)
+- **`fixup_moved_run` DONE.** Cursor-walks the moved in-order run; per moved node,
+  `old_v = p2v(anchor_p - delta)`, if in `floating` → update handle, else
+  `parent().update_child(ci, new_v)`. Root never in a run (inv 4). Anchor-may-
+  -or-may-not-move handled by the `anchor_moves` pre-step. 0 errors.
 
-**A node that gets a new child moves to the position after
-`child[nchildren/2]`'s rightmost descendant.** (General rule.) So inserting a
-child can move the parent *over other nodes*.
+## Dead end — do not repeat
 
-**The split operation** (child `i` splits into `i` and `i+1`; child `i` keeps
-its left half, its right half becomes `i+1`'s subtree):
-- free a slot after child `i`'s *new* (left-half) rightmost descendant;
-- move the **parent** there (it hops from after child `i`'s old rightmost
-  descendant to after its new one);
-- the **new child `i+1`** takes the parent's old slot (now between child `i`'s
-  left half and the relocated right-half subtree);
-- the right-half subtree ends up to the right of the new child — in-order intact.
+A previous attempt deleted the fixup and placed each new node at the nearest
+DIR-side `None` WITHOUT sliding (`OpenSlot(slide.from)`), reasoning "key routing
+works regardless of physical order." This violates inv 3 (linear-scan iteration
+/ serialization needs physical==in-order) AND fails `ubtree_insert_many`
+(no-slide ⇒ `grow_and_spread` finds a DIR-side None each split ⇒ `len` doubles ⇒
+`UB_CAP` exhaustion). It also rewrote `remove` and read `debug_height` in logic
+(that field is debug-only by contract). Reverted. The fix MUST slide + fixup over
+a contiguous in-order run.
 
-Concretely, as the user framed it: "free space for insert after child-4's
-rightmost descendant, move parent there, new child takes parent's old spot."
+## Roadmap (remaining)
 
-**New primitives required.**
-1. **`leftmost` / `rightmost` walks** on the probe/walker (a `TreeRoute`/`TreeNav`
-   addition): descend always taking child 0 / child `k-1` until terminal. Pure
-   reads — testable in isolation. `insert_position` uses them to resolve anchors;
-   splits use them to find hop targets.
-2. **Block-level node split** — formally relocate a node's right-half subtree and
-   open a slot (with the parent hop + new-child-takes-old-slot above), instead of
-   the current "place a new node at the nearest free None." This is where the
-   moved-ptr fixup actually has a contiguous in-order run to walk.
+1. **`insert_2`** — two sequential placements with cross floating handles
+   (`[child_in]` then `[n1, child_in]`). Reuses `fixup_moved_run`. The placement
+   = subtree-aware anchor (`target_gap`) → `find_slot` (pin=root) →
+   `fixup_moved_run` → `slide_none` → `insert`. Cursor-positioning at the anchor
+   is the caller's setup (the walker must be at the anchor with a valid ancestor
+   stack before `fixup_moved_run`).
+2. **`split_leaf`** — terminal split utility (no clone, no remove). Ask
+   `parent.insert_position`, `L.split()`, single-insert n2, return
+   `(sep, n2_v)`.
+3. **`split_internal`** — clone + `Node::split` on clone + route incoming +
+   `insert_2` + `block.remove(Y)` + rewire (root branch / non-root return
+   `(sep, p2)`).
+4. **`Walker::insert` driver + rewire `UBTree::insert` + delete legacy
+   `split_child`/`split_root`.**
+5. **Un-ignore `ubtree_insert_many`** + final `cargo check --lib`.
 
-## Implementation order
+ORDER: 1 → 2 → 3 → 4 → 5. the tree must be intact when any fixup runs (inv 6), so
+each placement's fixup completes before the next placement/wiring.
 
-1. **`leftmost`/`rightmost` walk primitives** on `TreeRoute`/`TreeNav` (+ tests).
-   Unblocks subtree-aware `insert_position`; pure reads.
-2. **Subtree-aware `insert_position`** — resolve before/after to subtree
-   extremities via the walks above. The receiver is the node being inserted
-   against (parent), so the walks read the parent's child subtrees.
-3. **Block-level node split** — the subtree-relocate + parent-hop + open-slot
-   primitive. Decide the signature: likely a `Walker` method that, given the
-   child being split, performs the relocate + hop + returns the new child's
-   vaddr and the moved-run fixup.
-4. **Rewire `insert_child`/`split_child`/`split_root`** on top of (2)+(3):
-   - `insert_child`: anchor at subtree boundary (2); on placing a node that has
-     its own subtree, place adjacent to that subtree.
-   - `split_child`/`split_root`: use the block-level split (3) instead of
-     "copy right half + insert_child + manual wire."
-5. Re-enable `ubtree_insert_many` (currently `#[ignore]`) once the moved-ptr
-   fixup survives a multi-level split.
+## Test bar
 
-## Test progress bar
-
-- `ubtree_single_node`: currently fails at `split_root` #2's following
-  `split_child` fixup (`parent().unwrap()` on `None`) — the open problem.
-  After this plan, should pass fully (insert/get/remove/range for 5 keys).
+- `ubtree_single_node` passes fully (insert/get/remove/range, 5 keys). [currently
+  panics — legacy `UBTree::insert` still wired]
 - `ubtree_root_split_only`, `ubtree_get_mut`, `probe_maps_key_to_lptr`,
-  `debug_layout_demo`: check still pass.
-- `ubtree_insert_many` (`#[ignore]`): the real multi-level stress test; un-ignore
-  after the plan lands.
+  `debug_layout_demo`, `leftmost_rightmost_desc` stay green.
+- `ubtree_insert_many` un-ignored, passing (300 inserts/get/remove/re-get).
 
-## Notes for the next agent
+⚠️ **Don't run the full `cargo test`** — it OOMs the IDE. Use `cargo check --lib`
+only, or a single named test with the user's OK.
 
-- The working tree already contains fixes 1–4 above; do not revert them.
-- `eprintln!` debug lines prefixed `[fixup]`/`[next]` in `tree_traits.rs` and
-  `lib.rs` are pre-existing debug instrumentation — leave or remove as you see
-  fit, but they're not the bug.
-- `DEGREE = 2` is intentional ("small for easy tracing"); the split-on-overflow
-  policy (invariant 6) is what makes it workable, not bumping the degree.
-- When tracing layout, remember vaddr↔phys depends on the current translator
-  (`shift`/`offset`/`rotation`); spreads halve `shift` and remap `i → 2i`, and
-  vaddrs are stable across spreads (re-translate pos/pin after a spread — see
+## Tracing notes
+
+- Tests print the block `Debug` layout (`i:[child_phys,...]`, `j:X`) per insert.
+  When a test fails, read it and CHECK inv 3 by hand: map each node's child vaddrs
+  to phys, write the in-order sequence, compare to physical slot order.
+- vaddr↔phys depends on the current translator; spreads halve `shift` and remap
+  `i→2i`, vaddrs stable across spreads (re-translate pos/pin after —
   `block.rs::find_slot`).
+- `eprintln!` `[fixup]`/`[next]` lines are debug instrumentation; remove once green.
+- DEGREE=3 (small for tracing). `INode::debug_height` is debug-only — never read
+  it in logic.

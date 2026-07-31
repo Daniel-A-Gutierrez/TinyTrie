@@ -112,8 +112,8 @@ probe it, get the value as an Lptr from map(&k)->V on the raw node type.
 ///in a b+tree theres 1 more key per value for inodes
 ///degree 2 = binary (max 2 children, 1 separator). small for easy tracing.
 pub(crate) struct INode<K: Sized + Ord, I: BlockIndex, L: BlockIndex> {
-    pub(crate) keys:        [K; 1],
-    pub(crate) leaves:      [PtrUnion<I, L>; 2],
+    pub(crate) keys:        [K; 2],
+    pub(crate) leaves:      [PtrUnion<I, L>; 3],
     pub(crate) nchildren:   u8, //occupied child slots. nkeys = nchildren-1. 0 = fresh.
     ///debug-only node height (0 = terminal/leaf, >0 = internal level). read solely by
     ///`SlotDebug::debug_render` to pick SlicePtr vs child-vaddr. never read by logic, so a
@@ -122,7 +122,11 @@ pub(crate) struct INode<K: Sized + Ord, I: BlockIndex, L: BlockIndex> {
 }
 
 impl<K: Ord, I: BlockIndex, L: BlockIndex> INode<K, I, L> {
-    pub(crate) const DEGREE: usize = 2;
+    //TODO(split): bump to >=3. DEGREE=2 can't split (a full 1-key node can't yield two
+    //non-degenerate halves + a separator). proactive AND bottom-up splitting both need >=3.
+    //resize keys[..DEGREE-1], leaves[..DEGREE], children_array's const assert, and the
+    //insert_position `half = DEGREE/2` math.
+    pub(crate) const DEGREE: usize = 3;
 
     fn nkeys(&self) -> usize { self.nchildren.saturating_sub(1) as usize }
 
@@ -133,9 +137,9 @@ impl<K: Ord, I: BlockIndex, L: BlockIndex> INode<K, I, L> {
     ///child vaddrs (the union's `internal` arm) for occupied child slots; `None` for the
     ///rest. reads the internal arm — valid at internal levels (see `ChildNodeIter`);
     ///terminal nodes hold `SlicePtr`s there, so callers must be height-aware.
-    pub(crate) fn children_array(&self) -> [Option<I>; 2] {
-        const { assert!(Self::DEGREE == 2) }
-        let mut a = [None; 2];
+    pub(crate) fn children_array(&self) -> [Option<I>; 3] {
+        const { assert!(Self::DEGREE == 3) }
+        let mut a = [None; 3];
         for i in 0..self.nchildren as usize {
             a[i] = Some(unsafe { self.leaves[i].internal });
         }
@@ -236,7 +240,7 @@ impl<K: Ord, I: BlockIndex, L: BlockIndex> OrderedNode<I, InOrder> for INode<K, 
 
 impl<'a, K, I, L> Node<'a, I, InOrder> for INode<K, I, L>
 where
-    K: Ord + 'a,
+    K: Ord + Copy + Default + 'a,
     I: BlockIndex,
     L: BlockIndex,
 {
@@ -274,6 +278,35 @@ where
     fn update_child(&mut self, child_idx: usize, new_p: I) { self.leaves[child_idx].internal = new_p; }
 
     fn clear_child(&mut self, _child_idx: usize) { todo!() }
+
+    ///logical split: self keeps left half, returns (right half, separator).
+    ///thin wrapper over `split_off`: `let (sep, right) = self.split_off(self.nchildren as usize >> 1); (right, sep)`.
+    ///mid = child_count >> 1; separator = keys[mid-1] (boundary key, promoted up).
+    fn split(&mut self) -> (Self, Self::K) {
+        let mid = self.nchildren as usize >> 1;
+        let (sep, right) = self.split_off(mid);
+        (right, sep)
+    }
+
+    ///insert (k, payload) in order; split-when-full, return the overflow to propagate.
+    ///maps the `Payload` arm to the `PtrUnion` storage (the union IS the unification of
+    ///value-bucket and child ptr): `Value(v) => v` (already a PtrUnion, terminal arm set by
+    ///caller); `Child(p) => PtrUnion{internal: p}` (wrap the child vaddr).
+    ///  let payload = match payload { Payload::Value(v)=>v, Payload::Child(p)=>PtrUnion{internal:p} };
+    ///  if !is_full: insert_bucket(k, payload); None.
+    ///  else: let (sep, right) = self.split_off(nchildren>>1);
+    ///        if k < sep { self.insert_bucket(k, payload) } else { right.insert_bucket(k, payload) };
+    ///        Some(Overflow{ right, sep }).
+    /// both halves have room post-split (DEGREE>=3 — TODO: bump DEGREE 2 -> >=3, resize
+    /// keys/leaves arrays and the `children_array` const assert).
+    fn insert(&mut self, k: Self::K, payload: Payload<Self::V, I>) -> Option<Overflow<Self, Self::K>> {
+        let v = match payload { Payload::Value(v) => v, Payload::Child(p) => PtrUnion { internal: p } };
+        if !self.is_full() { self.insert_bucket(k, v); return None; }
+        let mid = self.nchildren as usize >> 1;
+        let (sep, mut right) = self.split_off(mid);
+        if k < sep { self.insert_bucket(k, v) } else { right.insert_bucket(k, v) }
+        Some(Overflow { right, sep })
+    }
 }
 
 
@@ -285,6 +318,7 @@ where
 {
     fn position(&self) -> Inner::P { self.pos }
     fn set_position(&mut self, p: Inner::P) { self.pos = p; }
+    fn height(&self) -> Inner::P { self.height }
 }
 
 impl<'b, 'a, Inner, O> TreeRoute<'b, 'a, TreeBlock<'a, Inner, O>> for InodeProbe<'b, 'a, Inner, O>
@@ -339,6 +373,7 @@ where
 {
     fn position(&self) -> Inner::P { self.pos }
     fn set_position(&mut self, p: Inner::P) { self.pos = p; }
+    fn height(&self) -> Inner::P { self.height }
 }
 
 impl<'b, 'a, Inner, O> TreeRoute<'b, 'a, TreeBlock<'a, Inner, O>> for InodeWalker<'b, 'a, Inner, O>
@@ -485,6 +520,7 @@ where
     I: BlockIndex,
     L: BlockIndex,
 {
+    ///`Default` is `empty` — used by `promote_new_root` (`Node::default()`) for the new root.
     fn empty() -> Self {
         Self {
             keys: std::array::from_fn(|_| K::default()),
@@ -556,6 +592,16 @@ where
     }
 }
 
+///`Default` == `empty`; required by `Node: Default` (used by `promote_new_root`'s new root).
+impl<K, I, L> Default for INode<K, I, L>
+where
+    K: Ord + Copy + Default,
+    I: BlockIndex,
+    L: BlockIndex,
+{
+    fn default() -> Self { Self::empty() }
+}
+
 ///split a full child of the walker's current node. ORDER MATTERS: the arena insert's
 ///moved-ptr fixup traverses the tree, so the tree must be intact when we insert. thus:
 /// (1) copy off the right half WITHOUT mutating the child (tree intact);
@@ -564,6 +610,11 @@ where
 /// separator + sibling ptr); (4) only then shrink the old child to its left half.
 /// returns the pushed separator (caller picks which half to descend into). parent is
 /// assumed non-full (proactive top-down split invariant).
+///
+///TODO(split): REPLACE with the bottom-up design — `Node::split` (logical) +
+///`Walker::split_current`/`place_new`/`hop_to_median`/`fixup_moved_run` (phys). this free
+///fn's copy-right-half + manual parent wiring + the broken direct-child fixup go away.
+///see SPLIT_PLAN.md step 5 + the `Tree split invariants` section in CLAUDE.md.
 fn split_child<K>(
     walker: &mut InodeWalker<'_, 'static, UBInner<K>, InOrder>,
     child_idx: usize,
@@ -642,6 +693,12 @@ impl<K: Ord + Copy + Default + 'static> UBTree<K> {
     }
 
     pub fn insert(&mut self, k: K, v: PtrUnion<u32, u16>) {
+        //TODO(split): REWIRE to `Walker::insert` (bottom-up). this is the old proactive
+        //top-down descent (inv 5, retired): pre-split full children on the way down, split
+        //the root when full. the new driver descends to the leaf with NO pre-split, calls
+        //`Node::insert`, and propagates `Overflow` up the parent stack via
+        //`Walker::split_current`/`place_new`/`hop_to_median`/`promote_new_root`. requires
+        //DEGREE>=3 (see INode::DEGREE todo). see SPLIT_PLAN.md step 5.
         //split on overflow: the root only gains a child when (a) it's a terminal root and a
         //new separator is inserted (full root 0..=DEGREE-1 seps → +1 overflows), or (b) it's an
         //internal root and an immediate child split pushes a separator up. proactive splitting
@@ -705,6 +762,10 @@ impl<K: Ord + Copy + Default + 'static> UBTree<K> {
     ///via `insert_child`, wire the new root to [old root, sibling] + the pushed separator,
     ///bump height, then shrink the old root to its left half. tree.root() (unchanged
     ///vaddr) ends up holding the new root.
+    ///
+    ///TODO(split): REPLACE with `Walker::promote_new_root` — driven by the overflow
+    ///reaching the top of the parent stack in `Walker::insert`. the copy-right-half +
+    ///manual wiring here go away; `Node::split` + `place_new` do the work. see SPLIT_PLAN.md.
     fn split_root(&mut self) {
         let old_root_v = self.tree.root();
         let old_h = *self.tree.meta();
@@ -728,7 +789,15 @@ impl<K: Ord + Copy + Default + 'static> UBTree<K> {
             .insert_root(old_root_v, INode::empty())
             .ok()
             .expect("split_root: insert_root");
-        //(3) place the right half as the new root's child 1.
+        //insert_root's fixup repositions the walker (prev/next) and corrupts its lineage;
+        //reset it to the new root (at tree.root, height old_h+1, empty stack) before placing
+        //the sibling as child 1.
+        walker.set_position(walker.root());
+        walker.height = old_h.wrapping_add(1);
+        walker.stack.clear();
+        //(3) place the right half as the new root's child 1. subtree-aware: `right` is an
+        //internal node adopting the old root's right-half children, so insert_child anchors
+        //at the adopted subtree's rightmost descendant (invariant 3).
         let sibling_v = walker
             .insert_child(1, right)
             .ok()

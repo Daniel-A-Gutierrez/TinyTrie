@@ -12,6 +12,25 @@ pub type TreeP<'a, T> = <<T as Tree<'a>>::Inner as BlockTrait<'a>>::P;
 pub type TreeT<'a, T> = <<T as Tree<'a>>::Inner as BlockTrait<'a>>::T;
 pub type TreeK<'a, T> =
     <TreeT<'a, T> as Node<'a, TreeP<'a, T>, <T as Tree<'a>>::O>>::K;
+pub type TreeV<'a, T> =
+    <TreeT<'a, T> as Node<'a, TreeP<'a, T>, <T as Tree<'a>>::O>>::V;
+
+///propagated split result: the new (right) node + the separator promoted to the parent.
+///carried by value up the walker's parent stack; the walker phys-places `right` (`place_new`)
+///then inserts `sep` — pointing at the placed right's vaddr — into the parent via `Node::insert`.
+pub struct Overflow<N: Sized, K> {
+    pub right: N,
+    pub sep: K,
+}
+
+///what `Node::insert` is adding alongside a key: a value (terminal node) or a child pointer
+///(internal node). the caller (walker) knows the height and picks the arm; the node impl maps
+///it to storage (`INode`: `Value(v) => v`, `Child(p) => PtrUnion{internal: p}`). tagged (not two
+///Options) so exactly one payload is expressible — `(Some,Some)`/`(None,None)` aren't.
+pub enum Payload<V, P> {
+    Value(V),
+    Child(P),
+}
 
 
 /// `'a` here and on every `*<'a, ...>` below is ONLY the outlives bound: it guarantees
@@ -27,7 +46,7 @@ pub trait OrderedNode<P: BlockIndex, O: Ordering> {
 /// `P` is the block's ptr type (a param, not associated, so Tree::P and the node's P
 /// are the SAME type in generic contexts). `'a` is the outlives bound only; accessor
 /// iterators are scoped to `&self`'s own borrow (`'s`, `'a: 's`).
-pub trait Node<'a, P: BlockIndex, O: Ordering>: Sized + 'a + OrderedNode<P, O> {
+pub trait Node<'a, P: BlockIndex, O: Ordering>: Sized + 'a + OrderedNode<P, O> + Default {
     type K: Sized + 'a;
     type V: Sized + 'a;
 
@@ -69,6 +88,20 @@ pub trait Node<'a, P: BlockIndex, O: Ordering>: Sized + 'a + OrderedNode<P, O> {
 
     ///drop the child ptr at child_idx (for remove).
     fn clear_child(&mut self, child_idx: usize);
+
+    ///logical split: self keeps the left half, returns (right half, separator).
+    ///`mid = child_count >> 1`; separator = the boundary key (keys[mid-1]) promoted to
+    ///the parent. PURELY logical — no phys placement, no pointer fixup. the walker
+    ///(`place_new`/`hop_to_median`) does the phys work. INode impl == `split_off(mid)`.
+    fn split(&mut self) -> (Self, Self::K);
+
+    ///insert (k, payload) in order; if full, split first then route it into the owning half.
+    ///uniform over leaves (`Payload::Value`) and internals (`Payload::Child`): the SAME fn
+    ///inserts a bucket into a terminal node and a child ptr into an internal during split
+    ///propagation. both halves have room post-split (DEGREE>=3), so at most one split per call.
+    ///returns the overflow for the walker to propagate up the parent stack, or None if it fit.
+    ///INode impl == `insert_bucket` + `split_off` when full, mapping the `Payload` arm to `PtrUnion`.
+    fn insert(&mut self, k: Self::K, payload: Payload<Self::V, P>) -> Option<Overflow<Self, Self::K>>;
 }
 
 ///node may store its elements sparse, next/prev isnt necessarily position +- 1;
@@ -107,6 +140,9 @@ pub trait NodeIterMut<'a, T>: NodeIterBase<'a, T> {
 pub trait TreePos<P: BlockIndex> {
     fn position(&self) -> P; //current node vaddr
     fn set_position(&mut self, p: P);
+    ///current node's height (P::MIN = terminal). the terminal detector for walks that
+    ///must not read a terminal node's `children()` (those hold SlicePtrs, not child vaddrs).
+    fn height(&self) -> P;
 }
 
 ///walker navigation: the ancestor stack + sibling/cousin stepping, on top of `TreePos`.
@@ -200,6 +236,34 @@ where 'a: 'b
         it.seek(child_idx);
         it.current()
     }
+
+    ///subtree extremity of `child` at height `child_h`: descend taking child k-1 (`right`)
+    ///or child 0 (`!right`) until terminal (height MIN). pure read — does not move
+    ///`self.position` or touch the ancestor stack. stops at MIN so it never reads a
+    ///terminal node's `children()` (SlicePtrs, not child vaddrs).
+    fn extremity_at(&self, child: TreeP<'a, T>, child_h: TreeP<'a, T>, right: bool) -> TreeP<'a, T> {
+        let mut v = child;
+        let mut h = child_h;
+        while h > <TreeP<'a, T> as Num>::MIN {
+            let k = self.block().get(v).children().len();
+            let idx = if right { k.saturating_sub(1) } else { 0 };
+            let mut it = self.block().get(v).children();
+            it.seek(idx);
+            v = it.current();
+            h = h.wrapping_sub(<TreeP<'a, T> as Num>::ONE);
+        }
+        v
+    }
+    ///leftmost descendant of `child`, a direct child of the current node (height
+    ///`self.height()-1`): descend child 0 to terminal, return its vaddr.
+    fn leftmost_desc(&self, child: TreeP<'a, T>) -> TreeP<'a, T> {
+        self.extremity_at(child, self.height().wrapping_sub(<TreeP<'a, T> as Num>::ONE), false)
+    }
+    ///rightmost descendant of `child`, a direct child of the current node (height
+    ///`self.height()-1`): descend child k-1 to terminal, return its vaddr.
+    fn rightmost_desc(&self, child: TreeP<'a, T>) -> TreeP<'a, T> {
+        self.extremity_at(child, self.height().wrapping_sub(<TreeP<'a, T> as Num>::ONE), true)
+    }
 }
 
 ///read-only probe over a `Tree`: owns a `&'b T` borrow. Descend-to-leaf — no lineage
@@ -267,6 +331,27 @@ where 'a: 'b
         let (anchor, dir) = match rel {
             RelTo::Before(p) => (p, false),
             RelTo::After(p) => (p, true),
+        };
+        //subtree-aware: if the new child is internal (height > MIN) and adopts a subtree,
+        //anchor at that subtree's extremity (rightmost for After, leftmost for Before) so
+        //the node lands adjacent to its own subtree — physical order stays == in-order
+        //walk order (invariant 3). a terminal new child (height MIN) keeps the immediate
+        //anchor (its extremity is itself). the new child sits at height self.height()-1;
+        //its adopted children at self.height()-2.
+        let child_h = self.height().wrapping_sub(<TreeP<'a, T> as Num>::ONE);
+        let anchor = if child_h > <TreeP<'a, T> as Num>::MIN {
+            let nkids = node.children().len();
+            if nkids > 0 {
+                let idx = if dir { nkids - 1 } else { 0 };
+                let mut it = node.children();
+                it.seek(idx);
+                let subchild = it.current();
+                self.extremity_at(subchild, child_h.wrapping_sub(<TreeP<'a, T> as Num>::ONE), dir)
+            } else {
+                anchor
+            }
+        } else {
+            anchor
         };
         //the root is pinned
         let pin = Some(self.root());
@@ -392,6 +477,237 @@ where 'a: 'b
         let v = self.block_mut().remove(cur_v);
         self.block_mut().get_mut(parent_v).clear_child(child_idx);
         Some(v)
+    }
+
+    ///phys-place a NEW node at its in-order gap and return its vaddr, or Err(node) if
+    ///the arena is exhausted. target_gap = phys(in_order_predecessor) + 1 — leaf: left
+    ///sibling; internal: rightmost_desc(c[mid-1]). subtree-aware anchor (the existing
+    ///`insert_child` body): resolve the anchor to a subtree extremity, `find_slot` at it
+    ///(pin = root), `fixup_moved_run`, `slide_none`, `insert`. `floating` = vaddrs of other
+    ///not-yet-wired nodes this placement's slide might move (handles to keep consistent).
+    fn place_new<'s>(
+        &'s mut self,
+        node: TreeT<'a, T>,
+        floating: &mut [TreeP<'a, T>],
+    ) -> Result<TreeP<'a, T>, TreeT<'a, T>>
+    where 'a: 's {
+        // 1. anchor = insert_position of the current node for child_idx (node-local),
+        //    then resolve to the subtree extremity if `node` is internal w/ children:
+        //    rightmost_desc (After) / leftmost_desc (Before) — so the node lands adjacent
+        //    to its own subtree (invariant 3).
+        // 2. pin = Some(self.root()); slide = find_slot(anchor, dir, pin)?; Err(node) on None.
+        // 3. fixup_moved_run(slide, floating) — rewrite moved nodes' inbound ptrs BEFORE
+        //    slide_none (the tree is intact; the fixup traverses it). vaddrs change on slide.
+        // 4. slot = slide_none(slide, pin); self.block_mut().insert(node, slot)
+        todo!("subtree-aware find_slot + fixup_moved_run + slide_none + insert")
+    }
+
+    ///re-median an EXISTING node (by vaddr handle) that gained or lost children: if its phys
+    ///slot no longer equals target_gap (between its new median pair), slide it there and
+    ///fixup. no-op if already at the gap. `node_v` is a handle: the hop changes the node's
+    ///vaddr, so the handle is updated (caller reads the final vaddr out). `floating` = other
+    ///unwired handles this hop's slide might move. the moved run contains the node's own
+    ///children between its old and new median gap — fixup rewrites their vaddrs in THIS node's
+    ///children array (cur.parent() is the hopping node itself for those).
+    fn hop_to_median<'s>(
+        &'s mut self,
+        node_v: &mut TreeP<'a, T>,
+        floating: &mut [TreeP<'a, T>],
+    ) where 'a: 's {
+        // 1. read the node; mid = child_count >> 1; gap = phys(rightmost_desc(c[mid-1])) + 1.
+        // 2. if phys(*node_v) == gap: return.
+        // 3. find_slot(gap, dir, pin=root); fixup_moved_run(slide, floating+[*node_v]);
+        //    slide_none; move the node record to the opened slot; *node_v = new vaddr.
+        todo!("relocate existing node to its new median gap + fixup + update handle")
+    }
+
+    ///after a slide, rewrite each moved node's inbound child pointer — UNLESS the node is
+    ///floating (in `floating`): then it has no wired parent, so update the HANDLE instead.
+    ///vaddrs are NOT stable across a slide (phys moved ⇒ vaddr moved), so a wired node's
+    ///parent has a stale child vaddr and a floating node's handle is stale. cursor from the
+    ///slide's insertion point in the slide direction; per moved node:
+    ///   if its old vaddr is in `floating`: replace that handle entry with the new vaddr;
+    ///   else: `parent.children[j] = new_v` (parent from the cursor's ancestor stack).
+    ///the run is contiguous in-order so next()/prev() + the ancestor stack enumerate it.
+    ///root is never in the run (pinned). anchor may or may not be in the run (find_slot
+    ///prefers a None on the insert side; if found, anchor doesn't move). the tree MUST be
+    ///walkable (all wired nodes linked) when this runs — floating nodes are the only
+    ///disconnected ones, and they're handled via handles, not traversal.
+    fn fixup_moved_run<'s>(
+        &'s mut self,
+        slide: crate::store::NoneSlide,
+        floating: &mut [TreeP<'a, T>],
+    ) where 'a: 's {
+        if slide.from == slide.to { return; }
+        //caller positioned `self` at the anchor; derive anchor_p0 from it.
+        let anchor_p0 = self.block().v2p(self.position());
+        let count = slide.from.abs_diff(slide.to);
+        let go_next = slide.from > anchor_p0;       //right = true
+        let delta: usize = if slide.from < slide.to { usize::MAX } else { 1 };
+        //anchor is in the moved run iff it lies strictly between from and to (the None
+        //at `from` is a gap, not a node). legacy: skip = 0 when anchor stationary, else 1.
+        let anchor_moves = if slide.from < slide.to {
+            slide.from < anchor_p0 && anchor_p0 <= slide.to
+        } else {
+            slide.to <= anchor_p0 && anchor_p0 < slide.from
+        };
+        //node now at anchor_p was previously at anchor_p ∓ delta (it shifted one slot
+        //toward `from`); that old phys yields the old vaddr the parent/handle still holds.
+        let mut anchor_p = anchor_p0.wrapping_add(delta);
+        if !anchor_moves {
+            //anchor stationary: step past it before entering the moved run.
+            if go_next { self.next() } else { self.prev() }
+            anchor_p = anchor_p.wrapping_add(delta);
+        }
+        for _ in 0..count {
+            let new_v = self.block().p2v(anchor_p);
+            let old_v = self.block().p2v(anchor_p.wrapping_sub(delta));
+            if let Some(h) = floating.iter_mut().find(|h| **h == old_v) {
+                *h = new_v;
+            } else {
+                let (parent_v, ci) = self.parent().expect("moved wired node has no parent");
+                self.block_mut().get_mut(parent_v).update_child(ci, new_v);
+            }
+            if go_next { self.next() } else { self.prev() }
+            anchor_p = anchor_p.wrapping_add(delta);
+        }
+    }
+
+    ///place one new unparented node at `target_gap = phys(anchor)+1` in `dir`. `self`
+    /// must be positioned at the anchor with a valid ancestor stack. `pin` (a vaddr)
+    /// clamps the slide so it never crosses `pin`; `floating` holds vaddrs of
+    /// placed-but-unwired nodes this slide might move (handles updated in place by
+    /// `fixup_moved_run`). Err(node) if the arena is full.
+    fn place_one<'s>(
+        &'s mut self,
+        node: TreeT<'a, T>,
+        dir: bool,
+        floating: &mut [TreeP<'a, T>],
+        pin: TreeP<'a, T>,
+    ) -> Result<TreeP<'a, T>, TreeT<'a, T>>
+    where 'a: 's {
+        let pos = self.position();
+        let slide = match self.block_mut().find_slot(pos, dir, Some(pin)) {
+            Some(s) => s,
+            None => return Err(node),
+        };
+        if slide.from != slide.to {
+            self.fixup_moved_run(slide, floating);
+        }
+        let slot = self.block_mut().slide_none(slide, Some(pin));
+        Ok(self.block_mut().insert(node, slot))
+    }
+
+    ///position `self` at `rightmost_desc(base.children[child_idx])` by descending (pushing
+    /// the ancestor stack each level). `self` starts at `base`. NOT `TreeRoute::rightmost_desc`
+    /// (read-only, no stack) — this is the mut descend that builds the lineage `fixup_moved_run` needs.
+    fn descend_to_rightmost_desc<'s>(&'s mut self, base: TreeP<'a, T>, child_idx: usize)
+    where 'a: 's {
+        let _ = base; //precondition: self already at base
+        self.descend(child_idx);
+        while self.height() > <TreeP<'a, T> as Num>::MIN {
+            let k = self.block().get(self.position()).children().len();
+            self.descend(k.saturating_sub(1));
+        }
+    }
+
+    ///two sequential placements of split halves n1 (at child_idx1's rightmost-desc gap)
+    /// and n2 (at child_idx2's). `self` positioned at Y (the split node, intact and wired).
+    /// Y is pinned so it never moves; placements re-descend from Y between them. `child_in`
+    /// is an already-placed-but-unwired child vaddr (floating handle) or None. returns
+    /// (p1, p2) — final vaddrs (handles updated if a slide moved n1 during placement 2).
+    fn insert_2<'s>(
+        &'s mut self,
+        y: TreeP<'a, T>,
+        child_idx1: usize,
+        n1: TreeT<'a, T>,
+        child_idx2: usize,
+        n2: TreeT<'a, T>,
+        child_in: Option<TreeP<'a, T>>,
+    ) -> (TreeP<'a, T>, TreeP<'a, T>)
+    where 'a: 's {
+        let pin = y;
+        //placement 1: anchor = rightmost_desc(Y.children[child_idx1]).
+        self.descend_to_rightmost_desc(y, child_idx1);
+        let mut floating1: Vec<TreeP<'a, T>> = Vec::new();
+        if let Some(c) = child_in { floating1.push(c); }
+        let _p1 = self.place_one(n1, true, &mut floating1, pin)
+            .unwrap_or_else(|_| panic!("insert_2: arena full"));
+        //child_in's handle may have been updated by placement 1's slide; carry it forward.
+        let child_in = if floating1.is_empty() { None } else { Some(floating1[0]) };
+        //Y pinned → didn't move and is an ancestor of every node in the (Y-bounded) run, so
+        //ascending from the post-fixup cursor restores position+height+stack to Y. this also
+        //resets `height` (set_position alone can't — it's a separate field decremented by descend).
+        while self.position() != y { self.ascend(); }
+        //placement 2: anchor = rightmost_desc(Y.children[child_idx2]); n1 is now floating.
+        self.descend_to_rightmost_desc(y, child_idx2);
+        let mut floating2: Vec<TreeP<'a, T>> = vec![_p1];
+        if let Some(c) = child_in { floating2.push(c); }
+        let p2 = self.place_one(n2, true, &mut floating2, pin)
+            .unwrap_or_else(|_| panic!("insert_2: arena full"));
+        (floating2[0], p2)
+    }
+
+    ///the per-level unit of bottom-up propagation. self.current() is the node that just
+    ///split (kept the left half); `o` carries its unplaced right half + separator. ORDER is
+    ///place → hop → wire (keeps the floating window to one node):
+    ///   (1) right_v = place_new(o.right, &mut [])              // right placed, floating
+    ///   (2) hop_to_median(&mut left_v, &mut [right_v])         // left re-medians; if the hop's
+    ///                                                           //   slide moves right, right_v handle updates
+    ///   (3) pop to parent; parent.insert(o.sep, Payload::Child(right_v))  // wire right in (final vaddr)
+    /// returns the parent's overflow to keep propagating, or None if it absorbed the separator.
+    /// DRIVER GUARDS THE ROOT: only call when self.parent().is_some(); the root case (parent
+    /// None) is order-sensitive (2 placements before wiring) and goes to `promote_new_root`.
+    fn split_current<'s>(&'s mut self, o: Overflow<TreeT<'a, T>, TreeK<'a, T>>)
+        -> Option<Overflow<TreeT<'a, T>, TreeK<'a, T>>>
+    where 'a: 's {
+        // let mut right_v = self.place_new(o.right, &mut []).ok().expect("arena full");
+        // let mut left_v = self.position();
+        // self.hop_to_median(&mut left_v, &mut [right_v]);      // right_v may update here
+        // let (parent_v, _) = self.pop().unwrap();              // driver guaranteed non-root
+        // self.set_position(parent_v); self.height += ONE;
+        // self.block_mut().get_mut(parent_v).insert(o.sep, Payload::Child(right_v))  // may overflow
+        todo!("place right (float) + hop left (right_v in floating) + wire (sep, Child(right_v)) into parent")
+    }
+
+    ///root overflow: promote a new root above self.current() (the root that just split, kept
+    ///the left half at the root vaddr). `o.right` is the unplaced right half. INV 2: the new
+    ///root ADOPTS tree.root's vaddr (tree.root unchanged); the old root (c0) is demoted to a
+    ///fresh vaddr and becomes child 0. 2 new nodes placed before wiring, so BOTH are floating
+    ///through the placements — handles tracked, fixups update handles not parent ptrs. order:
+    ///   (1) right_v = place_new(o.right, &mut [])              // c1 placed at its median (right of root)
+    ///   (2) hop_to_median(&mut c0_v, &mut [right_v])           // c0 (old root) hops to its left-half
+    ///                                                           //   median, VACATING the root vaddr; c0's
+    ///                                                           //   link from tree.root is severed -> c0_v
+    ///                                                           //   is floating too; right_v may update
+    ///   (3) new_root_v = place_new(Self::default(), &mut [right_v, c0_v])  // new root at the vacated
+    ///                                                           //   root vaddr (= tree.root, inv 2)
+    ///   (4) wire: new_root.insert(o.sep, Payload::Child(right_v))  // keys[0]=sep, leaves[1]=right_v, nchildren=2
+    ///              new_root.update_child(0, c0_v)              // leaves[0]=c0_v
+    ///   (5) set_root(new_root_v) (= tree.root, unchanged); bump meta (height +1).
+    /// c0's hop and c1's placement are in disjoint ranges in the balanced case (left vs right
+    /// of the root), so the floating slide rarely triggers — but recursive/general splits can
+    /// overlap, so the handle mechanism is the general safety net. uses `Node::default()` for
+    /// the empty new root + `insert`/`update_child` (both on the trait) — no new setters.
+    fn promote_new_root<'s>(&'s mut self, o: Overflow<TreeT<'a, T>, TreeK<'a, T>>)
+    where 'a: 's {
+        todo!("place right + hop c0 (both floating) + place default new root at root vaddr + wire via insert+update_child + set_root + bump height")
+    }
+
+    ///bottom-up insert driver. descend to the leaf for `k` (NO pre-split — retires inv 5's
+    ///proactive ≤1-level guarantee), `Node::insert(k, Payload::Value(v))` at the leaf, then
+    ///propagate `Overflow` up the parent stack: while overflow and not at root, `split_current`
+    ///(place right + hop + wire into parent); if the root overflows, `promote_new_root`.
+    ///propagation can reach the root. generic via `Node::default()` + `insert`/`update_child`.
+    fn insert<'s>(&'s mut self, k: TreeK<'a, T>, v: TreeV<'a, T>)
+    where 'a: 's {
+        // while let Some(ci) = self.try_route(&k) { self.descend(ci); }       // descend to leaf
+        // let mut ov = self.current_mut().insert(k, Payload::Value(v));     // leaf may split
+        // while let Some(o) = ov {
+        //     if self.parent().is_none() { self.promote_new_root(o); return; }  // root overflow
+        //     ov = self.split_current(o);                                    // place + hop + wire into parent
+        // }
+        todo!("bottom-up driver: descend + Node::insert(Value) + split_current loop + promote_new_root")
     }
 }
 

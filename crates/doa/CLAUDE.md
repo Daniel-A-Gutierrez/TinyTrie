@@ -109,3 +109,80 @@ Arena tier (intended, currently skeleton / todo!()):
 - Overprovisioning — OVERP = true widening PTR.
 - Subtrees & forwarding — block_id: usize roots with small internal PTRs; a node's value can be a block_id forwarding to another block.
 - Ordering across splits — prev/next linked list so iteration is a contiguous logical scan across split blocks.
+
+# Tree split invariants (design — in progress)
+
+The block stores tree nodes in **walk (in-order) order**: physical slot order ==
+in-order traversal order. This is what makes slide-fixups a sequential cursor
+walk. Split insert is **bottom-up** (overflow propagates up the parent stack; may
+reach the root — the old proactive ≤1-level guarantee is retired; bottom-up splits
+only when actually needed, for better space utilization). DEGREE ≥ 3 (a full node
+needs ≥2 keys to split into two non-degenerate halves + a separator; DEGREE=2
+can't split). **DEGREE is now 3.**
+
+- **Clone before splitting an internal node (the orphan fix).** `Node::split`
+  (`split_off`) shrinks self to the left half, which orphans the right-half
+  children — they're in the block but no placed node references them (inbound ptrs
+  only in the owned right half). Sliding to open the right half's median slot would
+  move orphaned children and `fixup_moved_run` couldn't update their inbound ptrs
+  (no placed parent). **So `split_internal` clones Y first**: the original Y stays
+  in the block, intact, wired to its children (tree walkable, fixup's `parent()`
+  works); the clone is split into n1/n2 (the only new floating nodes); after
+  `insert_2` places them, `block.remove(Y)` frees Y's slot and the parent is
+  rewired to `[p1, p2]`. Y's children stay referenced throughout (by Y, then n1/n2).
+- **Leaves skip the clone.** A leaf (terminal, height `MIN`) has no in-block
+  children (only external `SlicePtr`s) — nothing to orphan. `split_leaf` does
+  `L.split()` in place (L becomes n1), no clone, no remove.
+- **`target_gap(X) = phys(in_order_predecessor(X)) + 1`** — placement formula. Leaf:
+  predecessor = left sibling. Internal: predecessor = `rightmost_desc(c[mid-1])`,
+  `mid = child_count >> 1`. Median placement is an ORDERING property (node between
+  its two median children's subtrees), not an exact address — slides preserve
+  in-order so they can't break it. The median rule is the TARGET when a node is
+  placed, not a perpetual invariant on every node.
+- **`Node::split(&mut self) -> (Self, K)`** — logical only. Drains the right half
+  into a new node; self keeps the left half; returns `(right, separator)`. No phys,
+  no fixup. Used on clones (internal) and on L directly (leaf).
+- **`Node: Default`** — `default()` is the empty node (INode: `empty()`); used by
+  `split_internal`'s root branch to construct the new root.
+- **`Payload<V,P>` / `Overflow { right, sep }`** — `Payload` is a tagged enum (not
+  two `Option`s) so exactly one payload is expressible. `Node::insert` maps
+  `Payload`→storage; `Overflow` carries a whole node, not a payload. (`Node::insert`
+  is NOT used on the split path — the driver uses `insert_bucket` +
+  `split_leaf`/`split_internal`; it stays as a trait method for consumers.)
+- **`insert_2`** — two sequential placements (no combined slide): place n1
+  (floating = `[child_in]`), then place n2 (floating = `[n1, child_in]`). Each
+  placement = subtree-aware anchor (`target_gap`) → `find_slot` (pin=root) →
+  `fixup_moved_run` → `slide_none` → `insert`. One slide may pass over n1 or
+  `child_in` (placed-but-unwired) → `fixup_moved_run`'s floating branch updates the
+  handle. The walker must be at the anchor with a valid ancestor stack before each
+  `fixup_moved_run`.
+- **`split_leaf(L)`** — ask `parent.insert_position(parent_v, L_idx+1)` (anchor
+  resolves to `After(L)` since n2 is terminal); `L.split()` (L=n1 in place);
+  single-insert n2 after L; return `(sep, n2_v)` to the driver.
+- **`split_internal(Y, sep_in, child_in)`** — `clone=Y.clone(); (n2,sep)=clone.split();`
+  route `(sep_in, child_in)` into n1 or n2; `insert_2` places n1, n2;
+  `block.remove(Y)`; rewire: **root** → new root (`Node::default()`) at Y's freed
+  slot (= `tree.root`, inv 2) over `[p1, p2]` + sep, bump height, return None;
+  **non-root** → `grandparent.children[Y_idx] = p1`, return `(sep, p2)` for the
+  driver. (p1-replacement is child-count-neutral; the +1 is the returned `(sep,
+  p2)` the driver inserts into the grandparent.)
+- **`Walker::insert` (driver)** — descend to leaf (no pre-split); leaf has room →
+  `insert_bucket`; else `ov = split_leaf(L)`. Loop: `ov=Some((sep,child))` → pop
+  parent; parent has room → `parent.insert(sep, Payload::Child(child))`, done;
+  else `ov2 = split_internal(parent, sep, child)` (`None` ⇒ parent was root, new
+  root placed, done; `Some(ov)` ⇒ propagate to grandparent).
+- **vaddrs are stable across grow/spread (translator remaps) but NOT across a
+  slide.** A slide shifts ≤`bit_width` elements ±1; their phys changes ⇒ vaddr
+  changes ⇒ the parent holding that child's vaddr has a stale pointer. That
+  rewrite **is** the fixup. Root is never in a slide run (pinned, inv 4).
+- **`fixup_moved_run(slide, &mut [P] floating)`** — DONE. Cursor from the slide's
+  insertion point in the slide direction; per moved node, `old_v = p2v(anchor_p −
+  delta)`, if `old_v` in `floating` → rewrite that handle entry to the new vaddr;
+  else rewrite the child pointer in its parent (`parent.children[j] = new_v`,
+  parent from the cursor's ancestor stack). The run is contiguous in-order, so
+  `next()`/`prev()` + the ancestor stack enumerate it. The `anchor_moves` check
+  pre-steps the cursor when the anchor is stationary.
+- **Anchor may or may not be in the run.** `find_slot` prefers a `None` on the
+  insert side; if found, the slide is between anchor and that `None` and the
+  anchor doesn't move. Else the anchor is in the run and is fixed up like any
+  other node. `fixup_moved_run` handles both uniformly (the `anchor_moves` branch).

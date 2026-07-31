@@ -120,6 +120,7 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
 }
 
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
+#[derive(Clone, Copy)]
 pub struct NoneSlide {
     pub(crate) from: usize,
     pub(crate) to:   usize,

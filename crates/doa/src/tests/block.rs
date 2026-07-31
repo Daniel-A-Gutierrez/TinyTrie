@@ -46,8 +46,8 @@ mod uniform {
         assert_eq!(b.len(), 0);
         assert_eq!(b.occupied(), 0);
         assert!(b.first_vaddr().is_none());
-        assert_eq!(b.translator().shift(), 16);
-        assert_eq!(b.translator().inner_offset(), 32768);
+        assert_eq!(b.translator().shift(), 15);
+        assert_eq!(b.translator().inner_offset(), 0);
     }
 
     #[test]
@@ -134,12 +134,19 @@ mod uniform {
     fn exhaustion_returns_none() {
         let mut b: Small = BlockMutTrait::new();
         let root = b.insert_root(0);
-        for i in 1..4 {
-            let last = b.last_vaddr().unwrap();
-            let ms = b.find_slot(last, true, Some(root)).expect("slot");
+        // InOrder root sits at phys len/2. Fill around it with the pin keeping root
+        // put: two before (leftward slides use phys1 then phys0) and one after (phys3),
+        // reaching occupied=4=len=cap=max_capacity.
+        let first = b.first_vaddr().unwrap();
+        for i in 1..=2 {
+            let ms = b.find_slot(first, false, Some(root)).expect("slot before");
             let slot = b.slide_none(ms, Some(root));
             b.insert(i, slot);
         }
+        let last = b.last_vaddr().unwrap();
+        let ms = b.find_slot(last, true, Some(root)).expect("slot after");
+        let slot = b.slide_none(ms, Some(root));
+        b.insert(3, slot);
         assert_eq!(b.occupied(), 4);
         assert_eq!(b.len(), b.max_capacity());
         let last = b.last_vaddr().unwrap();
@@ -150,15 +157,15 @@ mod uniform {
     fn pin_root_never_moves() {
         let mut b: Blk = BlockMutTrait::new();
         let root = b.insert_root(0);
-        let root_phys = b.v2p(root);
         for i in 1..30 {
             let last = b.last_vaddr().unwrap();
             let ms = b.find_slot(last, true, Some(root)).expect("slot");
             let slot = b.slide_none(ms, Some(root));
             b.insert(i, slot);
-            // root vaddr still resolves to the same value AND phys
+            // root vaddr stable + getable; InOrder root sits at phys len/2 (spread
+            // doubles len so root phys moves 1->2->4...; the pin keeps slides off it).
             assert_eq!(*b.get(root), 0);
-            assert_eq!(b.v2p(root), root_phys, "root phys moved at i={i}");
+            assert_eq!(b.v2p(root), b.len()/2, "root not at len/2 at i={i}");
         }
     }
 }
@@ -175,14 +182,16 @@ mod pluripotent {
     fn new_empty_u16() {
         let b: Blk16 = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 7); // Half(u8)::BIT_WIDTH - 1
-        assert_eq!(b.translator().inner_offset(), 32768);
+        assert_eq!(b.translator().inner_offset(), 0);
+        assert_eq!(b.translator().outer_offset(), 32768);
     }
 
     #[test]
     fn new_empty_u32() {
         let b: Blk32 = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 15); // Half(u16)::BIT_WIDTH - 1
-        assert_eq!(b.translator().inner_offset(), 1 << 31);
+        assert_eq!(b.translator().inner_offset(), 0);
+        assert_eq!(b.translator().outer_offset(), 1 << 31);
     }
 
     #[test]
@@ -298,7 +307,7 @@ mod append {
     fn new_empty() {
         let b: Blk = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 0);
-        assert_eq!(b.translator().inner_offset(), 65280);
+        assert_eq!(b.translator().inner_offset(), 256);
     }
 
     #[test]
@@ -309,7 +318,7 @@ mod append {
             let v = b.try_insert_back(i).unwrap();
             pairs.push((v, i));
         }
-        assert_eq!(pairs[0].0, 256); // p2v(0) = 0 - 65280 (mod) = 256
+        assert_eq!(pairs[0].0, 256); // p2v(0) = (0 + 256) << 0 = 256
         assert_eq!(pairs[1].0, 257);
         stable(&b, &pairs);
         roundtrip(&b);
@@ -360,7 +369,7 @@ mod append {
                 Err(_) => break,
             }
         }
-        // offset starts 65280; each prepend +1; Err when offset wraps to MIN (0)
+        // inner starts 256; each prepend -1; Err when inner hits MIN (0)
         assert_eq!(count, 256);
     }
 
@@ -390,7 +399,7 @@ mod prepend {
     fn new_empty() {
         let b: Blk = BlockMutTrait::new();
         assert_eq!(b.translator().shift(), 0);
-        assert_eq!(b.translator().inner_offset(), 65280);
+        assert_eq!(b.translator().inner_offset(), 256);
     }
 
     #[test]
