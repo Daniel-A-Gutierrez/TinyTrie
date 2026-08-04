@@ -35,18 +35,18 @@ fn ubtree_single_node() {
     assert_eq!(ptr_of(t.get(&30).unwrap()), 20);
 }
 
-///many inserts: exercises split_root (height growth) and split_child (sibling splits
-///under a non-full root, recursively). currently `#[ignore]` — needs the moved-ptr
-///fixup in `insert_child`/`insert_root` to handle the moved run around the anchor
-///(the fixup today runs from `self.position()` = parent, not the anchor, so it walks
-///the parent's subtree and `parent().unwrap()` panics at the root). run with
-///`cargo test -- --ignored` once that lands.
+///many inserts: exercises root promotion (height growth) and internal splits (sibling
+///splits under a non-full root, recursively) via the bottom-up Walker::insert driver.
+///300 inserts / get / remove / re-get. (Previously #[ignore]'d awaiting the moved-ptr
+///fixup; the bottom-up clone-based split landed — see SPLIT_PLAN.md.)
 #[test]
-#[ignore = "awaiting insert_child/insert_root moved-ptr fixup"]
 fn ubtree_insert_many() {
     let mut t: UBTree<u64> = UBTree::new();
     let keys: Vec<u64> = (0..300u64).map(|i| i * 13 + 7).collect();
-    for &k in &keys { t.insert(k, tp((k % 1000) as u16)); }
+    for (i, &k) in keys.iter().enumerate() {
+        eprintln!("[INS] i={i}");
+        t.insert(k, tp((k % 1000) as u16));
+    }
     for &k in &keys {
         assert_eq!(ptr_of(t.get(&k).expect("get")), (k % 1000) as u16, "k={k}");
     }
@@ -82,8 +82,8 @@ type InodeTree = TreeBlock<'static, Blk, InOrder>;
 
 fn inode(nchildren: u8, debug_height: u32) -> INode<u32, u32, u16> {
     INode {
-        keys:      [0u32; 2],
-        leaves:    [PtrUnion { internal: 0u32 }; 3],
+        keys:      [0u32; 3],
+        leaves:    [PtrUnion { internal: 0u32 }; 4],
         nchildren,
         debug_height,
     }
@@ -188,8 +188,8 @@ fn debug_layout_demo() {
     //CAP 16 keeps the layout readable; I=L=u16 so children_array holds in-block vaddrs.
     type Blk = UniformBlock<'static, INode<u32, u16, u16>, InOrder, u16, 16>;
     let mk_inode = |child: u16, nchildren: u8| INode::<u32, u16, u16> {
-        keys:      [0u32; 2],
-        leaves:    [PtrUnion { internal: child }; 3],
+        keys:      [0u32; 3],
+        leaves:    [PtrUnion { internal: child }; 4],
         nchildren,
         debug_height: 1, //these are internal nodes pointing at a child
     };

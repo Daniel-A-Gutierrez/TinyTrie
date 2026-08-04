@@ -182,6 +182,17 @@ pub trait BlockMutTrait<'a>: BlockTrait<'a> {
         self.store_mut().swap(pa, pb);
     }
 
+    ///swap the record at vaddr `target` with the None at `open`. returns the slot freed at
+    ///`target`'s old phys and the new vaddr of the record that was at `target` (now at
+    ///`open`'s phys). used to relocate a wired node to a new gap (`hop_to_median`) and to
+    ///land a new node at a specific vaddr (root promote): the caller inserts into the freed
+    ///slot, or reads the returned vaddr to update the node's inbound pointer.
+    fn swap_open(&mut self, target: Self::P, open: OpenSlot) -> (OpenSlot, Self::P) {
+        let p_target = self.translator().v2p(target);
+        self.store_mut().swap(p_target, open.0);
+        (OpenSlot(p_target), self.translator().p2v(open.0))
+    }
+
     //none of the split stuff is really in use or correct or working.
 
     ///split at P::MIDPOINT: [MIDPOINT,len) move into a new block; self keeps [0,MIDPOINT).

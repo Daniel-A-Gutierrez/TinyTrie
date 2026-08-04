@@ -1,6 +1,152 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Laundry List
+Ok big changes
+Revise Node Trait
+Collapse TreePos + TreeNav? 
+TreeBlock will be a new module depending on treetraits, holding concrete implementations of the walker and treeblock. 
+TreeBlockMut will be a sealed trait that treeblock impls and the walkers depend on for raw block ops.
+The Tree's public interface will require using a walker or probe.
+NodeIter goes away , replacing it with a plain old iterator, and supporting get_child(i) etc on node.
+We have 2 concrete structs - stackless walker and walker. Stackless gets used for probe. 
+Each ordering is implemented for each walker type, and specifies methods for prev,next,descend_left,descend_right, left, right, ascend, descend. 
+
+# Value semantics
+1 per 'slot' , shares slots with children
+1 per node, all slots are children
+1 per key, all slots are children
+enum/union nodes, all slots are children or all slots are values.
+no values
+
+nav doesnt care but inserting children / splitting does. 
+if we make each a trait variant, ie ValueNode we have
+SlotValueNode
+    Node.insert_child(key, i, ptr) //tree doesnt care abt values?
+    parent.split_child(i) needs Node.insert(key,i,ptr) but ptr and val are MutExc so we're good
+MonoValueNode
+    Node.insert_child(key,i,ptr)
+    parent.split_child(i) // Node.split_into makes no sense? cant split a single value. 
+KeyValueNode
+    Node.insert_child(key,value,i,ptr) //each key has 1 value stored with it
+    parent.split_child(i) requires inserting a whole (k,v,p) into the parent 
+INode / LeafNode
+    //parent must be a Inode, child may not be.
+    node.as_inode().insert_child(key,i,ptr);
+    node.as_leaf()? //not used internally?
+    node.as_inode().split_child(i) //makes use of insert (key,i,ptr)
+
+So how do we discriminate an Inode and a Leaf node?
+Stored Tag on node
+Stored tag on reference
+By height
+
+So , this is all done in self.insert_child and self.split_child. 
+The walker has to have some way of determining if its at a inode or a lnode. 
+Node.try_route(key)->Option< usize > right? 
+If the walker knows theres 2 types, instead of T, T::A and T::B. 
+So this try_route could return Option( ARef(p), BRef(p) ).
+Or if the native type T is an enum, we'd need to support T::As_Inode and T::As_Leaf
+We could wrap node.try_route in self.try_route(&self,key) and use that to return `Option<usize>`
+wrapping it with a height check.
+In RefTag's case itd return an `Option<ARef(usize), BRef(usize)>`, and T has to support as_a or as_b.
+In NodeTag's case the raw type is an enum and the walker has to match on it to descend. 
+
+The walkers need a trait to extend to get try_route and as_inode->Option< T::A >
+the inode trait thus needs to exist, and be what exposes insert_child and split_child. 
+
+So our node types are 
+RefTagNode : try_route -> Node::RouteT
+EnumNode -> as_inode, as_leafnode -> Result< Node::Inode > , Result< Node::LNode >
+UnionNode -> unsafe as_inode, unsafe as_leafnode -> Node::Inode, Node::LNode
+ValueNode -> self.value()-> V, try_route 
+PairNode //convenience, key is just (K,V)
+
+
+# Ordering Problem
+OK, the 'in order' and 'root doesnt move' axioms contradict eachother.
+ive put some revised notes in node_ordering.md as for how to approach that. 
+Block exposes a translated interface over the store
+The alloc strat determines how the translator adjusts its parameters by the block's actions.
+Does it even need to be a compile time thing then? Cant it be a runtime thing? 
+Just a struct with default constructors? 
+Since they all support the same actions more or less. 
+I think that might be a tiny performance regression but only for push_front... its already there i guess so i can leave it. 
+
+So then - whats the point of tree block? Just a block where the type is guaranteed to be a node with an ordering? 
+Where the real interface is exposed through the walker/probe? 
+It stores the root and metadata needed for walker and probe construction i guess? 
+
+Ok so right now the tree block passes inner as its generic to the traits which they operate on. 
+I think, for now, i should move towards keeping all the walker impls in this crate. Theyre tricky.
+The consumer only gets to influence behavior by parameterizing tree node and impl'ing node. 
+
+So ordered node collapses into node.
+I want to get rid of NodeIterBase and instead work on exactsizeiter + doubleendediter 
+We can make use of a separate trait for ParentPtrNode though, that would make it so the mutable interface just doesnt need the walker at all. 
+
+as for the inner thing, i think its cleaner if treeblockmut extends blockmut and is a sealed trait that treeblock implements, which is how the walkers work over it. 
+
+Also i dont see why treepos + treenav exist and are just subtraits of walker? 
+
+As for inserting and splitting - perhaps 'split child' and 'insert child' need to be supported on the node level, as well as 'split'. 
+
+The tree needs to be valid for us to insert a node so... 
+i think we need to preempt the split, insert a node at the correct position, then drain a node into it? 
+
+So walker.split_child(i) : 
+    
+    //split ancestors as necessary
+    if self.parent.is_full() {
+        let (_,child_idx) = self.stack.pop();
+        self.split_child(child_idx);
+    }
+
+    //first we insert the new empty node to the right of child i's subtree. 
+    //this is different for bfo though.
+    let height = self.height() //maybe depth is a better word than height? 
+    self.descend(i)
+    let levels = self.walk_rightmost()
+    let new_v = self.insert( node::default(), after ) //insert fixes up self ptrs
+    while self.height() > height {
+        self.pop()
+    }
+
+    //for bfo itd be
+    //walk to left sibling/cousin
+    let mut walked = 0;
+    while current.children.len() == 0 {
+        walker.left();
+        walked+=1;
+    }
+    walker.descend_rightmost(1); //go 1 level at most.
+    walker.insert(after,empty)
+    for _ in 0..walked { walker.right() }
+
+    //i suppose the unifying function would just be 'walker.prev()'
+
+
+    //now we split the child into the new slot, and update the parent
+    self.split_child(i, new_v) : 
+        self.descend(i)
+        self.split_into(new_v) -> sep
+        self.pop()
+        self.insert_child_p(i,sep,new_v);
+
+    //parent may have to move to sit at correct position now
+    //in order : 
+    if i <= DEGREE/2
+        let h = self.height()
+        self.descend(i);
+        self.walk_rightmost();
+        self.find_slot(after)->NoneSlide
+        self.fixup(NoneSlide)
+        let v = self.buf().slide(NoneSlide)
+        while h > self.height() {
+            self.pop()
+        }
+        self.swap(v) //need to update current but dont have to re-descend. also repoints parent
+    //the other orderings dont move. 
 # In order tree maintenance
 
     i seeee yes insert_position needs subtree awareness, insert before child 2 doesnt mean insert before parent.children[2] , it needs to traverse to the leftmost child

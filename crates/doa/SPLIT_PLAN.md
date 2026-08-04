@@ -95,6 +95,14 @@ child_in_v]`). each placement = `find_slot` + `fixup_moved_run` + `slide_none` +
 (floating branch) instead of a parent. NO combined slide; reuse
 `fixup_moved_run` as-is.
 
+**Only the root is pinned (inv 4).** `pin = self.root()` for both placements. Y is NOT
+pinned, so it may move in placement 1's slide; `insert_2` **re-descends from the (pinned,
+stable) root** between placements (`reposition_to_anchor`: reset to root via
+`set_position`+`set_height`+clear-stack, descend the root→Y `path`, then
+`descend_to_rightmost_desc(child_idx)`). The root→Y path stays live because
+`fixup_moved_run` keeps every moved node's parent pointer current. `path` (child indices
+root→Y) is passed by the caller (`split_internal`).
+
 ### `target_gap(X) = phys(in_order_predecessor(X)) + 1`
 - leaf: predecessor = left sibling.
 - internal: predecessor = `rightmost_desc(c[mid-1])`, `mid = child_count >> 1`.
