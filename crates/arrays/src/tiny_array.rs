@@ -70,6 +70,22 @@ where [(); N]:
     pub fn push(&mut self, val: T) {
         self.insert_at(self.len as usize, val);
     }
+    /// Remove and return the element at `pos`, shifting `[pos+1..len)` left.
+    /// Panics if `pos >= len`. Decrements `len`.
+    pub fn remove(&mut self, pos: usize) -> T {
+        debug_assert!(pos < self.len as usize, "TinyArray::remove_at: oob");
+        let l = self.len as usize;
+        let val = unsafe { self.slots[pos].as_ptr().read() };
+        unsafe {
+            std::ptr::copy(
+                self.slots[pos + 1].as_ptr(),
+                self.slots[pos].as_mut_ptr(),
+                l - pos - 1,
+            );
+        }
+        self.len -= 1;
+        val
+    }
 }
 impl<T, const N: usize> Default for TinyArray<T, N>
 where [(); N]:

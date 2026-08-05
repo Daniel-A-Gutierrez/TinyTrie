@@ -3,7 +3,6 @@ use crate::index::UnsignedNum;
 /// virtual <-> physical address translation. P is the in-block pointer type;
 /// physical slots are usize. v2p is the hot lookup path, p2v runs on remap.
 pub(crate) trait AddressTranslator<P>: Sized {
-
     ///virtual address to physical slot
     fn v2p(&self, virt: P) -> usize;
 
@@ -30,8 +29,12 @@ type P2v<P> = fn(P, P, P, u32, u32) -> P;
 
 // apply x.method(arg) only when the param is nonzero (nz); z is a passthrough.
 macro_rules! apply {
-    ($x:expr, z, $method:ident, $arg:expr) => { $x };
-    ($x:expr, nz, $method:ident, $arg:expr) => { $x.$method($arg) };
+    ($x:expr, z, $method:ident, $arg:expr) => {
+        $x
+    };
+    ($x:expr, nz, $method:ident, $arg:expr) => {
+        $x.$method($arg)
+    };
 }
 
 // generate one v2p/p2v pair for a given (inner, outer, shift, rot) nz/z pattern.
@@ -57,22 +60,22 @@ macro_rules! variant {
     };
 }
 
-variant!(v2p_0000 / p2v_0000, inner=z, outer=z, shift=z, rot=z);
-variant!(v2p_1000 / p2v_1000, inner=nz, outer=z, shift=z, rot=z);
-variant!(v2p_0100 / p2v_0100, inner=z, outer=nz, shift=z, rot=z);
-variant!(v2p_0010 / p2v_0010, inner=z, outer=z, shift=nz, rot=z);
-variant!(v2p_0001 / p2v_0001, inner=z, outer=z, shift=z, rot=nz);
-variant!(v2p_1100 / p2v_1100, inner=nz, outer=nz, shift=z, rot=z);
-variant!(v2p_1010 / p2v_1010, inner=nz, outer=z, shift=nz, rot=z);
-variant!(v2p_1001 / p2v_1001, inner=nz, outer=z, shift=z, rot=nz);
-variant!(v2p_0110 / p2v_0110, inner=z, outer=nz, shift=nz, rot=z);
-variant!(v2p_0101 / p2v_0101, inner=z, outer=nz, shift=z, rot=nz);
-variant!(v2p_0011 / p2v_0011, inner=z, outer=z, shift=nz, rot=nz);
-variant!(v2p_1110 / p2v_1110, inner=nz, outer=nz, shift=nz, rot=z);
-variant!(v2p_1101 / p2v_1101, inner=nz, outer=nz, shift=z, rot=nz);
-variant!(v2p_1011 / p2v_1011, inner=nz, outer=z, shift=nz, rot=nz);
-variant!(v2p_0111 / p2v_0111, inner=z, outer=nz, shift=nz, rot=nz);
-variant!(v2p_1111 / p2v_1111, inner=nz, outer=nz, shift=nz, rot=nz);
+variant!(v2p_0000 / p2v_0000, inner = z, outer = z, shift = z, rot = z);
+variant!(v2p_1000 / p2v_1000, inner = nz, outer = z, shift = z, rot = z);
+variant!(v2p_0100 / p2v_0100, inner = z, outer = nz, shift = z, rot = z);
+variant!(v2p_0010 / p2v_0010, inner = z, outer = z, shift = nz, rot = z);
+variant!(v2p_0001 / p2v_0001, inner = z, outer = z, shift = z, rot = nz);
+variant!(v2p_1100 / p2v_1100, inner = nz, outer = nz, shift = z, rot = z);
+variant!(v2p_1010 / p2v_1010, inner = nz, outer = z, shift = nz, rot = z);
+variant!(v2p_1001 / p2v_1001, inner = nz, outer = z, shift = z, rot = nz);
+variant!(v2p_0110 / p2v_0110, inner = z, outer = nz, shift = nz, rot = z);
+variant!(v2p_0101 / p2v_0101, inner = z, outer = nz, shift = z, rot = nz);
+variant!(v2p_0011 / p2v_0011, inner = z, outer = z, shift = nz, rot = nz);
+variant!(v2p_1110 / p2v_1110, inner = nz, outer = nz, shift = nz, rot = z);
+variant!(v2p_1101 / p2v_1101, inner = nz, outer = nz, shift = z, rot = nz);
+variant!(v2p_1011 / p2v_1011, inner = nz, outer = z, shift = nz, rot = nz);
+variant!(v2p_0111 / p2v_0111, inner = z, outer = nz, shift = nz, rot = nz);
+variant!(v2p_1111 / p2v_1111, inner = nz, outer = nz, shift = nz, rot = nz);
 
 ///address translator using fn-ptr specialization (see bench notes / v2p_fnptr).
 ///adaptive tier shape: re-point v2p/p2v in set_params when the block's params
@@ -81,16 +84,23 @@ variant!(v2p_1111 / p2v_1111, inner=nz, outer=nz, shift=nz, rot=nz);
 pub(crate) struct Translator<P: UnsignedNum> {
     inner_offset: P,
     outer_offset: P,
-    shift:    u32,
-    rotation: u32,
-    v2p:      V2p<P>,
-    p2v:      P2v<P>,
+    shift:        u32,
+    rotation:     u32,
+    v2p:          V2p<P>,
+    p2v:          P2v<P>,
 }
 
 impl<P: UnsignedNum> Translator<P> {
     pub(crate) fn new(inner_offset: P, outer_offset: P, shift: u32, rotation: u32) -> Self {
-        Self { inner_offset, outer_offset, shift, rotation, v2p: v2p_0000::<P>, p2v: p2v_0000::<P> }
-            .specialize(inner_offset, outer_offset, shift, rotation)
+        Self {
+            inner_offset,
+            outer_offset,
+            shift,
+            rotation,
+            v2p: v2p_0000::<P>,
+            p2v: p2v_0000::<P>,
+        }
+        .specialize(inner_offset, outer_offset, shift, rotation)
     }
     pub(crate) fn inner_offset(&self) -> P {
         self.inner_offset
@@ -107,7 +117,13 @@ impl<P: UnsignedNum> Translator<P> {
 
     ///re-point the specialized bodies after a param change (one indirect call
     ///per lookup thereafter, no per-iter branch).
-    pub(crate) fn set_params(&mut self, inner_offset: P, outer_offset: P, shift: u32, rotation: u32) {
+    pub(crate) fn set_params(
+        &mut self,
+        inner_offset: P,
+        outer_offset: P,
+        shift: u32,
+        rotation: u32,
+    ) {
         self.inner_offset = inner_offset;
         self.outer_offset = outer_offset;
         self.shift = shift;
@@ -204,13 +220,19 @@ impl<P: UnsignedNum> Translator<P> {
 }
 
 impl<P: UnsignedNum> AddressTranslator<P> for Translator<P> {
-
     fn v2p(&self, virt: P) -> usize {
-        (self.v2p)(virt, self.inner_offset, self.outer_offset, self.shift, self.rotation).as_usize()
+        (self.v2p)(virt, self.inner_offset, self.outer_offset, self.shift, self.rotation)
+            .as_usize()
     }
 
     fn p2v(&self, phys: usize) -> P {
-        (self.p2v)(P::from_usize(phys), self.inner_offset, self.outer_offset, self.shift, self.rotation)
+        (self.p2v)(
+            P::from_usize(phys),
+            self.inner_offset,
+            self.outer_offset,
+            self.shift,
+            self.rotation,
+        )
     }
 
     fn vdist(&self, v1: P, v2: P) -> usize {

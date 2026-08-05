@@ -1,23 +1,270 @@
-use crate::{InOrder, Ordering, PostOrder, PreOrder, index::*, store::{Cursor, DequeStore, NoneSlide, Store, VecStore}, translator::{AddressTranslator, Translator}};
+use crate::alloc_strat::*;
+use crate::{InOrder, Ordering, PostOrder, PreOrder,
+            index::*,
+            store::{DequeStore, NoneSlide, Store, VecStore},
+            translator::{AddressTranslator, Translator}};
 use std::fmt;
 use std::fmt::Write as _;
 use std::marker::PhantomData;
-use crate::alloc_strat::*;
-
-
 
 ///per-strategy concrete block aliases. `BlockMutTrait` is only impl'd for these four
 ///(strategy, store) combos, so these are the only `RawBlock` family members that are
 ///tree-usable as `Inner`. `pub(crate)` because the stores are `pub(crate)`.
-pub(crate) type UniformBlock<'a, T, O : Ordering, P, const CAP: usize> =
+pub(crate) type UniformBlock<'a, T, O: Ordering, P, const CAP: usize> =
     RawBlock<'a, T, P, Uniform<O>, VecStore<T, CAP>>;
-pub(crate) type PluripotentBlock<'a, T, O : Ordering, P, const CAP: usize> =
+pub(crate) type PluripotentBlock<'a, T, O: Ordering, P, const CAP: usize> =
     RawBlock<'a, T, P, Pluripotent<O>, DequeStore<T, CAP>>;
 pub(crate) type AppendBlock<'a, T, P, const CAP: usize> =
     RawBlock<'a, T, P, Append, VecStore<T, CAP>>;
 pub(crate) type PrependBlock<'a, T, P, const CAP: usize> =
     RawBlock<'a, T, P, Prepend, VecStore<T, CAP>>;
 
+///positioned reader over a block's `Some` slots. the cursor tracks a **physical**
+///slot internally but `position()` returns the **vaddr** (translated via the block's
+///translator); `seek` takes a vaddr and translates it to phys. `pos == None` means
+///at-end (no current element); `prev` from at-end is a no-op.
+pub trait Cursor<'b, T: 'b, P: BlockIndex> {
+    ///vaddr of the current element, or `None` if at-end.
+    fn position(&self) -> Option<P>;
+    ///current element, or `None` if at-end.
+    fn current(&self) -> Option<&'b T>;
+    ///O(1) jump to vaddr `v` (translated to phys); panics if out of bounds or `None`.
+    fn seek(&mut self, v: P);
+    ///advance to the next `Some` slot. returns false iff at-end (no advance).
+    fn next(&mut self) -> bool;
+    ///advance to the previous `Some` slot. returns false iff already at the first.
+    fn prev(&mut self) -> bool;
+    ///seek to the first occupied slot; returns its vaddr, or `None` if empty.
+    fn first(&mut self) -> Option<P>;
+    ///seek to the last occupied slot; returns its vaddr, or `None` if empty.
+    fn last(&mut self) -> Option<P>;
+}
+
+///positioned mut reader over a block's `Some` slots. same phys-internal / vaddr-out
+/// model as `Cursor`. `current_mut` reborrows the block on each call (the returned ref
+/// is tied to the cursor borrow, not the block's lifetime), so it is not a streaming
+/// iterator — call, use, drop, advance.
+pub trait CursorMut<'b, T: 'b, P: BlockIndex> {
+    fn position(&self) -> Option<P>;
+    fn current_mut(&mut self) -> Option<&mut T>;
+    fn seek(&mut self, v: P);
+    fn next(&mut self) -> bool;
+    fn prev(&mut self) -> bool;
+    fn first(&mut self) -> Option<P>;
+    fn last(&mut self) -> Option<P>;
+}
+
+///block-backed read cursor: holds a shared `&block` ref, scans the store's slots via
+///`block.store().slot`, and translates phys↔vaddr through `block.translator()`. while
+/// held it only blocks `&mut` access to the block, not other shared reads.
+pub(crate) struct BlockCursor<'a, 'b, B: BlockTrait<'a>>
+where 'a: 'b
+{
+    block: &'b B,
+    pos:   Option<usize>,
+    _a:    PhantomData<&'a ()>,
+}
+
+impl<'a, 'b, B: BlockTrait<'a>> BlockCursor<'a, 'b, B>
+where 'a: 'b
+{
+    pub(crate) fn new(block: &'b B) -> Self {
+        let mut c = Self { block, pos: None, _a: PhantomData };
+        let _ = c.first();
+        c
+    }
+
+    ///decompose: yield the block borrow back plus the current vaddr (stable across
+    ///store mutations — the translator remaps, so the same vaddr survives a slide/
+    ///spread). `None` if the cursor was at-end.
+    pub(crate) fn into_parts(self) -> (&'b B, Option<B::P>) {
+        let v = self.position();
+        (self.block, v)
+    }
+
+    ///rebuild by detranslating the stable vaddr back to a (possibly new) phys. `v ==
+    ///None` rebuilds an at-end cursor.
+    pub(crate) fn from_parts(block: &'b B, v: Option<B::P>) -> Self {
+        let pos = v.map(|vv| block.translator().v2p(vv));
+        Self { block, pos, _a: PhantomData }
+    }
+}
+
+impl<'a, 'b, B: BlockTrait<'a>> Cursor<'b, B::T, B::P> for BlockCursor<'a, 'b, B>
+where 'a: 'b
+{
+    fn position(&self) -> Option<B::P> {
+        self.pos.map(|p| self.block.translator().p2v(p))
+    }
+
+    fn current(&self) -> Option<&'b B::T> {
+        let p = self.pos?;
+        Some(self.block.get_raw(p))
+    }
+
+    fn seek(&mut self, v: B::P) {
+        let p = self.block.translator().v2p(v);
+        let n = self.block.store().len();
+        assert!(p < n, "cursor: seek out of bounds");
+        assert!(self.block.store().slot(p).is_some(), "cursor: seek to None");
+        self.pos = Some(p);
+    }
+
+    fn next(&mut self) -> bool {
+        let Some(p) = self.pos else { return false };
+        let s = self.block.store();
+        for q in (p + 1)..s.len() {
+            if s.slot(q).is_some() {
+                self.pos = Some(q);
+                return true;
+            }
+        }
+        self.pos = None;
+        false
+    }
+
+    fn prev(&mut self) -> bool {
+        let Some(p) = self.pos else { return false };
+        let s = self.block.store();
+        for q in (0..p).rev() {
+            if s.slot(q).is_some() {
+                self.pos = Some(q);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn first(&mut self) -> Option<B::P> {
+        let s = self.block.store();
+        for p in 0..s.len() {
+            if s.slot(p).is_some() {
+                self.pos = Some(p);
+                return Some(self.block.translator().p2v(p));
+            }
+        }
+        self.pos = None;
+        None
+    }
+
+    fn last(&mut self) -> Option<B::P> {
+        let s = self.block.store();
+        for p in (0..s.len()).rev() {
+            if s.slot(p).is_some() {
+                self.pos = Some(p);
+                return Some(self.block.translator().p2v(p));
+            }
+        }
+        self.pos = None;
+        None
+    }
+}
+
+///block-backed mut cursor: holds an exclusive `&mut block` ref. while held, the
+/// block's normal mut interface is inaccessible (the cursor's phys would be stale
+/// after a `find_slot`/slide anyway) — `into_parts` yields the `&mut block` back so the
+/// caller can mutate, then `from_parts` rebuilds by detranslating the stable vaddr.
+pub(crate) struct BlockCursorMut<'a, 'b, B: BlockMutTrait<'a>>
+where 'a: 'b
+{
+    block: &'b mut B,
+    pos:   Option<usize>,
+    _a:    PhantomData<&'a ()>,
+}
+
+impl<'a, 'b, B: BlockMutTrait<'a>> BlockCursorMut<'a, 'b, B>
+where 'a: 'b
+{
+    pub(crate) fn new(block: &'b mut B) -> Self {
+        let mut c = Self { block, pos: None, _a: PhantomData };
+        let _ = c.first();
+        c
+    }
+
+    ///decompose: yield the exclusive block borrow back plus the current vaddr
+    /// (stable across store mutations). `None` if the cursor was at-end.
+    pub(crate) fn into_parts(self) -> (&'b mut B, Option<B::P>) {
+        let v = self.position();
+        (self.block, v)
+    }
+
+    ///rebuild by detranslating the stable vaddr back to a (possibly new) phys. `v ==
+    ///None` rebuilds an at-end cursor.
+    pub(crate) fn from_parts(block: &'b mut B, v: Option<B::P>) -> Self {
+        let pos = v.map(|vv| block.translator().v2p(vv));
+        Self { block, pos, _a: PhantomData }
+    }
+}
+
+impl<'a, 'b, B: BlockMutTrait<'a>> CursorMut<'b, B::T, B::P> for BlockCursorMut<'a, 'b, B>
+where 'a: 'b
+{
+    fn position(&self) -> Option<B::P> {
+        self.pos.map(|p| self.block.translator().p2v(p))
+    }
+
+    fn current_mut(&mut self) -> Option<&mut B::T> {
+        let p = self.pos?;
+        Some(self.block.get_mut_raw(p))
+    }
+
+    fn seek(&mut self, v: B::P) {
+        let p = self.block.translator().v2p(v);
+        let n = self.block.store().len();
+        assert!(p < n, "cursor: seek out of bounds");
+        assert!(self.block.store().slot(p).is_some(), "cursor: seek to None");
+        self.pos = Some(p);
+    }
+
+    fn next(&mut self) -> bool {
+        let Some(p) = self.pos else { return false };
+        let s = self.block.store();
+        for q in (p + 1)..s.len() {
+            if s.slot(q).is_some() {
+                self.pos = Some(q);
+                return true;
+            }
+        }
+        self.pos = None;
+        false
+    }
+
+    fn prev(&mut self) -> bool {
+        let Some(p) = self.pos else { return false };
+        let s = self.block.store();
+        for q in (0..p).rev() {
+            if s.slot(q).is_some() {
+                self.pos = Some(q);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn first(&mut self) -> Option<B::P> {
+        let s = self.block.store();
+        for p in 0..s.len() {
+            if s.slot(p).is_some() {
+                self.pos = Some(p);
+                return Some(self.block.translator().p2v(p));
+            }
+        }
+        self.pos = None;
+        None
+    }
+
+    fn last(&mut self) -> Option<B::P> {
+        let s = self.block.store();
+        for p in (0..s.len()).rev() {
+            if s.slot(p).is_some() {
+                self.pos = Some(p);
+                return Some(self.block.translator().p2v(p));
+            }
+        }
+        self.pos = None;
+        None
+    }
+}
 
 ///debug rendering aid for a block-stored item. debug-only. the item carries its own
 ///debug height (`INode::debug_height`); `debug_render` reads it to pick the right
@@ -35,6 +282,10 @@ pub trait BlockTrait<'a>: 'a {
     type T: Sized + 'a;
     type P: BlockIndex;
     type S: Store<'a, Self::T> + 'a;
+    type Cursor<'b>: Cursor<'b, Self::T, Self::P>
+    where
+        'a: 'b,
+        Self: 'b;
 
     fn store<'b>(&'b self) -> &'b Self::S
     where 'a: 'b;
@@ -46,16 +297,37 @@ pub trait BlockTrait<'a>: 'a {
         self.store().get(self.translator().v2p(ptr))
     }
 
+    ///raw (physical-address) get, no translation. panics if the slot is `None`
+    /// (contract violation — caller guarantees `p` is occupied).
+    fn get_raw<'b>(&'b self, p: usize) -> &'b Self::T
+    where 'a: 'b {
+        self.store().get(p)
+    }
+
     ///vaddr of first occupied slot, None if empty.
     fn first_vaddr<'b>(&'b self) -> Option<Self::P>
     where 'a: 'b {
-        self.store().cursor().first().map(|p| self.translator().p2v(p))
+        let s = self.store();
+        let tr = self.translator();
+        for p in 0..s.len() {
+            if s.slot(p).is_some() {
+                return Some(tr.p2v(p));
+            }
+        }
+        None
     }
 
     ///vaddr of last occupied slot, None if empty.
     fn last_vaddr<'b>(&'b self) -> Option<Self::P>
     where 'a: 'b {
-        self.store().cursor().last().map(|p| self.translator().p2v(p))
+        let s = self.store();
+        let tr = self.translator();
+        for p in (0..s.len()).rev() {
+            if s.slot(p).is_some() {
+                return Some(tr.p2v(p));
+            }
+        }
+        None
     }
 
     fn v2p(&self, virt: Self::P) -> usize {
@@ -94,24 +366,39 @@ pub trait BlockTrait<'a>: 'a {
         self.store().iter()
     }
 
-    fn cursor<'b>(&'b self) -> impl Cursor<'b, Self::T> + 'b
-    where 'a: 'b {
-        self.store().cursor()
-    }
+    ///block read cursor: positioned at the first occupied slot (or at-end if empty).
+    fn cursor<'b>(&'b self) -> Self::Cursor<'b>
+    where 'a: 'b;
 }
 
 ///mutation surface. blocks of different alloc strats implement a common interface but failures must be handled at runtime.
 ///`A` (the strategy) is associated; `T`/`P`/`S` come from the `BlockTrait` supertrait.
 pub trait BlockMutTrait<'a>: BlockTrait<'a> {
     type A: AllocStrat<Self::P>;
+    type CursorMut<'b>: CursorMut<'b, Self::T, Self::P>
+    where
+        'a: 'b,
+        Self: 'b;
 
     fn new() -> Self;
     fn store_mut(&mut self) -> &mut Self::S;
 
     fn translator_mut(&mut self) -> &mut Translator<Self::P>;
 
-    fn get_mut<'b>(&'b mut self, ptr: Self::P) -> &'b mut Self::T where 'a:'b{
+    ///block mut cursor: positioned at the first occupied slot (or at-end if empty).
+    fn cursor_mut<'b>(&'b mut self) -> Self::CursorMut<'b>
+    where 'a: 'b;
+
+    fn get_mut<'b>(&'b mut self, ptr: Self::P) -> &'b mut Self::T
+    where 'a: 'b {
         let p = self.translator().v2p(ptr);
+        self.store_mut().get_mut(p)
+    }
+
+    ///raw (physical-address) mut get, no translation. panics if the slot is `None`
+    /// (contract violation — caller guarantees `p` is occupied).
+    fn get_mut_raw<'b>(&'b mut self, p: usize) -> &'b mut Self::T
+    where 'a: 'b {
         self.store_mut().get_mut(p)
     }
 
@@ -152,14 +439,21 @@ pub trait BlockMutTrait<'a>: BlockTrait<'a> {
 
     ///find free slot or make space if possible. dir is logical (true=after);
     ///REVERSED strategies flip it to phys.
-    fn find_slot(&mut self, pos: Self::P, dir: bool, pin: Option<Self::P>) -> Option<NoneSlide> {
+    fn find_slot(
+        &mut self,
+        pos: Self::P,
+        dir: bool,
+        pin: Option<Self::P>,
+    ) -> Option<NoneSlide> {
         let dir = dir ^ Self::A::REVERSED;
         let pp = self.translator().v2p(pos);
         let pinp = pin.map(|p| self.translator().v2p(p));
         if let Some(ms) = self.store().find_slot(pp, dir, Self::A::INSERT_BUDGET, pinp) {
             return Some(ms);
         }
-        if self.len()==self.max_capacity() { return None }
+        if self.len() == self.max_capacity() {
+            return None;
+        }
         let _ = self.grow_and_spread();
         //spread shifted phys (i->2i) and halved shift; vaddrs are stable, so re-translate.
         let pp = self.translator().v2p(pos);
@@ -168,7 +462,7 @@ pub trait BlockMutTrait<'a>: BlockTrait<'a> {
     }
 
     ///place `v` at the opened slot. returns its vaddr.
-    fn insert(&mut self, v: Self::T, slot: OpenSlot) -> Self::P ;
+    fn insert(&mut self, v: Self::T, slot: OpenSlot) -> Self::P;
 
     fn remove(&mut self, ptr: Self::P) -> Self::T {
         let p = self.translator().v2p(ptr);
@@ -231,23 +525,33 @@ pub(crate) struct OpenSlot(pub(crate) usize);
 
 ///fwd-or-rev iterator wrapper: REVERSED strategies pick Rev, else Fwd. The dead
 ///arm is never constructed per-monomorphization (A::REVERSED is const).
-pub(crate) enum DirIter<F, R> { Fwd(F), Rev(R) }
+pub(crate) enum DirIter<F, R> {
+    Fwd(F),
+    Rev(R),
+}
 
 impl<F: Iterator, R: Iterator<Item = F::Item>> Iterator for DirIter<F, R> {
     type Item = F::Item;
     #[inline]
     fn next(&mut self) -> Option<F::Item> {
-        match self { Self::Fwd(i) => i.next(), Self::Rev(i) => i.next() }
+        match self {
+            Self::Fwd(i) => i.next(),
+            Self::Rev(i) => i.next(),
+        }
     }
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self { Self::Fwd(i) => i.size_hint(), Self::Rev(i) => i.size_hint() }
+        match self {
+            Self::Fwd(i) => i.size_hint(),
+            Self::Rev(i) => i.size_hint(),
+        }
     }
 }
 
 impl<F: ExactSizeIterator, R: ExactSizeIterator<Item = F::Item>> ExactSizeIterator
     for DirIter<F, R>
-{}
+{
+}
 
 impl<'a, T, P, A, S> BlockTrait<'a> for RawBlock<'a, T, P, A, S>
 where
@@ -259,6 +563,9 @@ where
     type T = T;
     type P = P;
     type S = S;
+    type Cursor<'b>
+        = BlockCursor<'a, 'b, Self>
+    where 'a: 'b;
 
     fn store<'b>(&'b self) -> &'b S
     where 'a: 'b {
@@ -267,6 +574,11 @@ where
 
     fn translator<'b>(&'b self) -> &'b Translator<P> {
         &self.translator
+    }
+
+    fn cursor<'b>(&'b self) -> Self::Cursor<'b>
+    where 'a: 'b {
+        BlockCursor::new(self)
     }
 
     ///REVERSED strategies iterate high→low (front at the back).
@@ -278,9 +590,9 @@ where
 }
 
 ///`Debug` view: translator params + physical slot layout (`[i:[child_phys,...], j:X, ...]`).
-///the layout is rebuilt from the store cursor — Nones are inserted up to the cursor's
-///position so the full sparse physical layout (gaps included) is visible. each Some's
-///child vaddrs (`SlotDebug::debug_children`) are mapped to physical slots via `v2p`.
+///the full sparse physical layout (gaps included) is rendered by probing each slot via
+///`Store::slot`. each Some's child vaddrs (`SlotDebug::debug_render`) are mapped to
+///physical slots via `v2p`.
 impl<'a, T, P, A, S> fmt::Debug for RawBlock<'a, T, P, A, S>
 where
     T: Sized + 'a + SlotDebug<P>,
@@ -298,34 +610,29 @@ where
             tr.shift(),
             tr.rotation()
         )?;
-        let len = self.store.len();
+        let s = self.store();
+        let len = s.len();
         let mut buf = String::new();
         buf.push_str("  slots: [");
-        let mut cur = self.store.cursor();
-        let mut next_some = cur.first();
-        let mut phys = 0usize;
-        while phys < len {
-            if next_some == Some(phys) {
-                {
-                    let item = cur.current().expect("cursor at Some");
-                    if phys > 0 { buf.push_str(", "); }
+        for phys in 0..len {
+            if phys > 0 {
+                buf.push_str(", ");
+            }
+            match s.slot(phys) {
+                Some(item) => {
                     let parts = item.debug_render(tr);
                     let _ = write!(buf, "{phys}:[{}]", parts.join(","));
                 }
-                cur.next();
-                next_some = cur.position();
-            } else {
-                if phys > 0 { buf.push_str(", "); }
-                let _ = write!(buf, "{phys}:X");
+                None => {
+                    let _ = write!(buf, "{phys}:X");
+                }
             }
-            phys += 1;
         }
         buf.push(']');
         f.write_str(&buf)?;
         f.write_str("\n}")
     }
 }
-
 
 ///strategy-agnostic Self-construction: new + split + split_and_rotate. one copy
 ///(behavior varies via A for `new`); the per-strategy BlockMutTrait impls delegate
@@ -380,7 +687,10 @@ where
     ///split at P::MIDPOINT + odds-gap both halves (rotation is the split remap primitive).
     ///precondition: len == P::MAX().as_usize() + 1.
     pub(crate) fn split_and_rotate_block(&mut self) -> Self {
-        debug_assert!(self.store.len() == P::MAX.as_usize() + 1, "split_and_rotate: block not full");
+        debug_assert!(
+            self.store.len() == P::MAX.as_usize() + 1,
+            "split_and_rotate: block not full"
+        );
         let at = P::MIDPOINT.as_usize();
         let right = self.store.split_and_rotate(at);
         self.translator.set_rotation(self.translator.rotation() + 1);
@@ -403,26 +713,50 @@ where
 //ordering-agnostic. the `const` cap-assert monomorphizes per O under the bound.
 
 impl<'a, T, P, O: Ordering, const CAP: usize> BlockMutTrait<'a>
-for RawBlock<'a, T, P, Uniform<O>, VecStore<T, CAP>>
+    for RawBlock<'a, T, P, Uniform<O>, VecStore<T, CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
     Uniform<O>: AllocStrat<P>,
 {
     type A = Uniform<O>;
+    type CursorMut<'b>
+        = BlockCursorMut<'a, 'b, Self>
+    where 'a: 'b;
 
     fn new() -> Self {
-        const { assert!(CAP <= <Uniform<O> as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Uniform::CAP_LIMIT"); }
+        const {
+            assert!(
+                CAP <= <Uniform<O> as AllocStrat<P>>::CAP_LIMIT,
+                "CAP exceeds Uniform::CAP_LIMIT"
+            );
+        }
         Self::new_block()
     }
-    fn store_mut(&mut self) -> &mut VecStore<T, CAP> { &mut self.store }
-    fn translator_mut(&mut self) -> &mut Translator<P> { &mut self.translator }
+    fn store_mut(&mut self) -> &mut VecStore<T, CAP> {
+        &mut self.store
+    }
+    fn translator_mut(&mut self) -> &mut Translator<P> {
+        &mut self.translator
+    }
+    fn cursor_mut<'b>(&'b mut self) -> Self::CursorMut<'b>
+    where 'a: 'b {
+        BlockCursorMut::new(self)
+    }
 
-    fn split(&mut self) -> Self { self.split_block() }
-    fn split_and_rotate(&mut self) -> Self { self.split_and_rotate_block() }
+    fn split(&mut self) -> Self {
+        self.split_block()
+    }
+    fn split_and_rotate(&mut self) -> Self {
+        self.split_and_rotate_block()
+    }
 
-    fn try_insert_back(&mut self, v: T) -> Result<P, T> { Err(v) }
-    fn try_insert_front(&mut self, v: T) -> Result<P, T> { Err(v) }
+    fn try_insert_back(&mut self, v: T) -> Result<P, T> {
+        Err(v)
+    }
+    fn try_insert_front(&mut self, v: T) -> Result<P, T> {
+        Err(v)
+    }
 
     fn insert(&mut self, v: T, slot: OpenSlot) -> P {
         //vaddr stable across the spread below (i->2i+SPREAD_OFFSET, on_grow); compute first.
@@ -437,35 +771,55 @@ where
     }
 }
 
-impl<'a, T, P, O: Ordering, const CAP : usize> BlockMutTrait<'a>
-for RawBlock<'a, T, P, Pluripotent<O>, DequeStore<T,CAP>>
+impl<'a, T, P, O: Ordering, const CAP: usize> BlockMutTrait<'a>
+    for RawBlock<'a, T, P, Pluripotent<O>, DequeStore<T, CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
     type A = Pluripotent<O>;
+    type CursorMut<'b>
+        = BlockCursorMut<'a, 'b, Self>
+    where 'a: 'b;
 
     fn new() -> Self {
-        const { assert!(CAP <= <Pluripotent<O> as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Pluripotent::CAP_LIMIT"); }
+        const {
+            assert!(
+                CAP <= <Pluripotent<O> as AllocStrat<P>>::CAP_LIMIT,
+                "CAP exceeds Pluripotent::CAP_LIMIT"
+            );
+        }
         Self::new_block()
     }
-    fn store_mut(&mut self) -> &mut DequeStore<T, CAP> { &mut self.store }
-    fn translator_mut(&mut self) -> &mut Translator<P> { &mut self.translator }
+    fn store_mut(&mut self) -> &mut DequeStore<T, CAP> {
+        &mut self.store
+    }
+    fn translator_mut(&mut self) -> &mut Translator<P> {
+        &mut self.translator
+    }
+    fn cursor_mut<'b>(&'b mut self) -> Self::CursorMut<'b>
+    where 'a: 'b {
+        BlockCursorMut::new(self)
+    }
 
-    fn split(&mut self) -> Self { self.split_block() }
-    fn split_and_rotate(&mut self) -> Self { self.split_and_rotate_block() }
+    fn split(&mut self) -> Self {
+        self.split_block()
+    }
+    fn split_and_rotate(&mut self) -> Self {
+        self.split_and_rotate_block()
+    }
 
     ///dense append into the free half.
-    fn try_insert_back(&mut self, v: T) -> Result<P,T> {
+    fn try_insert_back(&mut self, v: T) -> Result<P, T> {
         if self.len() < self.max_capacity() {
             let p = self.store.push_back(v);
-            return Ok(self.translator.p2v(p)); 
+            return Ok(self.translator.p2v(p));
         }
         return Err(v);
     }
 
     ///dense append into the free half.
-    fn try_insert_front(&mut self, v: T) -> Result<P,T> {
+    fn try_insert_front(&mut self, v: T) -> Result<P, T> {
         if self.len() < self.max_capacity() {
             //on_push_front bumps inner_offset to cancel the phys shift push_front causes.
             self.store.push_front(v);
@@ -484,29 +838,53 @@ where
 ///Append: dense push_back (front=low). shift 0, offset=-K (low K reserved for the
 ///rare prepend). one None per BUDGET pushes stocks mid-insert gaps.
 impl<'a, T, P, const CAP: usize> BlockMutTrait<'a>
-for RawBlock<'a, T, P, Append, VecStore<T, CAP>>
+    for RawBlock<'a, T, P, Append, VecStore<T, CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
     type A = Append;
+    type CursorMut<'b>
+        = BlockCursorMut<'a, 'b, Self>
+    where 'a: 'b;
 
     fn new() -> Self {
-        const { assert!(CAP <= <Append as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Append::CAP_LIMIT"); }
+        const {
+            assert!(
+                CAP <= <Append as AllocStrat<P>>::CAP_LIMIT,
+                "CAP exceeds Append::CAP_LIMIT"
+            );
+        }
         Self::new_block()
     }
-    fn store_mut(&mut self) -> &mut VecStore<T, CAP> { &mut self.store }
-    fn translator_mut(&mut self) -> &mut Translator<P> { &mut self.translator }
+    fn store_mut(&mut self) -> &mut VecStore<T, CAP> {
+        &mut self.store
+    }
+    fn translator_mut(&mut self) -> &mut Translator<P> {
+        &mut self.translator
+    }
+    fn cursor_mut<'b>(&'b mut self) -> Self::CursorMut<'b>
+    where 'a: 'b {
+        BlockCursorMut::new(self)
+    }
 
-    fn split(&mut self) -> Self { self.split_block() }
-    fn split_and_rotate(&mut self) -> Self { self.split_and_rotate_block() }
+    fn split(&mut self) -> Self {
+        self.split_block()
+    }
+    fn split_and_rotate(&mut self) -> Self {
+        self.split_and_rotate_block()
+    }
 
     ///hot: dense push_back; every BUDGET-th push stocks a None gap for mid-inserts.
     fn try_insert_back(&mut self, v: T) -> Result<P, T> {
         let occ = self.occupied();
         let pad = occ != 0 && occ % <Append as AllocStrat<P>>::INSERT_BUDGET == 0;
-        if self.len() + 1 + pad as usize > self.max_capacity() { return Err(v); }
-        if pad { self.store_mut().grow_back(1); }
+        if self.len() + 1 + pad as usize > self.max_capacity() {
+            return Err(v);
+        }
+        if pad {
+            self.store_mut().grow_back(1);
+        }
         let p = self.store_mut().push_back(v);
         Ok(self.translator().p2v(p))
     }
@@ -514,7 +892,9 @@ where
     ///cold: push_front into the reserved low range; on_push_front bumps inner_offset
     ///to cancel the phys shift. refuses once the K reservation is spent (offset==MIN).
     fn try_insert_front(&mut self, v: T) -> Result<P, T> {
-        if self.translator().inner_offset() == P::MIN { return Err(v); }
+        if self.translator().inner_offset() == P::MIN {
+            return Err(v);
+        }
         self.store_mut().push_front(v);
         Self::A::on_push_front(self.translator_mut());
         Ok(self.translator().p2v(0))
@@ -530,29 +910,53 @@ where
 ///iteration is high→low, find_slot dir flipped (REVERSED). cold push_front hits the
 ///reserved low range as the back.
 impl<'a, T, P, const CAP: usize> BlockMutTrait<'a>
-for RawBlock<'a, T, P, Prepend, VecStore<T, CAP>>
+    for RawBlock<'a, T, P, Prepend, VecStore<T, CAP>>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
     type A = Prepend;
+    type CursorMut<'b>
+        = BlockCursorMut<'a, 'b, Self>
+    where 'a: 'b;
 
     fn new() -> Self {
-        const { assert!(CAP <= <Prepend as AllocStrat<P>>::CAP_LIMIT, "CAP exceeds Prepend::CAP_LIMIT"); }
+        const {
+            assert!(
+                CAP <= <Prepend as AllocStrat<P>>::CAP_LIMIT,
+                "CAP exceeds Prepend::CAP_LIMIT"
+            );
+        }
         Self::new_block()
     }
-    fn store_mut(&mut self) -> &mut VecStore<T, CAP> { &mut self.store }
-    fn translator_mut(&mut self) -> &mut Translator<P> { &mut self.translator }
+    fn store_mut(&mut self) -> &mut VecStore<T, CAP> {
+        &mut self.store
+    }
+    fn translator_mut(&mut self) -> &mut Translator<P> {
+        &mut self.translator
+    }
+    fn cursor_mut<'b>(&'b mut self) -> Self::CursorMut<'b>
+    where 'a: 'b {
+        BlockCursorMut::new(self)
+    }
 
-    fn split(&mut self) -> Self { self.split_block() }
-    fn split_and_rotate(&mut self) -> Self { self.split_and_rotate_block() }
+    fn split(&mut self) -> Self {
+        self.split_block()
+    }
+    fn split_and_rotate(&mut self) -> Self {
+        self.split_and_rotate_block()
+    }
 
     ///hot: push_back (front=high); every BUDGET-th push stocks a None gap.
     fn try_insert_front(&mut self, v: T) -> Result<P, T> {
         let occ = self.occupied();
         let pad = occ != 0 && occ % <Prepend as AllocStrat<P>>::INSERT_BUDGET == 0;
-        if self.len() + 1 + pad as usize > self.max_capacity() { return Err(v); }
-        if pad { self.store_mut().grow_back(1); }
+        if self.len() + 1 + pad as usize > self.max_capacity() {
+            return Err(v);
+        }
+        if pad {
+            self.store_mut().grow_back(1);
+        }
         let p = self.store_mut().push_back(v);
         Ok(self.translator().p2v(p))
     }
@@ -560,7 +964,9 @@ where
     ///cold: physical push_front into the reserved low range (the back, for Prepend);
     ///on_push_front bumps inner_offset to cancel the phys shift. refuses at offset==MIN.
     fn try_insert_back(&mut self, v: T) -> Result<P, T> {
-        if self.translator().inner_offset() == P::MIN { return Err(v); }
+        if self.translator().inner_offset() == P::MIN {
+            return Err(v);
+        }
         self.store_mut().push_front(v);
         Self::A::on_push_front(self.translator_mut());
         Ok(self.translator().p2v(0))

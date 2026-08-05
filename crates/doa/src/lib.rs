@@ -1,21 +1,24 @@
 mod abstract_tree;
 mod alloc_strat;
 mod block;
+mod btree;
 mod index;
 mod inline_leafblock;
 mod leafblock;
+mod node;
 mod store;
 mod translator;
-mod tree_traits;
+mod tree_block;
+mod walker;
 use crate::leafblock::{PtrUnion, SlicePtr};
+use crate::translator::{AddressTranslator, Translator};
 use block::*;
 use index::*;
-use crate::translator::{Translator, AddressTranslator};
+use node::*;
 use std::{cmp::Ordering::{Equal, Greater, Less},
           collections::VecDeque,
           marker::PhantomData,
           ops::Range};
-use tree_traits::*;
 
 pub struct BFO;
 pub struct InOrder;
@@ -38,26 +41,19 @@ pub(crate) type LPtr = u16;
 
 //fractal forest
 struct FractalForest<K: Ord + Sized + Clone, V: Sized> {
-
     ///root is at trees[0]
     root:   BTree<K, BPtr>, //map key to a terminal block
     ltrees: Vec<BTree<K, V>>,
     len:    usize,
 }
 
-
-
-
 struct BTree<K: Sized + Ord + Clone, V: Sized> {
-
     // inodes : block::Block<INode<K, IPtr, LPtr>,IPtr,PreOrder,Pluripotent>, //require preorder and fixed root, and pluripotent
     leaves: leafblock::LeafBlock<K, V, LPtr>, //leafblock is random so it can guarantee capacity so long as inodes max size is 4096 (for u16, fanout 16)
     height: u32,
     next:   u32,
     prev:   u32,
 }
-
-
 
 impl<K, V> BTree<K, V>
 where

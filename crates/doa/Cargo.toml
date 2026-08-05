@@ -10,6 +10,7 @@ homepage = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
 readme = "README.md"
 [dependencies]
 itertools = "0.15.0"
+arrays = {path="../arrays"}
 
 [features]
 default = []

@@ -19,7 +19,6 @@ pub struct SlicePtr<P: BlockIndex> {
 }
 
 impl<P: BlockIndex> SlicePtr<P> {
-
     fn new(ptr: P, len: P) -> Self {
         Self { ptr, len }
     }
@@ -69,7 +68,6 @@ where
 // steady state: addr_shift=0, rotate=0 -> consecutive virt = consecutive phys,
 // so a leaf's [ptr, ptr+cap) is a contiguous phys run (may wrap the deque -> 2 slices).
 pub enum GrowErr {
-
     ///no adjacent gap within budget; caller may spread or split.
     NoBudget,
 

@@ -106,7 +106,6 @@ where
     F: UnsignedNum,
     M: Mode<T>,
 {
-
     fn get(&self, ptr: P) -> LeafNode<T, P, F, M, MIN, MAX> {
         todo!()
     }

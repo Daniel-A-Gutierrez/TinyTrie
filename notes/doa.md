@@ -1,6 +1,46 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Block Cursor
+Currently block.cursor yields a store cursor which only stores a reference to the store, and doesnt give access to it.
+I need a block cursor that stores a reference to the block, probably with position mapped to a vaddr but not necessarily. 
+It needs to yield the block so i can translate and seek using stored ptrs. 
+or actually i think cursor just needs to be implemented at the block level, the store is only used by block, so if its cursor isnt useful, best to just move it. 
+
+# Remaking walker and node
+Ok so the node variants are in, one issue - having the key type be (k,v) means the user needs to know the value in advance, so its not a map. 
+try_route could seek by < or <= to get you a range technically, worth keeping in pocket for future. 
+
+desired consumer flow :
+```rust
+struct MyNode<K,V,P> {
+    //defs
+}
+impl<K,V,P> MyNode { fn map... }
+
+impl<K,V,P> Node for MyNode<K,V,P> {
+    type K = K; type V = V; type P = P;
+}
+impl ANodeTrait for MyNode {
+    //defs
+}
+
+struct MyTree<K,V> {
+    tree : TreeBlock<MyNode<K,V,u16>, Ordering<u16>, Uniform<PreOrder>, VecStore<MyNode<K,V,P>>> 
+}
+let tree = MyTree<u64,u64>::new();
+
+impl<K,V> MyTree<K,V> {
+    fn get(&self, key : &K) -> Option<V> {
+        let mut walker = Walker::new(&self.tree);
+        walker.walk_to(key);
+        let value = walker.current().map(key);
+        return value;
+    }
+}
+
+```
+
 # Laundry List
 Ok big changes
 Revise Node Trait
@@ -62,6 +102,9 @@ UnionNode -> unsafe as_inode, unsafe as_leafnode -> Node::Inode, Node::LNode
 ValueNode -> self.value()-> V, try_route 
 PairNode //convenience, key is just (K,V)
 
+i think enumnode and union node arent traits at all actually
+also UnionNode vs UnionChildNode are distinct. Is the entire node a union or just its child slot?
+If its the child slot, we do child_as_val or child_as_ptr()
 
 # Ordering Problem
 OK, the 'in order' and 'root doesnt move' axioms contradict eachother.

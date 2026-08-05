@@ -1,8 +1,8 @@
 use super::*;
 use crate::index::BlockIndex;
-use crate::store::{Cursor, NoneSlide, Store, VecStore, DequeStore};
+use crate::store::{DequeStore, Store, VecStore};
 
-///for every occupied phys slot, v2p(p2v(p))==p and get(vaddr) matches the cursor.
+///for every occupied slot, p2v(v2p(v))==v and get(vaddr) matches the cursor.
 fn roundtrip<P, A, S>(b: &RawBlock<'static, u64, P, A, S>)
 where
     P: BlockIndex,
@@ -11,10 +11,10 @@ where
 {
     let mut c = b.cursor();
     c.first();
-    while let Some(p) = c.position() {
-        let v = b.p2v(p);
-        assert_eq!(b.v2p(v), p, "v2p(p2v(p)) != p at phys {p}");
-        assert_eq!(*b.get(v), *c.current().unwrap(), "get(v) != cursor at phys {p}");
+    while let Some(v) = c.position() {
+        let p = b.v2p(v);
+        assert_eq!(b.p2v(p), v, "p2v(v2p(v)) != v at vaddr {v:?}");
+        assert_eq!(*b.get(v), *c.current().unwrap(), "get(v) != cursor at vaddr {v:?}");
         if !c.next() {
             break;
         }
@@ -165,7 +165,7 @@ mod uniform {
             // root vaddr stable + getable; InOrder root sits at phys len/2 (spread
             // doubles len so root phys moves 1->2->4...; the pin keeps slides off it).
             assert_eq!(*b.get(root), 0);
-            assert_eq!(b.v2p(root), b.len()/2, "root not at len/2 at i={i}");
+            assert_eq!(b.v2p(root), b.len() / 2, "root not at len/2 at i={i}");
         }
     }
 }

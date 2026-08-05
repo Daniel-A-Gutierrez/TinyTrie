@@ -1,11 +1,15 @@
 use std::marker::PhantomData;
 
-use crate::{InOrder, Ordering, PostOrder, PreOrder, block::RawBlock, index::*, store::{DequeStore, VecStore}, translator::Translator};
+use crate::{InOrder, Ordering, PostOrder, PreOrder,
+            block::RawBlock,
+            index::*,
+            store::{DequeStore, VecStore},
+            translator::Translator};
 pub trait AllocStrat<P: BlockIndex>: 'static {
     ///initial shift for an empty block. Uniform = P::BIT_WIDTH (full range);
     ///Pluripotent = P::Half::BIT_WIDTH; Append/Prepend = 0 (dense).
     const INIT_SHIFT: u32;
-    ///initial capacity for a block with this strategy. generally 1 or 2. 
+    ///initial capacity for a block with this strategy. generally 1 or 2.
     const INIT_CAP: u32;
     ///initial offset (as usize; new_block wraps into P). Anchor so growth has
     ///headroom on the non-dominant side.
@@ -40,8 +44,8 @@ pub trait AllocStrat<P: BlockIndex>: 'static {
     //TODO on_split -> (left translator, right translator)
 }
 
-pub struct Uniform<O : Ordering> ( PhantomData<O> );
-pub struct Pluripotent<O : Ordering> ( PhantomData<O> );
+pub struct Uniform<O: Ordering>(PhantomData<O>);
+pub struct Pluripotent<O: Ordering>(PhantomData<O>);
 pub struct Append;
 pub struct Prepend;
 

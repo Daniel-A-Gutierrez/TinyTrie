@@ -30,7 +30,6 @@ pub trait Num:
     + Shl<u32, Output = Self>
     + Shr<u32, Output = Self>
 {
-
     /// Neutral address — where pointers anchor so growth has room both ways.
     /// Signed: `0`. Unsigned: range midpoint `(MAX >> 1) + 1` = `1 << (bit_width - 1)`.
     const MIDPOINT: Self;
@@ -56,7 +55,6 @@ pub trait Num:
 /// Signed `Num` — adds negation and `isize` conversion. Signed addresses
 /// convert through `isize`, never `usize`.
 pub trait SignedNum: Num + Neg<Output = Self> {
-
     fn as_isize(self) -> isize;
 
     fn from_isize(n: isize) -> Self;
@@ -64,7 +62,6 @@ pub trait SignedNum: Num + Neg<Output = Self> {
 
 /// Unsigned `Num` — adds `usize` conversion (direct Vec/slot indexing).
 pub trait UnsignedNum: Num {
-
     fn as_usize(self) -> usize;
 
     fn from_usize(n: usize) -> Self;
@@ -127,7 +124,6 @@ macro_rules! impl_unsigned {
 }
 macro_rules! impl_block_index {
     ($t:ty,$half:ty) => {
-
         impl BlockIndex for $t {
             type Half = $half;
 
@@ -145,7 +141,6 @@ macro_rules! impl_block_index {
 }
 macro_rules! impl_signed_index {
     ($t:ty,$half:ty) => {
-
         impl SignedBlockIndex for $t {
             type Half = $half;
 

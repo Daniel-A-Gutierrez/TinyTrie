@@ -10,13 +10,15 @@
 extern crate test;
 #[path = "../src/store.rs"]
 mod store;
-use store::{NoneSlide, Store};
 use std::num::NonZeroU64;
+use store::{NoneSlide, Store};
 use test::{Bencher, black_box};
 
 struct Elem(NonZeroU64, [u64; 15]);
 const _: () = assert!(std::mem::size_of::<Option<Elem>>() == 128);
-fn some() -> Elem { Elem(NonZeroU64::new(1).unwrap(), [0; 15]) }
+fn some() -> Elem {
+    Elem(NonZeroU64::new(1).unwrap(), [0; 15])
+}
 
 const N: usize = 1 << 20;
 const BUDGET: usize = N;
@@ -33,7 +35,9 @@ fn splitmix(state: &mut u64) -> u64 {
 
 fn flags(n_some: usize) -> Vec<bool> {
     let mut f = vec![false; N];
-    for i in 0..n_some { f[i] = true; }
+    for i in 0..n_some {
+        f[i] = true;
+    }
     let mut s = 0xDEAD_BEEF_CAFE_BABE;
     for i in (1..N).rev() {
         let j = (splitmix(&mut s) % (i as u64 + 1)) as usize;
@@ -50,7 +54,11 @@ fn positions() -> Vec<usize> {
 fn build_store<'a, S: Store<'a, Elem>>(fl: &[bool]) -> S {
     let mut st = S::new();
     for &on in fl {
-        if on { st.push_back(some()); } else { st.grow_back(1); }
+        if on {
+            st.push_back(some());
+        } else {
+            st.grow_back(1);
+        }
     }
     st
 }

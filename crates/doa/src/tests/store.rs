@@ -37,7 +37,13 @@ fn ref_find_slot(
     let max = (u32::MAX as usize).min(buf.len()).min(pos + budget);
     let min = pos.saturating_sub(budget);
     let (min, max) = match pin {
-        Some(p) if p == pos => if dir { (pos, max) } else { (min, pos) },
+        Some(p) if p == pos => {
+            if dir {
+                (pos, max)
+            } else {
+                (min, pos)
+            }
+        }
         Some(p) if p < pos => (min.max(p + 1), max),
         Some(p) => (min, max.min(p)),
         None => (min, max),
@@ -82,7 +88,13 @@ fn ref_nearest(
     let max = (u32::MAX as usize).min(buf.len()).min(pos + budget);
     let min = pos.saturating_sub(budget);
     let (min, max) = match pin {
-        Some(p) if p == pos => if dir { (pos, max) } else { (min, pos) },
+        Some(p) if p == pos => {
+            if dir {
+                (pos, max)
+            } else {
+                (min, pos)
+            }
+        }
         Some(p) if p < pos => (min.max(p + 1), max),
         Some(p) => (min, max.min(p)),
         None => (min, max),
@@ -94,7 +106,11 @@ fn ref_nearest(
         let l = buf[pos - 1 - k].is_none();
         let r = buf[pos + 1 + k].is_none();
         if l && r {
-            return if dir { Some((pos + 1 + k, pos + 1)) } else { Some((pos - 1 - k, pos - 1)) };
+            return if dir {
+                Some((pos + 1 + k, pos + 1))
+            } else {
+                Some((pos - 1 - k, pos - 1))
+            };
         }
         if l {
             return Some((pos - 1 - k, if !dir { pos - 1 } else { pos }));
@@ -439,39 +455,6 @@ mod vec {
     }
 
     #[test]
-    fn cursor_walk() {
-        let mut s: VecStore<u64, MC> = VecStore::new();
-        s.push_back(1);
-        s.push_back(2);
-        s.push_back(3);
-        s.remove(1); // [1,None,3]
-        let mut c = s.cursor();
-        assert_eq!(c.first(), Some(0));
-        assert_eq!(*c.current().unwrap(), 1);
-        assert!(c.next());
-        assert_eq!(c.position(), Some(2));
-        assert_eq!(*c.current().unwrap(), 3);
-        assert!(!c.next());
-        assert!(c.position().is_none());
-        // prev from at-end (pos None) is a no-op; reposition via last.
-        assert!(!c.prev());
-        assert_eq!(c.last(), Some(2));
-        assert!(c.prev());
-        assert_eq!(c.position(), Some(0));
-        assert!(!c.prev());
-    }
-
-    #[test]
-    #[should_panic(expected = "cursor: seek to None")]
-    fn cursor_seek_none_panics() {
-        let mut s: VecStore<u64, MC> = VecStore::new();
-        s.push_back(1);
-        s.remove(0);
-        let mut c = s.cursor();
-        c.seek(0);
-    }
-
-    #[test]
     fn swap_slots() {
         let mut s: VecStore<u64, MC> = VecStore::new();
         s.push_back(1);
@@ -486,13 +469,19 @@ mod vec {
         let mut s: VecStore<u64, MC> = VecStore::new();
         for op in 0..300u64 {
             match op % 6 {
-                0 if s.len() < MC => { s.push_back(op); }
-                1 if s.len() < MC => { s.push_front(op); }
+                0 if s.len() < MC => {
+                    s.push_back(op);
+                }
+                1 if s.len() < MC => {
+                    s.push_front(op);
+                }
                 2 if s.occupied() > 0 => {
                     let idx = s.buf.iter().position(|o| o.is_some()).unwrap();
                     s.remove(idx);
                 }
-                3 if s.len() + 2 <= MC => { s.grow_back(1); }
+                3 if s.len() + 2 <= MC => {
+                    s.grow_back(1);
+                }
                 _ => {}
             }
             assert_inv(&s, MC);
@@ -680,95 +669,100 @@ mod deq {
         assert_eq!(final_, orig);
     }
 
-///compare a DequeStore find fn against a reference over many configs, including
-///pos at the front/back boundary (Less/Equal/Greater than flen).
-fn check_find<F, R>(find: F, ref_fn: R, is_wrapped: bool)
-where
-    F: Fn(&DequeStore<u64, MC>, usize, bool, usize, Option<usize>) -> Option<(usize, usize)>,
-    R: Fn(&[Option<u64>], usize, bool, usize, Option<usize>) -> Option<(usize, usize)>,
-{
-    let mut s = if is_wrapped { wrapped() } else { DequeStore::new() };
-    if !is_wrapped {
-        for i in 0..10 {
-            s.push_back(i);
+    ///compare a DequeStore find fn against a reference over many configs, including
+    ///pos at the front/back boundary (Less/Equal/Greater than flen).
+    fn check_find<F, R>(find: F, ref_fn: R, is_wrapped: bool)
+    where
+        F: Fn(
+            &DequeStore<u64, MC>,
+            usize,
+            bool,
+            usize,
+            Option<usize>,
+        ) -> Option<(usize, usize)>,
+        R: Fn(&[Option<u64>], usize, bool, usize, Option<usize>) -> Option<(usize, usize)>,
+    {
+        let mut s = if is_wrapped { wrapped() } else { DequeStore::new() };
+        if !is_wrapped {
+            for i in 0..10 {
+                s.push_back(i);
+            }
         }
-    }
-    // punch some Nones
-    s.remove(2);
-    s.remove(5);
-    if !is_wrapped {
-        s.remove(7);
-    }
-    let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-    let n = s.len();
-    let budgets = [1usize, 2, 3, 5, 8, 16, 100];
-    for pos in 0..n {
-        if snap[pos].is_none() {
-            continue; // contract: pos occupied
+        // punch some Nones
+        s.remove(2);
+        s.remove(5);
+        if !is_wrapped {
+            s.remove(7);
         }
-        for &dir in &[false, true] {
-            for &b in &budgets {
-                for pin in [None, Some(0usize), Some(3), Some(n - 1), Some(pos)] {
-                    let got = find(&s, pos, dir, b, pin);
-                    let exp = ref_fn(&snap, pos, dir, b, pin);
-                    assert_eq!(
-                        got, exp,
-                        "find pos={pos} dir={dir} b={b} pin={pin:?} wrapped={is_wrapped}"
-                    );
+        let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
+        let n = s.len();
+        let budgets = [1usize, 2, 3, 5, 8, 16, 100];
+        for pos in 0..n {
+            if snap[pos].is_none() {
+                continue; // contract: pos occupied
+            }
+            for &dir in &[false, true] {
+                for &b in &budgets {
+                    for pin in [None, Some(0usize), Some(3), Some(n - 1), Some(pos)] {
+                        let got = find(&s, pos, dir, b, pin);
+                        let exp = ref_fn(&snap, pos, dir, b, pin);
+                        assert_eq!(
+                            got, exp,
+                            "find pos={pos} dir={dir} b={b} pin={pin:?} wrapped={is_wrapped}"
+                        );
+                    }
                 }
             }
         }
     }
-}
-
-#[test]
-fn find_slot_matches_ref_contiguous() {
-    check_find(
-        |s, pos, dir, b, pin| s.find_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
-        ref_find_slot,
-        false,
-    );
-}
-
-#[test]
-fn find_slot_matches_ref_wrapped() {
-    check_find(
-        |s, pos, dir, b, pin| s.find_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
-        ref_find_slot,
-        true,
-    );
-}
-
-#[test]
-fn find_nearest_matches_ref_contiguous() {
-    check_find(
-        |s, pos, dir, b, pin| s.find_nearest_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
-        ref_nearest,
-        false,
-    );
-}
-
-#[test]
-fn find_nearest_matches_ref_wrapped() {
-    check_find(
-        |s, pos, dir, b, pin| s.find_nearest_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
-        ref_nearest,
-        true,
-    );
-}
 
     #[test]
-    fn iter_cursor_wrapped() {
+    fn find_slot_matches_ref_contiguous() {
+        check_find(
+            |s, pos, dir, b, pin| s.find_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
+            ref_find_slot,
+            false,
+        );
+    }
+
+    #[test]
+    fn find_slot_matches_ref_wrapped() {
+        check_find(
+            |s, pos, dir, b, pin| s.find_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
+            ref_find_slot,
+            true,
+        );
+    }
+
+    #[test]
+    fn find_nearest_matches_ref_contiguous() {
+        check_find(
+            |s, pos, dir, b, pin| {
+                s.find_nearest_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to))
+            },
+            ref_nearest,
+            false,
+        );
+    }
+
+    #[test]
+    fn find_nearest_matches_ref_wrapped() {
+        check_find(
+            |s, pos, dir, b, pin| {
+                s.find_nearest_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to))
+            },
+            ref_nearest,
+            true,
+        );
+    }
+
+    #[test]
+    fn iter_rev_wrapped() {
         let s = wrapped();
         let fwd: Vec<u64> = s.iter().copied().collect();
         let mut rev = fwd.clone();
         rev.reverse();
         assert_eq!(s.iter().rev().copied().collect::<Vec<_>>(), rev);
-        let mut c = s.cursor();
-        assert_eq!(c.first(), Some(0));
-        assert_eq!(*c.current().unwrap(), *s.get(0));
-        assert!(c.next());
-        assert_eq!(c.last(), Some(s.len() - 1));
     }
 
     ///front→back fallback under a `max` pin. front all Some (forces the fallback);

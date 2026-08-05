@@ -1,17 +1,22 @@
 use std::cmp::Ordering::*;
-use std::{collections::VecDeque,
-          ops::Index};
+use std::collections::VecDeque;
 
 ///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that limits max cap and provides
 ///access/shift semantics
 ///address translation
 ///dumb insertion
 pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
-
     ///in-bounds occupied slot. bounds-checks; panics if the slot is None (contract violation).
     fn get<'b>(&'b self, ptr: usize) -> &'b T;
 
     fn get_mut(&mut self, ptr: usize) -> &mut T;
+
+    ///in-bounds slot: `Some` ref if occupied, `None` if empty. used by the block cursor
+    ///to scan across gaps without panicking.
+    fn slot(&self, p: usize) -> Option<&T>;
+
+    ///in-bounds mut slot: `Some` mut ref if occupied, `None` if empty.
+    fn slot_mut(&mut self, p: usize) -> Option<&mut T>;
 
     ///slide the None at `from` to `to`; returns `to`. `from==to` => no slide. `pin`, if set, is a
     ///slot whose element must not move.
@@ -97,10 +102,9 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///take slot len-1 if Some (set None), else None. occupancy -1 when Some.
     fn pop_back(&mut self) -> Option<T>;
 
-    fn iter<'b>(&'b self) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
-    where 'a: 'b;
-
-    fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
+    fn iter<'b>(
+        &'b self,
+    ) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
     where 'a: 'b;
 
     fn slots<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
@@ -159,7 +163,6 @@ impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> Iterator for SomeIter<'b, T, 
 }
 
 impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> ExactSizeIterator for SomeIter<'b, T, I> {
-
     #[inline]
     fn len(&self) -> usize {
         self.remaining
@@ -169,7 +172,6 @@ impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> ExactSizeIterator for SomeIte
 impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterator
     for SomeIter<'b, T, I>
 {
-
     fn next_back(&mut self) -> Option<&'b T> {
         for slot in self.inner.by_ref().rev() {
             if let Some(v) = slot {
@@ -177,116 +179,6 @@ impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterato
                 return Some(v);
             }
         }
-        None
-    }
-}
-
-///positioned reader over a store's `Some` slots — distinct from `iter()` (a forward
-///`ExactSizeIterator`). `seek` is O(1) (direct index); `next`/`prev`/first-positioning scan
-///across `None` gaps. `pos == None` means at-end (no current element).
-pub trait Cursor<'b, T: 'b> {
-
-    ///physical slot of the current element, or `None` if at-end.
-    fn position(&self) -> Option<usize>;
-
-    ///current element, or `None` if at-end.
-    fn current(&self) -> Option<&'b T>;
-
-    ///O(1) jump to physical slot `p`; panics if out of bounds or `None`.
-    fn seek(&mut self, p: usize);
-
-    ///advance to the next `Some` slot. returns false iff at-end (no advance).
-    fn next(&mut self) -> bool;
-
-    ///advance to the previous `Some` slot. returns false iff already at the first.
-    fn prev(&mut self) -> bool;
-
-    ///seek to the nearest `Some` to the beginning (the first occupied slot). its position, or `None` if empty.
-    fn first(&mut self) -> Option<usize>;
-
-    ///seek to the nearest `Some` to the end (the last occupied slot). its position, or `None` if empty.
-    fn last(&mut self) -> Option<usize>;
-}
-
-///cursor backed by direct indexing into `S` (a `Vec`/`VecDeque` of `Option<T>`).
-pub(crate) struct SlotCursor<'b, T: 'b, S: Index<usize, Output = Option<T>>> {
-    buf:    &'b S,
-    nslots: usize,
-    pos:    Option<usize>,
-}
-
-impl<'b, T: 'b, S: Index<usize, Output = Option<T>>> SlotCursor<'b, T, S> {
-
-    fn new(buf: &'b S, nslots: usize) -> Self {
-        let mut c = Self { buf, nslots, pos: None };
-        let _ = c.first();
-        c
-    }
-
-    #[inline]
-    fn slot(&self, p: usize) -> &'b T {
-        self.buf[p].as_ref().expect("cursor: None at occupied slot")
-    }
-}
-
-impl<'b, T: 'b, S: Index<usize, Output = Option<T>>> Cursor<'b, T> for SlotCursor<'b, T, S> {
-
-    fn position(&self) -> Option<usize> {
-        self.pos
-    }
-
-    fn current(&self) -> Option<&'b T> {
-        self.pos.map(|p| self.slot(p))
-    }
-
-    fn seek(&mut self, p: usize) {
-        assert!(p < self.nslots, "cursor: seek out of bounds");
-        assert!(self.buf[p].is_some(), "cursor: seek to None");
-        self.pos = Some(p);
-    }
-
-    fn next(&mut self) -> bool {
-        let Some(p) = self.pos else { return false };
-        for q in (p + 1)..self.nslots {
-            if self.buf[q].is_some() {
-                self.pos = Some(q);
-                return true;
-            }
-        }
-        self.pos = None;
-        false
-    }
-
-    fn prev(&mut self) -> bool {
-        let Some(p) = self.pos else { return false };
-        for q in (0..p).rev() {
-            if self.buf[q].is_some() {
-                self.pos = Some(q);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn first(&mut self) -> Option<usize> {
-        for p in 0..self.nslots {
-            if self.buf[p].is_some() {
-                self.pos = Some(p);
-                return Some(p);
-            }
-        }
-        self.pos = None;
-        None
-    }
-
-    fn last(&mut self) -> Option<usize> {
-        for p in (0..self.nslots).rev() {
-            if self.buf[p].is_some() {
-                self.pos = Some(p);
-                return Some(p);
-            }
-        }
-        self.pos = None;
         None
     }
 }
@@ -350,7 +242,6 @@ impl<T, const MAX_CAP: usize> VecStore<T, MAX_CAP> {
 }
 
 impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_CAP> {
-
     fn new() -> Self {
         Self { buf: Vec::new(), occupied: 0 }
     }
@@ -361,6 +252,14 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
 
     fn get_mut(&mut self, ptr: usize) -> &mut T {
         self.buf[ptr].as_mut().expect("store: None at occupied ptr")
+    }
+
+    fn slot(&self, p: usize) -> Option<&T> {
+        self.buf[p].as_ref()
+    }
+
+    fn slot_mut(&mut self, p: usize) -> Option<&mut T> {
+        self.buf[p].as_mut()
     }
 
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
@@ -396,7 +295,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         //clamp to keep the slide off the pin. pin never inside [from,to] after this.
         let (min, max) = match pin {
             Some(p) if p == pos => {
-
                 //pos pinned: search DIR side only. after(dir=true)⇒right, before⇒left.
                 if dir { (pos, max) } else { (min, pos) }
             }
@@ -410,16 +308,17 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         //outward scan over [min, pos) down and (pos, max) up.
         let lcnt = pos - min;
         let rcnt = max.saturating_sub(pos + 1);
-        match if dir { dual_scan_outward::<_, true>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt) }
-              else { dual_scan_outward::<_, false>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt) }
-        {
+        match if dir {
+            dual_scan_outward::<_, true>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt)
+        } else {
+            dual_scan_outward::<_, false>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt)
+        } {
             NearestNone::Left(l) => {
                 Some(NoneSlide { from: l, to: if !dir { pos - 1 } else { pos } })
             }
-            NearestNone::Right(r) => Some(NoneSlide {
-                from: r,
-                to:   if dir { pos + 1 } else { pos },
-            }),
+            NearestNone::Right(r) => {
+                Some(NoneSlide { from: r, to: if dir { pos + 1 } else { pos } })
+            }
             NearestNone::NotFound => None,
         }
     }
@@ -436,7 +335,11 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         let min = pos.saturating_sub(budget);
         let (min, max) = match pin {
             Some(p) if p == pos => {
-                if dir { (pos, max) } else { (min, pos) }
+                if dir {
+                    (pos, max)
+                } else {
+                    (min, pos)
+                }
             }
             Some(p) if p < pos => (min.max(p + 1), max),
             Some(p) => (min, max.min(p)),
@@ -592,7 +495,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
     }
 
     fn split_and_rotate(&mut self, at: usize) -> Self {
-
         // odds-gap both halves: element at half-index i -> physical slot 2i+1 (even None).
         // the store doesn't know the address space (max representable addr != MAX_CAP in
         // general), so it just spreads by 2i+1; the block layer owns vptr/translator mapping.
@@ -645,14 +547,11 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         v
     }
 
-    fn iter<'b>(&'b self) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
+    fn iter<'b>(
+        &'b self,
+    ) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
     where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
-    }
-
-    fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
-    where T: 'b {
-        SlotCursor::new(&self.buf, self.buf.len())
     }
 
     fn slots<'b>(&self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
@@ -677,7 +576,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
 }
 
 impl<T, const MAX_CAP: usize> VecStore<T, MAX_CAP> {
-
     /// SAFETY: ptr must be in-bounds and occupied.
     pub(crate) unsafe fn get_unchecked(&self, ptr: usize) -> &T {
         unsafe { self.buf.get_unchecked(ptr).as_ref().unwrap_unchecked() }
@@ -703,7 +601,6 @@ impl<T, const MAX_CAP: usize> DequeStore<T, MAX_CAP> {
 }
 
 impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX_CAP> {
-
     fn new() -> Self {
         Self { buf: VecDeque::new(), occupied: 0 }
     }
@@ -714,6 +611,14 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
 
     fn get_mut(&mut self, ptr: usize) -> &mut T {
         self.buf[ptr].as_mut().expect("store: None at occupied ptr")
+    }
+
+    fn slot(&self, p: usize) -> Option<&T> {
+        self.buf[p].as_ref()
+    }
+
+    fn slot_mut(&mut self, p: usize) -> Option<&mut T> {
+        self.buf[p].as_mut()
     }
 
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
@@ -797,25 +702,39 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                 debug_assert!(front[pos].is_some());
                 let fmax = max.min(fl);
                 let scan = |front, back| match dir {
-                    true => dual_scan_outward::<_, true>(front, back, pos.wrapping_sub(1), pos + 1, pos - min, fmax.saturating_sub(pos + 1)),
-                    false => dual_scan_outward::<_, false>(front, back, pos.wrapping_sub(1), pos + 1, pos - min, fmax.saturating_sub(pos + 1)),
+                    true => dual_scan_outward::<_, true>(
+                        front,
+                        back,
+                        pos.wrapping_sub(1),
+                        pos + 1,
+                        pos - min,
+                        fmax.saturating_sub(pos + 1),
+                    ),
+                    false => dual_scan_outward::<_, false>(
+                        front,
+                        back,
+                        pos.wrapping_sub(1),
+                        pos + 1,
+                        pos - min,
+                        fmax.saturating_sub(pos + 1),
+                    ),
                 };
                 match scan(front, front) {
                     NearestNone::Left(l) => {
                         Some(NoneSlide { from: l, to: if !dir { pos - 1 } else { pos } })
                     }
-                    NearestNone::Right(r) => Some(NoneSlide {
-                        from: r,
-                        to:   if dir { pos + 1 } else { pos },
-                    }),
+                    NearestNone::Right(r) => {
+                        Some(NoneSlide { from: r, to: if dir { pos + 1 } else { pos } })
+                    }
 
                     //front exhausted within budget: any None in back is right of pos.
-                    NearestNone::NotFound => {
-                        back[0..max.saturating_sub(fl)].iter().position(|i| i.is_none()).map(|x| {
+                    NearestNone::NotFound => back[0..max.saturating_sub(fl)]
+                        .iter()
+                        .position(|i| i.is_none())
+                        .map(|x| {
                             let r = x + fl;
                             NoneSlide { from: r, to: if dir { pos + 1 } else { pos } }
-                        })
-                    }
+                        }),
                 }
             }
             Equal => {
@@ -824,8 +743,22 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                 debug_assert!(!back.is_empty() && back[0].is_some());
                 let bcnt = max.saturating_sub(fl);
                 let scan = |front, back| match dir {
-                    true => dual_scan_outward::<_, true>(front, back, fl.wrapping_sub(1), 1, fl - min, bcnt.saturating_sub(1)),
-                    false => dual_scan_outward::<_, false>(front, back, fl.wrapping_sub(1), 1, fl - min, bcnt.saturating_sub(1)),
+                    true => dual_scan_outward::<_, true>(
+                        front,
+                        back,
+                        fl.wrapping_sub(1),
+                        1,
+                        fl - min,
+                        bcnt.saturating_sub(1),
+                    ),
+                    false => dual_scan_outward::<_, false>(
+                        front,
+                        back,
+                        fl.wrapping_sub(1),
+                        1,
+                        fl - min,
+                        bcnt.saturating_sub(1),
+                    ),
                 };
                 match scan(front, back) {
                     NearestNone::Left(p) => {
@@ -845,8 +778,22 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                 let fmin = min.saturating_sub(fl);
                 let fmax = max.saturating_sub(fl);
                 let scan = |front, back| match dir {
-                    true => dual_scan_outward::<_, true>(front, back, fpos.wrapping_sub(1), fpos + 1, fpos - fmin, fmax.saturating_sub(fpos + 1)),
-                    false => dual_scan_outward::<_, false>(front, back, fpos.wrapping_sub(1), fpos + 1, fpos - fmin, fmax.saturating_sub(fpos + 1)),
+                    true => dual_scan_outward::<_, true>(
+                        front,
+                        back,
+                        fpos.wrapping_sub(1),
+                        fpos + 1,
+                        fpos - fmin,
+                        fmax.saturating_sub(fpos + 1),
+                    ),
+                    false => dual_scan_outward::<_, false>(
+                        front,
+                        back,
+                        fpos.wrapping_sub(1),
+                        fpos + 1,
+                        fpos - fmin,
+                        fmax.saturating_sub(fpos + 1),
+                    ),
                 };
                 match scan(back, back) {
                     NearestNone::Left(l) => {
@@ -859,14 +806,12 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                     }
 
                     //back exhausted within budget: any None in front is left of pos.
-                    NearestNone::NotFound => front[min.min(fl)..fl]
-                        .iter()
-                        .rev()
-                        .position(|o| o.is_none())
-                        .map(|p| {
+                    NearestNone::NotFound => {
+                        front[min.min(fl)..fl].iter().rev().position(|o| o.is_none()).map(|p| {
                             let abs = fl - p - 1;
                             NoneSlide { from: abs, to: if !dir { pos - 1 } else { pos } }
-                        }),
+                        })
+                    }
                 }
             }
         }
@@ -885,7 +830,11 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         let min = pos.saturating_sub(budget);
         let (min, max) = match pin {
             Some(p) if p == pos => {
-                if dir { (pos, max) } else { (min, pos) }
+                if dir {
+                    (pos, max)
+                } else {
+                    (min, pos)
+                }
             }
             Some(p) if p < pos => (min.max(p + 1), max),
             Some(p) => (min, max.min(p)),
@@ -1113,7 +1062,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
     }
 
     fn split_and_rotate(&mut self, at: usize) -> Self {
-
         // odds-gap both halves: element at half-index i -> physical slot 2i+1 (even None).
         // the store doesn't know the address space (max representable addr != MAX_CAP in
         // general), so it just spreads by 2i+1; the block layer owns vptr/translator mapping.
@@ -1166,14 +1114,11 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         v
     }
 
-    fn iter<'b>(&'b self) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
+    fn iter<'b>(
+        &'b self,
+    ) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
     where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
-    }
-
-    fn cursor<'b>(&'b self) -> impl Cursor<'b, T> + 'b
-    where T: 'b {
-        SlotCursor::new(&self.buf, self.buf.len())
     }
 
     fn slots<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
