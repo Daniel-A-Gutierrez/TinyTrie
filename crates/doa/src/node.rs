@@ -69,8 +69,8 @@ where
     I: Node + Copy,
     L: Node + Copy,
 {
-    inode: I,
-    lnode: L,
+    pub inode: I,
+    pub lnode: L,
 }
 
 impl<K, V, P, I, L> Node for UnionNode<I, L>

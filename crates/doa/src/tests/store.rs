@@ -313,14 +313,14 @@ mod vec {
             s.push_back(i);
         }
         s.remove(2); // [1,2,None,4]
-        let to = s.slide_none(NoneSlide { from: 2, to: 0 }, None);
+        let to = s.slide_none(NoneSlide::new(2, 0), None);
         assert_eq!(to, 0);
         assert_eq!(s.buf[0], None);
         assert_eq!(s.buf[1], Some(1));
         assert_eq!(s.buf[2], Some(2));
         assert_eq!(s.buf[3], Some(4));
         // reverse: slide None 0 -> 2
-        let to = s.slide_none(NoneSlide { from: 0, to: 2 }, None);
+        let to = s.slide_none(NoneSlide::new(0, 2), None);
         assert_eq!(to, 2);
         assert_eq!(s.buf[2], None);
         assert_eq!(s.buf[0], Some(1));
@@ -334,7 +334,7 @@ mod vec {
             s.push_back(i);
         }
         s.remove(2); // [1,2,None,4]
-        let _ = s.slide_none(NoneSlide { from: 2, to: 0 }, Some(3));
+        let _ = s.slide_none(NoneSlide::new(2, 0), Some(3));
         assert_eq!(s.buf[3], Some(4), "pinned slot moved");
         assert_eq!(s.buf[0], None);
     }
@@ -630,13 +630,13 @@ mod deq {
         for from in 0..n {
             for to in 0..n {
                 let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-                let _ = s.slide_none(NoneSlide { from, to }, None);
+                let _ = s.slide_none(NoneSlide::new(from, to), None);
                 let mut exp = snap.clone();
                 ref_slide(&mut exp, from, to);
                 let got: Vec<Option<u64>> = s.buf.iter().cloned().collect();
                 assert_eq!(got, exp, "slide {from}->{to} (wrapped)");
                 // restore
-                let _ = s.slide_none(NoneSlide { from: to, to: from }, None);
+                let _ = s.slide_none(NoneSlide::new(to, from), None);
             }
         }
         // fully restored
@@ -657,12 +657,12 @@ mod deq {
         for from in 0..n {
             for to in 0..n {
                 let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-                let _ = s.slide_none(NoneSlide { from, to }, None);
+                let _ = s.slide_none(NoneSlide::new(from, to), None);
                 let mut exp = snap.clone();
                 ref_slide(&mut exp, from, to);
                 let got: Vec<Option<u64>> = s.buf.iter().cloned().collect();
                 assert_eq!(got, exp, "slide {from}->{to} (contiguous)");
-                let _ = s.slide_none(NoneSlide { from: to, to: from }, None);
+                let _ = s.slide_none(NoneSlide::new(to, from), None);
             }
         }
         let final_: Vec<Option<u64>> = s.buf.iter().cloned().collect();

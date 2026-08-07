@@ -1,5 +1,8 @@
 use std::cmp::Ordering::*;
 use std::collections::VecDeque;
+use crate::Fixup;
+use crate::index::BlockIndex;
+use crate::translator::{AddressTranslator, Translator};
 
 ///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that limits max cap and provides
 ///access/shift semantics
@@ -124,10 +127,25 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
 }
 
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
+///delta: shift each moved item's phys by. from>to ⇒ None moves left ⇒ items move
+///right ⇒ +1. from<to ⇒ items move left ⇒ -1. equal ⇒ 0.
 #[derive(Clone, Copy)]
 pub struct NoneSlide {
     pub(crate) from: usize,
     pub(crate) to:   usize,
+    pub(crate) delta : isize,
+}
+
+impl NoneSlide {
+    pub(crate) fn new(from: usize, to: usize) -> Self {
+        Self { from, to, delta: (from as isize - to as isize).signum() }
+    }
+}
+
+impl Fixup for NoneSlide {
+    fn fix_p(&self, p: &mut usize) {
+        *p = p.wrapping_add(self.delta as usize); //delta=-1 ⇒ usize::MAX ⇒ p-1
+    }
 }
 
 ///which side the nearest None was found on (slice-relative index).
@@ -314,10 +332,10 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
             dual_scan_outward::<_, false>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt)
         } {
             NearestNone::Left(l) => {
-                Some(NoneSlide { from: l, to: if !dir { pos - 1 } else { pos } })
+                Some(NoneSlide::new(l, if !dir { pos - 1 } else { pos }))
             }
             NearestNone::Right(r) => {
-                Some(NoneSlide { from: r, to: if dir { pos + 1 } else { pos } })
+                Some(NoneSlide::new(r, if dir { pos + 1 } else { pos }))
             }
             NearestNone::NotFound => None,
         }
@@ -352,24 +370,24 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
             if rcnt > 0
                 && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
             {
-                return Some(NoneSlide { from: pos + 1 + r, to: pos + 1 });
+                return Some(NoneSlide::new(pos + 1 + r, pos + 1));
             }
             if lcnt > 0
                 && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
             {
-                return Some(NoneSlide { from: min + l, to: pos });
+                return Some(NoneSlide::new(min + l, pos));
             }
             None
         } else {
             if lcnt > 0
                 && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
             {
-                return Some(NoneSlide { from: min + l, to: pos - 1 });
+                return Some(NoneSlide::new(min + l, pos - 1));
             }
             if rcnt > 0
                 && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
             {
-                return Some(NoneSlide { from: pos + 1 + r, to: pos });
+                return Some(NoneSlide::new(pos + 1 + r, pos));
             }
             None
         }
@@ -721,10 +739,10 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                 };
                 match scan(front, front) {
                     NearestNone::Left(l) => {
-                        Some(NoneSlide { from: l, to: if !dir { pos - 1 } else { pos } })
+                        Some(NoneSlide::new(l, if !dir { pos - 1 } else { pos }))
                     }
                     NearestNone::Right(r) => {
-                        Some(NoneSlide { from: r, to: if dir { pos + 1 } else { pos } })
+                        Some(NoneSlide::new(r, if dir { pos + 1 } else { pos }))
                     }
 
                     //front exhausted within budget: any None in back is right of pos.
@@ -733,7 +751,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                         .position(|i| i.is_none())
                         .map(|x| {
                             let r = x + fl;
-                            NoneSlide { from: r, to: if dir { pos + 1 } else { pos } }
+                            NoneSlide::new(r, if dir { pos + 1 } else { pos })
                         }),
                 }
             }
@@ -762,11 +780,11 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                 };
                 match scan(front, back) {
                     NearestNone::Left(p) => {
-                        Some(NoneSlide { from: p, to: if !dir { pos - 1 } else { pos } })
+                        Some(NoneSlide::new(p, if !dir { pos - 1 } else { pos }))
                     }
                     NearestNone::Right(p) => {
                         let r = p + fl;
-                        Some(NoneSlide { from: r, to: if dir { pos + 1 } else { pos } })
+                        Some(NoneSlide::new(r, if dir { pos + 1 } else { pos }))
                     }
                     NearestNone::NotFound => None,
                 }
@@ -798,18 +816,18 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
                 match scan(back, back) {
                     NearestNone::Left(l) => {
                         let abs = l + fl;
-                        Some(NoneSlide { from: abs, to: if !dir { pos - 1 } else { pos } })
+                        Some(NoneSlide::new(abs, if !dir { pos - 1 } else { pos }))
                     }
                     NearestNone::Right(r) => {
                         let abs = r + fl;
-                        Some(NoneSlide { from: abs, to: if dir { pos + 1 } else { pos } })
+                        Some(NoneSlide::new(abs, if dir { pos + 1 } else { pos }))
                     }
 
                     //back exhausted within budget: any None in front is left of pos.
                     NearestNone::NotFound => {
                         front[min.min(fl)..fl].iter().rev().position(|o| o.is_none()).map(|p| {
                             let abs = fl - p - 1;
-                            NoneSlide { from: abs, to: if !dir { pos - 1 } else { pos } }
+                            NoneSlide::new(abs, if !dir { pos - 1 } else { pos })
                         })
                     }
                 }
@@ -909,18 +927,18 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
 
         if dir {
             if let Some(r) = scan_right() {
-                return Some(NoneSlide { from: r, to: pos + 1 });
+                return Some(NoneSlide::new(r, pos + 1));
             }
             if let Some(l) = scan_left() {
-                return Some(NoneSlide { from: l, to: pos });
+                return Some(NoneSlide::new(l, pos));
             }
             None
         } else {
             if let Some(l) = scan_left() {
-                return Some(NoneSlide { from: l, to: pos - 1 });
+                return Some(NoneSlide::new(l, pos - 1));
             }
             if let Some(r) = scan_right() {
-                return Some(NoneSlide { from: r, to: pos });
+                return Some(NoneSlide::new(r, pos));
             }
             None
         }

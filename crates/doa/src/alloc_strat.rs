@@ -27,6 +27,7 @@ pub trait AllocStrat<P: BlockIndex>: 'static {
     const CAP_LIMIT: usize;
     ///logical direction reversed (front = high end). Prepend only.
     const REVERSED: bool;
+    const INIT_ROOT : P;
 
     ///translator mutations per event.
     fn on_grow(t: &mut Translator<P>) {
@@ -72,7 +73,7 @@ macro_rules! strat {
            inner: $inner:expr, outer: $outer:expr,
            spread: $spread:expr, inner_grows: $ig:expr, outer_shrinks: $os:expr,
            budget: $budget:expr, cap_limit: $clim:expr, reversed: $rev:expr,
-           push_front_grows: $pfg:tt, }
+           push_front_grows: $pfg:tt, init_root : $init_root:expr}
     ) => {
         impl<$($g)*> AllocStrat<P> for $ty {
             const INIT_SHIFT: u32 = $shift;
@@ -85,6 +86,7 @@ macro_rules! strat {
             const INSERT_BUDGET: usize = $budget;
             const CAP_LIMIT: usize = $clim;
             const REVERSED: bool = $rev;
+            const INIT_ROOT: P = $init_root;
             strat_push_front!($pfg);
         }
     };
@@ -95,7 +97,7 @@ strat!((P: BlockIndex) => Uniform<PreOrder>, {
     inner: 0, outer: 0, spread: 0,
     inner_grows: false, outer_shrinks: false,
     budget: P::BIT_WIDTH as usize, cap_limit: 1 << P::BIT_WIDTH, reversed: false,
-    push_front_grows: false,
+    push_front_grows: false, init_root : P::ZERO
 });
 
 strat!((P: BlockIndex) => Uniform<InOrder>, {
@@ -103,7 +105,7 @@ strat!((P: BlockIndex) => Uniform<InOrder>, {
     inner: 0, outer: 0, spread: 0,
     inner_grows: false, outer_shrinks: false,
     budget: P::BIT_WIDTH as usize, cap_limit: 1 << P::BIT_WIDTH, reversed: false,
-    push_front_grows: false,
+    push_front_grows: false,init_root : P::MIDPOINT
 });
 
 strat!((P: BlockIndex) => Uniform<PostOrder>, {
@@ -111,7 +113,7 @@ strat!((P: BlockIndex) => Uniform<PostOrder>, {
     inner: 1 << (P::BIT_WIDTH - 1), outer: 0, spread: 1,
     inner_grows: false, outer_shrinks: true,
     budget: P::BIT_WIDTH as usize, cap_limit: 1 << P::BIT_WIDTH, reversed: false,
-    push_front_grows: false,
+    push_front_grows: false, init_root : P::MAX
 });
 
 // Pluripotent written by hand (not via strat!) because its on_push_front lives in
@@ -130,6 +132,7 @@ impl<P: BlockIndex, O: Ordering> AllocStrat<P> for Pluripotent<O> {
     const INSERT_BUDGET: usize = P::Half::BIT_WIDTH as usize;
     const CAP_LIMIT: usize = 1 << P::Half::BIT_WIDTH;
     const REVERSED: bool = false;
+    const INIT_ROOT : P = P::MIDPOINT;
     fn on_push_front(t: &mut Translator<P>) {
         t.set_outer_offset(t.outer_offset().wrapping_sub(P::from_usize(1 << t.shift())));
     }
@@ -141,6 +144,7 @@ strat!((P: BlockIndex) => Append, {
     inner_grows: false, outer_shrinks: false,
     budget: 16, cap_limit: (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH), reversed: false,
     push_front_grows: true,
+    init_root: P::ZERO
 });
 
 strat!((P: BlockIndex) => Prepend, {
@@ -148,5 +152,5 @@ strat!((P: BlockIndex) => Prepend, {
     inner: 1 << P::Half::BIT_WIDTH, outer: 0, spread: 0,
     inner_grows: false, outer_shrinks: false,
     budget: 16, cap_limit: (1 << P::BIT_WIDTH) - (1 << P::Half::BIT_WIDTH), reversed: true,
-    push_front_grows: true,
+    push_front_grows: true, init_root: P::ZERO
 });

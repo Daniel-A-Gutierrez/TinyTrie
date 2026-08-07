@@ -7,6 +7,28 @@ I need a block cursor that stores a reference to the block, probably with positi
 It needs to yield the block so i can translate and seek using stored ptrs. 
 or actually i think cursor just needs to be implemented at the block level, the store is only used by block, so if its cursor isnt useful, best to just move it. 
 
+Ok its at the block level but we still have problems. 
+Why is it that the cursor keeps cropping up as a useful utility? Is it because it lets me know when things need to be upkept? Like when we insert and that possibly moves the item the cursor is pointing to? 
+
+I think i need to accept that im being forced into an architectural decision: 
+- wrap the methods that can shift the item at a physical address in the cursor
+- have the cursor be invalidated in order to perform those ops (they take and return self)
+
+i think ill do the prior. 
+regarding the splitting of traits across trait + trait mut , we also have the doubling of walker / probe to deal with .
+does the walker store P, usize, or & , etc. 
+for now i want find_slot, grow_and_spread, swap, swap_open, and slide none to have cursor variants on blocktraitmut which take a &Mut cursor and fix its position so the item it points to doesnt change. 
+then the walker impl for unionnode can just do self.cursor.next() and prev(), and insert doesnt have to worry about deconstructing itself. 
+
+i think the block should switch to taking physical addresses. still support vget and vget_mut() but theyre conveniences that do the translation automatically. 
+open slot goes from phys to phys+virt.
+the cursor storing phys internally makes fixup very easy , we can actually reason over distances and seek to exact positions from none_slide. 
+find_slot-may grow, affects phys ptrs... returns `Option<GrowFixup>` where GrowFixup {shift, offset} and impls Fixup(usize) -> usize. 
+slide_none moves items in none_slide, none_slide exists to make fixup possible. 
+could impl none_slide.fixup(p) -> new_p , if p was in range it gets incremented/decremented. 
+also none_slide.range() -> Range(lower,higher).
+split and split_and_rotate could have their own fixup types i dont wanna think about. 
+
 # Remaking walker and node
 Ok so the node variants are in, one issue - having the key type be (k,v) means the user needs to know the value in advance, so its not a map. 
 try_route could seek by < or <= to get you a range technically, worth keeping in pocket for future. 

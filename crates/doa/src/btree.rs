@@ -1,12 +1,11 @@
 use std::marker::PhantomData;
 
-use crate::block::Cursor;
-use crate::block::OpenSlot;
+use crate::block_cursor::{BlockCursor, Cursor};
 use crate::index::BlockIndex;
 use crate::node::{D, INode, LNode, Node, SplittableNode, UnionNode};
-use crate::tree_block::{TreeBlock, TreeBlockMut};
+use crate::tree_block::TreeBlockMut;
 use crate::walker::*;
-use crate::{Ordering, PreOrder};
+use crate::PreOrder;
 use arrays::tiny_array::TinyArray;
 
 trait C: D + Copy {}
@@ -85,7 +84,7 @@ where
     }
 
     fn try_route(&self, k: &Self::K) -> Option<usize> {
-        Some(self.keys().position(|key| key >= k).unwrap_or_else(self.keys.len()))
+        Some(self.keys().position(|key| key >= k).unwrap_or(self.keys.len()))
     }
 
     fn child(&self, child_idx: usize) -> &P {
@@ -97,14 +96,14 @@ where
     }
 
     fn insert_child(&mut self, child_addr: Self::P, child_key: Self::K) -> usize {
-        let pos = self.keys().position(|key| &child_key < key).unwrap_or_else(self.keys.len());
+        let pos = self.keys().position(|key| &child_key < key).unwrap_or(self.keys.len());
         self.children.insert_at(pos, child_addr);
         self.keys.insert_at(pos, child_key);
         return pos;
     }
 
     fn remove_child(&mut self, child_key: &Self::K) -> Option<(Self::K, Self::P)> {
-        let pos = self.keys().position(|key| key >= child_key).unwrap_or_else(self.keys.len());
+        let pos = self.keys().position(|key| key >= child_key).unwrap_or(self.keys.len());
         let p = self.children.remove(pos);
         let k = self.keys.remove(pos);
         return Some((k, p));
@@ -113,7 +112,7 @@ where
 
 impl<K, V, P> LNode<K, V> for BLNode<K, V, P>
 where
-    K: C,
+    K: C + Ord,
     V: C,
     P: BlockIndex,
 {
@@ -130,7 +129,7 @@ where
     }
 
     fn insert(&mut self, k: K, v: V) -> usize {
-        let pos = self.keys().position(|key| k < key).unwrap_or_else(self.keys.len());
+        let pos = self.keys().position(|key| k < *key).unwrap_or(self.keys.len());
         self.keys.insert_at(pos, k);
         self.values.insert_at(pos, v);
         return pos;
@@ -143,65 +142,110 @@ where
 
 type BNode<K, V, P> = UnionNode<BINode<K, V, P>, BLNode<K, V, P>>;
 
-///for a b+tree treeblock's meta is its (uniform) height.
-impl<'block, 'walker, K, V, P, B> TreeWalker<'block, 'walker, PreOrder, B>
-    for Probe<'block, 'walker, B>
+///b+tree `TreeBlock` meta is its (uniform) height. discriminates inode (depth <
+/// height) from lnode (depth == height); the block stores nodes in pre-order, so
+/// `go_next`/`go_prev` are block-slot next/prev.
+impl<'block, 'walker, K, V, P, B>
+    TreeWalker<'block, 'walker, PreOrder, B, BlockCursor<'block, 'walker, B, &'walker B>>
+    for Probe<'block, B, BlockCursor<'block, 'walker, B, &'walker B>, Height>
 where
     'block: 'walker,
-    B: TreeBlockMut<'block, T = BNode<K, V, P>, Meta = usize>,
+    B: TreeBlockMut<'block, T = BNode<K, V, P>, Meta = Height, P = P, V = V>,
     K: C,
     V: C,
     P: BlockIndex,
 {
-    ///returns current after moving to next in ordering
-    fn go_next<'b>(&'b mut self) -> Option<&'b B::T>
-    where 'walker: 'b {
-        //at leaf
-        self.cursor.next();
-        self.cursor.current()
+    fn go_next(&mut self) -> Option<&B::T> {
+        self.cursor.next()
     }
-    ///returns current after moving to prev in ordering
-    fn go_prev<'b>(&'b mut self) -> Option<&'b B::T>
-    where 'walker: 'b {
-        self.cursor.prev();
-        self.cursor.current();
+
+    fn go_prev(&mut self) -> Option<&B::T> {
+        self.cursor.prev()
     }
-    ///returns current after moving to child at idx
-    fn descend<'b>(&'b mut self, idx: usize) -> Option<&'b B::T>
-    where 'walker: 'b {
-        let node = self.cursor.current().unwrap();
-        if self.depth < self.cursor {}
+
+    fn descend(&mut self, idx: usize) -> Option<&B::T> {
+        if self.depth >= self.meta.0 {
+            return None;
+        }
+        let next = self
+            .cursor
+            .current()
+            .map(|node| *unsafe { node.inode.children.get(idx) })?;
+        self.depth += 1;
+        self.cursor.seek(next)
     }
-    ///returns current and new depth
-    fn descend_right<'b>(&'b mut self, times: usize) -> Option<(&'b B::T, usize)>
-    where 'walker: 'b {
-        todo!()
+
+    fn descend_right(&mut self, times: usize) -> Option<(&B::T, usize)> {
+        let mut count = 0;
+        while count < times && self.depth < self.meta.0 {
+            let n = match self.cursor.current() {
+                Some(c) => unsafe { c.inode.children.len() },
+                None => break,
+            };
+            if n == 0 {
+                break;
+            }
+            self.descend(n - 1);
+            count += 1;
+        }
+        self.cursor.current().map(|c| (c, count))
     }
-    ///returns how many times walker descended.
-    fn descend_left<'b>(&'b mut self, times: usize) -> Option<(&'b B::T, usize)>
-    where 'walker: 'b {
-        todo!()
+
+    fn descend_left(&mut self, times: usize) -> Option<(&B::T, usize)> {
+        let mut count = 0;
+        while count < times && self.depth < self.meta.0 {
+            let n = match self.cursor.current() {
+                Some(c) => unsafe { c.inode.children.len() },
+                None => break,
+            };
+            if n == 0 {
+                break;
+            }
+            self.descend(0);
+            count += 1;
+        }
+        self.cursor.current().map(|c| (c, count))
     }
-    fn ascend<'b>(&'b mut self) -> Option<&'b B::T>
-    where 'walker: 'b {
-        todo!()
+
+    fn ascend(&mut self) -> Option<&B::T> {
+        if self.depth == 0 {
+            return None;
+        }
+        let parent = self.cursor.current().map(|node| {
+            if self.depth < self.meta.0 {
+                unsafe { node.inode.parent }
+            } else {
+                unsafe { node.lnode.parent }
+            }
+        })?;
+        self.depth -= 1;
+        self.cursor.seek(parent)
     }
+
     fn depth(&self) -> usize {
-        todo!()
+        self.depth as usize
     }
-    fn new(height: usize, block: &B) -> Self {
-        todo!()
+
+    fn new(height: usize, block: &'walker B) -> Self {
+        Self {
+            cursor: BlockCursor::new_at(block, block.root()),
+            depth: 0,
+            meta: Height(height as u64),
+            _l: PhantomData,
+        }
     }
+
     fn position(&self) -> (B::P, usize) {
-        todo!()
+        (self.cursor.address().unwrap_or(P::MIN), self.depth as usize)
     }
 }
 
-impl<'block, 'walker, K, V, P, B> TreeWalkerMut<'block, 'walker, PreOrder, B>
-    for Probe<'block, 'walker, B>
+impl<'block, 'walker, K, V, P, B>
+    TreeWalkerMut<'block, 'walker, PreOrder, B, BlockCursor<'block, 'walker, B, &'walker mut B>>
+    for Probe<'block, B, BlockCursor<'block, 'walker, B, &'walker mut B>, Height>
 where
     'block: 'walker,
-    B: TreeBlockMut<'block, T = BNode<K, V, P>, Meta = usize>,
+    B: TreeBlockMut<'block, T = BNode<K, V, P>, Meta = Height, P = P, V = V>,
     K: C,
     V: C,
     P: BlockIndex,
@@ -209,26 +253,29 @@ where
     fn new_mut(height: usize, block: &'walker mut B) -> Self {
         todo!()
     }
-    fn current_mut<'b>(&'b mut self) -> &'b mut B::T
-    where 'walker: 'b {
+
+    fn current_mut(&mut self) -> Option<&mut <B>::T> {
         todo!()
     }
-    fn insert_child(&mut self, k: <B::T as Node>::K, i: usize, ptr: B::P) {
+
+    fn insert_child(self, k: <<B>::T as Node>::K, i: usize, ptr: <B>::P) -> Self {
         todo!()
     }
-    fn remove_child(&mut self, child: usize) -> Option<(<B::T as Node>::K, B::P)> {
+
+    fn remove_child(&mut self, child: usize) -> Option<(<<B>::T as Node>::K, <B>::P)> {
         todo!()
     }
-    fn split_child(&mut self, child: usize, ptr: B::P)
+
+    fn split_child(self, child: usize, ptr: <B>::P) -> Self
     where B::T: SplittableNode<<B::T as Node>::K> {
         todo!()
     }
-    //move current to an open position
-    fn swap_none(&mut self, other: OpenSlot) {
+
+    fn swap_none(self, other: crate::block::OpenSlot) -> Self {
         todo!()
     }
-    //fixup internal pointers after applying a slide
-    fn fixup_stack(&mut self, fixup: &[(B::P, B::P)]) {
+
+    fn fixup_stack(self, fixup: &[(<B>::P, <B>::P)]) -> Self {
         todo!()
     }
 }

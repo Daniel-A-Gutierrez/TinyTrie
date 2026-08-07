@@ -1,9 +1,10 @@
 use std::marker::PhantomData;
 
 use crate::alloc_strat::AllocStrat;
-use crate::block::{BlockCursor, BlockCursorMut, BlockMutTrait, BlockTrait, OpenSlot, RawBlock};
+use crate::block_cursor::{BlockCursor};
+use crate::block::{BlockMutTrait, BlockTrait, OpenSlot, RawBlock};
 use crate::node::Node;
-use crate::store::Store;
+use crate::store::{NoneSlide, Store};
 use crate::translator::Translator;
 use crate::{Ordering, index::*};
 pub struct TreeBlock<'a, T, P, A, S, O, Meta>
@@ -17,6 +18,7 @@ where
 {
     meta:  Meta,
     block: RawBlock<'a, T, P, A, S>,
+    root : P,
     _o:    PhantomData<O>,
 }
 
@@ -29,6 +31,8 @@ where Self::T: Node
     type O;
     fn meta(&self) -> &Self::Meta;
     fn set_meta(&mut self, m: Self::Meta);
+    fn root(&self) -> Self::P;
+    fn set_root(&mut self, p : Self::P);
 }
 
 impl<'a, T, P, A, S, O, Meta> BlockTrait<'a> for TreeBlock<'a, T, P, A, S, O, Meta>
@@ -43,8 +47,7 @@ where
     type T = T;
     type P = P;
     type S = S;
-    type Cursor<'b>
-        = BlockCursor<'a, 'b, Self>
+    type Cursor<'b> = BlockCursor<'a, 'b, Self, &'b Self>
     where 'a: 'b;
 
     fn store<'b>(&'b self) -> &'b Self::S
@@ -79,11 +82,10 @@ where
     RawBlock<'a, T, P, A, S>: BlockMutTrait<'a, A = A> + BlockTrait<'a, T = T, P = P, S = S>,
 {
     type A = A;
-    type CursorMut<'b>
-        = BlockCursorMut<'a, 'b, Self>
+    type CursorMut<'b> = BlockCursor<'a, 'b, Self, &'b mut Self>
     where 'a: 'b;
     fn new() -> Self {
-        Self { meta: Meta::default(), block: RawBlock::new(), _o: PhantomData }
+        Self { meta: Meta::default(), block: RawBlock::new(), _o: PhantomData, root : A::INIT_ROOT }
     }
 
     fn store_mut(&mut self) -> &mut Self::S {
@@ -95,28 +97,31 @@ where
 
     fn cursor_mut<'b>(&'b mut self) -> Self::CursorMut<'b>
     where 'a: 'b {
-        BlockCursorMut::new(self)
+        BlockCursor::new(self)
     }
 
-    fn insert(&mut self, v: Self::T, slot: OpenSlot) -> Self::P {
+    fn insert(&mut self, v: Self::T, slot: OpenSlot) -> usize {
         self.block.insert(v, slot)
     }
 
     fn split(&mut self) -> Self {
-        Self { meta: Meta::default(), block: self.block.split(), _o: PhantomData }
+        todo!();
+        Self { meta: Meta::default(), block: self.block.split(), _o: PhantomData, root : self.root }
     }
     fn split_and_rotate(&mut self) -> Self {
+        todo!(); //these are stubbed because idk what to set root to in the new block yet. 
         Self {
             meta:  Meta::default(),
             block: self.block.split_and_rotate(),
+            root : self.root,
             _o:    PhantomData,
         }
     }
 
-    fn try_insert_back(&mut self, v: Self::T) -> Result<Self::P, Self::T> {
+    fn try_insert_back(&mut self, v: Self::T) -> Result<usize, Self::T> {
         self.block.try_insert_back(v)
     }
-    fn try_insert_front(&mut self, v: Self::T) -> Result<Self::P, Self::T> {
+    fn try_insert_front(&mut self, v: Self::T) -> Result<usize, Self::T> {
         self.block.try_insert_front(v)
     }
 }
@@ -140,5 +145,9 @@ where
     }
     fn set_meta(&mut self, m: Meta) {
         self.meta = m
+    }
+    fn root(&self) -> Self::P { self.root }
+    fn set_root(&mut self, p : Self::P) {
+        self.root = p;
     }
 }

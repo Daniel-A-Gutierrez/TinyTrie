@@ -10,6 +10,7 @@ mod store;
 mod translator;
 mod tree_block;
 mod walker;
+mod block_cursor;
 use crate::leafblock::{PtrUnion, SlicePtr};
 use crate::translator::{AddressTranslator, Translator};
 use block::*;
@@ -38,6 +39,17 @@ enum RelTo<T> {
 pub(crate) type BPtr = i32;
 pub(crate) type IPtr = u32;
 pub(crate) type LPtr = u16;
+
+pub(crate) trait Fixup{
+    fn fix_v<P : BlockIndex>(&self, v: &mut P, a : &Translator<P>) {
+        let mut p = a.v2p(*v);
+        self.fix_p(&mut p);
+        *v = a.p2v(p);
+    }
+    fn fix_p(&self, p: &mut usize);
+}
+
+
 
 //fractal forest
 struct FractalForest<K: Ord + Sized + Clone, V: Sized> {

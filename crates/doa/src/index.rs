@@ -33,7 +33,7 @@ pub trait Num:
     /// Neutral address — where pointers anchor so growth has room both ways.
     /// Signed: `0`. Unsigned: range midpoint `(MAX >> 1) + 1` = `1 << (bit_width - 1)`.
     const MIDPOINT: Self;
-
+    const ZERO : Self;
     const ONE: Self;
     const MIN: Self;
     const MAX: Self;
@@ -91,6 +91,7 @@ macro_rules! impl_num {
         $( impl Num for $t {
             const MIDPOINT: Self = $midpoint;
             const ONE: Self = 1;
+            const ZERO: Self = 0;
             const MIN: Self = <$t>::MIN;
             const MAX: Self = <$t>::MAX;
             const BIT_WIDTH: u8 = (std::mem::size_of::<$t>() * 8) as u8;
