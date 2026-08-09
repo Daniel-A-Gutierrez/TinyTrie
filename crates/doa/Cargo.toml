@@ -15,12 +15,6 @@ arrays = {path="../arrays"}
 [features]
 default = []
 
-[[bench]]
-name = "layout_bench"
-
-[[bench]]
-name = "spread_bench"
-
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

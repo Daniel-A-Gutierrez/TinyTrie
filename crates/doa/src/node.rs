@@ -16,12 +16,15 @@ pub trait Node {
     type P: BlockIndex;
     //maximum number of children per node (relevant for in-order ordering)
     const DEGREE: usize;
-    ///note that has parent doesn't guarantee parent will work as expected, notably on union nodes it doesnt even if both inner types do.
-    const HAS_PARENT: bool;
-    ///return None if this node type doesnt store a parent ptr
-    fn parent(&self) -> Option<Self::P>;
-    ///make noop if this node type doesnt store a parent ptr
-    fn update_parent(&mut self, p: Self::P);
+}
+
+///kind-free parent pointer. the `UnionNode` wrapper carries it as a direct field;
+///the bare union and the variants do not. a node that is a parent is always an
+///inode, so its children are accessed with the variant already known from depth —
+/// which is what makes a stackless run-parent-fixup possible.
+pub trait HasParent<P: BlockIndex> {
+    fn parent(&self) -> P;
+    fn set_parent(&mut self, p: P);
 }
 
 // pub trait NodeUnion {
@@ -64,13 +67,54 @@ pub trait TaggedChildNode: Node {
     fn children(&self) -> impl DoubleExact<Item = EnumRef<Self::P>>;
 }
 
-pub union UnionNode<I, L>
+///bare untagged union of inode/lnode; variant is external (height-discriminated).
+///never `HasParent` — parent lives on the `UnionNode` wrapper.
+pub union OrphanUnionNode<I, L>
 where
     I: Node + Copy,
     L: Node + Copy,
 {
     pub inode: I,
     pub lnode: L,
+}
+
+impl<K, V, P, I, L> Node for OrphanUnionNode<I, L>
+where
+    K: D,
+    V: D,
+    P: BlockIndex,
+    I: Node<K = K, V = V, P = P> + Copy,
+    L: Node<K = K, V = V, P = P> + Copy,
+{
+    type K = K;
+    type V = V;
+    type P = P;
+    const DEGREE: usize = I::DEGREE;
+}
+
+///`OrphanUnionNode` + a hoisted `parent` field. parent is kind-free (a direct
+///field, no union variant needed) so a stackless walker can read a moved node's
+///parent to fix stale child pointers without an ancestor stack.
+pub struct UnionNode<I, L>
+where
+    I: Node + Copy,
+    L: Node<P = I::P> + Copy,
+{
+    pub orphan: OrphanUnionNode<I, L>,
+    pub parent: I::P,
+}
+
+impl<I, L> HasParent<I::P> for UnionNode<I, L>
+where
+    I: Node + Copy,
+    L: Node<P = I::P> + Copy,
+{
+    fn parent(&self) -> I::P {
+        self.parent
+    }
+    fn set_parent(&mut self, p: I::P) {
+        self.parent = p;
+    }
 }
 
 impl<K, V, P, I, L> Node for UnionNode<I, L>
@@ -85,11 +129,6 @@ where
     type V = V;
     type P = P;
     const DEGREE: usize = I::DEGREE;
-    const HAS_PARENT: bool = I::HAS_PARENT & L::HAS_PARENT;
-    fn parent(&self) -> Option<Self::P> {
-        None
-    }
-    fn update_parent(&mut self, p: Self::P) {}
 }
 
 impl<K, V, P, I, L> Node for EnumNode<I, L>
@@ -104,25 +143,6 @@ where
     type V = V;
     type P = P;
     const DEGREE: usize = I::DEGREE;
-    const HAS_PARENT: bool = I::HAS_PARENT & L::HAS_PARENT;
-    fn parent(&self) -> Option<Self::P> {
-        if Self::HAS_PARENT {
-            match self {
-                Self::INode(i) => i.parent(),
-                Self::LNode(l) => l.parent(),
-            }
-        } else {
-            None
-        }
-    }
-    fn update_parent(&mut self, p: Self::P) {
-        if Self::HAS_PARENT {
-            match self {
-                Self::INode(i) => i.update_parent(p),
-                Self::LNode(l) => l.update_parent(p),
-            }
-        }
-    }
 }
 
 // ///nodes which are an untagged union over an Inode and a LeafNode, discriminated by height or reftag.

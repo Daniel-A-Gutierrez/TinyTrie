@@ -7,6 +7,7 @@ use crate::tree_block::TreeBlockMut;
 use crate::Ordering;
 
 ///use as meta on treeblock for fixed height trees (like b+ trees or S trees)
+#[derive(Default)]
 pub struct Height(pub u64);
 
 pub struct Walker<'block, B, C>
@@ -56,6 +57,12 @@ where
     fn depth(&self) -> usize;
     fn new(height: usize, block: &'walker B) -> Self;
     fn position(&self) -> (B::P, usize);
+    ///route by `k` from the current node to the terminal (leaf) under `k`; returns the
+    ///terminal's vaddr (the walker is left positioned on it). `None` if at-end.
+    fn walk_to(&mut self, k: &<B::T as Node>::K) -> Option<B::P>;
+    ///consume: route by `k` to the terminal leaf, yielding it as a ref tied to the
+    ///block borrow (`'walker`) so it outlives the walker. `None` if at-end.
+    fn walk_into(self, k: &<B::T as Node>::K) -> Option<&'walker B::T>;
 }
 
 ///mut walker. returned `&mut B::T` are tied to the `&mut self` call borrow
@@ -71,13 +78,19 @@ where
 {
     fn new_mut(height: usize, block: &'walker mut B) -> Self;
     fn current_mut(&mut self) -> Option<&mut B::T>;
-    fn insert_child(self, k: <B::T as Node>::K, i: usize, ptr: B::P) -> Self;
+    ///route by `k` from the current node to the terminal (leaf) under `k`; returns the
+    ///terminal's vaddr (the walker is left positioned on it). `None` if at-end.
+    fn walk_to(&mut self, k: &<B::T as Node>::K) -> Option<B::P>;
+    ///consume: route by `k` to the terminal leaf, yielding it as a mut ref tied to
+    ///the block borrow (`'walker`) so it outlives the walker. `None` if at-end.
+    fn walk_into(self, k: &<B::T as Node>::K) -> Option<&'walker mut B::T>;
+    fn insert_child(&mut self, k: <B::T as Node>::K, i: usize, node: B::T);
     fn remove_child(&mut self, child: usize) -> Option<(<B::T as Node>::K, B::P)>;
-    fn split_child(self, child: usize, ptr: B::P) -> Self
+    fn split_child(&mut self, child: usize, ptr: B::P)
     where
         B::T: SplittableNode<<B::T as Node>::K>;
     //move current to an open position
-    fn swap_none(self, other: OpenSlot) -> Self;
+    fn swap_none(&mut self, other: OpenSlot);
     //fixup internal pointers after applying a slide
-    fn fixup_stack(self, fixup: &[(B::P, B::P)]) -> Self;
+    fn fixup_stack(&mut self, fixup: &[(B::P, B::P)]);
 }

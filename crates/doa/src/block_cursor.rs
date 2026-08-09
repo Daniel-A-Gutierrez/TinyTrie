@@ -94,6 +94,20 @@ where
     pub(crate) fn v2p(&self, v: B::P) -> usize {
         self.block.v2p(v)
     }
+
+    ///is phys an occupied slot? (non-panicking, unlike `seek`).
+    pub(crate) fn slot_occupied(&self, phys: usize) -> bool {
+        phys < self.block.store().len() && self.block.store().slot(phys).is_some()
+    }
+
+    ///physical slot of the tree root (the find_slot pin — root must never move).
+    pub(crate) fn root_phys(&self) -> usize
+    where
+        B: crate::tree_block::TreeBlockMut<'block>,
+        B::T: crate::node::Node,
+    {
+        self.block.v2p(self.block.root())
+    }
 }
 
 impl<'block, 'cursor, B: BlockMutTrait<'block>, R: DerefMut<Target = B>>
