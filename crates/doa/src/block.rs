@@ -177,6 +177,13 @@ pub trait BlockMutTrait<'a>: BlockTrait<'a> {
         self.store_mut().get_mut(p)
     }
 
+    ///two disjoint `&mut` to occupied physical slots `a`, `b`. panics if `a == b`
+    ///or either is `None`. for `split_into` between two in-block nodes.
+    fn get_disjoint_mut<'b>(&'b mut self, a: usize, b: usize) -> (&'b mut Self::T, &'b mut Self::T)
+    where 'a: 'b {
+        self.store_mut().get_disjoint_mut(a, b)
+    }
+
     ///slide the None `ms.from` -> `ms.to`; returns the opened slot. `pin` (phys) must
     ///not move.
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> OpenSlot {
@@ -245,8 +252,8 @@ pub trait BlockMutTrait<'a>: BlockTrait<'a> {
         slot.0
     }
 
-    fn remove(&mut self, p: usize) -> Self::T {
-        self.store_mut().remove(p)
+    fn remove(&mut self, p: usize) -> (Self::T,OpenSlot) {
+        (self.store_mut().remove(p),OpenSlot(p))
     }
 
     ///swap the contents at two phys slots.
@@ -266,13 +273,12 @@ pub trait BlockMutTrait<'a>: BlockTrait<'a> {
 
     //none of the split stuff is really in use or correct or working.
 
-    ///split at P::MIDPOINT: [MIDPOINT,len) move into a new block; self keeps [0,MIDPOINT).
+    ///self keeps [0,at).
     ///precondition: len == P::MAX.as_usize() + 1 (block full).
-    fn split(&mut self) -> Self;
+    fn split(&mut self, at : usize) -> Self;
 
-    ///split at P::MIDPOINT + odds-gap both halves (rotation is the split remap primitive).
-    ///precondition: len == P::MAX.as_usize() + 1.
-    fn split_and_rotate(&mut self) -> Self;
+    ///split at 'at' and then spread both sides, add 1 rotation to translator. 
+    fn split_and_rotate(&mut self, at : usize) -> Self;
 
     ///failure is a signal to use a different block or block type.
     ///will not move elements
@@ -442,46 +448,39 @@ where
         }
     }
 
-    ///split at P::MIDPOINT (virtual): [MIDPOINT,len) move into a new block; self keeps
-    ///[0,MIDPOINT). precondition: len == P::MAX.as_usize() + 1 (block full).
-    pub(crate) fn split_block(&mut self) -> Self {
-        debug_assert!(self.store.len() == P::MAX.as_usize() + 1, "split: block not full");
-        let at = self.translator.v2p(P::MIDPOINT);
+    ///split [at,len) into a new block, cloning the translator. 
+    ///precondition: len == P::MAX.as_usize() + 1 (block full).
+    ///caller guarantees no nodes present in right point to nodes in left. 
+    pub(crate) fn split_block(&mut self, at : usize) -> Self {
+        debug_assert!(self.store.len() == P::MAX.as_usize() + 1, "split: block not at capacity");
         let right = self.store.split(at);
+        let mut translator = self.translator.clone();
+        let at = P::from_usize(at);
+        //we want the right half to maintain its internal pointers integrity.
+        //splitting at=5 where phys 5 mapped to phys X before, now it maps to 0, so we must 
+        //update inner offset to at. 
+        //p2v = ((p+io)<<shl + oo).rot_l(rot), v2p = (v.rot_r(rot) - oo) >> shl - io. 
+        translator.set_inner_offset(P::ZERO.wrapping_sub(at));
         Self {
-            _strategy:  PhantomData,
             store:      right,
-            translator: Translator::new(
-                self.translator.inner_offset(),
-                self.translator.outer_offset(),
-                self.translator.shift(),
-                self.translator.rotation(),
-            ),
+            translator,
+            _strategy:  PhantomData,
             _phantom:   PhantomData,
         }
     }
 
-    ///split at P::MIDPOINT + odds-gap both halves (rotation is the split remap primitive).
-    ///precondition: len == P::MAX().as_usize() + 1.
-    pub(crate) fn split_and_rotate_block(&mut self) -> Self {
-        debug_assert!(
-            self.store.len() == P::MAX.as_usize() + 1,
-            "split_and_rotate: block not full"
-        );
-        let at = P::MIDPOINT.as_usize();
-        let right = self.store.split_and_rotate(at);
-        self.translator.set_rotation(self.translator.rotation() + 1);
-        Self {
-            _strategy:  PhantomData,
-            store:      right,
-            translator: Translator::new(
-                self.translator.inner_offset(),
-                self.translator.outer_offset(),
-                self.translator.shift(),
-                self.translator.rotation(),
-            ),
-            _phantom:   PhantomData,
-        }
+    ///split [at,len) into a new block, cloning the translator. 
+    ///precondition: len == P::MAX.as_usize() + 1 (block full).
+    ///caller guarantees no nodes present in right point to nodes in left. 
+    ///l_odds and r_odds let the caller designate if the spread should land elements on even or odd 
+    ///slots in each half
+    pub(crate) fn split_and_rotate_block(&mut self, at : usize) -> Self {
+        let mut r = self.split_block(at);
+        r.store.spread(1);
+        r.translator.set_rotation((r.translator.rotation()+1) % P::BIT_WIDTH as u32);
+        self.store.spread(0);
+        self.translator.set_rotation((self.translator.rotation()+1) % P::BIT_WIDTH as u32);
+        return r;
     }
 }
 
@@ -521,11 +520,12 @@ where
         BlockCursor::new(self)
     }
 
-    fn split(&mut self) -> Self {
-        self.split_block()
+    fn split(&mut self, at : usize) -> Self {
+        self.split_block(at)
     }
-    fn split_and_rotate(&mut self) -> Self {
-        self.split_and_rotate_block()
+
+    fn split_and_rotate(&mut self, at : usize) -> Self {
+        self.split_and_rotate_block(Self::A::SPREAD_OFFSET)
     }
 
     fn try_insert_back(&mut self, v: T) -> Result<usize, T> {
@@ -602,11 +602,12 @@ where
         BlockCursor::new(self)
     }
 
-    fn split(&mut self) -> Self {
-        self.split_block()
+    fn split(&mut self, at : usize) -> Self {
+        self.split_block(at)
     }
-    fn split_and_rotate(&mut self) -> Self {
-        self.split_and_rotate_block()
+
+    fn split_and_rotate(&mut self, at : usize) -> Self {
+        self.split_and_rotate_block(at)
     }
 
     ///dense append into the free half.
@@ -664,11 +665,11 @@ where
         BlockCursor::new(self)
     }
 
-    fn split(&mut self) -> Self {
-        self.split_block()
+    fn split(&mut self, at : usize) -> Self {
+        self.split_block(at)
     }
-    fn split_and_rotate(&mut self) -> Self {
-        self.split_and_rotate_block()
+    fn split_and_rotate(&mut self, at : usize) -> Self {
+        self.split_and_rotate_block(at)
     }
 
     ///hot: dense push_back; every BUDGET-th push stocks a None gap for mid-inserts.
@@ -732,11 +733,11 @@ where
         BlockCursor::new(self)
     }
 
-    fn split(&mut self) -> Self {
-        self.split_block()
+    fn split(&mut self, at : usize) -> Self {
+        self.split_block(at)
     }
-    fn split_and_rotate(&mut self) -> Self {
-        self.split_and_rotate_block()
+    fn split_and_rotate(&mut self, at : usize) -> Self {
+        self.split_and_rotate_block(at)
     }
 
     ///hot: push_back (front=high); every BUDGET-th push stocks a None gap.

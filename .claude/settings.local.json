@@ -18,5 +18,6 @@
       "mcp__ide__getDiagnostics",
       "Bash(rtk proxy *)"
     ]
-  }
+  },
+  "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000" }
 }

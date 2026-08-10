@@ -1,8 +1,6 @@
 use std::cmp::Ordering::*;
-use std::collections::VecDeque;
 use crate::Fixup;
-use crate::index::BlockIndex;
-use crate::translator::{AddressTranslator, Translator};
+use std::collections::VecDeque;
 
 ///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that limits max cap and provides
 ///access/shift semantics
@@ -20,6 +18,11 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
 
     ///in-bounds mut slot: `Some` mut ref if occupied, `None` if empty.
     fn slot_mut(&mut self, p: usize) -> Option<&mut T>;
+
+    ///two disjoint `&mut` to occupied slots `a` and `b`. panics if `a == b` or
+    ///either slot is `None` (contract violation). for `split_into` between two
+    ///in-block nodes.
+    fn get_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut T);
 
     ///slide the None at `from` to `to`; returns `to`. `from==to` => no slide. `pin`, if set, is a
     ///slot whose element must not move.
@@ -94,10 +97,6 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
 
     ///split buf at `at`: [at, len) move into a new store, drained from self; self keeps [0, at).
     fn split(&mut self, at: usize) -> Self;
-
-    ///split at `at` and odds-gap both halves: self keeps left half at odd slots 2p+1 (even None),
-    ///new same-cap store gets right half (reindexed from 0) at odd slots 2k+1. old right-half slots overwritten.
-    fn split_and_rotate(&mut self, at: usize) -> Self;
 
     ///take slot 0 if Some (set None), else None. occupancy -1 when Some.
     fn pop_front(&mut self) -> Option<T>;
@@ -278,6 +277,15 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
 
     fn slot_mut(&mut self, p: usize) -> Option<&mut T> {
         self.buf[p].as_mut()
+    }
+
+    fn get_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut T) {
+        assert!(a != b, "get_disjoint_mut: a == b");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let (left, right) = self.buf.split_at_mut(hi);
+        let lo_ref = left[lo].as_mut().expect("get_disjoint_mut: None slot");
+        let hi_ref = right[0].as_mut().expect("get_disjoint_mut: None slot");
+        if a < b { (lo_ref, hi_ref) } else { (hi_ref, lo_ref) }
     }
 
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
@@ -512,36 +520,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         Self { buf: right, occupied: right_count }
     }
 
-    fn split_and_rotate(&mut self, at: usize) -> Self {
-        // odds-gap both halves: element at half-index i -> physical slot 2i+1 (even None).
-        // the store doesn't know the address space (max representable addr != MAX_CAP in
-        // general), so it just spreads by 2i+1; the block layer owns vptr/translator mapping.
-        let cap = self.buf.capacity();
-        let left_len = at;
-        let right_len = self.buf.len() - at;
-        assert!(
-            right_len * 2 <= MAX_CAP && left_len * 2 <= MAX_CAP,
-            "split_and_rotate: exceeds max cap"
-        );
-        let right_some = self.buf.iter().skip(at).filter(|s| s.is_some()).count();
-
-        // new same-cap buf: right half (at+k) -> slot 2k+1, even None.
-        let mut right_buf: Vec<Option<T>> = Vec::with_capacity(cap);
-        right_buf.resize_with(right_len * 2, || None);
-        for k in 0..right_len {
-            right_buf[2 * k + 1] = self.buf[at + k].take();
-        }
-
-        // odds-gap left half in self: p -> 2p+1. reverse so destinations (>p, already vacated)
-        // never clobber a not-yet-moved source; even slots end up None (sources are take'd).
-        self.buf.resize_with(left_len * 2, || None);
-        for p in (0..left_len).rev() {
-            self.buf[2 * p + 1] = self.buf[p].take();
-        }
-        self.occupied -= right_some;
-        Self { buf: right_buf, occupied: right_some }
-    }
-
     fn pop_front(&mut self) -> Option<T> {
         if self.buf.is_empty() {
             return None;
@@ -637,6 +615,17 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
 
     fn slot_mut(&mut self, p: usize) -> Option<&mut T> {
         self.buf[p].as_mut()
+    }
+
+    fn get_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut T) {
+        assert!(a != b, "get_disjoint_mut: a == b");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        //make the deque's logical range contiguous (indices stable), then split.
+        let slice = self.buf.make_contiguous();
+        let (left, right) = slice.split_at_mut(hi);
+        let lo_ref = left[lo].as_mut().expect("get_disjoint_mut: None slot");
+        let hi_ref = right[0].as_mut().expect("get_disjoint_mut: None slot");
+        if a < b { (lo_ref, hi_ref) } else { (hi_ref, lo_ref) }
     }
 
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
@@ -1077,36 +1066,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         let right = self.buf.split_off(at);
         self.occupied -= right_count;
         Self { buf: right, occupied: right_count }
-    }
-
-    fn split_and_rotate(&mut self, at: usize) -> Self {
-        // odds-gap both halves: element at half-index i -> physical slot 2i+1 (even None).
-        // the store doesn't know the address space (max representable addr != MAX_CAP in
-        // general), so it just spreads by 2i+1; the block layer owns vptr/translator mapping.
-        let cap = self.buf.capacity();
-        let left_len = at;
-        let right_len = self.buf.len() - at;
-        assert!(
-            right_len * 2 <= MAX_CAP && left_len * 2 <= MAX_CAP,
-            "split_and_rotate: exceeds max cap"
-        );
-        let right_some = self.buf.iter().skip(at).filter(|s| s.is_some()).count();
-
-        // new same-cap buf: right half (at+k) -> slot 2k+1, even None.
-        let mut right_buf: VecDeque<Option<T>> = VecDeque::with_capacity(cap);
-        right_buf.resize_with(right_len * 2, || None);
-        for k in 0..right_len {
-            right_buf[2 * k + 1] = self.buf[at + k].take();
-        }
-
-        // odds-gap left half in self: p -> 2p+1. reverse so destinations (>p, already vacated)
-        // never clobber a not-yet-moved source; even slots end up None (sources are take'd).
-        self.buf.resize_with(left_len * 2, || None);
-        for p in (0..left_len).rev() {
-            self.buf[2 * p + 1] = self.buf[p].take();
-        }
-        self.occupied -= right_some;
-        Self { buf: right_buf, occupied: right_some }
     }
 
     fn pop_front(&mut self) -> Option<T> {

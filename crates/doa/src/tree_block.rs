@@ -78,7 +78,7 @@ where
     A: AllocStrat<P>,
     S: Store<'a, T> + 'a,
     O: Ordering,
-    Meta: Sized + 'static + Default,
+    Meta: Sized + 'static + Default + Clone,
     RawBlock<'a, T, P, A, S>: BlockMutTrait<'a, A = A> + BlockTrait<'a, T = T, P = P, S = S>,
 {
     type A = A;
@@ -103,19 +103,27 @@ where
     fn insert(&mut self, v: Self::T, slot: OpenSlot) -> usize {
         self.block.insert(v, slot)
     }
-
-    fn split(&mut self) -> Self {
-        todo!();
-        Self { meta: Meta::default(), block: self.block.split(), _o: PhantomData, root : self.root }
-    }
-    fn split_and_rotate(&mut self) -> Self {
-        todo!(); //these are stubbed because idk what to set root to in the new block yet. 
-        Self {
-            meta:  Meta::default(),
-            block: self.block.split_and_rotate(),
-            root : self.root,
-            _o:    PhantomData,
+    ///that this is a naieve version for the trait impl, it doesnt produce a valid
+    ///treeblock on its own. it presumes the root of the right half is at 'at'
+    fn split(&mut self, at : usize) -> Self {
+        let r = self.block.split_block(at);
+        Self { 
+            _o : PhantomData,
+            meta : self.meta.clone(),
+            block : r,
+            root : P::ZERO //inorder : 0, preorder :0, postorder : len TODO
         }
+    }
+
+    ///root needs setting after this for the right half. 
+    fn split_and_rotate(&mut self, at : usize) -> Self {
+        let r = self.block.split_and_rotate(at);
+        Self { 
+            _o : PhantomData,
+            meta : self.meta.clone(),
+            block : r,
+            root : P::ONE //inorder : 0, preorder :0, postorder : len TODO : fix root after
+        }    
     }
 
     fn try_insert_back(&mut self, v: Self::T) -> Result<usize, Self::T> {
@@ -133,7 +141,7 @@ where
     A: AllocStrat<P>,
     S: Store<'a, T> + 'a,
     O: Ordering,
-    Meta: Sized + 'static + Default,
+    Meta: Sized + 'static + Default + Clone,
     RawBlock<'a, T, P, A, S>: BlockMutTrait<'a, A = A> + BlockTrait<'a, T = T, P = P, S = S>,
 {
     type Meta = Meta;

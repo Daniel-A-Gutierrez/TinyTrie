@@ -81,6 +81,7 @@ variant!(v2p_1111 / p2v_1111, inner = nz, outer = nz, shift = nz, rot = nz);
 ///adaptive tier shape: re-point v2p/p2v in set_params when the block's params
 ///change (grow/spread/graduate). for a statically-known strategy, a const-generic
 ///block inlines the math and beats even this — Translator is for the adaptive tier.
+#[derive(Clone)]
 pub(crate) struct Translator<P: UnsignedNum> {
     inner_offset: P,
     outer_offset: P,

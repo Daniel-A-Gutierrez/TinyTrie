@@ -17,9 +17,11 @@ pub trait Cursor<'cursor, T: 'cursor, P: BlockIndex> {
     fn position(&self) -> Option<usize>;
     ///current element, or `None` if at-end.
     fn current(&self) -> Option<&T>;
-    ///O(1) jump to vaddr `v` (translated to phys); panics if out of bounds or `None`.
-    ///returns the element now under the cursor.
-    fn seek(&mut self, v: P) -> Option<&T>;
+    ///O(1) jump to phys `phys`; sets the cursor there. no bounds/occupancy assert —
+    ///`store.get` panics on an out-of-bounds or `None` slot (the store's responsibility).
+    fn seek(&mut self, phys: usize) -> Option<&T>;
+    ///O(1) jump to vaddr `v` (translated to phys via `v2p`); convenience over `seek`.
+    fn vseek(&mut self, v: P) -> Option<&T> { self.seek(self.v2p(v)) }
     ///advance to the next `Some` slot. returns the new element, or `None` if at-end.
     fn next(&mut self) -> Option<&T>;
     ///advance to the previous `Some` slot. returns the new element, or `None` if at the first.
@@ -65,12 +67,11 @@ where
         c
     }
 
-    ///decompose: yield the block ref back plus the current vaddr (stable across
-    ///store mutations — the translator remaps, so the same vaddr survives a slide/
-    ///spread). `None` if the cursor was at-end.
-    pub(crate) fn into_parts(self) -> (R, Option<B::P>) {
-        let v = self.pos.map(|phys| self.block.translator().p2v(phys));
-        (self.block, v)
+    ///decompose: yield the block ref back plus the current phys (no translation —
+    ///the consumer indexes the block physically). `None` if the cursor was at-end.
+    ///(for a handle that survives store mutations, use the vaddr via `from_parts`.)
+    pub(crate) fn into_parts(self) -> (R, Option<usize>) {
+        (self.block, self.pos)
     }
 
     ///rebuild by detranslating the stable vaddr back to a (possibly new) phys.
@@ -153,10 +154,10 @@ where
     }
 
     ///remove the element at phys `phys`. if it was the tracked element, the cursor goes at-end.
-    pub(crate) fn remove(&mut self, phys: usize) -> B::T {
+    pub(crate) fn remove(&mut self, phys: usize) -> (B::T,OpenSlot) {
         let t = self.block.remove(phys);
         if self.pos == Some(phys) {
-            self.pos = None;
+            self.next();
         }
         t
     }
@@ -182,6 +183,48 @@ where
         }
         (freed, new_phys)
     }
+
+    ///two disjoint `&mut` to the occupied slots at vaddrs `a_v`, `b_v` (translated to
+    ///phys). panics if `a_v == b_v` or either slot is `None`. the returned refs are tied
+    ///to `&mut self`, so the cursor can't be moved while they live — drop them before
+    ///seeking/inserting again.
+    pub(crate) fn get_disjoint(
+        &mut self,
+        a_v: B::P,
+        b_v: B::P,
+    ) -> (&mut B::T, &mut B::T) {
+        let a = self.block.v2p(a_v);
+        let b = self.block.v2p(b_v);
+        self.block.get_disjoint_mut(a, b)
+    }
+
+    ///mut access by phys (not the cursor's tracked pos). panics if `None`.
+    pub(crate) fn get_mut_phys(&mut self, phys: usize) -> &mut B::T {
+        self.block.get_mut(phys)
+    }
+
+    ///TreeBlock pass-throughs the split driver needs (root management).
+    pub(crate) fn set_root(&mut self, v: B::P)
+    where
+        B: crate::tree_block::TreeBlockMut<'block>,
+        B::T: crate::node::Node,
+    {
+        self.block.set_root(v)
+    }
+    pub(crate) fn set_meta(&mut self, m: B::Meta)
+    where
+        B: crate::tree_block::TreeBlockMut<'block>,
+        B::T: crate::node::Node,
+    {
+        self.block.set_meta(m)
+    }
+    pub(crate) fn root_v(&self) -> B::P
+    where
+        B: crate::tree_block::TreeBlockMut<'block>,
+        B::T: crate::node::Node,
+    {
+        self.block.root()
+    }
 }
 
 impl<'block, 'cursor, B: BlockTrait<'block>, R: Deref<Target = B>> Cursor<'cursor, B::T, B::P>
@@ -204,11 +247,7 @@ where
         Some(self.block.get(phys))
     }
 
-    fn seek(&mut self, v: B::P) -> Option<&B::T> {
-        let phys = self.block.translator().v2p(v);
-        let n = self.block.store().len();
-        assert!(phys < n, "cursor: seek out of bounds");
-        assert!(self.block.store().slot(phys).is_some(), "cursor: seek to None");
+    fn seek(&mut self, phys: usize) -> Option<&B::T> {
         self.pos = Some(phys);
         Some(self.block.get(phys))
     }

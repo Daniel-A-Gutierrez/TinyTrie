@@ -21,6 +21,6 @@
         "TOKEN_SAVIOR_PROFILE": "optimized"
       }
     }
-  }
-
+  },
+ "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000" }
 }

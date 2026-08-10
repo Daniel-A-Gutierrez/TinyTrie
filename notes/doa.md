@@ -1,6 +1,52 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Node semantics
+Is 'unique' a necessary flag ? 
+if a leafnode can take non unique keys so long as vals are unique, then an inode produced by splitting can have multiple identical keys with no values to distinguish them. 
+so unique / nonunique have different lookup signatures - non unique lookups are twice as expensive and result in ranges. 
+I think try_route results in Option<(usize,usize)> in such a case. 
+it also means our current impl implies each key is unique. 
+
+Following this train of thought , could a node be broken down into
+
+Keys -> Unique/NonUnique
+Children -> Has/Doesnt Have
+Values -> None/Mono/Paired/Children/Paired-NonUnique
+Splittable -> binary, degree? 
+
+also, can i define the indoe /lnode traits around being unique/nonunique...? 
+Do i define a separate method for update when the key was already there and have insert panic? 
+
+
+##  Optimizing 
+Ive got an agent implementing the switch to `lookup -> (usize, cmp)` instead of `try_route(key)->Option<usize>` , should avoid rescanning the keys repeatedly. 
+Also going to not do lazy construction, the btree will start with a root node that it never removes to skip the 'len==0' check in insert. 
+Going to abstract fixup none slide out, its not too hard when we know the parent pointer. 
+
+Need splitting before we can do any meaningful testing though, and block splitting to see it shine at large sizes which is where i expect dominance . 
+
+## Block Splitting
+Theres a gross bit here - the split_and_rotate thing only works when we can split cleanly at P::MIDPOINT. 
+we know the root will be full so the actual split location for pre-order is `root.children[degree/2 + 1]`. Its a root split so a new node gets pushed up into a block of its own, while the right and left halves go off.  
+This only happens when the block is at capacity... 
+
+Ok worked example, 3 bit addresses
+
+4-7 rotate_left 1 to 1,3,5,7. 
+3-6 rotate left 1 to what, 6,1,3,5 ? bad.
+inner offset 1 = (3+1).rl(1) -> 1 so when splitting 
+we need to set inner offset to midpoint - split_point, overflow wrapping so 
+4-5=-1 , so that 5,6,7 -> 1,3,5. 
+left keeps its root which was at 0. 
+right needs a new one, which is fine, as the 0 slot will be open because math. 
+actually the left side's rl would make it so everything ends up on evens , no offset necessary, 
+and since it keeps its root thats fine. cool , saves an op, only the right * may  * need the offset. 
+the right half does need a new root, and where it goes depends on the ordering. 
+I think inserting that can be a caller responsibility then . 
+
+
+
 # Block Cursor
 Currently block.cursor yields a store cursor which only stores a reference to the store, and doesnt give access to it.
 I need a block cursor that stores a reference to the block, probably with position mapped to a vaddr but not necessarily. 

@@ -1,6 +1,7 @@
 //static is temporary, need to use lifetimes if i want interned keys/values in a side buf.
 
 use crate::index::BlockIndex;
+use std::cmp::Ordering;
 
 //default shorthand for stored types
 pub trait D: 'static + Sized {}
@@ -168,7 +169,15 @@ where
     fn values(&self) -> impl DoubleExact<Item = &V>;
     fn pairs(&self) -> impl DoubleExact<Item = (&K, &V)>;
     fn keys(&self) -> impl DoubleExact<Item = &K>;
+    ///maximal-info search: `(pos, cmp)` where `pos` is the first index with
+    ///`keys[pos] >= k` (the insertion point), and `cmp = k.cmp(&keys[pos])` — or
+    ///`Greater` when `pos == len` (k exceeds all keys). `Equal` ⇒ hit at `pos`.
+    ///one scan feeds get/remove (hit at `pos`) and insert (place at `pos`, replace if
+    ///`Equal`); the implementor picks its own scan (linear/binary).
+    fn lookup(&self, k: &K) -> (usize, Ordering);
     fn insert(&mut self, k: K, v: V) -> usize;
+    ///insert at a known position (from `lookup`), no rescan. the B+ tree's insert path.
+    fn insert_at(&mut self, pos: usize, k: K, v: V);
     fn remove(&mut self, pos: usize) -> (K, V);
 }
 
@@ -184,11 +193,21 @@ pub trait SplittableNode<K>: Default {
 
 pub trait INode: Node {
     fn keys(&self) -> impl DoubleExact<Item = &Self::K>;
-    fn try_route(&self, k: &Self::K) -> Option<usize>;
+    ///route + terminal signal. `Some((pos, cmp))` ⇒ `pos` is the first index with
+    ///`keys[pos] >= k` and `cmp = k.cmp(&keys[pos])` (or `Greater` past end); the caller
+    ///applies its tree's equal-key routing (B+ routes an equal separator to the right
+    ///child: `child = pos + (cmp == Equal)`). `None` ⇒ stop here (this node is the
+    ///terminal / k matches in-node). B+ inodes always return `Some` (height guarantees
+    ///a child to descend into), so the walker may `unwrap_unchecked`.
+    fn lookup(&self, k: &Self::K) -> Option<(usize, Ordering)>;
     fn child(&self, child_idx: usize) -> &Self::P;
     fn children(&self) -> impl DoubleExact<Item = &Self::P>;
-    //returns child_idx of new child
-    fn insert_child(&mut self, child_addr: Self::P, child_key: Self::K) -> usize;
+    ///insert a child whose min key is `child_key` (the B+ separator). B+ convention:
+    ///`keys[i] = min(child[i+1])`, `#keys = #children - 1`, `child[0]` underflow (no key
+    ///before it). returns the new child's index.
+    fn insert_child(&mut self, child_key: Self::K, child_addr: Self::P) -> usize;
+    ///remove the child whose min key is `child_key` (a separator key); returns
+    ///`(separator, child)`. `None` if `child_key` is not a separator.
     fn remove_child(&mut self, child_key: &Self::K) -> Option<(Self::K, Self::P)>;
 }
 
