@@ -456,3 +456,205 @@ mod prepend {
         assert_eq!(count, 256);
     }
 }
+
+// ---------------------------------------------------------------------------
+// split / split_and_rotate — vaddr preservation via self-pointers
+// ---------------------------------------------------------------------------
+// each slot stores its own vaddr (value == p2v(phys)). after a block op, every
+// occupied slot's value must still equal its vaddr: if the op preserves vaddrs the
+// self-pointers hold; if it reindexes them, the assert fires. this is the visual
+// "does the op maintain pointers" check the split path needs.
+mod split {
+    use super::*;
+    type Blk = RawBlock<'static, u32, u32, Uniform<PreOrder>, VecStore<u32, 16>>;
+
+    ///fill to cap-full (dummy values), then a self-pointer pass: now that no more slides
+    ///will run, set each occupied slot's value to its own vaddr. slides during the fill
+    ///move elements (changing their vaddrs), so the self-pointer must be set last.
+    fn fill_self_pointers(b: &mut Blk) {
+        let root = b.insert_root(0);
+        let root = b.p2v(root);
+        loop {
+            let Some(last) = b.last_vaddr() else { break };
+            let Some(ns) = b.find_slot(b.v2p(last), true, Some(b.v2p(root))).slide else { break };
+            let slot = b.slide_none(ns, Some(b.v2p(root)));
+            b.insert(0, slot);
+        }
+        for phys in 0..b.len() {
+            if b.store().slot(phys).is_some() {
+                let v = b.p2v(phys);
+                *b.get_mut(phys) = v;
+            }
+        }
+    }
+
+    ///every occupied slot: vget(its vaddr) == its vaddr.
+    fn assert_self_pointers(b: &Blk) {
+        for phys in 0..b.len() {
+            if b.store().slot(phys).is_some() {
+                let v = b.p2v(phys);
+                assert_eq!(*b.vget(v), v, "phys {phys}: self-pointer broken (vaddr {v:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn split_preserves_self_pointers() {
+        let mut b: Blk = BlockMutTrait::new();
+        fill_self_pointers(&mut b);
+        assert_eq!(b.len(), b.max_capacity(), "precondition: block cap-full");
+        let at = b.len() / 2;
+        let right = b.split_block(at);
+        assert_eq!(b.len(), at, "left half keeps [0,at)");
+        assert_self_pointers(&b);
+        assert_self_pointers(&right);
+    }
+
+    ///small-CAP (u32, CAP=16) block fills to shift=28 — the shift>0 regime. the doa.md
+    ///spread-both-odd + de-rotated-at offset handling assumes sh=0 (the +1->high-bit
+    ///wrap and `(q+at) ror R` distribution both need vaddrs spanning 0..MAX). at
+    ///shift=28 vaddrs are packed in the top bits and it doesn't hold. ignored: shift>0
+    ///is deferred (the full-address-space tests below cover the sh=0 regime).
+    #[ignore]
+    #[test]
+    fn split_and_rotate_left_half_preserves_self_pointers() {
+        let mut b: Blk = BlockMutTrait::new();
+        fill_self_pointers(&mut b);
+        assert_eq!(b.len(), b.max_capacity());
+        let at = b.len() / 2;
+        let _right = b.split_block_and_rotate(at);
+        assert_self_pointers(&b);
+    }
+
+    ///right half is spread(1) (phys i -> 2i+1). the +1 only wraps to the high bit
+    ///(= MIDPOINT = `at`, placing the right in the upper vaddr half) when vaddrs
+    ///span 0..MAX (full address space, shift=0). at shift>0 vaddrs are packed in
+    ///the top bits and the +1 doesn't wrap usefully — so this small-CAP (shift=28)
+    ///right half is genuinely unhandled here. see split_and_rotate_full_address_space
+    ///for the regime where it works. ignored: needs the general de-rotate/add/
+    ///re-rotate offset handling (or a full-address-space block).
+    #[ignore]
+    #[test]
+    fn split_and_rotate_right_half_preserves_self_pointers() {
+        let mut b: Blk = BlockMutTrait::new();
+        fill_self_pointers(&mut b);
+        assert_eq!(b.len(), b.max_capacity());
+        let at = b.len() / 2;
+        let right = b.split_block_and_rotate(at);
+        assert_self_pointers(&right);
+    }
+
+    //full address space: u16, 65536 self-pointers at shift=0 (vaddr == phys). here
+    //spread(1)'s +1 wraps via ror into the high bit (= MIDPOINT = `at`), so the
+    //rotation both preserves vaddrs AND places the right half in the upper half
+    //(no inner=at needed). built directly (set shift=0 + grow_back + insert) to
+    //skip the O(n^2) find_slot fill. this is the arena-tier block-split regime.
+    type FullBlk = RawBlock<'static, u16, u16, Uniform<PreOrder>, VecStore<u16, 65536>>;
+
+    fn fill_full_self_pointers(b: &mut FullBlk) {
+        b.translator_mut().set_shift(0); //fully-grown: inner=0, outer=0 => vaddr == phys
+        b.store_mut().grow_back(65536);
+        for p in 0..65536 {
+            let v = b.p2v(p);
+            b.store_mut().insert(v, p);
+        }
+    }
+
+    fn assert_self_pointers_full(b: &FullBlk) {
+        for phys in 0..b.len() {
+            if b.store().slot(phys).is_some() {
+                let v = b.p2v(phys);
+                assert_eq!(*b.vget(v), v, "phys {phys}: self-pointer broken (vaddr {v:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn split_and_rotate_full_address_space() {
+        let mut b: FullBlk = BlockMutTrait::new();
+        fill_full_self_pointers(&mut b);
+        assert_eq!(b.len(), b.max_capacity());
+        assert_eq!(b.translator().shift(), 0);
+        let at = b.len() / 2;
+        eprintln!("pre:   sh={} inner={} outer={} rot={}",
+            b.translator().shift(), b.translator().inner_offset(),
+            b.translator().outer_offset(), b.translator().rotation());
+        let right = b.split_block_and_rotate(at);
+        eprintln!("left:  sh={} inner={} outer={} rot={}",
+            b.translator().shift(), b.translator().inner_offset(),
+            b.translator().outer_offset(), b.translator().rotation());
+        eprintln!("right: sh={} inner={} outer={} rot={}",
+            right.translator().shift(), right.translator().inner_offset(),
+            right.translator().outer_offset(), right.translator().rotation());
+        //left = spread(0) on even phys (vaddr 0..at); right = spread(1) on odd phys
+        //(vaddr at..MAX). the +1 wraps to the high bit so the right lands upper half.
+        assert_eq!(b.translator().rotation(), 1);
+        assert_eq!(right.translator().rotation(), 1);
+        assert_self_pointers_full(&b);
+        assert_self_pointers_full(&right);
+    }
+
+    ///the de-rotate/add-at/re-rotate goal: `at` is NOT the midpoint. a full block
+    ///forces at = len/2 = MIDPOINT (both halves must fit after the ×2 spread), so
+    ///this uses a half-full block (len 32768 < max 65536) and splits at 8192. the
+    ///right's outer = at - MIDPOINT cancels the rotation's +MIDPOINT (the +1 wrap)
+    ///and nets `at`, so the right half preserves and starts at vaddr `at`.
+    #[test]
+    fn split_and_rotate_non_midpoint_at() {
+        let mut b: FullBlk = BlockMutTrait::new();
+        b.translator_mut().set_shift(0);
+        b.store_mut().grow_back(32768);
+        for p in 0..32768 {
+            let v = b.p2v(p);
+            b.store_mut().insert(v, p);
+        }
+        let at = 8192;
+        eprintln!("non-mid pre:   sh={} inner={} outer={} rot={} len={} at={}",
+            b.translator().shift(), b.translator().inner_offset(),
+            b.translator().outer_offset(), b.translator().rotation(), b.len(), at);
+        let right = b.split_block_and_rotate(at);
+        eprintln!("non-mid left:  sh={} inner={} outer={} rot={} len={}",
+            b.translator().shift(), b.translator().inner_offset(),
+            b.translator().outer_offset(), b.translator().rotation(), b.len());
+        eprintln!("non-mid right: sh={} inner={} outer={} rot={} len={}",
+            right.translator().shift(), right.translator().inner_offset(),
+            right.translator().outer_offset(), right.translator().rotation(), right.len());
+        assert_self_pointers_full(&b);
+        assert_self_pointers_full(&right);
+    }
+
+    ///repeated split_and_rotate (rot>0): the doa.md design's home turf. simulate a
+    ///block that already split_and_rotate'd once at MIDPOINT — its right half has
+    ///rot=1, outer=0 (left_outer = -MIDPOINT, right = that + at ror 0 = 0). splitting
+    ///that full block again at MIDPOINT (rot 1->2) must still preserve: left outer =
+    ///outer - (MIDPOINT ror 1) = -16384, right outer = left + (MIDPOINT ror 1) = 0.
+    ///at=MIDPOINT is no-carry (q+at = MIDPOINT, single bit), so the de-rotated-at
+    ///distribution holds.
+    #[test]
+    fn split_and_rotate_repeated_rot1() {
+        let mut b: FullBlk = BlockMutTrait::new();
+        b.translator_mut().set_shift(0);
+        b.translator_mut().set_rotation(1);
+        b.translator_mut().set_outer_offset(0); //right half of a first at=MIDPOINT split
+        b.store_mut().grow_back(65536); //full (the right half after a MIDPOINT split is full)
+        for p in 0..65536 {
+            let v = b.p2v(p);
+            b.store_mut().insert(v, p);
+        }
+        let at = 32768; //MIDPOINT — no-carry, the doa.md repeated regime
+        eprintln!("rot1 pre:   sh={} inner={} outer={} rot={} len={} at={}",
+            b.translator().shift(), b.translator().inner_offset(),
+            b.translator().outer_offset(), b.translator().rotation(), b.len(), at);
+        let right = b.split_block_and_rotate(at);
+        eprintln!("rot1 left:   sh={} inner={} outer={} rot={} len={}",
+            b.translator().shift(), b.translator().inner_offset(),
+            b.translator().outer_offset(), b.translator().rotation(), b.len());
+        eprintln!("rot1 right:  sh={} inner={} outer={} rot={} len={}",
+            right.translator().shift(), right.translator().inner_offset(),
+            right.translator().outer_offset(), right.translator().rotation(), right.len());
+        assert_eq!(b.translator().rotation(), 2);
+        assert_eq!(right.translator().rotation(), 2);
+        assert_self_pointers_full(&b);
+        assert_self_pointers_full(&right);
+    }
+}

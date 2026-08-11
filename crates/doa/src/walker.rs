@@ -187,4 +187,12 @@ where
     ///stackless `Probe` vseeks around the run (vaddrs are stable pre-slide); a stackful
     ///walker would walk the run as a traversal.
     fn fixup(&mut self, ns: &NoneSlide);
+    ///split a full block at the root's median-child subtree boundary. consumes the
+    ///walker: self's block becomes the left half (mutated in place, its root stable),
+    ///the returned block is the right half, and the separator key is returned for the
+    ///caller to wire both block roots under an arena parent. each half's root lands at
+    ///the ordering's ROOT_POS. impl is ordering-specific: pre/in/post split by slice
+    ///(`block.split_block(at)`); BFO drains via decompose (TBD). no `SplittableNode`
+    ///bound — the impl downcasts (BNode is a bare union; only BINode/BLNode split).
+    fn split_tree(self) -> (B, <B::T as Node>::K);
 }

@@ -481,6 +481,83 @@ where
             self.cursor.swap_open(src, other);
         }
     }
+
+    ///preorder block split (see trait doc). positions at the root, consumes self.
+    ///splits the root inode at its median child; split-and-rotates the block at the
+    ///boundary (child[mid]'s phys — pre-order: a child precedes its subtree, so its own
+    ///slot is the subtree's first = the slice point), so the right half's nodes land on
+    ///odd slots leaving phys 0 free; places the new right-block root there (find_slot
+    ///before the first occupied is a no-op slide) and repoints the right half's direct
+    ///children — their `parent` still names the old root, now in the left half — at the
+    ///new root. returns the right block + separator; the caller wires both block roots
+    ///under an arena parent.
+    fn split_tree(mut self) -> (B, <B::T as Node>::K) {
+        let root_v = self.cursor.root_v();
+        self.cursor.vseek(root_v);
+        self.depth = 0;
+
+        //boundary = phys of child[n/2] (pre-order: the child is its subtree's first node).
+        let child_mid_v = {
+            let root = self.cursor.current().expect("split_tree: no root");
+            let n = unsafe { root.orphan.inode.children.len() };
+            debug_assert!(n >= 2, "split_tree: root needs >=2 children");
+            *unsafe { root.orphan.inode.children.get(n / 2) }
+        };
+        let at = self.cursor.v2p(child_mid_v);
+
+        //split the root in place: self keeps the left children, blank = right half + sep.
+        let mut blank = BNode {
+            orphan: OrphanUnionNode { inode: BINode::default() },
+            parent: P::MIN,
+        };
+        let sep = {
+            let root = self.cursor.current_mut().expect("split_tree: no root");
+            unsafe { root.orphan.inode.split_into(&mut blank.orphan.inode) }
+        };
+
+        //consume the walker → &mut block, split-and-rotate at the boundary. the right
+        //half's nodes land on odd slots (spread offset 1) leaving phys 0 free. R_left
+        //stays at its slot; split_block_and_rotate clobbered the root to P::MAX — restore.
+        let cursor = self.current_into();
+        let (block, _) = cursor.into_parts();
+        let mut right = block.split_block_and_rotate(at);
+        block.set_root(root_v);
+
+        //place the new right root at phys 0 (the free slot the spread opened). find_slot
+        //before the first occupied lands on it with from==to — a no-op slide.
+        let (new_root_v, new_phys) = {
+            let mut rc = BlockCursor::new(&mut right);
+            let first = rc.position().expect("split_tree: right half empty");
+            let found = rc.find_slot(first, false, None);
+            let slot = match found.slide {
+                Some(ns) => {
+                    debug_assert_eq!(ns.from, ns.to, "split_tree: expected no-op slide (phys 0 free)");
+                    rc.slide_none(ns, None)
+                }
+                None => panic!("split_tree: no front None after split-and-rotate"),
+            };
+            let phys = rc.insert(blank, slot);
+            (rc.p2v(phys), phys)
+        };
+        right.set_root(new_root_v);
+
+        //repoint the right half's direct children: their `parent` still names the old root
+        //(now in the left half — a cross-block vaddr) → set it to the new right root.
+        let child_vs: Vec<P> = {
+            let r = right.get_mut(new_phys);
+            let n = unsafe { r.orphan.inode.children.len() };
+            let mut vs = Vec::with_capacity(n);
+            for i in 0..n {
+                vs.push(*unsafe { r.orphan.inode.children.get(i) });
+            }
+            vs
+        };
+        for cv in child_vs {
+            right.vget_mut(cv).set_parent(new_root_v);
+        }
+
+        (right, sep)
+    }
 }
 
 //Stage 1 split driver: leaf split + root promotion (height 0 -> 1). the cursor must

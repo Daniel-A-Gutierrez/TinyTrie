@@ -105,24 +105,26 @@ where
     }
     ///that this is a naieve version for the trait impl, it doesnt produce a valid
     ///treeblock on its own. it presumes the root of the right half is at 'at'
-    fn split(&mut self, at : usize) -> Self {
+    fn split_block(&mut self, at : usize) -> Self {
         let r = self.block.split_block(at);
+        self.root = P::MAX; //intentionally bad root in most cases to force consumer to fix it. 
         Self { 
             _o : PhantomData,
             meta : self.meta.clone(),
             block : r,
-            root : P::ZERO //inorder : 0, preorder :0, postorder : len TODO
+            root : P::MAX //inorder : 0, preorder :0, postorder : len TODO
         }
     }
 
     ///root needs setting after this for the right half. 
-    fn split_and_rotate(&mut self, at : usize) -> Self {
+    fn split_block_and_rotate(&mut self, at : usize) -> Self {
         let r = self.block.split_and_rotate(at);
+        self.root = P::MAX;
         Self { 
             _o : PhantomData,
             meta : self.meta.clone(),
             block : r,
-            root : P::ONE //inorder : 0, preorder :0, postorder : len TODO : fix root after
+            root : P::MAX //inorder : 0, preorder :0, postorder : len TODO : fix root after
         }    
     }
 
@@ -158,4 +160,6 @@ where
     fn set_root(&mut self, p : Self::P) {
         self.root = p;
     }
+
 }
+ 

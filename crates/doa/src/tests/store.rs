@@ -286,27 +286,6 @@ mod vec {
     }
 
     #[test]
-    fn split_and_rotate_odds_gap() {
-        let mut s: VecStore<u64, MC> = VecStore::new();
-        for i in 0..6 {
-            s.push_back(i);
-        }
-        let right = s.split_and_rotate(3);
-        assert_eq!(s.len(), 6);
-        assert_eq!(right.len(), 6);
-        assert_eq!(s.occupied(), 3);
-        assert_eq!(right.occupied(), 3);
-        for p in 0..3 {
-            assert_eq!(s.buf[2 * p], None);
-            assert_eq!(s.buf[2 * p + 1], Some(p as u64));
-        }
-        for k in 0..3 {
-            assert_eq!(right.buf[2 * k], None);
-            assert_eq!(right.buf[2 * k + 1], Some((k + 3) as u64));
-        }
-    }
-
-    #[test]
     fn slide_none_both_dirs() {
         let mut s: VecStore<u64, MC> = VecStore::new();
         for i in 1..=4 {
@@ -595,30 +574,7 @@ mod deq {
         assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
         assert_eq!(right.iter().copied().collect::<Vec<_>>(), vec![3, 4, 5]);
     }
-
-    #[test]
-    fn split_and_rotate_odds_gap() {
-        let mut s: DequeStore<u64, MC> = DequeStore::new();
-        for i in 0..6 {
-            s.push_back(i);
-        }
-        let right = s.split_and_rotate(3);
-        assert_eq!(s.len(), 6);
-        assert_eq!(right.len(), 6);
-        assert_eq!(s.occupied(), 3);
-        assert_eq!(right.occupied(), 3);
-        let ls: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-        let rs: Vec<Option<u64>> = right.buf.iter().cloned().collect();
-        for p in 0..3 {
-            assert_eq!(ls[2 * p], None);
-            assert_eq!(ls[2 * p + 1], Some(p as u64));
-        }
-        for k in 0..3 {
-            assert_eq!(rs[2 * k], None);
-            assert_eq!(rs[2 * k + 1], Some((k + 3) as u64));
-        }
-    }
-
+    
     #[test]
     fn slide_none_matches_ref_all_pairs_wrapped() {
         let orig: Vec<Option<u64>> = {

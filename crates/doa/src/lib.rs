@@ -25,12 +25,19 @@ pub struct BFO;
 pub struct InOrder;
 pub struct PreOrder;
 pub struct PostOrder;
-pub trait Ordering: 'static {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootPos { Beginning, Middle, End }
+
+pub trait Ordering: 'static {
+    ///where the tree root lives in a fresh block.
+    const ROOT_POS: RootPos;
+}
 
 ///easiest to split, iteration OK
-impl Ordering for InOrder {}
-impl Ordering for PostOrder {}
-impl Ordering for PreOrder {}
+impl Ordering for InOrder   { const ROOT_POS: RootPos = RootPos::Middle; }
+impl Ordering for PreOrder  { const ROOT_POS: RootPos = RootPos::Beginning; }
+impl Ordering for PostOrder { const ROOT_POS: RootPos = RootPos::End; }
 
 enum RelTo<T> {
     Before(T),

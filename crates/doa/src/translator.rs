@@ -13,17 +13,20 @@ pub(crate) trait AddressTranslator<P>: Sized {
     fn vdist(&self, v1: P, v2: P) -> usize;
 }
 
-// p2v(p) = ((p + inner_offset) << shift + outer_offset) rol rotation.
-// v2p(v) = ((v ror rotation - outer_offset) >> shift) - inner_offset   (exact
-// inverse on canonical slots). inner_offset lives in physical space (added
-// before the shift), outer_offset in virtual space (added after); the split
-// lets a block pin its root at the beginning/middle/end by tuning the two
-// offsets independently across orderings (see doa.md). Each op whose param is
-// 0 is a runtime no-op the CPU does NOT elide (see bench notes), so specialize
-// picks a pre-baked body that skips zero-param ops entirely — straight-line,
-// no per-iter branch, no mispredict risk. Dispatch happens once per set_*,
-// not per lookup; the call target is constant for the life of the params, so
-// the BTB-predicted indirect call costs ~1 cycle on the v chain (see bench).
+// p2v(p) = ((p + inner_offset) << shift) ror rotation + outer_offset.
+// v2p(v) = ((v - outer_offset) rol rotation) >> shift - inner_offset   (exact
+// inverse on canonical slots). outer_offset lives in VIRTUAL space, AFTER the
+// rotation (so it survives a rotation bump unchanged as a vaddr anchor — but to
+// absorb a physical delta like the split's `at` it must be de-rotated, added, then
+// re-rotated; and on a rotation bump it is itself rotated to keep its anchor, see
+// split_and_rotate). inner_offset lives in PHYSICAL space (added before the shift,
+// unaffected by rotation). p2v rotates RIGHT so the vaddr follows the physical
+// spread. Each op whose param is 0 is a runtime no-op the CPU does NOT elide (see
+// bench notes), so specialize picks a pre-baked body that skips zero-param ops
+// entirely — straight-line, no per-iter branch, no mispredict risk. Dispatch
+// happens once per set_*, not per lookup; the call target is constant for the
+// life of the params, so the BTB-predicted indirect call costs ~1 cycle on the v
+// chain (see bench).
 type V2p<P> = fn(P, P, P, u32, u32) -> P; // x, inner, outer, shift, rotation
 type P2v<P> = fn(P, P, P, u32, u32) -> P;
 
@@ -44,8 +47,8 @@ macro_rules! variant {
         #[inline]
         #[allow(unused_variables)]
         fn $v2p<P: UnsignedNum>(x: P, inner: P, outer: P, shift: u32, rotation: u32) -> P {
-            let x = apply!(x, $r, rotate_right, rotation);
             let x = apply!(x, $o, wrapping_sub, outer);
+            let x = apply!(x, $r, rotate_left, rotation);
             let x = apply!(x, $s, wrapping_shr, shift);
             apply!(x, $i, wrapping_sub, inner)
         }
@@ -54,8 +57,8 @@ macro_rules! variant {
         fn $p2v<P: UnsignedNum>(x: P, inner: P, outer: P, shift: u32, rotation: u32) -> P {
             let x = apply!(x, $i, wrapping_add, inner);
             let x = apply!(x, $s, wrapping_shl, shift);
-            let x = apply!(x, $o, wrapping_add, outer);
-            apply!(x, $r, rotate_left, rotation)
+            let x = apply!(x, $r, rotate_right, rotation);
+            apply!(x, $o, wrapping_add, outer)
         }
     };
 }
