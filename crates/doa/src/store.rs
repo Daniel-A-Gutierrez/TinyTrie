@@ -123,6 +123,19 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     fn max_capacity() -> usize; //the maximum capacity of the store type.
 
     fn new() -> Self;
+
+    ///build a store of `n` Nones — a fresh, empty (occupied=0) buffer of length `n`.
+    fn with_capacity(n: usize) -> Self {
+        let mut s = Self::new();
+        let _ = s.grow_back(n);
+        s
+    }
+
+    ///construct a store from a vec of slots. occupied = count of Some.
+    fn from_vec(v: Vec<Option<T>>) -> Self;
+
+    ///deconstruct into a vec of slots.
+    fn into_vec(self) -> Vec<Option<T>>;
 }
 
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
@@ -261,6 +274,15 @@ impl<T, const MAX_CAP: usize> VecStore<T, MAX_CAP> {
 impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_CAP> {
     fn new() -> Self {
         Self { buf: Vec::new(), occupied: 0 }
+    }
+
+    fn from_vec(v: Vec<Option<T>>) -> Self {
+        let occupied = v.iter().filter(|s| s.is_some()).count();
+        Self { buf: v, occupied }
+    }
+
+    fn into_vec(self) -> Vec<Option<T>> {
+        self.buf
     }
 
     fn get(&self, ptr: usize) -> &T {
@@ -599,6 +621,15 @@ impl<T, const MAX_CAP: usize> DequeStore<T, MAX_CAP> {
 impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX_CAP> {
     fn new() -> Self {
         Self { buf: VecDeque::new(), occupied: 0 }
+    }
+
+    fn from_vec(v: Vec<Option<T>>) -> Self {
+        let occupied = v.iter().filter(|s| s.is_some()).count();
+        Self { buf: v.into(), occupied }
+    }
+
+    fn into_vec(self) -> Vec<Option<T>> {
+        self.buf.into()
     }
 
     fn get(&self, ptr: usize) -> &T {

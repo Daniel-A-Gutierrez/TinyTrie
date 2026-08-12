@@ -1,6 +1,57 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# More Bit Rotation
+
+Goal : rotate when the split isnt at midpoint (P::MIDPOINT or Len/2) 
+Also, investigate it when shift != 0? 
+
+so lets do 4 bit pointers first 
+0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+
+rotate left 1 : 
+rot_left (left (0-7), 1): 0,2,4,6...14
+rot_left (right(8-15),1): 1,3,5,7,9,11,13,15
+
+so for each item to land on its corresponding physical space, right goes in a new buf and spreads with offset 1. Left either spreads using shift or rotates. 
+
+left (0-7) : 0,x,1,x,2,x,3,x...7
+right(8-15): x,8,x,9,x,10,x,11,x,12,x,13,x,14,x,15
+
+so to be clear : 
+p2v(p) = (p - oo).rr(rot) 
+v2p(v) = (p).rl(rot) + oo 
+after first rotate for both : 
+rot = 1, oo = 0
+
+the virtuals then would line up with just a rotate, no offset necessary
+
+right rotated left 1 : x,1,x,3,x,5,x,7
+left holds too. 
+
+so in the case where no offsets apply, shift is zero, and we're splitting at midpoint, our translator is just rot=1,everything_else=0
+
+## Bit Rotation Off of Midpoint
+
+0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+
+not possible, one side will be too large to spread, unless we restrict cap. is that better than 
+just splitting at the midpoint then moving elements afterward to fix the tree? 
+actually wait a sec, no, its not a problem at all, the off-midpoint elements just fall on the slots in between the other elements. 
+so spread is the wrong primitive. 
+we want to clone the translator, add 1 rotate to it, then walking phys from midpoint..len 
+move each item from old[i] to new[ new_trans.v2p( old_trans.p2v( i ) ) ] 
+then from at..midpoint or midpoint..at
+
+wrapping addition due to offset is a spliter - if we had oo=8, for example, we should consider that to fill the right block we're not just using phys, were using (phys + oo) , so the range isnt at..len. we need at as a vaddr and the right edge as a vaddr as well...
+
+## Experiments
+i want to make sure this stuff works on an array of 16 numbers, [0..16] . each is intended to be a vaddr pointing to itself, so after any sort of operation we do, we want to guarantee
+v2p(arr[i]) == i . the math should act as though 0..15 is our full address space, like we're using a 4 bit pointer, so wrapping_add, rotate, shift, etc. need emulation.
+
+then on that array we want to test if split_and_rotate works with various preconditions - if outer offset is set, if shift is > 0, various values for vstart and vend, inner offset values,
+etc. maybe only ones that can be produced by uniform and pluripotent alloc strats...
+
 # Node semantics
 Is 'unique' a necessary flag ? 
 if a leafnode can take non unique keys so long as vals are unique, then an inode produced by splitting can have multiple identical keys with no values to distinguish them. 

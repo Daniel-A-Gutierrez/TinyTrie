@@ -468,36 +468,32 @@ where
         }
     }
 
-    ///split [at,len) into a new block, cloning the translator. 
-    ///precondition: len == P::MAX.as_usize() + 1 (block full).
-    ///caller guarantees no nodes present in right point to nodes in left. 
-    ///l_odds and r_odds let the caller designate if the spread should land elements on even or odd 
-    ///slots in each half
-    pub(crate) fn split_and_rotate(&mut self, at : usize) -> Self {
-        //doa.md design: spread BOTH halves to odd (2i+1), bump rotation. the +1 wraps
-        //via ror into the de-rotated MIDPOINT bit (MIDPOINT ror R); the left cancels it
-        //(outer -= MIDPOINT ror R, stays lower), the right adds the de-rotated `at`
-        //(at ror R) on top to land upper. inner is dropped to inner_old (the rotation
-        //replaces split's inner=at). rot bumps R->R+1. this preserves vaddrs across
-        //repeated splits (any R) for at = MIDPOINT / no-carry `at` (q+at doesn't carry).
-        //FIXME: shift>0 and carry-prone `at` (q's range overlaps at's set bits) need
-        //more; the +1->high-bit wrap and the de-rotated-at both assume sh=0 + no-carry.
-        let rot = self.translator().rotation();
-        let inner = self.translator().inner_offset();
-        let outer = self.translator().outer_offset();
-        let mid_r = P::MIDPOINT.rotate_right(rot);
-        let at_r = P::from_usize(at).rotate_right(rot);
-        let left_outer = outer.wrapping_sub(mid_r);
-        let mut r = self.split(at);
-        r.translator.set_inner_offset(inner);
-        r.translator.set_outer_offset(left_outer.wrapping_add(at_r));
-        self.translator.set_outer_offset(left_outer);
-        let rot1 = (rot + 1) % P::BIT_WIDTH as u32;
-        r.store.spread(1);
-        r.translator.set_rotation(rot1);
-        self.store.spread(1);
-        self.translator.set_rotation(rot1);
-        return r;
+     ///construct a RawBlock from a store + translator.
+    pub(crate) fn from_parts(store: S, translator: Translator<P>) -> Self {
+        Self { store, translator, _strategy: PhantomData, _phantom: PhantomData }
+    }
+
+    ///split [v_start, v_end) vaddrs into a new block (rotation-remap). the right range
+    ///moves to a new store; the left stays in self with gaps where right was. each
+    ///element keeps its vaddr (the translator is a bijection, so the move is 1:1).
+    ///the new block's translator bumps rotation by 1 (to intersperse free space).
+    ///wrapping is free: v2p/p2v wrap mod 2^BW, the phys iteration wraps mod len.
+    pub(crate) fn split_and_rotate(&mut self, v_start: P, v_end: P) -> Self {
+        let len = self.store.len();
+        let cap = S::max_capacity();
+        let mut new_trans = self.translator.clone();
+        new_trans.set_rotation((self.translator.rotation() + 1) % P::BIT_WIDTH as u32);
+        let mut new_store = S::with_capacity(cap);
+        let mut i = self.translator.v2p(v_start);
+        let end = self.translator.v2p(v_end);
+        while i != end {
+            let v = self.translator.p2v(i);
+            let new_phys = new_trans.v2p(v);
+            let elem = self.store.remove(i);
+            new_store.insert(elem, new_phys);
+            i = (i + 1) % len;
+        }
+        Self::from_parts(new_store, new_trans)
     }
 }
 
@@ -542,7 +538,9 @@ where
     }
 
     fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        self.split_and_rotate(at)
+        let v_start = self.p2v(at);
+        let v_end = self.p2v(0);
+        self.split_and_rotate(v_start, v_end)
     }
 
     fn try_insert_back(&mut self, v: T) -> Result<usize, T> {
@@ -624,7 +622,9 @@ where
     }
 
     fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        self.split_and_rotate(at)
+        let v_start = self.p2v(at);
+        let v_end = self.p2v(0);
+        self.split_and_rotate(v_start, v_end)
     }
 
     ///dense append into the free half.
@@ -687,7 +687,9 @@ where
     }
 
     fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        self.split_and_rotate(at)
+        let v_start = self.p2v(at);
+        let v_end = self.p2v(0);
+        self.split_and_rotate(v_start, v_end)
     }
 
     ///hot: dense push_back; every BUDGET-th push stocks a None gap for mid-inserts.
@@ -755,7 +757,9 @@ where
         self.split(at)
     }
     fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        self.split_and_rotate(at)
+        let v_start = self.p2v(at);
+        let v_end = self.p2v(0);
+        self.split_and_rotate(v_start, v_end)
     }
 
     ///hot: push_back (front=high); every BUDGET-th push stocks a None gap.

@@ -657,4 +657,76 @@ mod split {
         assert_self_pointers_full(&b);
         assert_self_pointers_full(&right);
     }
+
+    //cap limited to half the address space (MIDPOINT), so min shift = 1: blocks are
+    //always spreadable on both sides (a cap-full block splits at cap/2 = MIDPOINT/2,
+    //each half <= cap after the x2 spread), and `at` is always a single high bit
+    //(MIDPOINT/2 << sh = MIDPOINT) so q<<sh and at<<sh are disjoint — no carry, sound
+    //for any R. this is the user's proposal: test split_and_rotate across generations
+    //(increasing R) and various single-bit `at` values.
+    type HalfBlk = RawBlock<'static, u16, u16, Uniform<PreOrder>, VecStore<u16, 32768>>;
+    const HALF_CAP: usize = 32768; //MIDPOINT for u16
+
+    ///build a full (len = HALF_CAP) block at the given (rot, outer), shift=1, dense
+    ///self-pointers. simulates a half-cap block that filled up at generation `rot`.
+    fn make_half(rot: u32, outer: u16) -> HalfBlk {
+        let mut b: HalfBlk = BlockMutTrait::new();
+        b.translator_mut().set_shift(1);
+        b.translator_mut().set_rotation(rot);
+        b.translator_mut().set_outer_offset(outer);
+        b.store_mut().grow_back(HALF_CAP);
+        for p in 0..HALF_CAP {
+            let v = b.p2v(p);
+            b.store_mut().insert(v, p);
+        }
+        b
+    }
+
+    fn assert_sp_half(b: &HalfBlk, ctx: &str) {
+        for phys in 0..b.len() {
+            if b.store().slot(phys).is_some() {
+                let v = b.p2v(phys);
+                assert_eq!(*b.vget(v), v, "{ctx}: phys {phys} broken (vaddr {v:?})");
+            }
+        }
+    }
+
+    ///split_and_rotate across generations R=0,1,2,3 at at=MIDPOINT/2 (the cap-full
+    ///split point). each generation takes the previous right half's (rot, outer) and
+    ///re-fills to cap, then splits again. vaddrs must preserve at every generation.
+    #[test]
+    fn split_and_rotate_half_cap_generations() {
+        let mut rot = 0u32;
+        let mut outer = 0u16;
+        let at = HALF_CAP / 2; //MIDPOINT/2 = 16384, single bit BW-2
+        for g in 0..=3u32 {
+            let mut b = make_half(rot, outer);
+            assert_eq!(b.len(), b.max_capacity(), "gen {g} not cap-full");
+            let right = b.split_block_and_rotate(at);
+            assert_sp_half(&b, &format!("gen {g} left"));
+            assert_sp_half(&right, &format!("gen {g} right"));
+            //advance to the right half for the next generation
+            rot = (rot + 1) % u16::BIT_WIDTH as u32;
+            outer = right.translator().outer_offset();
+        }
+    }
+
+    ///various single-bit `at` values at R=0 (first split — no ror-distribution, so any
+    ///no-carry `at` works). each `at` is a power of two (one bit), with a non-full block
+    ///(len = 2*at) so the split fits the x2 spread on both sides.
+    #[test]
+    fn split_and_rotate_half_cap_various_ats() {
+        for &at in &[4096usize, 8192, 16384] {
+            let mut b: HalfBlk = BlockMutTrait::new();
+            b.translator_mut().set_shift(1);
+            b.store_mut().grow_back(2 * at);
+            for p in 0..(2 * at) {
+                let v = b.p2v(p);
+                b.store_mut().insert(v, p);
+            }
+            let right = b.split_block_and_rotate(at);
+            assert_sp_half(&b, &format!("at={at} left"));
+            assert_sp_half(&right, &format!("at={at} right"));
+        }
+    }
 }

@@ -118,7 +118,9 @@ where
 
     ///root needs setting after this for the right half. 
     fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        let r = self.block.split_and_rotate(at);
+        let v_start = self.block.p2v(at);
+        let v_end = self.block.p2v(0);
+        let r = self.block.split_and_rotate(v_start, v_end);
         self.root = P::MAX;
         Self { 
             _o : PhantomData,

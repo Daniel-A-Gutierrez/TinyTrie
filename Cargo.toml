@@ -3,7 +3,7 @@ members = [
     "crates/tiny-trie",
     "crates/btrees",
     "crates/poly-trie",
-    "crates/benches", "crates/arrays", "crates/doa",
+    "crates/benches", "crates/arrays", "crates/doa", "crates/block_splitting",
 ]
 resolver = "2"
 
