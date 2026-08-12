@@ -49,7 +49,8 @@ impl Translator {
         self.shift -= 1;
     }
 
-    /// Bump `rotation` by 1 (the split partner to `spread`).
+    /// Bump `rotation` by 1 (the split partner to `spread`). Re-anchoring `inner_offset`
+    /// per child is the split's job, not rotation's.
     pub fn rotate(&mut self) {
         self.rotation = self.rotation.wrapping_add(1) % Nibble::BIT_WIDTH as u32;
     }
