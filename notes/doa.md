@@ -119,6 +119,34 @@ also, the translation necessary to work with rotation isnt as simple as a spread
 
 also regardless of the value of io so long as len <= ptr::max+1 we dont clobber addresses.
 
+## Conclusions for pluripotent
+split by spreading until spread is exhausted then split via rotation using the approach layed out previously. 
+
+splitting is .. what does io become if we're doing a basic split on a rotated block? 
+weird edge case, but i guess we just need io = v_split_at.rr(block.rot) 
+
+what do we name the non-mid split and rotate? split_rotate_uneven(at) then split_rotate() is midpoint by default. 
+
+oh also because of the wrap point not having any items interspersed between it and 0 after rotate, the math might change. previously i assumed with that method that takin 5 from the right frees up 10 empty slots due to the rotate spreading, but if the wrap point is in the 5 slots, thats minus 1. so the uneven split needs to actually take out n+1 spaces from the dest to be safe.
+
+## Fixup post split
+if we let the items go out of order they fit and referential integrity is maintained, but further fixups wont work, because they rely on physical order = traversal order. 
+
+so, say we've got 5 out of 32678+5 items on the odds at the start of our left split child. parent relations still check out, so we can move the items on the right end left to make space naievely. then we move the items on the odd spots on the left to the right end, and we're golden. 
+
+there is 1 problem : inserting the new root for the right half. I think it has to be done before the split to guarantee it ends up on the leftmost slot. we dont have the tree integrity to do a insert after the split until the misplaced high elements get moved out of the left side. 
+
+another note - this is an experiment where io = 8 in the parent
+Translator { inner_offset: Nibble(0), outer_offset: Nibble(0), shift: 0, rotation: 1 }
+before: [  8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,  4,  5,  6,  7,]
+v2p(v): [  1,  3,  5,  7,  9, 11, 13, 15,  0,  2,  4,  6,  8, 10, 12, 14,]
+p2v(i): [  0,  8,  1,  9,  2, 10,  3, 11,  4, 12,  5, 13,  6, 14,  7, 15,]
+
+note that even though the low half is on the high side, in the right child they still end up on evens. means that we cant assume that the high physical side ends up on odds. 
+its phys+io < midpoint, at least when going rot=0=>1 . itd be over midpoint.rr(rot) afterward. 
+
+idk how much it matters. Might need some support for the 'swap left adjacent none to make space at the right end'. like insert but it doesnt insert, it moves. maybe 'compact' is a better term. 
+
 
 # More Bit Rotation
 

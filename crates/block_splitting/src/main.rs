@@ -159,23 +159,23 @@ mod tests {
 
     #[test]
     fn rotate_range() {
-        let mut io = 5;
+        let mut io =8;
         let mut count = 0;
         let translator = Translator::new(Nibble(io),Nibble::ZERO,0,1);
-        let rt = Translator::new(Nibble(10),Nibble::ZERO,0,1);
-        let lt = Translator::new(Nibble(14),Nibble::ZERO,0,1);
+        let rt = Translator::new(Nibble((8+io)%16).rotate_left(1),Nibble::ZERO,0,1);
+        let lt = Translator::new(Nibble(io).rotate_left(1),Nibble::ZERO,0,1);
         let mut virt = vec![];
         let mut phys = vec![];
         let mut p2vi = vec![];
         while count < 16 {
             virt.push( (io+count) % 16);
-            phys.push(rt.v2p(Nibble::from_u8((io + count)%16 )).as_usize());
+            phys.push( rt.v2p(Nibble::from_u8((io + count)%16 )).as_usize());
             p2vi.push ( rt.p2v(Nibble(count)).as_u8());
             count += 1;
         }
 
-        println!("{:?}", lt);
-        print!("v     : "); fw_print_arr( &virt);
+        println!("{:?}", rt);
+        print!("before: "); fw_print_arr( &virt);
         print!("v2p(v): "); fw_print_arr( &phys); //should be 0..16
         print!("p2v(i): "); fw_print_arr( &p2vi); //should be v
     }
