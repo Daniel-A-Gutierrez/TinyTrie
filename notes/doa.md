@@ -1,6 +1,125 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Been a bit
+picking back up, im not sure about the degree of parameterization of the alloc strategies. 
+Also i think instead of fixing roots itd be better to have the consumer of the block have to handle whatever 'fixed' points they have shifting in their fixup logic. 
+Append/prepend just grow like normal vecs, dont bother filling with none preemptively, just insert 1 none at the end after an insertion. 
+This view makes alloc strat a performance consideration rather than a correctness requirement.
+
+push back / front should be equivalent to before first and after last, reversed for prepend. 
+pluripotent is the trickier one, inner offset has to be midpoint intially, decrementing by `1<<shift` on push_front. 
+Insertion isnt hard, splitting is the question.
+
+Append - take out a section, make a new block from it, make a new block from the left and right too. 
+    Right's inner offset is updated.
+    Parents of all sections need fixup potentially. 
+Prepend - same
+Uniform - split in 2, rotate only simple if split is at midpoint.
+    otherwise, we need to pull the offending section out, split and rotate, then manually put it in and do fixup. 
+    for claritys sake, imagine a 3 bit pointer and a 8 element array splitting at 7 then trying to bitrotate - relative ordering isnt conserved, high elements are interleaved with low.
+    since we want 5 and 6 to stay left, we take out 3,4,5,6 beforehand, split the block in 2 and rotate the halves, then paste 3,4,5,6 at the end of the left block dense. 
+    Splitting in 3 : actually similar logic as above but we don't put the split off section back afterward. 
+Pluripotent : vaddrs > midpoint rotate onto odds, < midpoint onto evens. 
+    unlike uniform we cant guarantee our represented vaddr range is centered on midpoint. 
+    left keeps its ioffset, right gets a new one.  as long as (offset+vaddr) of the right half is > MIDPOINT rotate intersperses nones. 
+    v2p is sub io, shift right, rotate left
+    2,4,6,8,10,12,14 
+    split at 10
+    shift = 1 , io = 2, rot = 0 || shift = 1, io = 10, rot = 0
+    2,4,6,8  || 10,12,14
+    2=>0, 4=>1, 6=>2, 8=>3, 10=>4,
+    with 1 rot its a spread, all of those are < 8 so they double.
+    if the right half were io=midpoint instead...? or midpoint.min(split point)
+    i think we expend shift first before trying to rotate... 
+    once we have though, 0..16 split at say, 12, maps 
+    12..16 to have io=12, rotate = 1 
+    12=>0, 4=>1, 13=>2, 5=>3, 14=>4, 6=>5, 15=>6, 7=>7? etc.  
+    thats ok for uniform because we dont need to prepend but for pluripotent its not. 
+    if io can wrap whats our min/max? p2v(0)? so here thats 6. p2v(15) = 15+12 rr 1 = 1011 rr 1 = 1101 = 13
+    virtual wrapping is ok but physical wrapping isnt, we want to reject push_front and push_back that exceed the address space. 
+    when len == cap we reject push... is that all? 
+    when shift == 0 we reject spread
+    i mean, sounds good to me... so long as split from..to is no longer than max_cap / 2. 
+    if thats not the case then you have to do the trick described earlier for uniform. 
+    actually wait tho, rotate wont work right if our ptr is overprovisioned, it doesnt interleave, since shift will be 0 and cap is halfptr::max. 
+    io can be arbitrarily high though.
+    i suppose a fully shifted-out pluripotent block eventually just becomes a continuous range.
+    at that point its like a little uniform that can't rotate because its pointer is too wide. 
+    i suppose *something* has to rotate into the spots between them, even if we use rotate like a spread for both sides. 
+    i suppose as long as max_cap == halfptr::max + 1, the rotated in vaddrs cant overlap the rotated existing ones...
+    so its a non issue? We dont do the even/odd thing, theyre both even. 
+    
+    what happens if our array - while physically ordered, the addresses wrap over max, and we rotate? 
+    addrs = 12,13,14,15,0,1,2,3  (io=12, r =0)
+    0b1100 -> 0110 = 6
+    0b1101 -> 1110 = 14
+    rr1 : 6,14,7,15,0,8,1,9  (io=12, r=1?)
+    6 rl 1 = 12 - 12 = 0 so good. 
+    0 rl 1 = 0 - 12 = 4 so good still. 
+
+    oops that was using rotate right for v2p , it should be rotate left
+    0b1100 -> 1001 = 9, -12 = 9, %16 = 9
+    0b1101 -> 1011 = 11 , -12 = -1, %16 =15
+    v2p(addrs) = 5,7,9,
+
+## Rotation with offset cotd
+
+Translator { inner_offset: Nibble(7), outer_offset: Nibble(0), shift: 0, rotation: 0 }
+v  : [  7,  8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,  4,  5,  6,]
+v2p: [  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,]
+p2v: [  7,  8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,  4,  5,  6,]
+
+Thats what we want to see. when we add rotation to the translator : 
+
+translator : rot=1, io=7
+v     : [  7,  8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,  4,  5,  6,]
+v2p(v): [  7, 10, 12, 14,  0,  2,  4,  6,  8,  9, 11, 13, 15,  1,  3,  5,]
+p2v(i): [ 11,  4, 12,  5, 13,  6, 14,  7, 15,  0,  8,  1,  9,  2, 10,  3,]
+
+what id want to see is everything on the left remain in order with an empty space in between. if elements are ordered physically, v6 is our max and v7 is our min, corresponding to phys 0 and 15.
+
+so a proper split should take 15,0..6 and put them on odds right ? 
+no, since 15 is the min of the right side, we want it to map to 0 phys, so io=15. 
+as for the left, 7..15, we want them on evens on the left. the wrap point seems to change... 7 winds up at 7 instead of 0. so 7 would have to be our start? 
+
+no p2v(0) is the start, 
+
+so for the right half (v is still the parent, io=7 rot=0)
+Translator { inner_offset: Nibble(15), outer_offset: Nibble(0), shift: 0, rotation: 1 }
+v     : [  7,  8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,  4,  5,  6,]
+v2p(v): [ 15,  2,  4,  6,  8, 10, 12, 14,  0,  1,  3,  5,  7,  9, 11, 13,]
+p2v(i): [ 15,  0,  8,  1,  9,  2, 10,  3, 11,  4, 12,  5, 13,  6, 14,  7,]
+
+what we want to see is 15 at the left, 6 at the max. we do get that. but...
+the evens odd bit isnt as i expected.
+oddity - rotate cant put anything between 15 and 0 . so while this op makes space,
+its not quite even. its not equivalent to a spread. good to know. 
+
+and the left half
+Translator { inner_offset: Nibble(9), outer_offset: Nibble(0), shift: 0, rotation: 1 }
+v     : [  7,  8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,  4,  5,  6,]
+v2p(v): [  5,  8, 10, 12, 14,  0,  2,  4,  6,  7,  9, 11, 13, 15,  1,  3,]
+p2v(i): [ 12,  5, 13,  6, 14,  7, 15,  0,  8,  1,  9,  2, 10,  3, 11,  4,]
+
+tbh i guessed with 9 , its not at all what we want
+
+Translator { inner_offset: Nibble(14), outer_offset: Nibble(0), shift: 0, rotation: 1 }
+v     : [  7,  8,  9, 10, 11, 12, 13, 14, 15,  0,  1,  2,  3,  4,  5,  6,]
+v2p(v): [  0,  3,  5,  7,  9, 11, 13, 15,  1,  2,  4,  6,  8, 10, 12, 14,]
+p2v(i): [  7, 15,  0,  8,  1,  9,  2, 10,  3, 11,  4, 12,  5, 13,  6, 14,]
+
+so io.rl(1) is the new io that puts 7 at 0 and 14 at 15. cool.
+wait would the right half have to be that too? 15 mightve been lucky.
+yup so left gets io.rl(1) and right gets ... io=old_translator.p2v(len/2).rl(1)
+the first vaddr of the right rl 1 basically. 
+
+so vaddrs can wrap, but the physical space is always leftmost = least rightmost = greatest. 
+also, the translation necessary to work with rotation isnt as simple as a spread, but it maintains order so long as the split happens at the midpoint physically. 
+
+also regardless of the value of io so long as len <= ptr::max+1 we dont clobber addresses.
+
+
 # More Bit Rotation
 
 Goal : rotate when the split isnt at midpoint (P::MIDPOINT or Len/2) 

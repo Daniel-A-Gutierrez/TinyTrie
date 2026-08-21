@@ -137,7 +137,6 @@ impl<P: BlockIndex, O: Ordering> AllocStrat<P> for Pluripotent<O> {
         t.set_outer_offset(t.outer_offset().wrapping_sub(P::from_usize(1 << t.shift())));
     }
 }
-
 strat!((P: BlockIndex) => Append, {
     shift: 0, cap: 1,
     inner: 1 << P::Half::BIT_WIDTH, outer: 0, spread: 0,

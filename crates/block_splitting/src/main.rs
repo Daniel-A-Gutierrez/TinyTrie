@@ -8,20 +8,15 @@ use block::Block;
 use nibble::Nibble;
 use translator::Translator;
 
-/// insert `v` (as payload) at the phys slot for vaddr `v`.
+/// insert `v` (as payload) at the phys slot for vaddr `v`. Delegates to `Block::put`
+/// (auto-spreading); on already-full / shift==0 blocks it just inserts (no spread).
 fn put(b: &mut Block<u8>, v: u8) {
-    let phys = b.translator().v2p(Nibble::from_u8(v)).as_usize();
-    b.insert(phys, v);
+    b.put(v);
 }
 
 /// fill every empty phys with its decoded vaddr (`p2v(phys)`), so `block[i] == p2v(i)`.
 fn fill(b: &mut Block<u8>) {
-    for phys in 0..b.len() {
-        if b.get(phys).is_none() {
-            let v = b.translator().p2v(Nibble::from_usize(phys)).as_u8();
-            b.insert(phys, v);
-        }
-    }
+    b.fill();
 }
 
 /// invariant: for every occupied phys `i`, `v2p(block[i]) == i` AND `p2v(i) == block[i]`
@@ -77,9 +72,113 @@ fn main() {
     println!("{right}");
 }
 
+/// split `b` in half at the phys midpoint: `split_and_shift` if `shift > 0` (room to
+/// shift), else `split_and_rotate` (full, `shift == 0`). Returns the right child.
+fn split_half(b: &mut Block<u8>) -> Block<u8> {
+    let at = b.len() / 2;
+    if b.translator().shift == 0 {
+        b.split_and_rotate(at)
+    } else {
+        b.split_and_shift(at)
+    }
+}
+
+/// fill a uniform block to cap: grow via `put` (auto-spread) when `len < cap`, else
+/// `fill()` the empty phys (children are born at `len == cap`).
+fn fill_uniform(b: &mut Block<u8>) {
+    if b.len() < b.cap() {
+        for v in 0..b.cap() as u8 {
+            b.put(v);
+        }
+    } else {
+        b.fill();
+    }
+}
+
+/// fill a pluripotent block to cap: grow via push_front/back + an initial `put` when
+/// `len < cap` (root only), else `fill()` (children born at `len == cap`).
+fn fill_pluripotent(b: &mut Block<u8>) {
+    if b.len() < b.cap() {
+        b.put(b.translator().p2v(Nibble::ZERO).as_u8());
+        let mut front = true;
+        while b.len() < b.cap() {
+            if front {
+                b.push_front(b.front_vaddr().as_u8());
+            } else {
+                b.push_back(b.back_vaddr().as_u8());
+            }
+            front = !front;
+        }
+    } else {
+        b.fill();
+    }
+}
+
+/// torture: fill every frontier block to cap, split it, keep both halves. Repeat for
+/// `generations` splits, then fill the final leaves. Returns every block ever created
+/// (root, all children, all leaves). Asserts the both-direction invariant on every
+/// block after every fill and every split, and that filled blocks are at cap.
+fn torture(root: Block<u8>, fill: fn(&mut Block<u8>), generations: usize) -> Vec<Block<u8>> {
+    let mut all: Vec<Block<u8>> = vec![root];
+    let mut frontier: Vec<usize> = vec![0];
+    for gen_n in 0..generations {
+        let mut next: Vec<usize> = Vec::with_capacity(frontier.len() * 2);
+        for &idx in &frontier {
+            fill(&mut all[idx]);
+            assert!(check_invariant(&all[idx]), "gen{gen_n} idx{idx} after fill");
+            assert_eq!(all[idx].occupancy(), all[idx].cap(), "gen{gen_n} idx{idx} not full");
+
+            let right = split_half(&mut all[idx]);
+            assert!(check_invariant(&all[idx]), "gen{gen_n} idx{idx} left after split");
+            let ridx = all.len();
+            all.push(right);
+            assert!(check_invariant(&all[ridx]), "gen{gen_n} ridx{ridx} right after split");
+            next.push(idx);
+            next.push(ridx);
+        }
+        frontier = next;
+    }
+    for &idx in &frontier {
+        fill(&mut all[idx]);
+        assert!(check_invariant(&all[idx]), "leaf idx{idx} after fill");
+    }
+    all
+}
+
+fn fw_print_arr<T>(v: &[T]) where T : std::fmt::Display {
+    print!("[");
+    for e in v {
+        print!("{:3},",e);
+    }
+    print!("]\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotate_range() {
+        let mut io = 5;
+        let mut count = 0;
+        let translator = Translator::new(Nibble(io),Nibble::ZERO,0,1);
+        let rt = Translator::new(Nibble(10),Nibble::ZERO,0,1);
+        let lt = Translator::new(Nibble(14),Nibble::ZERO,0,1);
+        let mut virt = vec![];
+        let mut phys = vec![];
+        let mut p2vi = vec![];
+        while count < 16 {
+            virt.push( (io+count) % 16);
+            phys.push(rt.v2p(Nibble::from_u8((io + count)%16 )).as_usize());
+            p2vi.push ( rt.p2v(Nibble(count)).as_u8());
+            count += 1;
+        }
+
+        println!("{:?}", lt);
+        print!("v     : "); fw_print_arr( &virt);
+        print!("v2p(v): "); fw_print_arr( &phys); //should be 0..16
+        print!("p2v(i): "); fw_print_arr( &p2vi); //should be v
+    }
 
     #[test]
     fn fill_and_log() {
@@ -351,5 +450,62 @@ mod tests {
             eprintln!(" {:>8} | {:<9} | {}", at, l, r);
         }
         assert!(midpoint_ok, "midpoint (8) must keep invariant on both halves");
+    }
+
+    // uniform root: shift=bw=4, len=1, cap=16, offsets=0. Grows by spread (put
+    // auto-spreads), full at shift=0, splits via split_and_rotate every generation.
+    #[test]
+    fn torture_uniform() {
+        let all = torture(Block::uniform(), fill_uniform, 3);
+        // 3 split generations: each doubles the frontier; left reuses the parent slot,
+        // right is pushed. 2^3 = 8 live blocks (all kept, all validated in `torture`).
+        assert_eq!(all.len(), 1 << 3, "uniform: expected 8 blocks over 3 generations");
+        for (i, b) in all.iter().enumerate() {
+            assert!(check_invariant(b), "uniform block {i} invalid: {b}");
+        }
+        // every uniform block has cap 16 (inherited); root starts shift=bw, full at 0.
+        assert!(all.iter().all(|b| b.cap() == 16));
+        assert_eq!(Block::<u8>::uniform().translator().shift, Nibble::BIT_WIDTH as u32);
+        eprintln!("\n== uniform torture ({} blocks) ==", all.len());
+        for (i, b) in all.iter().enumerate() {
+            eprintln!("[{i}] len={} occ={} cap={} {b}", b.len(), b.occupancy(), b.cap());
+        }
+    }
+
+    // pluripotent root: shift=2, len=1, cap=4, inner=0, outer=8. Grows by push
+    // (front/back/middle), full at len==cap while shift>0, splits via split_and_shift
+    // until shift hits 0, then split_and_rotate. Exercises all three insert kinds.
+    #[test]
+    fn torture_pluripotent() {
+        let all = torture(Block::pluripotent(), fill_pluripotent, 3);
+        assert_eq!(all.len(), 1 << 3, "pluripotent: expected 8 blocks over 3 generations");
+        for (i, b) in all.iter().enumerate() {
+            assert!(check_invariant(b), "pluripotent block {i} invalid: {b}");
+        }
+        // root: shift=2, cap=4, outer=8 (verified on a fresh root — `all[0]` is the
+        // leftmost leaf after 3 in-place splits, not the original root).
+        let root: Block<u8> = Block::pluripotent();
+        assert_eq!(root.cap(), 4);
+        assert_eq!(root.translator().shift, 2);
+        assert_eq!(root.translator().outer_offset, Nibble::from_u8(8));
+        assert!(all.iter().all(|b| b.cap() == 4));
+        eprintln!("\n== pluripotent torture ({} blocks) ==", all.len());
+        for (i, b) in all.iter().enumerate() {
+            eprintln!("[{i}] len={} occ={} cap={} {b}", b.len(), b.occupancy(), b.cap());
+        }
+    }
+
+    // mixed forest: run both strategies side by side, all blocks valid.
+    #[test]
+    fn torture_mixed() {
+        let u = torture(Block::uniform(), fill_uniform, 3);
+        let p = torture(Block::pluripotent(), fill_pluripotent, 3);
+        for (i, b) in u.iter().enumerate() {
+            assert!(check_invariant(b), "mixed uniform {i}: {b}");
+        }
+        for (i, b) in p.iter().enumerate() {
+            assert!(check_invariant(b), "mixed pluripotent {i}: {b}");
+        }
+        assert_eq!(u.len() + p.len(), 16);
     }
 }

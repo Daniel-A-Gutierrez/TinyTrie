@@ -58,6 +58,23 @@ impl<T> Block<T> {
         Self { buf: (0..len).map(|_| None).collect(), translator, occupancy: 0, cap }
     }
 
+    /// Uniform root: `shift = bw` (len 1), `cap = MAX_CAP`, no offsets. Grows purely by
+    /// spread (insert auto-spreads); never push_front/back. Full at `shift == 0`.
+    pub fn uniform() -> Self {
+        let tr = Translator::new(Nibble::ZERO, Nibble::ZERO, Nibble::BIT_WIDTH as u32, 0);
+        Self { buf: vec![None], translator: tr, occupancy: 0, cap: MAX_CAP }
+    }
+
+    /// Pluripotent root: `shift = 2`, `len = 1`, `cap = 4`, `inner = 0`, `outer = 8`.
+    /// The offset lives in OUTER (vaddr) space: at `shift > 0` decrementing inner would
+    /// overflow and break v2p round-trip, so push_front bumps outer instead. Canonical
+    /// set wraps (`{8,12,0,4}`), leaving room on both ends — front/back/middle all work.
+    /// Grows by push (len up, shift constant); full at `len == cap` while `shift > 0`.
+    pub fn pluripotent() -> Self {
+        let tr = Translator::new(Nibble::ZERO, Nibble::from_u8(8), 2, 0);
+        Self { buf: vec![None], translator: tr, occupancy: 0, cap: 4 }
+    }
+
     pub fn translator(&self) -> &Translator {
         &self.translator
     }
@@ -279,4 +296,89 @@ impl<T> Block<T> {
     //     }
     //     self.translator = left_new; right
     // }
+}
+
+impl Block<u8> {
+    /// Fill every empty phys in `[0, len)` with its decoded vaddr `p2v(phys)`, so
+    /// `block[i] == p2v(i)` (and `v2p(block[i]) == i` on canonical phys). No growth.
+    pub fn fill(&mut self) {
+        for phys in 0..self.len() {
+            if self.buf[phys].is_none() {
+                let v = self.translator.p2v(Nibble::from_usize(phys)).as_u8();
+                self.buf[phys] = Some(v);
+                self.occupancy += 1;
+            }
+        }
+    }
+
+    /// vaddr the next `push_back` will occupy: `p2v(len)` (translator unchanged).
+    pub fn back_vaddr(&self) -> Nibble {
+        self.translator.p2v(Nibble::from_usize(self.len()))
+    }
+
+    /// vaddr the next `push_front` will occupy: `p2v(0)` after the offset is bumped
+    /// (`inner -= 1` at `shift == 0`, `outer -= 1<<shift` at `shift > 0`).
+    pub fn front_vaddr(&self) -> Nibble {
+        let mut t = self.translator;
+        let stride = 1u8 << t.shift;
+        if t.shift == 0 {
+            t.inner_offset = t.inner_offset.wrapping_sub(Nibble::ONE);
+        } else {
+            t.outer_offset = t.outer_offset.wrapping_sub(Nibble::from_u8(stride));
+        }
+        t.p2v(Nibble::ZERO)
+    }
+
+    /// Insert `v` (as payload) at `v2p(v)`. If the target phys is occupied or out of the
+    /// live region, auto-spread (doubling `len`, dropping `shift`) and retry — so filling
+    /// a growing block with canonical vaddrs drives its own growth. Panics at the cap
+    /// (`len == cap` or `shift == 0` with no room): must split, not spread.
+    pub fn put(&mut self, v: u8) {
+        let vn = Nibble::from_u8(v);
+        loop {
+            let phys = self.translator.v2p(vn).as_usize();
+            if phys < self.len() && self.buf[phys].is_none() {
+                self.buf[phys] = Some(v);
+                self.occupancy += 1;
+                return;
+            }
+            assert!(
+                self.translator.shift > 0 && self.len() < self.cap,
+                "put: at cap (len={}, cap={}, shift={}), must split",
+                self.len(), self.cap, self.translator.shift
+            );
+            self.spread(false);
+        }
+    }
+
+    /// Append `item` at a new phys `len` (vaddr `p2v(len)`). No translator change — the
+    /// new phys is already canonical for an inner=0 block growing within `cap`. Panics
+    /// at the cap. `item` should be `back_vaddr()` for the invariant to hold.
+    pub fn push_back(&mut self, item: u8) {
+        assert!(self.len() < self.cap, "push_back: at cap (len={}, cap={}), must split", self.len(), self.cap);
+        self.buf.push(Some(item));
+        self.occupancy += 1;
+    }
+
+    /// Prepend `item` at phys 0: bump the offset down by one stride (`inner -= 1` at
+    /// `shift == 0`; `outer -= 1<<shift` at `shift > 0`, since inner lives pre-shift and
+    /// would overflow), shift existing items `phys i -> i+1`, grow `len` by 1. Existing
+    /// vaddrs are preserved (offset down by stride, phys up by 1 ⇒ vaddr constant).
+    /// `item` should be `front_vaddr()` for the invariant to hold. Panics at the cap.
+    pub fn push_front(&mut self, item: u8) {
+        assert!(self.len() < self.cap, "push_front: at cap (len={}, cap={}), must split", self.len(), self.cap);
+        let stride = 1u8 << self.translator.shift;
+        if self.translator.shift == 0 {
+            self.translator.inner_offset = self.translator.inner_offset.wrapping_sub(Nibble::ONE);
+        } else {
+            self.translator.outer_offset = self.translator.outer_offset.wrapping_sub(Nibble::from_u8(stride));
+        }
+        let n = self.buf.len();
+        self.buf.push(None);
+        for i in (0..n).rev() {
+            self.buf[i + 1] = self.buf[i].take();
+        }
+        self.buf[0] = Some(item);
+        self.occupancy += 1;
+    }
 }
