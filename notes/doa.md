@@ -147,6 +147,10 @@ its phys+io < midpoint, at least when going rot=0=>1 . itd be over midpoint.rr(r
 
 idk how much it matters. Might need some support for the 'swap left adjacent none to make space at the right end'. like insert but it doesnt insert, it moves. maybe 'compact' is a better term. 
 
+## On the alloc strat parameterization
+just because btrees move their root doesnt mean other trees must, dont think its wrong to allow a fixed root thats supported by the alloc strat grow/spread/etc. 
+
+but insert root or split root should kinda imply that our insertions are being done without a fixed root. 
 
 # More Bit Rotation
 
