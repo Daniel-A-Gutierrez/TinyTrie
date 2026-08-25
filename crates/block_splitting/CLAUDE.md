@@ -63,14 +63,19 @@ from shift, and a cap-constrained block can be **full at `shift > 0`** (must spl
 Invariants: `occupied ≤ len ≤ cap ≤ MAX_CAP`; for every occupied phys `i`,
 `v2p(block[i]) == i` AND `p2v(i) == block[i]` (translator and contents are mutual inverses,
 so slot order == vaddr order — the invariant every split defends). `spread` doubles `len`
-and moves `phys i → 2i+offset`, dropping `shift` (vaddrs stable). Splits partition the
-canonical **cyclic** phys sequence into two arcs and re-anchor each child so its first
-vaddr lands at phys 0. Root constructors (`uniform`/`pluripotent`) are built directly,
-not via `new`, and deliberately start `len = 1` (under-filled vs `new`'s formula) because
-they grow by push/spread.
+and moves `phys i → 2i+offset`, dropping `shift` (vaddrs stable) — it reclaims a **low** bit
+as inter-item gap space. A split is the split-time dual of `spread`: when `shift` hits 0 the
+low bits are exhausted, so the block gives its top vaddr half to a sibling and **rotates** to
+reclaim the now-constant high bit (rotated into the low position) as the fresh gap bit. The
+two operations alternate forever, each freeing one bit of gap space. Rotation runs only at
+`shift == 0` (stride 1, where the 15/0 wrap seam has no vaddr between it) and never spreads —
+it buffers and remaps via `v2p`; the `i → 2i` spread runs only at `shift > 0` (stride ≥ 2,
+where the seam can't be a consecutive placed pair, so the spread always gaps a real midpoint).
+Root constructors (`uniform`/`pluripotent`) are built directly, not via `new`, and deliberately
+start `len = 1` (under-filled vs `new`'s formula) because they grow by push/spread.
 
 - `MAX_CAP = 16` — the address-space ceiling.
-- `anchored(old, first_phys)` — free fn: rotate `old` by 1 + re-anchor `inner` so the child's `p2v(0) == old.p2v(first_phys)`. `p2v` evaluated on `old` (pre-rotate); only the `rotate_left` uses the new rotation. Shared by both split children.
+- `rsplit_translator(old, first_phys)` — free fn (rotation split helper): rotate `old` by 1 + re-anchor `inner` so the child's `p2v(0) == old.p2v(first_phys)`. `p2v` evaluated on `old` (pre-rotate); only the `rotate_left` uses the new rotation. Asserts `old.shift == 0` (rotation is the shift-exhausted case). Used by both children in `split_and_rotate`.
 - `Block<T> { buf, translator, occupancy, cap }` — the block.
   - `new(translator, cap)` — `len = min(MAX_CAP >> shift, cap)`; asserts `shift ≤ BIT_WIDTH`, `cap ∈ [1, MAX_CAP]`.
   - `uniform()` — root: `shift = bw` (len 1), `cap = MAX_CAP`, no offsets; grows by spread, full at `shift == 0`.
@@ -78,10 +83,10 @@ they grow by push/spread.
   - `translator`/`cap`/`len`/`is_vacant`/`occupancy` — accessors.
   - `insert`/`get`/`remove`/`iter` — raw phys-slot ops; `insert`/`remove` panic on occupied/empty/OOB.
   - `spread(offset)` — double `len`, `phys i → 2i+offset`; panics if `2*len > cap` (at cap, must split) or `shift == 0`.
-  - `spread_in_place(offset, count)` — the move + `translator.spread` with no `len` growth; shared by `spread` (after pushing `None`s) and `split_and_shift` (moves into the just-emptied high half).
-  - `split_from_to(from, to)` — **general split**: left = arc `[from, to)`, right = arc `[to, from)`; `from > to` means a wrapping arc `[from, len) ∪ [0, to)`. Buffers both halves, re-inserts into anchored children (no in-place move, so wrapping arcs/scattered dests are fine). For `shift > 0` the cut must separate collision pairs `{v, v+8}` or the children collide. Sets `self.translator` before the re-insert loop (no transient state).
-  - `split_and_rotate(at)` = `split_from_to(0, at)` — the full (`shift == 0`) case.
-  - `split_and_shift(at)` — for `shift > 0`: right child born with `shift − 1` (stride gaps, no rotation), `inner` re-anchored at `p2v(at)`; left spreads in place into the emptied `[at, len)` (no `len` growth, so a cap-constrained block can split without calling `spread`).
+  - `spread_in_place(offset, count)` — the move + `translator.spread` with no `len` growth; shared by `spread` (after pushing `None`s) and `split_shift` (moves into the just-emptied high half).
+  - `split(at)` — **split dispatcher**: `shift > 0` → `split_shift` (free a low bit), else `split_and_rotate` (free the high bit). The public split entry; picks the operation that reclaims the next gap bit.
+  - `split_and_rotate(at)` — rotation split (`shift == 0`, asserted via `rsplit_translator`): left keeps phys `[0, at)`, right takes `[at, len)`; both children rotated + re-anchored at phys 0. Buffers both halves and re-inserts via each child's `v2p` (no `i → 2i` move). Reclaims the high bit as gap space.
+  - `split_shift(at)` (private) — shift split (`shift > 0`): right child born with `shift − 1` (stride gaps, no rotation), `inner` re-anchored at `p2v(at)`; left spreads in place into the emptied `[at, len)` (no `len` growth, so a cap-constrained block can split without calling `spread`). Reclaims a low bit.
 - `Block<u8>` — payload-specific extras:
   - `fill()` — seed every empty phys with its decoded vaddr `p2v(phys)`, so `block[i] == p2v(i)`; no growth.
   - `put(v)` — insert `v` at `v2p(v)`, auto-spread-and-retry (drives its own growth); panics at cap.
@@ -105,10 +110,11 @@ asserting test** — it builds a rotated translator and prints `v2p`/`p2v` array
 ## Status
 
 Compiles, 1 test (`rotate_range`, print-only). Realized: the nibble/translator/block tiers;
-`spread`, the general cyclic-arc `split_from_to` (handles wrapping canonical sets), the
-`shift > 0` `split_and_shift`, shared `spread_in_place`/`anchored` helpers. The
-`put`/`push_front`/`push_back` growth paths and the both-direction invariant are exercised
-by the (now-deleted) torture harness over `uniform` and `pluripotent` roots.
+`spread` (low-bit gap reclamation), the `split` dispatcher routing `shift > 0` → `split_shift`
+(low-bit) vs `shift == 0` → `split_and_rotate` (high-bit), shared `spread_in_place`/
+`rsplit_translator` helpers. The `put`/`push_front`/`push_back` growth paths and the
+both-direction invariant are exercised by the (now-deleted) torture harness over `uniform`
+and `pluripotent` roots.
 
 Not wired: `split_and_hollow` (carve out the near-midpoint slots that need manual fixup when
 `at` isn't the midpoint and cap = `PTR::MAX + 1` — the larger half can't spread via rotate

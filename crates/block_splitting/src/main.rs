@@ -37,7 +37,7 @@ fn main() {
     );
     println!("{b}");
 
-    let right = b.split_and_rotate(Nibble::MIDPOINT.as_usize());
+    let right = b.split(Nibble::MIDPOINT.as_usize());
     println!(
         "\nleft (len={}, occ={}, invariant={}):",
         b.len(),
@@ -66,6 +66,38 @@ where T: std::fmt::Display {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// phys-order vaddrs strictly increasing (the ordering invariant).
+    fn ordered(b: &Block<u8>) -> bool {
+        let vs: Vec<u8> = b.iter().map(|(_, &v)| v).collect();
+        vs.windows(2).all(|w| w[0] < w[1])
+    }
+
+    #[test]
+    fn ordered_after_split() {
+        // rotate-split path: full block, split at midpoint, both halves ordered.
+        let mut b: Block<u8> = Block::uniform();
+        for v in 0..16 { b.put(v); }
+        assert!(ordered(&b), "full");
+        let mut right = b.split(Nibble::MIDPOINT.as_usize());
+        assert!(ordered(&b), "rotate left {b}");
+        assert!(ordered(&right), "rotate right {right}");
+
+        // shift-split path: shift=2 block, split at midpoint, both halves ordered.
+        let mut b: Block<u8> = Block::new(Translator::new(Nibble::ZERO, Nibble::ZERO, 2, 0), Nibble::CAP >> 2);
+        for phys in 0..b.len() { b.insert(phys, b.translator().p2v(Nibble::from_usize(phys)).as_u8()); }
+        assert!(ordered(&b), "shift full");
+        let at = b.translator().v2p(Nibble::MIDPOINT).as_usize();
+        let r2 = b.split(at);
+        assert!(ordered(&b), "shift left {b}");
+        assert!(ordered(&r2), "shift right {r2}");
+
+        // off-midpoint rotate (expect ordering to BREAK — confirms the constraint).
+        let mut b: Block<u8> = Block::uniform();
+        for v in 0..16 { b.put(v); }
+        let _r3 = b.split_and_rotate(5);
+        eprintln!("off-midpoint rotate left: {b} (ordered={})", ordered(&b));
+    }
 
     #[test]
     fn rotate_range() {

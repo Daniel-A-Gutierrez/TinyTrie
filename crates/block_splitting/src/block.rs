@@ -8,7 +8,8 @@ pub const MAX_CAP: usize = Nibble::CAP;
 /// Build a child translator from `old`: bump `rotation` by 1 and re-anchor `inner_offset`
 /// so the child's `p2v(0) == old.p2v(first_phys)`. `outer`/`shift` inherited. `p2v` is
 /// evaluated on `old` (pre-rotate); only the `rotate_left` uses the new rotation.
-fn anchored(old: Translator, first_phys: usize) -> Translator {
+fn rsplit_translator(old: Translator, first_phys: usize) -> Translator {
+    assert!(old.shift == 0, "cannot rotate a non-zero shift");
     let mut t = old;
     t.rotate();
     t.inner_offset = old
@@ -168,37 +169,34 @@ impl<T> Block<T> {
         }
     }
 
-    /// General split: cut the canonical cyclic phys sequence into two arcs and rotate
-    /// each into its own block. `self` keeps the `[from, to)` arc (LEFT); the `[to, from)`
-    /// arc (RIGHT) splits off. `from > to` means the arc wraps: `[from, len) ∪ [0, to)`.
-    /// Both children bump `rotation` by 1 and re-anchor so their first vaddr lands at
-    /// phys 0. Items are buffered (both halves), so this handles wrapping canonical sets
-    /// (`shift > 0` + `inner != 0`) that the non-wrapping approach below can't.
-    ///
-    /// For `shift > 0` the cut must separate collision pairs `{v, v+8}` — `from`/`to` at
-    /// the vaddr-8 crossings — or the children collide (`insert` panics). For `shift == 0`
-    /// any `from != to` works.
-    pub fn split_from_to(&mut self, from: usize, to: usize) -> Block<T> {
-        assert!(from <= self.len(), "split_from_to: from {from} > len {}", self.len());
-        assert!(to <= self.len(), "split_from_to: to {to} > len {}", self.len());
-        assert!(from != to, "split_from_to: from == to (empty/full arc)");
+    /// Rotation split (`shift == 0`): left keeps phys `[0, at)`, right takes phys
+    /// `[at, len)`. Both children bump `rotation` by 1 and re-anchor so their first
+    /// vaddr lands at phys 0 — reclaiming the now-constant high bit (rotated into the
+    /// low position) as fresh inter-item gap space, the split-time dual of `spread`.
+    /// Items are buffered and re-inserted via each child's `v2p`: no in-place
+    /// `i -> 2i` move, which at stride 1 would mis-gap the 15/0 wrap seam (no vaddr
+    /// lies between them). Panics if `shift != 0` (via `rsplit_translator`) — route through
+    /// `split` to pick shift vs rotate automatically.
+    pub fn split_and_rotate(&mut self, at: usize) -> Block<T> {
+        assert!(at <= self.len(), "split_and_rotate: at {at} > len {}", self.len());
+        assert!(at != 0, "split_and_rotate: at == 0 (empty arc)");
         assert!(
             self.len() <= MAX_CAP >> self.translator.shift,
-            "split_from_to: len {} > {}",
+            "split_and_rotate: len {} > {}",
             self.len(),
             MAX_CAP >> self.translator.shift
         );
 
         let old = self.translator;
-        // left child = arc [from, to), right child = arc [to, from). Each rotated +
-        // re-anchored at its first phys so its first vaddr lands at phys 0.
-        let left_new = anchored(old, from);
+        // left child anchored at phys 0, right child at phys `at`. Each rotated +
+        // re-anchored so its first vaddr lands at phys 0.
+        let left_new = rsplit_translator(old, 0);
         let mut right = Block::new(old, self.cap);
-        right.translator = anchored(old, to);
+        right.translator = rsplit_translator(old, at);
         self.translator = left_new;
 
         // buffer both halves: drain all items, then re-insert into the anchored children
-        // (no in-place move, so wrapping arcs and scattered dests are fine).
+        // (no in-place move, so the rotation remap handles every item uniformly).
         let items: Vec<(usize, T)> = self
             .buf
             .iter_mut()
@@ -207,11 +205,9 @@ impl<T> Block<T> {
             .collect();
         self.occupancy = 0;
 
-        let in_left =
-            |p: usize| if from < to { p >= from && p < to } else { p >= from || p < to };
         for (phys, item) in items {
             let v = old.p2v(Nibble::from_usize(phys));
-            if in_left(phys) {
+            if phys < at {
                 let dst = self.translator.v2p(v).as_usize();
                 self.insert(dst, item);
             } else {
@@ -221,27 +217,32 @@ impl<T> Block<T> {
         right
     }
 
-    /// Non-wrapping split at `at`: left = phys `[0, at)`, right = phys `[at, len)`.
-    /// Thin special case of `split_from_to(0, at)`.
-    pub fn split_and_rotate(&mut self, at: usize) -> Block<T> {
-        self.split_from_to(0, at)
+    /// Split dispatcher: pick the operation that reclaims the next gap bit. If
+    /// `shift > 0` there's still a low bit to free, so shift (`split_shift`: right
+    /// `shift -= 1`, left spreads `i -> 2i`). Else `shift == 0` — low bits exhausted —
+    /// so rotate (`split_and_rotate`: give the top half to the sibling and reclaim the
+    /// high bit). `at` is the split point in phys space.
+    pub fn split(&mut self, at: usize) -> Block<T> {
+        if self.translator.shift > 0 {
+            self.split_shift(at)
+        } else {
+            self.split_and_rotate(at)
+        }
     }
 
-    /// Split a block that still has room to shift (`shift > 0`): the RIGHT half (phys
-    /// `[at, len)`) splits off into a new block with `shift -= 1` (more room, stride gaps)
-    /// and `inner` re-anchored so its first vaddr `p2v(at)` lands at phys 0. Then the LEFT
-    /// (`self`) spreads (`shift -= 1`, items to stride-2) so it also has room to grow. No
-    /// rotation — the shift decreases interleave the empty space. Use `split_and_rotate`
-    /// for full (`shift == 0`) blocks.
-    pub fn split_and_shift(&mut self, at: usize) -> Block<T> {
-        assert!(at <= self.len(), "split_and_shift: at {at} > len {}", self.len());
-        assert!(
-            self.translator.shift > 0,
-            "split_and_shift: shift == 0 (use split_and_rotate)"
-        );
+    /// Shift split (`shift > 0`): the RIGHT half (phys `[at, len)`) splits off into a
+    /// new block with `shift -= 1` (stride gaps, no rotation) and `inner` re-anchored
+    /// so its first vaddr `p2v(at)` lands at phys 0. Then the LEFT (`self`) spreads
+    /// (`shift -= 1`, items `i -> 2i`) into the just-emptied high phys — no `len`
+    /// growth (a cap-constrained block can't double). Safe at `shift > 0` because
+    /// stride `1 << shift >= 2` means the 15/0 wrap seam is never a consecutive placed
+    /// pair, so the spread always gaps a real midpoint vaddr.
+    fn split_shift(&mut self, at: usize) -> Block<T> {
+        assert!(at <= self.len(), "split_shift: at {at} > len {}", self.len());
+        assert!(self.translator.shift > 0, "split_shift: shift == 0 (use split_and_rotate)");
         assert!(
             self.len() <= MAX_CAP >> self.translator.shift,
-            "split_and_shift: len {} > {}",
+            "split_shift: len {} > {}",
             self.len(),
             MAX_CAP >> self.translator.shift
         );
@@ -267,8 +268,7 @@ impl<T> Block<T> {
             }
         }
         // in-place spread of the left: items phys i -> 2i (i in 0..at), shift -= 1, NO len
-        // growth. The high phys [at, len) were just emptied by the split, providing the space
-        // (a cap-constrained block can't grow len, so we don't call `spread` which doubles it).
+        // growth. The high phys [at, len) were just emptied by the split, providing the space.
         self.spread_in_place(false, at);
         right
     }
