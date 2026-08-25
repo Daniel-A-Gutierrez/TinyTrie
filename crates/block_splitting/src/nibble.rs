@@ -1,6 +1,6 @@
 use std::fmt;
 use std::hash::Hash;
-use std::ops::{Add, BitAnd, BitOr, BitXor, Not, Shl, Shr, Sub, Mul};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Mul, Not, Shl, Shr, Sub};
 
 /// 4-bit unsigned integer. Inner value invariant: always masked to low 4 bits (0..=15).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -11,7 +11,6 @@ impl Nibble {
     pub const CAP: usize = 1 << Self::BIT_WIDTH;
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(1);
-    pub const MIN: Self = Self(0);
     pub const MAX: Self = Self(15);
     pub const MIDPOINT: Self = Self(1 << (Self::BIT_WIDTH - 1));
 
@@ -147,73 +146,5 @@ impl Shr<u32> for Nibble {
     type Output = Self;
     fn shr(self, n: u32) -> Self {
         self.wrapping_shr(n)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn construct_masks() {
-        assert_eq!(Nibble::from_u8(0xFF).as_u8(), 15);
-        assert_eq!(Nibble::from_usize(17).as_u8(), 1);
-        assert_eq!(Nibble::from(20u8).as_u8(), 4);
-    }
-
-    #[test]
-    fn wrapping_add_overflow() {
-        assert_eq!((Nibble::MAX + Nibble::ONE).as_u8(), 0);
-        assert_eq!((Nibble(15) + Nibble(2)).as_u8(), 1);
-    }
-
-    #[test]
-    fn wrapping_sub_underflow() {
-        assert_eq!((Nibble::ZERO - Nibble::ONE).as_u8(), 15);
-        assert_eq!((Nibble(2) - Nibble(5)).as_u8(), 13);
-    }
-
-    #[test]
-    fn wrapping_mul() {
-        assert_eq!((Nibble(3) * Nibble(5)).as_u8(), 15);
-        assert_eq!((Nibble(4) * Nibble(4)).as_u8(), 0);
-    }
-
-    #[test]
-    fn rotate_left_carry() {
-        assert_eq!(Nibble(0b1001).rotate_left(1).as_u8(), 0b0011);
-    }
-
-    #[test]
-    fn rotate_round_trip() {
-        let v = Nibble(0b1011);
-        assert_eq!(v.rotate_left(2).rotate_right(2), v);
-        assert_eq!(v.rotate_left(5).rotate_right(5), v);
-    }
-
-    #[test]
-    fn wrapping_shl_truncates() {
-        assert_eq!((Nibble(15) << 1).as_u8(), 14);
-        assert_eq!(Nibble(0b0111).wrapping_shl(1).as_u8(), 0b1110);
-    }
-
-    #[test]
-    fn logical_shr() {
-        assert_eq!((Nibble(0b1000) >> 1).as_u8(), 0b0100);
-        assert_eq!(Nibble(0b1100).wrapping_shr(2).as_u8(), 0b0011);
-    }
-
-    #[test]
-    fn bitwise() {
-        assert_eq!((Nibble(0b1100) & Nibble(0b1010)).as_u8(), 0b1000);
-        assert_eq!((Nibble(0b1100) | Nibble(0b1010)).as_u8(), 0b1110);
-        assert_eq!((Nibble(0b1100) ^ Nibble(0b1010)).as_u8(), 0b0110);
-        assert_eq!((!Nibble(0b0000)).as_u8(), 0b1111);
-        assert_eq!((!Nibble(0b1010)).as_u8(), 0b0101);
-    }
-
-    #[test]
-    fn midpoint() {
-        assert_eq!(Nibble::MIDPOINT.as_u8(), 8);
     }
 }

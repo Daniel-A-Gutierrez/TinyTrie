@@ -5,16 +5,30 @@ use crate::translator::Translator;
 
 pub const MAX_CAP: usize = Nibble::CAP;
 
+/// Build a child translator from `old`: bump `rotation` by 1 and re-anchor `inner_offset`
+/// so the child's `p2v(0) == old.p2v(first_phys)`. `outer`/`shift` inherited. `p2v` is
+/// evaluated on `old` (pre-rotate); only the `rotate_left` uses the new rotation.
+fn anchored(old: Translator, first_phys: usize) -> Translator {
+    let mut t = old;
+    t.rotate();
+    t.inner_offset = old
+        .p2v(Nibble::from_usize(first_phys))
+        .wrapping_sub(old.outer_offset)
+        .rotate_left(t.rotation)
+        .wrapping_shr(old.shift);
+    t
+}
+
 /// Debug block: a `Vec<Option<T>>` of `len` slots + a `Translator` + a `cap` (max `len`).
 /// Operates on **phys** slots; the caller translates vaddr -> phys via `translator().v2p()`.
 /// `len = min(MAX_CAP >> shift, cap)`, so `log2(len) + shift <= bit_width` — len is decoupled
 /// from shift, and a cap-constrained block can be full at `shift > 0` (must split, not spread).
 #[derive(Clone)]
 pub struct Block<T> {
-    buf: Vec<Option<T>>,
+    buf:        Vec<Option<T>>,
     translator: Translator,
-    occupancy: usize,
-    cap: usize,
+    occupancy:  usize,
+    cap:        usize,
 }
 
 impl<T: fmt::Display> fmt::Display for Block<T> {
@@ -53,7 +67,7 @@ impl<T> Block<T> {
             translator.shift,
             Nibble::BIT_WIDTH
         );
-        assert!(cap >= 1 && cap <= MAX_CAP, "new: cap {cap} out of [1, {MAX_CAP}]");
+        assert!((1..=MAX_CAP).contains(&cap), "new: cap {cap} out of [1, {MAX_CAP}]");
         let len = (MAX_CAP >> translator.shift).min(cap);
         Self { buf: (0..len).map(|_| None).collect(), translator, occupancy: 0, cap }
     }
@@ -70,6 +84,10 @@ impl<T> Block<T> {
     /// overflow and break v2p round-trip, so push_front bumps outer instead. Canonical
     /// set wraps (`{8,12,0,4}`), leaving room on both ends — front/back/middle all work.
     /// Grows by push (len up, shift constant); full at `len == cap` while `shift > 0`.
+    ///
+    /// Built directly (not via `new`): `new` would size `len = min(MAX_CAP>>2, 4) = 4`, but
+    /// this root starts at `len = 1` and grows by `push_*`. `new`'s `len` formula is the
+    /// *full* size for a given translator; these roots deliberately start under-filled.
     pub fn pluripotent() -> Self {
         let tr = Translator::new(Nibble::ZERO, Nibble::from_u8(8), 2, 0);
         Self { buf: vec![None], translator: tr, occupancy: 0, cap: 4 }
@@ -111,10 +129,6 @@ impl<T> Block<T> {
         self.buf.get(phys).and_then(|s| s.as_ref())
     }
 
-    pub fn get_mut(&mut self, phys: usize) -> Option<&mut T> {
-        self.buf.get_mut(phys).and_then(|s| s.as_mut())
-    }
-
     /// remove and return the item at phys slot `phys`. Panics if `phys >= len` or the slot is empty.
     pub fn remove(&mut self, phys: usize) -> T {
         assert!(phys < self.len(), "remove: phys {phys} >= len {}", self.len());
@@ -136,13 +150,19 @@ impl<T> Block<T> {
     pub fn spread(&mut self, offset: bool) {
         let len = self.len();
         assert!(2 * len <= self.cap, "spread: 2*len {len} > cap/2 (at cap, must split)");
-        self.translator.spread(offset);
         self.buf.reserve(len);
         for _ in 0..len {
             self.buf.push(None);
         }
-        // high-to-low: dst (2i+offset) > i > any unprocessed j, so take() never clobbers.
-        for i in (0..len).rev() {
+        self.spread_in_place(offset, len);
+    }
+
+    /// Move each phys `i -> 2i + offset` for `i in 0..count` (high-to-low so `take()` never
+    /// clobbers an unprocessed slot) and update translator params. No `len` growth — caller
+    /// ensures the `[count, 2*count)` dst range is empty and in-bounds.
+    fn spread_in_place(&mut self, offset: bool, count: usize) {
+        self.translator.spread(offset);
+        for i in (0..count).rev() {
             let dst = 2 * i + offset as usize;
             self.buf[dst] = self.buf[i].take();
         }
@@ -171,21 +191,11 @@ impl<T> Block<T> {
 
         let old = self.translator;
         // left child = arc [from, to), right child = arc [to, from). Each rotated +
-        // re-anchored at its first phys: inner = (p2v(first) - outer).rol(new_rot) >> shift.
-        let mut left_new = old;
-        left_new.rotate();
-        left_new.inner_offset = old
-            .p2v(Nibble::from_usize(from))
-            .wrapping_sub(old.outer_offset)
-            .rotate_left(left_new.rotation)
-            .wrapping_shr(old.shift);
+        // re-anchored at its first phys so its first vaddr lands at phys 0.
+        let left_new = anchored(old, from);
         let mut right = Block::new(old, self.cap);
-        right.translator.rotate();
-        right.translator.inner_offset = old
-            .p2v(Nibble::from_usize(to))
-            .wrapping_sub(old.outer_offset)
-            .rotate_left(right.translator.rotation)
-            .wrapping_shr(old.shift);
+        right.translator = anchored(old, to);
+        self.translator = left_new;
 
         // buffer both halves: drain all items, then re-insert into the anchored children
         // (no in-place move, so wrapping arcs and scattered dests are fine).
@@ -197,16 +207,17 @@ impl<T> Block<T> {
             .collect();
         self.occupancy = 0;
 
-        let in_left = |p: usize| if from < to { p >= from && p < to } else { p >= from || p < to };
+        let in_left =
+            |p: usize| if from < to { p >= from && p < to } else { p >= from || p < to };
         for (phys, item) in items {
             let v = old.p2v(Nibble::from_usize(phys));
             if in_left(phys) {
-                self.insert(left_new.v2p(v).as_usize(), item);
+                let dst = self.translator.v2p(v).as_usize();
+                self.insert(dst, item);
             } else {
                 right.insert(right.translator.v2p(v).as_usize(), item);
             }
         }
-        self.translator = left_new;
         right
     }
 
@@ -243,7 +254,10 @@ impl<T> Block<T> {
             .wrapping_sub(old.outer_offset)
             .rotate_left(old.rotation)
             .wrapping_shr(right_shift);
-        let mut right = Block::new(Translator::new(right_inner, old.outer_offset, right_shift, old.rotation), self.cap);
+        let mut right = Block::new(
+            Translator::new(right_inner, old.outer_offset, right_shift, old.rotation),
+            self.cap,
+        );
 
         // left keeps its translator for now; move high-half items [at, len) into the right block.
         for phys in at..self.len() {
@@ -255,47 +269,9 @@ impl<T> Block<T> {
         // in-place spread of the left: items phys i -> 2i (i in 0..at), shift -= 1, NO len
         // growth. The high phys [at, len) were just emptied by the split, providing the space
         // (a cap-constrained block can't grow len, so we don't call `spread` which doubles it).
-        self.translator.spread(false);
-        for i in (0..at).rev() {
-            self.buf[2 * i] = self.buf[i].take();
-        }
+        self.spread_in_place(false, at);
         right
     }
-
-    // Original non-wrapping approach (in-place left move + drain), preserved for reference.
-    // It avoids buffering by moving the left half in place and draining only the wrap-
-    // clobbered middle [mid, at) where mid = v2p(MIDPOINT). Correct only when the canonical
-    // set is phys-contiguous from 0 (inner == 0, or no wrap); split_from_to above buffers
-    // both halves and handles wrapping arcs, and is the live implementation.
-    //
-    // pub fn split_and_rotate(&mut self, at: usize) -> Block<T> {
-    //     assert!(at <= self.len());
-    //     assert!(self.len() <= MAX_CAP >> self.translator.shift);
-    //     let mid = self.translator.v2p(Nibble::MIDPOINT).as_usize();
-    //     let mut left_new = self.translator.clone(); left_new.rotate();
-    //     let mut right = Block::new(self.translator.clone()); right.translator.rotate();
-    //     let tr = &self.translator;
-    //     left_new.inner_offset = tr.p2v(Nibble::ZERO).wrapping_sub(tr.outer_offset)
-    //         .rotate_left(left_new.rotation).wrapping_shr(tr.shift);
-    //     right.translator.inner_offset = tr.p2v(Nibble::from_usize(at)).wrapping_sub(tr.outer_offset)
-    //         .rotate_left(right.translator.rotation).wrapping_shr(tr.shift);
-    //     for phys in at..self.len() { if self.get(phys).is_some() {
-    //         let r = right.translator.v2p(self.translator.p2v(Nibble::from_usize(phys))).as_usize();
-    //         right.insert(r, self.remove(phys));
-    //     }}
-    //     let mut side = Vec::with_capacity(at.saturating_sub(mid));
-    //     for phys in mid..at { if self.get(phys).is_some() { side.push(Some(self.remove(phys))); }
-    //         else { side.push(None) } }
-    //     for phys in (0..mid).into_iter().rev() { if self.get(phys).is_some() {
-    //         let r = left_new.v2p(self.translator.p2v(Nibble::from_usize(phys))).as_usize();
-    //         self.insert(r, self.remove(phys));
-    //     }}
-    //     for (i, item) in side.into_iter().enumerate() {
-    //         let d = left_new.v2p(self.translator.p2v(Nibble::from_usize(mid + i))).as_usize();
-    //         if let Some(item) = item { self.insert(d, item); }
-    //     }
-    //     self.translator = left_new; right
-    // }
 }
 
 impl Block<u8> {
@@ -345,7 +321,9 @@ impl Block<u8> {
             assert!(
                 self.translator.shift > 0 && self.len() < self.cap,
                 "put: at cap (len={}, cap={}, shift={}), must split",
-                self.len(), self.cap, self.translator.shift
+                self.len(),
+                self.cap,
+                self.translator.shift
             );
             self.spread(false);
         }
@@ -355,7 +333,12 @@ impl Block<u8> {
     /// new phys is already canonical for an inner=0 block growing within `cap`. Panics
     /// at the cap. `item` should be `back_vaddr()` for the invariant to hold.
     pub fn push_back(&mut self, item: u8) {
-        assert!(self.len() < self.cap, "push_back: at cap (len={}, cap={}), must split", self.len(), self.cap);
+        assert!(
+            self.len() < self.cap,
+            "push_back: at cap (len={}, cap={}), must split",
+            self.len(),
+            self.cap
+        );
         self.buf.push(Some(item));
         self.occupancy += 1;
     }
@@ -366,12 +349,19 @@ impl Block<u8> {
     /// vaddrs are preserved (offset down by stride, phys up by 1 ⇒ vaddr constant).
     /// `item` should be `front_vaddr()` for the invariant to hold. Panics at the cap.
     pub fn push_front(&mut self, item: u8) {
-        assert!(self.len() < self.cap, "push_front: at cap (len={}, cap={}), must split", self.len(), self.cap);
+        assert!(
+            self.len() < self.cap,
+            "push_front: at cap (len={}, cap={}), must split",
+            self.len(),
+            self.cap
+        );
         let stride = 1u8 << self.translator.shift;
         if self.translator.shift == 0 {
-            self.translator.inner_offset = self.translator.inner_offset.wrapping_sub(Nibble::ONE);
+            self.translator.inner_offset =
+                self.translator.inner_offset.wrapping_sub(Nibble::ONE);
         } else {
-            self.translator.outer_offset = self.translator.outer_offset.wrapping_sub(Nibble::from_u8(stride));
+            self.translator.outer_offset =
+                self.translator.outer_offset.wrapping_sub(Nibble::from_u8(stride));
         }
         let n = self.buf.len();
         self.buf.push(None);

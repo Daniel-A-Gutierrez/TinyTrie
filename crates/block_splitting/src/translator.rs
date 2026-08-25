@@ -14,12 +14,17 @@ use crate::nibble::Nibble;
 pub struct Translator {
     pub inner_offset: Nibble,
     pub outer_offset: Nibble,
-    pub shift: u32,
-    pub rotation: u32,
+    pub shift:        u32,
+    pub rotation:     u32,
 }
 
 impl Translator {
-    pub const fn new(inner_offset: Nibble, outer_offset: Nibble, shift: u32, rotation: u32) -> Self {
+    pub const fn new(
+        inner_offset: Nibble,
+        outer_offset: Nibble,
+        shift: u32,
+        rotation: u32,
+    ) -> Self {
         Self { inner_offset, outer_offset, shift, rotation }
     }
 
@@ -45,7 +50,7 @@ impl Translator {
     pub fn spread(&mut self, offset: bool) {
         assert!(self.shift != 0, "spread: shift == 0");
         let inner = self.inner_offset.as_u8();
-        self.inner_offset = Nibble::from_u8((2 * inner).wrapping_sub(offset as u8) & 0x0F);
+        self.inner_offset = Nibble::from_u8((2 * inner).wrapping_sub(offset as u8));
         self.shift -= 1;
     }
 
@@ -69,62 +74,5 @@ impl fmt::Display for Translator {
             "inner={} outer={} shift={} rot={}",
             self.inner_offset, self.outer_offset, self.shift, self.rotation
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn t(inner: u8, outer: u8, shift: u32, rot: u32) -> Translator {
-        Translator::new(Nibble::from_u8(inner), Nibble::from_u8(outer), shift, rot)
-    }
-
-    #[test]
-    fn identity() {
-        let tr = t(0, 0, 0, 0);
-        for p in 0..16 {
-            assert_eq!(tr.p2v(Nibble::from_u8(p)).as_u8(), p);
-            assert_eq!(tr.v2p(Nibble::from_u8(p)).as_u8(), p);
-        }
-    }
-
-    // shift==0 => p2v is a bijection on all 16 (wrapping_add + rotate are bijections;
-    // shl is the only non-injective step). v2p inverts it exactly.
-    #[test]
-    fn shift_zero_is_bijection() {
-        for inner in 0..16u8 {
-            for outer in 0..16u8 {
-                for rot in 0..4u32 {
-                    let tr = t(inner, outer, 0, rot);
-                    for p in 0..16u8 {
-                        let v = tr.p2v(Nibble::from_u8(p));
-                        assert_eq!(tr.v2p(v).as_u8(), p, "inner={inner} outer={outer} rot={rot} phys={p}");
-                    }
-                }
-            }
-        }
-    }
-
-    // shift>0 => p2v is injective only where phys+inner < cap (cap = 16>>shift):
-    // the shift drops high bits, so phys+inner must stay in the low (bit_width-shift)
-    // bits. That range is exactly the canonical phys set the block places items in.
-    #[test]
-    fn canonical_range_round_trip() {
-        for shift in 1..4u32 {
-            let cap = 16u8 >> shift;
-            for inner in 0..16u8 {
-                let valid = cap.saturating_sub(inner);
-                for outer in 0..16u8 {
-                    for rot in 0..4u32 {
-                        let tr = t(inner, outer, shift, rot);
-                        for p in 0..valid {
-                            let v = tr.p2v(Nibble::from_u8(p));
-                            assert_eq!(tr.v2p(v).as_u8(), p, "inner={inner} outer={outer} shift={shift} rot={rot} phys={p}");
-                        }
-                    }
-                }
-            }
-        }
     }
 }

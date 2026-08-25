@@ -1,6 +1,46 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Vaddr Wrapping Note
+if cap >> shift >= len , we've overlapped vaddrs (bad). 
+So push front and back need to check that ptr::max >> shift < len. 
+
+## Blocks...
+Uniform, pluripotent, append, prepend...
+Fixed root, not fixed root 
+Splittable, parameters, strategies, store types, max capacity
+
+too much to juggle. 
+Block Base
+get : &T,  v2p, p2v, occupancy, len, capacity, max_capacity, cursor , vget, translator, from vec, into vec.
+
+BlockBaseMut 
+get_mut :&mut T, remove, swap, swap_open, get_mut_disjoint (require ptrs sorted)
+
+Uniform: 
+ordering is irrelevant
+find_slot, slide_none, insert, split_at
+
+Append: 
+push_back
+
+Prepend: push_front
+
+Pluripotent : 
+ordering irrelevant, root slides 
+push_front,push_back,find_slot,slide_none, insert, split_at
+
+`FixedRoot<Ordering>` : 
+root always lies at a certain physical and virtual position - pluripotent impossible. 
+find_slot, slide_none, insert, split
+
+
+From this blockbase seems complete, but the others can broadly be categorized as having middle insert capability, push front, push back, then either split_at or split. 
+
+the body of find_slot and slide_none will be different for fixed root as well. the 'fixed slot' arg gets removed and is implicitly the root for fixedroot, and none for the rest. 
+
+Is there a point though, to making the mutable bits composable by trait? 
+
 # Been a bit
 picking back up, im not sure about the degree of parameterization of the alloc strategies. 
 Also i think instead of fixing roots itd be better to have the consumer of the block have to handle whatever 'fixed' points they have shifting in their fixup logic. 
