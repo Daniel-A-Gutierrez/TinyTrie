@@ -1,5 +1,4 @@
-use crate::{Fixup, alloc_strat::*};
-use crate::{InOrder, Ordering, PostOrder, PreOrder,
+use crate::{Fixup, Ordering, RootPos,
             index::*,
             store::{DequeStore, NoneSlide, Store, VecStore},
             translator::{AddressTranslator, Translator}};
@@ -7,36 +6,108 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::marker::PhantomData;
 use crate::block_cursor::*;
-///per-strategy concrete block aliases. `BlockMutTrait` is only impl'd for these four
-///(strategy, store) combos, so these are the only `RawBlock` family members that are
-///tree-usable as `Inner`. `pub(crate)` because the stores are `pub(crate)`.
-pub(crate) type UniformBlock<'a, T, O: Ordering, P, const CAP: usize> =
-    RawBlock<'a, T, P, Uniform<O>, VecStore<T, CAP>>;
-pub(crate) type PluripotentBlock<'a, T, O: Ordering, P, const CAP: usize> =
-    RawBlock<'a, T, P, Pluripotent<O>, DequeStore<T, CAP>>;
-pub(crate) type AppendBlock<'a, T, P, const CAP: usize> =
-    RawBlock<'a, T, P, Append, VecStore<T, CAP>>;
-pub(crate) type PrependBlock<'a, T, P, const CAP: usize> =
-    RawBlock<'a, T, P, Prepend, VecStore<T, CAP>>;
 
-///debug rendering aid for a block-stored item. debug-only. the item carries its own
-///debug height (`INode::debug_height`); `debug_render` reads it to pick the right
-///interpretation of each leaf slot (terminal SlicePtr vs internal child vaddr -> phys).
-///carrying the height on the node (rather than walking the tree) keeps debug working
-///when the tree is broken mid-fixup — a walk would OOB-panic on an orphaned node.
+///block strategy marker. a type-level tag carried as `PhantomData` on `Block`; each mode
+///is a distinct *type* generic over its pointer width `P` (`Uniform<P>` ≠ `FixedRoot<O,P>`),
+/// so wrong-usecase calls are compile errors. per-mode: the translator config, the
+///addressable CAP limit (a const baked from `P`), and iteration direction.
+pub trait Mode: 'static {
+    ///the pointer width this mode is specialized for; bound to `Block`'s `P` at the alias.
+    type P: BlockIndex;
+    ///max store CAP this mode's translator can address, baked from `Self::P`.
+    const CAP_LIMIT: usize;
+    ///iteration direction: `Prepend` iterates high→low (reversed); others forward.
+    const REVERSED: bool = false;
+    ///the mode's initial translator config.
+    fn new_translator() -> Translator<Self::P>;
+}
+
+///no-pin full-range block (anchor 0, no insertion pin). for trees that grow by splitting
+///(the root can't stay at a fixed position anyway) and other consumers that don't pin.
+pub struct Uniform<P: BlockIndex>(PhantomData<P>);
+///root pinned at a fixed vaddr determined by `O` (preorder=0, inorder=MIDPOINT,
+///postorder=MAX); `find_slot`/`slide_none` implicitly pin `v2p(root_vaddr)`. the caller
+///has no choice but to pin.
+pub struct FixedRoot<O: Ordering, P: BlockIndex>(PhantomData<O>, PhantomData<P>);
+///half-range, both-ends-growable, root slides. `DequeStore`. pin=None. not generic over
+///ordering: push_back/push_front are incompatible with a fixed root position anyway.
+pub struct Pluripotent<P: BlockIndex>(PhantomData<P>);
+///dense `push_back` only (with a periodic None gap for mid-inserts). pin=None.
+pub struct Append<P: BlockIndex>(PhantomData<P>);
+///`Append` mirrored: dense `push_front` only (= physical `push_back`), iteration high→low. pin=None.
+pub struct Prepend<P: BlockIndex>(PhantomData<P>);
+
+impl<P: BlockIndex> Mode for Uniform<P> {
+    type P = P;
+    const CAP_LIMIT: usize = 1usize << P::BIT_WIDTH;
+    fn new_translator() -> Translator<P> {
+        Translator::new(P::ZERO, P::ZERO, P::BIT_WIDTH as u32, 0)
+    }
+}
+impl<O: Ordering, P: BlockIndex> Mode for FixedRoot<O, P> {
+    type P = P;
+    const CAP_LIMIT: usize = 1usize << P::BIT_WIDTH;
+    fn new_translator() -> Translator<P> {
+        let (shift, inner) = match O::ROOT_POS {
+            RootPos::Middle => (P::BIT_WIDTH as u32 - 1, 0usize),
+            RootPos::End => (P::BIT_WIDTH as u32, 1usize << (P::BIT_WIDTH - 1)),
+            RootPos::Beginning => (P::BIT_WIDTH as u32, 0usize),
+        };
+        Translator::new(P::from_usize(inner), P::ZERO, shift, 0)
+    }
+}
+impl<P: BlockIndex> Mode for Pluripotent<P> {
+    type P = P;
+    const CAP_LIMIT: usize = 1usize << P::Half::BIT_WIDTH;
+    fn new_translator() -> Translator<P> {
+        Translator::new(
+            P::ZERO,
+            P::from_usize(1usize << (P::BIT_WIDTH - 1)),
+            P::Half::BIT_WIDTH as u32 - 1,
+            0,
+        )
+    }
+}
+impl<P: BlockIndex> Mode for Append<P> {
+    type P = P;
+    const CAP_LIMIT: usize = 1usize << P::BIT_WIDTH;
+    fn new_translator() -> Translator<P> {
+        Translator::new(P::from_usize(1usize << P::Half::BIT_WIDTH), P::ZERO, 0, 0)
+    }
+}
+impl<P: BlockIndex> Mode for Prepend<P> {
+    type P = P;
+    const CAP_LIMIT: usize = 1usize << P::BIT_WIDTH;
+    const REVERSED: bool = true;
+    fn new_translator() -> Translator<P> {
+        Translator::new(P::from_usize(1usize << P::Half::BIT_WIDTH), P::ZERO, 0, 0)
+    }
+}
+
+///fixed root vaddr for an ordering (the FixedRoot pin target).
+fn root_vaddr<O: Ordering, P: BlockIndex>() -> P {
+    match O::ROOT_POS {
+        RootPos::Beginning => P::ZERO,
+        RootPos::Middle => P::MIDPOINT,
+        RootPos::End => P::MAX,
+    }
+}
+
+///debug rendering aid for a block-stored item. debug-only.
 pub(crate) trait SlotDebug<P: BlockIndex> {
     fn debug_render(&self, tr: &Translator<P>) -> Vec<String>;
 }
 
-///apply slide's fixup to the cursor after doing the slide, but to the nodes before doing the slide. 
+///find_slot result: an optional grow fixup (apply to live phys) + an optional pending
+///slide (apply via `slide_none`).
 pub struct FoundSlot {
-    pub(crate) grew : Option<GrewFixup>,
-    pub(crate) slide : Option<NoneSlide>
+    pub grew: Option<GrewFixup>,
+    pub slide: Option<NoneSlide>,
 }
 
 pub struct GrewFixup {
-    shl : u32, //if the block grew, shl=1, otherwise 0. 
-    shift_offset : u8 //depends on strategy, items ended up at 2i or 2i+1. this would be 1 in the latter case.
+    shl: u32,
+    shift_offset: u8,
 }
 
 pub struct InsufficientMaxCapacity();
@@ -48,36 +119,30 @@ impl Fixup for GrewFixup {
     }
 }
 
-///read-only block surface. `T`/`P`/`S` are associated (derived from the impl, i.e.
-///from the concrete `RawBlock` family member), so the tree tier can recover them as
-///`Inner::T`/`Inner::P`/`Inner::S` without restating them as params.
-pub trait BlockTrait<'a>: 'a {
+///read-only block surface. strat-agnostic: `T`/`P`/`S` derived from the impl. no `iter`
+///(iteration direction is per-usecase — `Uniform`/`FixedRoot` forward, `Prepend` reversed).
+pub trait BlockBase<'a>: 'a {
     type T: Sized + 'a;
     type P: BlockIndex;
     type S: Store<'a, Self::T> + 'a;
-    type Cursor<'cursor>: Cursor<'cursor, Self::T, Self::P>
-    where
-        'a: 'cursor,
-        Self: 'cursor;
+    ///per-block payload (e.g. `BTreeMeta<P>{height, root}` for tree blocks; `()` otherwise).
+    type Meta;
 
     fn store<'b>(&'b self) -> &'b Self::S
     where 'a: 'b;
-
     fn translator<'b>(&'b self) -> &'b Translator<Self::P>;
+    fn meta(&self) -> &Self::Meta;
 
-    ///physical get. panics if the slot is `None` (contract violation — caller
-    ///guarantees `p` is occupied).
+    ///physical get. panics if the slot is `None` (caller guarantees `p` occupied).
     fn get<'b>(&'b self, p: usize) -> &'b Self::T
     where 'a: 'b {
         self.store().get(p)
     }
-
     ///virtual get: translate vaddr→phys. panics if the slot is `None`.
     fn vget<'b>(&'b self, ptr: Self::P) -> &'b Self::T
     where 'a: 'b {
         self.store().get(self.translator().v2p(ptr))
     }
-
     ///vaddr of first occupied slot, None if empty.
     fn first_vaddr<'b>(&'b self) -> Option<Self::P>
     where 'a: 'b {
@@ -90,7 +155,6 @@ pub trait BlockTrait<'a>: 'a {
         }
         None
     }
-
     ///vaddr of last occupied slot, None if empty.
     fn last_vaddr<'b>(&'b self) -> Option<Self::P>
     where 'a: 'b {
@@ -103,291 +167,236 @@ pub trait BlockTrait<'a>: 'a {
         }
         None
     }
-
     fn v2p(&self, virt: Self::P) -> usize {
         self.translator().v2p(virt)
     }
-
     fn p2v(&self, phys: usize) -> Self::P {
         self.translator().p2v(phys)
     }
-
     fn vdist(&self, v1: Self::P, v2: Self::P) -> usize {
         self.translator().vdist(v1, v2)
     }
-
     fn occupied<'b>(&'b self) -> usize
     where 'a: 'b {
         self.store().occupied()
     }
-
     fn len<'b>(&'b self) -> usize
     where 'a: 'b {
         self.store().len()
     }
-
     fn cap<'b>(&'b self) -> usize
     where 'a: 'b {
         self.store().cap()
     }
-
     fn max_capacity(&self) -> usize {
         Self::S::max_capacity()
     }
-
-    fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Self::T> + 'b
-    where 'a: 'b {
-        self.store().iter()
-    }
-
-    ///block read cursor: positioned at the first occupied slot (or at-end if empty).
-    fn cursor<'cursor>(&'cursor self) -> Self::Cursor<'cursor>
-    where 'a: 'cursor;
 }
 
-///mutation surface. blocks of different alloc strats implement a common interface but failures must be handled at runtime.
-///`A` (the strategy) is associated; `T`/`P`/`S` come from the `BlockTrait` supertrait.
-pub trait BlockMutTrait<'a>: BlockTrait<'a> {
-    type A: AllocStrat<Self::P>;
-    type CursorMut<'cursor>: CursorMut<'cursor, Self::T, Self::P>
-    where
-        'a: 'cursor,
-        Self: 'cursor;
-
-    fn new() -> Self;
+///strat-agnostic mutation core — only what EVERY block supports regardless of alloc
+///strategy: slot accessors, `insert_root` (first insert), and in-place slot edits
+///(`get_mut`/`remove`/`swap`/`swap_open`). the mid-insert + split surface
+///(`find_slot`/`slide_none`/`grow_and_spread`/`insert`/`split_*`) lives on `SparseBlock`
+///(Uniform/Pluripotent/FixedRoot); the push surface (`try_push_*`) lives on the
+///per-usecase push traits (Pluripotent/Append/Prepend).
+pub trait BlockBaseMut<'a>: BlockBase<'a> {
     fn store_mut(&mut self) -> &mut Self::S;
-
     fn translator_mut(&mut self) -> &mut Translator<Self::P>;
+    fn set_meta(&mut self, m: Self::Meta);
 
-    ///block mut cursor: positioned at the first occupied slot (or at-end if empty).
-    fn cursor_mut<'cursor>(&'cursor mut self) -> Self::CursorMut<'cursor>
-    where 'a: 'cursor;
+    ///first insert into an empty block. grows to the strat's initial cap and lands the
+    ///root at the midpoint phys. returns the root's phys.
+    fn insert_root(&mut self, v: Self::T) -> usize;
 
-    ///physical mut get. panics if the slot is `None` (contract violation — caller
-    ///guarantees `p` is occupied).
+    ///physical mut get. panics if the slot is `None`.
     fn get_mut<'b>(&'b mut self, p: usize) -> &'b mut Self::T
     where 'a: 'b {
         self.store_mut().get_mut(p)
     }
-
-    ///virtual mut get: translate vaddr→phys. panics if the slot is `None`.
+    ///virtual mut get. panics if the slot is `None`.
     fn vget_mut<'b>(&'b mut self, ptr: Self::P) -> &'b mut Self::T
     where 'a: 'b {
         let p = self.translator().v2p(ptr);
         self.store_mut().get_mut(p)
     }
-
-    ///two disjoint `&mut` to occupied physical slots `a`, `b`. panics if `a == b`
-    ///or either is `None`. for `split_into` between two in-block nodes.
+    ///two disjoint `&mut` to occupied physical slots. panics if `a == b` or either is `None`.
     fn get_disjoint_mut<'b>(&'b mut self, a: usize, b: usize) -> (&'b mut Self::T, &'b mut Self::T)
     where 'a: 'b {
         self.store_mut().get_disjoint_mut(a, b)
     }
-
-    ///slide the None `ms.from` -> `ms.to`; returns the opened slot. `pin` (phys) must
-    ///not move.
-    fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> OpenSlot {
-        OpenSlot(self.store_mut().slide_none(ms, pin))
+    fn remove(&mut self, p: usize) -> (Self::T, OpenSlot) {
+        (self.store_mut().remove(p), OpenSlot(p))
     }
-
-    ///first insert into an empty block. grows to `INIT_CAP` Nones and lands the root at
-    ///the midpoint phys (`INIT_CAP/2`): for in-order (`INIT_CAP=2`) that's phys 1 — the
-    ///physical midpoint of the len-2 block. returns the root's phys.
-    fn insert_root(&mut self, v: Self::T) -> usize {
-        assert!(self.store().len() == 0, "insert_root: block not empty");
-        let cap = Self::A::INIT_CAP as usize;
-        self.store_mut().grow_back(cap);
-        let mid = cap / 2;
-        self.store_mut().insert(v, mid);
-        mid
-    }
-
-    ///manually grow + spread; fails if shift==0 or would exceed max capacity.
-    fn grow_and_spread(&mut self) -> Result<GrewFixup,InsufficientMaxCapacity> {
-        let shift = self.translator().shift();
-        if shift == 0 || self.store().len() * 2 > Self::S::max_capacity(){
-            return Err(InsufficientMaxCapacity());
-        }
-        Self::A::on_grow(self.translator_mut());
-        self.store_mut().spread(Self::A::SPREAD_OFFSET);
-        Ok(GrewFixup { shl: 1, shift_offset: Self::A::SPREAD_OFFSET as u8} )
-    }
-
-    ///find free slot or make space if possible. dir is logical (true=after);
-    ///REVERSED strategies flip it to phys. `pos`/`pin` are physical.
-    fn find_slot(
-        &mut self,
-        pos: usize,
-        dir: bool,
-        pin: Option<usize>,
-    ) -> FoundSlot {
-        let mut found = FoundSlot{grew:None,slide:None};
-        let dir = dir ^ Self::A::REVERSED;
-        if let Some(ns) = self.store().find_slot(pos, dir, Self::A::INSERT_BUDGET, pin) {
-            found.slide = Some(ns);
-            return found;
-        }
-        if self.len() == self.max_capacity() {
-            return found;
-        }
-        if let Ok(g) = self.grow_and_spread() {
-            found.grew = Some(g);
-        }
-        //spread remaps phys (i->2i+offset); apply the grew fixup to recover the new phys.
-        let mut pos = pos;
-        let mut pin = pin;
-        if let Some(g) = &found.grew {
-            g.fix_p(&mut pos);
-            if let Some(p) = pin.as_mut() {
-                g.fix_p(p);
-            }
-        }
-        found.slide = self.store().find_slot(pos, dir, self.len(), pin);
-        found
-    }
-
-    ///place `v` at the opened slot. returns its phys.
-    fn insert(&mut self, v: Self::T, slot: OpenSlot) -> usize {
-        self.store_mut().insert(v, slot.0);
-        slot.0
-    }
-
-    fn remove(&mut self, p: usize) -> (Self::T,OpenSlot) {
-        (self.store_mut().remove(p),OpenSlot(p))
-    }
-
-    ///swap the contents at two phys slots.
     fn swap(&mut self, a: usize, b: usize) {
         self.store_mut().swap(a, b);
     }
-
     ///swap the record at phys `src` with the None at `open`. returns the slot freed at
-    ///`src`'s phys and the phys of the record that was at `src` (now at `open`'s
-    ///phys). used to relocate a wired node to a new gap (`hop_to_median`) and to land a new
-    ///node at a specific phys (root promote): the caller inserts into the freed slot, or
-    ///reads the returned phys to update the node's inbound pointer.
+    ///`src`'s phys and the phys the record moved to.
     fn swap_open(&mut self, src: usize, open: OpenSlot) -> (OpenSlot, usize) {
         self.store_mut().swap(src, open.0);
         (OpenSlot(src), open.0)
     }
-
-    //none of the split stuff is really in use or correct or working.
-
-    ///self keeps [0,at).
-    ///precondition: len == P::MAX.as_usize() + 1 (block full).
-    fn split_block(&mut self, at : usize) -> Self;
-
-    ///split at 'at' and then spread both sides, add 1 rotation to translator. 
-    fn split_block_and_rotate(&mut self, at : usize) -> Self;
-
-    ///failure is a signal to use a different block or block type.
-    ///will not move elements
-    fn try_insert_back(&mut self, v: Self::T) -> Result<usize, Self::T>;
-
-    ///failure is a signal to use a different block or block type.
-    ///will not move elements
-    fn try_insert_front(&mut self, v: Self::T) -> Result<usize, Self::T>;
 }
 
-///raw ordered arena run: owns a store + translator, upholds no structural
-///invariant.
-pub struct RawBlock<'a, T, P, A, S>
+///sparse mid-insert + split surface: find/open a slot (`find_slot`/`slide_none`), grow
+///(`grow_and_spread`), place (`insert` — None→Some at a slot, distinct from push), and
+///split (`split_block`/`split_block_and_rotate`). impl'd by the sparse-capable strats
+///(Uniform/Pluripotent/FixedRoot); NOT by the dense push-only strats (Append/Prepend).
+///`slide_none`/`insert` are strat-agnostic defaults; `find_slot`/`grow_and_spread`/
+///`split_*` are per-Mode. pin is implicit per-Mode (root for FixedRoot, None otherwise).
+pub trait SparseBlock<'a>: BlockBaseMut<'a> {
+    ///find free slot or make space. `dir` is logical (true=after); `Prepend` flips it to
+    ///phys. `pos` is physical. pin is implicit per-Mode.
+    fn find_slot(&mut self, pos: usize, dir: bool) -> FoundSlot;
+    ///slide the None `ms.from` -> `ms.to`; returns the opened slot. pin=None default;
+    ///FixedRoot overrides to pin the root.
+    fn slide_none(&mut self, ms: NoneSlide) -> OpenSlot {
+        OpenSlot(self.store_mut().slide_none(ms, None))
+    }
+    ///manually grow + spread; fails if shift==0 or would exceed max capacity.
+    fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity>;
+    ///place `v` at the opened slot (None→Some). returns its phys. distinct from push.
+    fn insert(&mut self, v: Self::T, slot: OpenSlot) -> usize {
+        self.store_mut().insert(v, slot.0);
+        slot.0
+    }
+    ///self keeps [0,at). precondition: len == P::MAX.as_usize() + 1 (block full).
+    fn split_block(&mut self, at: usize) -> Self;
+    ///split at `at` then spread both sides, add 1 rotation to the translator.
+    fn split_block_and_rotate(&mut self, at: usize) -> Self;
+}
+
+///raw ordered arena run: owns a store + translator + a `Mode` tag, upholds no structural
+///invariant. the only concrete block type; per-usecase surfaces are traits impl'd for a
+///specific `Mode`.
+pub struct Block<'a, T, P, S, M, Meta = ()>
 where
     T: Sized + 'a,
     P: BlockIndex,
-    A: AllocStrat<P>,
+    M: Mode,
     S: Store<'a, T>,
+    Meta: 'a + Default + Clone,
 {
-    _strategy:  PhantomData<A>,
-    store:      S,
+    store: S,
     translator: Translator<P>,
-    _phantom:   PhantomData<&'a T>,
+    meta: Meta,
+    _mode: PhantomData<M>,
+    _phantom: PhantomData<&'a T>,
 }
 
-pub(crate) struct OpenSlot(pub(crate) usize);
+pub struct OpenSlot(pub usize);
 
-///fwd-or-rev iterator wrapper: REVERSED strategies pick Rev, else Fwd. The dead
-///arm is never constructed per-monomorphization (A::REVERSED is const).
-pub(crate) enum DirIter<F, R> {
-    Fwd(F),
-    Rev(R),
-}
-
-impl<F: Iterator, R: Iterator<Item = F::Item>> Iterator for DirIter<F, R> {
-    type Item = F::Item;
-    #[inline]
-    fn next(&mut self) -> Option<F::Item> {
-        match self {
-            Self::Fwd(i) => i.next(),
-            Self::Rev(i) => i.next(),
+///emits the per-`Mode` `BlockBaseMut` accessors (identical across all modes; only the
+///type params differ). invoked inside each `BlockBaseMut` impl.
+macro_rules! block_base_accessors {
+    ($S:ty, $P:ty) => {
+        fn store_mut(&mut self) -> &mut $S {
+            &mut self.store
         }
-    }
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Fwd(i) => i.size_hint(),
-            Self::Rev(i) => i.size_hint(),
+        fn translator_mut(&mut self) -> &mut Translator<$P> {
+            &mut self.translator
         }
-    }
+        fn set_meta(&mut self, m: Self::Meta) {
+            self.meta = m;
+        }
+    };
 }
 
-impl<F: ExactSizeIterator, R: ExactSizeIterator<Item = F::Item>> ExactSizeIterator
-    for DirIter<F, R>
-{
+///emits the strat-agnostic `split_block`/`split_block_and_rotate` (delegate to the
+///inherent split primitives). invoked inside each `SparseBlock` impl.
+macro_rules! sparse_split {
+    () => {
+        fn split_block(&mut self, at: usize) -> Self {
+            self.split(at)
+        }
+        fn split_block_and_rotate(&mut self, at: usize) -> Self {
+            let v_start = self.p2v(at);
+            let v_end = self.p2v(0);
+            self.split_and_rotate(v_start, v_end)
+        }
+    };
 }
 
-impl<'a, T, P, A, S> BlockTrait<'a> for RawBlock<'a, T, P, A, S>
+impl<'a, T, P, S, M, Meta> BlockBase<'a> for Block<'a, T, P, S, M, Meta>
 where
     T: Sized + 'a,
     P: BlockIndex,
-    A: AllocStrat<P>,
+    M: Mode,
     S: Store<'a, T> + 'a,
+    Meta: 'a + Default + Clone,
 {
     type T = T;
     type P = P;
     type S = S;
-    type Cursor<'cursor>
-        = BlockCursor<'a, 'cursor, Self, &'cursor Self>
-    where 'a: 'cursor;
+    type Meta = Meta;
 
     fn store<'b>(&'b self) -> &'b S
     where 'a: 'b {
         &self.store
     }
-
     fn translator<'b>(&'b self) -> &'b Translator<P> {
         &self.translator
     }
+    fn meta(&self) -> &Meta {
+        &self.meta
+    }
+}
 
+///concrete cursor factory on the `Block` struct: the cursor lives here (one impl), not on
+///the core traits (a generic `BlockBaseMut` cursor doesn't know the usecase). each
+///per-usecase trait extends this to expose its cursor.
+pub trait BlockCursorOf<'a>: BlockBase<'a> {
+    type Cursor<'cursor>: Cursor<'cursor, Self::T, Self::P>
+    where
+        'a: 'cursor,
+        Self: 'cursor;
+    type CursorMut<'cursor>: CursorMut<'cursor, Self::T, Self::P>
+    where
+        'a: 'cursor,
+        Self: 'cursor;
+    fn cursor<'cursor>(&'cursor self) -> Self::Cursor<'cursor>
+    where 'a: 'cursor;
+    fn cursor_mut<'cursor>(&'cursor mut self) -> Self::CursorMut<'cursor>
+    where 'a: 'cursor;
+}
+
+impl<'a, T, P, S, M, Meta> BlockCursorOf<'a> for Block<'a, T, P, S, M, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+    M: Mode,
+    S: Store<'a, T> + 'a,
+    Meta: 'a + Default + Clone,
+    Block<'a, T, P, S, M, Meta>: BlockBaseMut<'a>,
+{
+    type Cursor<'cursor>
+        = BlockCursor<'a, 'cursor, Self, &'cursor Self>
+    where 'a: 'cursor;
+    type CursorMut<'cursor>
+        = BlockCursor<'a, 'cursor, Self, &'cursor mut Self>
+    where 'a: 'cursor;
     fn cursor<'cursor>(&'cursor self) -> Self::Cursor<'cursor>
     where 'a: 'cursor {
         BlockCursor::new(self)
     }
-
-    ///REVERSED strategies iterate high→low (front at the back).
-    fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
-    where 'a: 'b {
-        let it = self.store().iter();
-        if A::REVERSED { DirIter::Rev(it.rev()) } else { DirIter::Fwd(it) }
+    fn cursor_mut<'cursor>(&'cursor mut self) -> Self::CursorMut<'cursor>
+    where 'a: 'cursor {
+        BlockCursor::new(self)
     }
 }
 
-///`Debug` view: translator params + physical slot layout (`[i:[child_phys,...], j:X, ...]`).
-///the full sparse physical layout (gaps included) is rendered by probing each slot via
-///`Store::slot`. each Some's child vaddrs (`SlotDebug::debug_render`) are mapped to
-///physical slots via `v2p`.
-impl<'a, T, P, A, S> fmt::Debug for RawBlock<'a, T, P, A, S>
+impl<'a, T, P, S, M> fmt::Debug for Block<'a, T, P, S, M>
 where
     T: Sized + 'a + SlotDebug<P>,
     P: BlockIndex,
-    A: AllocStrat<P>,
+    M: Mode,
     S: Store<'a, T> + 'a,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tr = &self.translator;
         writeln!(
             f,
-            "RawBlock {{\n  tr(inner={:?}, outer={:?}, shift={}, rot={})",
+            "Block {{\n  tr(inner={:?}, outer={:?}, shift={}, rot={})",
             tr.inner_offset(),
             tr.outer_offset(),
             tr.shift(),
@@ -417,67 +426,100 @@ where
     }
 }
 
-///strategy-agnostic Self-construction: new + split + split_and_rotate. one copy
-///(behavior varies via A for `new`); the per-strategy BlockMutTrait impls delegate
-///here so push_* are the only thing that differs by strategy.
-impl<'a, T, P, A, S> RawBlock<'a, T, P, A, S>
+///forward-or-reverse iterator wrapper: unifies `iter()` and `iter().rev()` behind one
+///`impl ExactSizeIterator` so `Block::iter` can branch on `Mode::REVERSED`.
+enum EitherIter<L: Iterator, R: Iterator<Item = L::Item>> {
+    Fwd(L),
+    Rev(R),
+}
+
+impl<L: Iterator, R: Iterator<Item = L::Item>> Iterator for EitherIter<L, R> {
+    type Item = L::Item;
+    fn next(&mut self) -> Option<L::Item> {
+        match self {
+            EitherIter::Fwd(l) => l.next(),
+            EitherIter::Rev(r) => r.next(),
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            EitherIter::Fwd(l) => l.size_hint(),
+            EitherIter::Rev(r) => r.size_hint(),
+        }
+    }
+}
+
+impl<L: ExactSizeIterator, R: ExactSizeIterator<Item = L::Item>> ExactSizeIterator
+    for EitherIter<L, R>
+{
+    fn len(&self) -> usize {
+        match self {
+            EitherIter::Fwd(l) => l.len(),
+            EitherIter::Rev(r) => r.len(),
+        }
+    }
+}
+
+///strat-agnostic Self-construction + split primitives + generic `new`/`iter`.
+impl<'a, T, P, S, M, Meta> Block<'a, T, P, S, M, Meta>
 where
     T: Sized + 'a,
     P: BlockIndex,
-    A: AllocStrat<P>,
+    M: Mode,
     S: Store<'a, T> + 'a,
+    Meta: 'a + Default + Clone,
 {
-    ///empty block: inner_offset = A::INIT_INNER_OFFSET (anchor w/ headroom on the
-    ///non-dominant side); outer_offset = A::INIT_OUTER_OFFSET; shift = A::INIT_SHIFT; rotation 0.
-    pub(crate) fn new_block() -> Self {
-        let shift = A::INIT_SHIFT;
-        debug_assert!(
-            S::max_capacity() <= A::CAP_LIMIT,
-            "store MAX_CAP exceeds strategy CAP_LIMIT"
-        );
+    ///fresh block: empty store + the mode's initial translator + default meta. compile-time
+    ///asserts the store's CAP fits the mode's addressable range.
+    pub fn new() -> Self {
+        const { assert!(S::CAP <= cap_limit::<P>(M::CAP_KIND), "CAP exceeds Mode CAP_LIMIT"); }
         Self {
-            _strategy:  PhantomData,
-            store:      S::new(),
-            translator: Translator::new(
-                P::from_usize(A::INIT_INNER_OFFSET),
-                P::from_usize(A::INIT_OUTER_OFFSET),
-                shift,
-                0,
-            ),
-            _phantom:   PhantomData,
+            store: S::with_capacity(n),
+            translator: M::new_translator::<P>(),
+            meta: Meta::default(),
+            _mode: PhantomData,
+            _phantom: PhantomData,
         }
     }
 
-    ///split [at,len) into a new block, cloning the translator.
-    ///precondition: at <= len. (a full block forces at = len/2 — both halves must fit
-    ///after the ×2 spread — so a non-midpoint split needs a non-full block.)
-    ///caller guarantees no nodes present in right point to nodes in left.
-    pub(crate) fn split(&mut self, at : usize) -> Self {
+    ///forward iteration; reversed for `Prepend` (high→low).
+    pub fn iter<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b T> + 'b
+    where
+        'a: 'b,
+    {
+        let it = self.store.iter();
+        if M::REVERSED {
+            EitherIter::Rev(it.rev())
+        } else {
+            EitherIter::Fwd(it)
+        }
+    }
+
+    ///construct from a store + translator + meta.
+    pub(crate) fn from_parts(store: S, translator: Translator<P>, meta: Meta) -> Self {
+        Self { store, translator, meta, _mode: PhantomData, _phantom: PhantomData }
+    }
+
+    ///split [at,len) into a new block, cloning the translator. caller guarantees no nodes
+    ///present in right point to nodes in left.
+    pub(crate) fn split(&mut self, at: usize) -> Self {
         debug_assert!(at <= self.store.len(), "split: at out of range");
         let right = self.store.split(at);
         let mut translator = self.translator.clone();
         let at = P::from_usize(at);
-        //preserve right-half vaddrs: element at old phys p now sits at right-store phys p-at,
-        //so p2v_new(p-at) must equal p2v_old(p). p2v=((p+io)<<sh+oo) rol rot => io_new = io_old + at.
+        //preserve right-half vaddrs: p2v_new(p-at) == p2v_old(p) => io_new = io_old + at.
         translator.set_inner_offset(self.translator.inner_offset().wrapping_add(at));
         Self {
-            store:      right,
+            store: right,
             translator,
-            _strategy:  PhantomData,
-            _phantom:   PhantomData,
+            meta: self.meta.clone(),
+            _mode: PhantomData,
+            _phantom: PhantomData,
         }
     }
 
-     ///construct a RawBlock from a store + translator.
-    pub(crate) fn from_parts(store: S, translator: Translator<P>) -> Self {
-        Self { store, translator, _strategy: PhantomData, _phantom: PhantomData }
-    }
-
-    ///split [v_start, v_end) vaddrs into a new block (rotation-remap). the right range
-    ///moves to a new store; the left stays in self with gaps where right was. each
-    ///element keeps its vaddr (the translator is a bijection, so the move is 1:1).
-    ///the new block's translator bumps rotation by 1 (to intersperse free space).
-    ///wrapping is free: v2p/p2v wrap mod 2^BW, the phys iteration wraps mod len.
+    ///split [v_start, v_end) vaddrs into a new block (rotation-remap). the new block's
+    ///translator bumps rotation by 1 (to intersperse free space).
     pub(crate) fn split_and_rotate(&mut self, v_start: P, v_end: P) -> Self {
         let len = self.store.len();
         let cap = S::max_capacity();
@@ -493,301 +535,349 @@ where
             new_store.insert(elem, new_phys);
             i = (i + 1) % len;
         }
-        Self::from_parts(new_store, new_trans)
+        Self::from_parts(new_store, new_trans, self.meta.clone())
     }
 }
 
-//one generic BlockMutTrait impl for Uniform<O>: per-ordering differences live in the
-//AllocStrat consts (SPREAD_OFFSET, GROW_*) read by on_grow/spread, so the body is
-//ordering-agnostic. the `const` cap-assert monomorphizes per O under the bound.
+// ---------------------------------------------------------------------------
+// BlockBaseMut impls — one per Mode. accessors + insert_root only (the mid-insert/split
+// surface is on SparseBlock; the push surface is on the per-usecase push traits).
+// ---------------------------------------------------------------------------
 
-impl<'a, T, P, O: Ordering, const CAP: usize> BlockMutTrait<'a>
-    for RawBlock<'a, T, P, Uniform<O>, VecStore<T, CAP>>
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> BlockBaseMut<'a> for Block<'a, T, P, VecStore<T, CAP>, Uniform, Meta>
 where
     T: Sized + 'a,
     P: BlockIndex,
-    Uniform<O>: AllocStrat<P>,
 {
-    type A = Uniform<O>;
-    type CursorMut<'cursor>
-        = BlockCursor<'a, 'cursor, Self, &'cursor mut Self>
-    where 'a: 'cursor;
+    block_base_accessors!(VecStore<T, CAP>, P);
 
-    fn new() -> Self {
-        const {
-            assert!(
-                CAP <= <Uniform<O> as AllocStrat<P>>::CAP_LIMIT,
-                "CAP exceeds Uniform::CAP_LIMIT"
-            );
-        }
-        Self::new_block()
+    fn insert_root(&mut self, v: T) -> usize {
+        assert!(self.store().len() == 0, "insert_root: block not empty");
+        self.store_mut().grow_back(1);
+        self.store_mut().insert(v, 0);
+        0
     }
-    fn store_mut(&mut self) -> &mut VecStore<T, CAP> {
-        &mut self.store
-    }
-    fn translator_mut(&mut self) -> &mut Translator<P> {
-        &mut self.translator
-    }
-    fn cursor_mut<'cursor>(&'cursor mut self) -> Self::CursorMut<'cursor>
-    where 'a: 'cursor {
-        BlockCursor::new(self)
-    }
+}
 
-    fn split_block(&mut self, at : usize) -> Self {
-        self.split(at)
-    }
+impl<'a, T, P, O: Ordering, const CAP: usize, Meta: 'a + Default + Clone> BlockBaseMut<'a>
+    for Block<'a, T, P, VecStore<T, CAP>, FixedRoot<O>, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+{
+    block_base_accessors!(VecStore<T, CAP>, P);
 
-    fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        let v_start = self.p2v(at);
-        let v_end = self.p2v(0);
-        self.split_and_rotate(v_start, v_end)
+    fn insert_root(&mut self, v: T) -> usize {
+        assert!(self.store().len() == 0, "insert_root: block not empty");
+        let cap = match O::ROOT_POS {
+            RootPos::Middle => 2,
+            _ => 1,
+        };
+        self.store_mut().grow_back(cap);
+        let mid = cap / 2;
+        self.store_mut().insert(v, mid);
+        mid
     }
+}
 
-    fn try_insert_back(&mut self, v: T) -> Result<usize, T> {
-        Err(v)
-    }
-    fn try_insert_front(&mut self, v: T) -> Result<usize, T> {
-        Err(v)
-    }
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> BlockBaseMut<'a>
+    for Block<'a, T, P, DequeStore<T, CAP>, Pluripotent, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+{
+    block_base_accessors!(DequeStore<T, CAP>, P);
 
-        ///find free slot or make space if possible. dir is logical (true=after);
-    ///REVERSED strategies flip it to phys. `pos`/`pin` are physical.
-    fn find_slot(
-        &mut self,
-        mut pos: usize,
-        dir: bool,
-        mut pin: Option<usize>,
-    ) -> FoundSlot {
-        let mut found = FoundSlot{grew:None,slide:None};
+    fn insert_root(&mut self, v: T) -> usize {
+        assert!(self.store().len() == 0, "insert_root: block not empty");
+        self.store_mut().grow_back(1);
+        self.store_mut().insert(v, 0);
+        0
+    }
+}
+
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> BlockBaseMut<'a> for Block<'a, T, P, VecStore<T, CAP>, Append, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+{
+    block_base_accessors!(VecStore<T, CAP>, P);
+
+    fn insert_root(&mut self, v: T) -> usize {
+        assert!(self.store().len() == 0, "insert_root: block not empty");
+        self.store_mut().grow_back(1);
+        self.store_mut().insert(v, 0);
+        0
+    }
+}
+
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> BlockBaseMut<'a> for Block<'a, T, P, VecStore<T, CAP>, Prepend, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+{
+    block_base_accessors!(VecStore<T, CAP>, P);
+
+    fn insert_root(&mut self, v: T) -> usize {
+        assert!(self.store().len() == 0, "insert_root: block not empty");
+        self.store_mut().grow_back(1);
+        self.store_mut().insert(v, 0);
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SparseBlock impls — Uniform/Pluripotent/FixedRoot. find_slot/grow_and_spread per-Mode;
+// slide_none/insert default (FixedRoot overrides slide_none to pin the root).
+// ---------------------------------------------------------------------------
+
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> SparseBlock<'a> for Block<'a, T, P, VecStore<T, CAP>, Uniform, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+{
+    sparse_split!();
+
+    fn find_slot(&mut self, mut pos: usize, dir: bool) -> FoundSlot {
+        let mut found = FoundSlot { grew: None, slide: None };
         let shift = self.translator().shift();
         if self.occupied() * 3 > self.len() * 4 && shift > 0 {
             if let Ok(g) = self.grow_and_spread() {
                 g.fix_p(&mut pos);
-                pin.as_mut().map(|x| g.fix_p(x));
-                found.grew=Some(g);
+                found.grew = Some(g);
             }
         }
-        let dir = dir ^ Self::A::REVERSED;
-        if let Some(ns) = self.store().find_slot(pos, dir, Self::A::INSERT_BUDGET, pin) {
+        if let Some(ns) = self.store().find_slot(pos, dir, P::BIT_WIDTH as usize, None) {
             found.slide = Some(ns);
             return found;
         }
         if self.len() == self.max_capacity() {
             return found;
         }
-        //this will never happen after a prior grow in the same lookup unless INSERT_BUDGET is 0 which would make no sense. 
         if let Ok(g) = self.grow_and_spread() {
             g.fix_p(&mut pos);
-            pin.as_mut().map(|x| g.fix_p(x));
-            found.grew=Some(g);
+            found.grew = Some(g);
+        }
+        found.slide = self.store().find_slot(pos, dir, self.len(), None);
+        found
+    }
+
+    fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity> {
+        let shift = self.translator().shift();
+        if shift == 0 || self.store().len() * 2 > VecStore::<T, CAP>::max_capacity() {
+            return Err(InsufficientMaxCapacity());
+        }
+        self.translator_mut().set_shift(shift - 1);
+        self.store_mut().spread(0);
+        Ok(GrewFixup { shl: 1, shift_offset: 0 })
+    }
+}
+
+impl<'a, T, P, O: Ordering, const CAP: usize, Meta: 'a + Default + Clone> SparseBlock<'a>
+    for Block<'a, T, P, VecStore<T, CAP>, FixedRoot<O>, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+{
+    sparse_split!();
+
+    fn find_slot(&mut self, mut pos: usize, dir: bool) -> FoundSlot {
+        let mut found = FoundSlot { grew: None, slide: None };
+        let shift = self.translator().shift();
+        let mut pin = Some(self.v2p(root_vaddr::<O, P>()));
+        if self.occupied() * 3 > self.len() * 4 && shift > 0 {
+            if let Ok(g) = self.grow_and_spread() {
+                g.fix_p(&mut pos);
+                if let Some(p) = pin.as_mut() {
+                    g.fix_p(p);
+                }
+                found.grew = Some(g);
+            }
+        }
+        if let Some(ns) = self.store().find_slot(pos, dir, P::BIT_WIDTH as usize, pin) {
+            found.slide = Some(ns);
+            return found;
+        }
+        if self.len() == self.max_capacity() {
+            return found;
+        }
+        if let Ok(g) = self.grow_and_spread() {
+            g.fix_p(&mut pos);
+            if let Some(p) = pin.as_mut() {
+                g.fix_p(p);
+            }
+            found.grew = Some(g);
         }
         found.slide = self.store().find_slot(pos, dir, self.len(), pin);
         found
     }
+
+    ///root is always pinned at `v2p(root_vaddr)` — override the `pin=None` default.
+    fn slide_none(&mut self, ms: NoneSlide) -> OpenSlot {
+        let pin = Some(self.v2p(root_vaddr::<O, P>()));
+        OpenSlot(self.store_mut().slide_none(ms, pin))
+    }
+
+    fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity> {
+        let shift = self.translator().shift();
+        if shift == 0 || self.store().len() * 2 > VecStore::<T, CAP>::max_capacity() {
+            return Err(InsufficientMaxCapacity());
+        }
+        self.translator_mut().set_shift(shift - 1);
+        let (spread, shrink_outer) = match O::ROOT_POS {
+            RootPos::End => (1usize, true),
+            _ => (0usize, false),
+        };
+        if shrink_outer {
+            let tr = self.translator_mut();
+            let new_outer = tr.outer_offset() >> 1;
+            tr.set_outer_offset(new_outer);
+        }
+        self.store_mut().spread(spread);
+        Ok(GrewFixup { shl: 1, shift_offset: spread as u8 })
+    }
 }
 
-impl<'a, T, P, O: Ordering, const CAP: usize> BlockMutTrait<'a>
-    for RawBlock<'a, T, P, Pluripotent<O>, DequeStore<T, CAP>>
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> SparseBlock<'a>
+    for Block<'a, T, P, DequeStore<T, CAP>, Pluripotent, Meta>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
-    type A = Pluripotent<O>;
-    type CursorMut<'cursor>
-        = BlockCursor<'a, 'cursor, Self, &'cursor mut Self>
-    where 'a: 'cursor;
+    sparse_split!();
 
-    fn new() -> Self {
-        const {
-            assert!(
-                CAP <= <Pluripotent<O> as AllocStrat<P>>::CAP_LIMIT,
-                "CAP exceeds Pluripotent::CAP_LIMIT"
-            );
+    fn find_slot(&mut self, mut pos: usize, dir: bool) -> FoundSlot {
+        let mut found = FoundSlot { grew: None, slide: None };
+        let budget = P::Half::BIT_WIDTH as usize;
+        if let Some(ns) = self.store().find_slot(pos, dir, budget, None) {
+            found.slide = Some(ns);
+            return found;
         }
-        Self::new_block()
-    }
-    fn store_mut(&mut self) -> &mut DequeStore<T, CAP> {
-        &mut self.store
-    }
-    fn translator_mut(&mut self) -> &mut Translator<P> {
-        &mut self.translator
-    }
-    fn cursor_mut<'cursor>(&'cursor mut self) -> Self::CursorMut<'cursor>
-    where 'a: 'cursor {
-        BlockCursor::new(self)
+        if self.len() == self.max_capacity() {
+            return found;
+        }
+        if let Ok(g) = self.grow_and_spread() {
+            g.fix_p(&mut pos);
+            found.grew = Some(g);
+        }
+        found.slide = self.store().find_slot(pos, dir, self.len(), None);
+        found
     }
 
-    fn split_block(&mut self, at : usize) -> Self {
-        self.split(at)
+    fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity> {
+        let shift = self.translator().shift();
+        if shift == 0 || self.store().len() * 2 > DequeStore::<T, CAP>::max_capacity() {
+            return Err(InsufficientMaxCapacity());
+        }
+        self.translator_mut().set_shift(shift - 1);
+        self.store_mut().spread(0);
+        Ok(GrewFixup { shl: 1, shift_offset: 0 })
     }
+}
 
-    fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        let v_start = self.p2v(at);
-        let v_end = self.p2v(0);
-        self.split_and_rotate(v_start, v_end)
-    }
+// ---------------------------------------------------------------------------
+// per-usecase type aliases. each is a concrete `Block<...,Mode,...>`; `new`/`iter` are
+// generic on `Block` (above). push-capable modes add inherent `try_push_*` below.
+// ---------------------------------------------------------------------------
 
-    ///dense append into the free half.
-    fn try_insert_back(&mut self, v: T) -> Result<usize, T> {
-        if self.len() < self.max_capacity() {
-            let p = self.store.push_back(v);
-            return Ok(p);
+///no-pin full-range sparse block.
+pub type UniformBlock<'a, T, P, const CAP: usize, Meta = ()> =
+    Block<'a, T, P, VecStore<T, CAP>, Uniform, Meta>;
+///root pinned at a fixed vaddr (preorder=0, inorder=MIDPOINT, postorder=MAX).
+pub type FixedRootBlock<'a, T, P, O, const CAP: usize, Meta = ()> =
+    Block<'a, T, P, VecStore<T, CAP>, FixedRoot<O>, Meta>;
+///half-range, both-ends-growable, root slides. `DequeStore`.
+pub type PluripotentBlock<'a, T, P, const CAP: usize, Meta = ()> =
+    Block<'a, T, P, DequeStore<T, CAP>, Pluripotent, Meta>;
+///dense `push_back` only (with a periodic None gap for mid-inserts).
+pub type AppendBlock<'a, T, P, const CAP: usize, Meta = ()> =
+    Block<'a, T, P, VecStore<T, CAP>, Append, Meta>;
+///`Append` mirrored: dense `push_front` only, iteration high→low.
+pub type PrependBlock<'a, T, P, const CAP: usize, Meta = ()> =
+    Block<'a, T, P, VecStore<T, CAP>, Prepend, Meta>;
+
+// --- push-capable modes: inherent push surface (not a trait). ---
+
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> Block<'a, T, P, DequeStore<T, CAP>, Pluripotent, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+{
+    pub fn try_push_back(&mut self, v: T) -> Result<usize, T> {
+        if self.store.len() < CAP {
+            return Ok(self.store.push_back(v));
         }
         Err(v)
     }
-
-    ///dense append into the free half.
-    fn try_insert_front(&mut self, v: T) -> Result<usize, T> {
-        if self.len() < self.max_capacity() {
-            //on_push_front bumps inner_offset to cancel the phys shift push_front causes.
+    pub fn try_push_front(&mut self, v: T) -> Result<usize, T> {
+        if self.store.len() < CAP {
+            //outer -= 1<<shift lowers vaddr by the same amount without inner overflow.
             self.store.push_front(v);
-            Self::A::on_push_front(self.translator_mut());
+            let sh = self.translator.shift();
+            let new_outer = self
+                .translator
+                .outer_offset()
+                .wrapping_sub(P::from_usize(1usize << sh));
+            self.translator.set_outer_offset(new_outer);
             return Ok(0);
         }
         Err(v)
     }
-
 }
 
-///Append: dense push_back (front=low). shift 0, offset=-K (low K reserved for the
-///rare prepend). one None per BUDGET pushes stocks mid-insert gaps.
-impl<'a, T, P, const CAP: usize> BlockMutTrait<'a>
-    for RawBlock<'a, T, P, Append, VecStore<T, CAP>>
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> Block<'a, T, P, VecStore<T, CAP>, Append, Meta>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
-    type A = Append;
-    type CursorMut<'cursor>
-        = BlockCursor<'a, 'cursor, Self, &'cursor mut Self>
-    where 'a: 'cursor;
-
-    fn new() -> Self {
-        const {
-            assert!(
-                CAP <= <Append as AllocStrat<P>>::CAP_LIMIT,
-                "CAP exceeds Append::CAP_LIMIT"
-            );
-        }
-        Self::new_block()
-    }
-    fn store_mut(&mut self) -> &mut VecStore<T, CAP> {
-        &mut self.store
-    }
-    fn translator_mut(&mut self) -> &mut Translator<P> {
-        &mut self.translator
-    }
-    fn cursor_mut<'cursor>(&'cursor mut self) -> Self::CursorMut<'cursor>
-    where 'a: 'cursor {
-        BlockCursor::new(self)
-    }
-
-    fn split_block(&mut self, at : usize) -> Self {
-        self.split(at)
-    }
-
-    fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        let v_start = self.p2v(at);
-        let v_end = self.p2v(0);
-        self.split_and_rotate(v_start, v_end)
-    }
-
-    ///hot: dense push_back; every BUDGET-th push stocks a None gap for mid-inserts.
-    fn try_insert_back(&mut self, v: T) -> Result<usize, T> {
-        let occ = self.occupied();
-        let pad = occ != 0 && occ % <Append as AllocStrat<P>>::INSERT_BUDGET == 0;
-        if self.len() + 1 + pad as usize > self.max_capacity() {
+    ///dense push_back; every 16th push stocks a None gap for mid-inserts.
+    pub fn try_push_back(&mut self, v: T) -> Result<usize, T> {
+        let occ = self.store.occupied();
+        let pad = occ != 0 && occ % 16 == 0;
+        if self.store.len() + 1 + pad as usize > CAP {
             return Err(v);
         }
         if pad {
-            self.store_mut().grow_back(1);
+            self.store.grow_back(1);
         }
-        let p = self.store_mut().push_back(v);
-        Ok(p)
+        Ok(self.store.push_back(v))
     }
-
-    ///cold: push_front into the reserved low range; on_push_front bumps inner_offset
-    ///to cancel the phys shift. refuses once the K reservation is spent (offset==MIN).
-    fn try_insert_front(&mut self, v: T) -> Result<usize, T> {
-        if self.translator().inner_offset() == P::MIN {
-            return Err(v);
-        }
-        self.store_mut().push_front(v);
-        Self::A::on_push_front(self.translator_mut());
-        Ok(0)
-    }
-
 }
 
-///Prepend: Append's layout reversed — push_back is the hot front insert (front=high),
-///iteration is high→low, find_slot dir flipped (REVERSED). cold push_front hits the
-///reserved low range as the back.
-impl<'a, T, P, const CAP: usize> BlockMutTrait<'a>
-    for RawBlock<'a, T, P, Prepend, VecStore<T, CAP>>
+impl<'a, T, P, const CAP: usize, Meta: 'a + Default + Clone> Block<'a, T, P, VecStore<T, CAP>, Prepend, Meta>
 where
     T: Sized + 'a,
     P: BlockIndex,
 {
-    type A = Prepend;
-    type CursorMut<'cursor>
-        = BlockCursor<'a, 'cursor, Self, &'cursor mut Self>
-    where 'a: 'cursor;
-
-    fn new() -> Self {
-        const {
-            assert!(
-                CAP <= <Prepend as AllocStrat<P>>::CAP_LIMIT,
-                "CAP exceeds Prepend::CAP_LIMIT"
-            );
-        }
-        Self::new_block()
-    }
-    fn store_mut(&mut self) -> &mut VecStore<T, CAP> {
-        &mut self.store
-    }
-    fn translator_mut(&mut self) -> &mut Translator<P> {
-        &mut self.translator
-    }
-    fn cursor_mut<'cursor>(&'cursor mut self) -> Self::CursorMut<'cursor>
-    where 'a: 'cursor {
-        BlockCursor::new(self)
-    }
-
-    fn split_block(&mut self, at : usize) -> Self {
-        self.split(at)
-    }
-    fn split_block_and_rotate(&mut self, at : usize) -> Self {
-        let v_start = self.p2v(at);
-        let v_end = self.p2v(0);
-        self.split_and_rotate(v_start, v_end)
-    }
-
-    ///hot: push_back (front=high); every BUDGET-th push stocks a None gap.
-    fn try_insert_front(&mut self, v: T) -> Result<usize, T> {
-        let occ = self.occupied();
-        let pad = occ != 0 && occ % <Prepend as AllocStrat<P>>::INSERT_BUDGET == 0;
-        if self.len() + 1 + pad as usize > self.max_capacity() {
+    ///dense push_front (= physical push_back, front=high); every 16th push stocks a None gap.
+    pub fn try_push_front(&mut self, v: T) -> Result<usize, T> {
+        let occ = self.store.occupied();
+        let pad = occ != 0 && occ % 16 == 0;
+        if self.store.len() + 1 + pad as usize > CAP {
             return Err(v);
         }
         if pad {
-            self.store_mut().grow_back(1);
+            self.store.grow_back(1);
         }
-        let p = self.store_mut().push_back(v);
-        Ok(p)
+        Ok(self.store.push_back(v))
     }
-
-    ///cold: physical push_front into the reserved low range (the back, for Prepend);
-    ///on_push_front bumps inner_offset to cancel the phys shift. refuses at offset==MIN.
-    fn try_insert_back(&mut self, v: T) -> Result<usize, T> {
-        if self.translator().inner_offset() == P::MIN {
-            return Err(v);
-        }
-        self.store_mut().push_front(v);
-        Self::A::on_push_front(self.translator_mut());
-        Ok(0)
-    }
-
 }
+
+///tree block marker: a `Uniform` block carrying an `Ordering` `O`. adds no methods — it
+/// exists so the walker can bound `B: TreeBlock<O>` and link its ordering to the block's.
+/// the block itself is O-agnostic storage; per-O behavior (incl. the tree split) lives in
+/// the walker, not here.
+pub trait TreeBlock<'a, O: Ordering>: SparseBlock<'a> + BlockCursorOf<'a> {}
+
+impl<'a, O: Ordering, T, P, const CAP: usize, Meta: 'a + Default + Clone> TreeBlock<'a, O>
+    for Block<'a, T, P, VecStore<T, CAP>, Uniform, Meta>
+where
+    T: Sized + 'a,
+    P: BlockIndex,
+    Block<'a, T, P, VecStore<T, CAP>, Uniform, Meta>: SparseBlock<'a> + BlockCursorOf<'a>,
+{
+}
+
 #[cfg(test)]
 #[path = "tests/block.rs"]
 mod tests;

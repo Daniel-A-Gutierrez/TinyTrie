@@ -1,15 +1,15 @@
 use super::*;
 use crate::index::BlockIndex;
 use crate::store::{DequeStore, Store, VecStore};
+use crate::{InOrder, PreOrder};
 
 ///for every occupied slot, p2v(v2p(v))==v and vget(vaddr) matches the cursor.
-fn roundtrip<P, A, S>(b: &RawBlock<'static, u64, P, A, S>)
+fn roundtrip<B>(b: &B)
 where
-    P: BlockIndex,
-    A: AllocStrat<P>,
-    S: Store<'static, u64> + 'static,
+    B: BlockBase<'static, T = u64>,
+    B::P: BlockIndex,
 {
-    let mut c = b.cursor();
+    let mut c = BlockCursor::new(b);
     c.first();
     while let Some(v) = c.address() {
         let p = b.v2p(v);
@@ -22,11 +22,10 @@ where
 }
 
 ///all recorded (vaddr,value) pairs still resolve.
-fn stable<P, A, S>(b: &RawBlock<'static, u64, P, A, S>, pairs: &[(P, u64)])
+fn stable<B>(b: &B, pairs: &[(B::P, u64)])
 where
-    P: BlockIndex,
-    A: AllocStrat<P>,
-    S: Store<'static, u64> + 'static,
+    B: BlockBase<'static, T = u64>,
+    B::P: BlockIndex,
 {
     for (v, val) in pairs {
         assert_eq!(*b.vget(*v), *val, "vaddr {:?} not stable", v);
@@ -34,15 +33,15 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Uniform (u16, VecStore)
+// FixedRoot<InOrder> (u16, VecStore) — root pinned at MIDPOINT
 // ---------------------------------------------------------------------------
-mod uniform {
+mod fixedroot {
     use super::*;
-    type Blk = RawBlock<'static, u64, u16, Uniform<InOrder>, VecStore<u64, 4096>>;
+    type Blk = Block<'static, u64, u16, VecStore<u64, 4096>, FixedRoot<InOrder>>;
 
     #[test]
     fn new_empty() {
-        let b: Blk = BlockMutTrait::new();
+        let b: Blk = Blk::new();
         assert_eq!(b.len(), 0);
         assert_eq!(b.occupied(), 0);
         assert!(b.first_vaddr().is_none());
@@ -52,7 +51,7 @@ mod uniform {
 
     #[test]
     fn insert_root_at_midpoint() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let p = b.insert_root(42);
         let v = b.p2v(p);
         assert_eq!(v, 32768);
@@ -63,19 +62,11 @@ mod uniform {
     }
 
     #[test]
-    fn pushes_rejected() {
-        let mut b: Blk = BlockMutTrait::new();
-        assert!(b.try_insert_back(1).is_err());
-        assert!(b.try_insert_front(1).is_err());
-        assert_eq!(b.len(), 0);
-    }
-
-    #[test]
     fn mid_insert_after_root_preserves_root() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let root = b.insert_root(100); let root = b.p2v(root);
-        let ms = b.find_slot(b.v2p(root), true, Some(b.v2p(root))).slide.expect("slot");
-        let slot = b.slide_none(ms, Some(b.v2p(root)));
+        let ms = b.find_slot(b.v2p(root), true).slide.expect("slot");
+        let slot = b.slide_none(ms);
         let new = b.insert(200, slot);
         assert_eq!(*b.vget(root), 100);
         assert_eq!(*b.get(new), 200);
@@ -85,15 +76,15 @@ mod uniform {
 
     #[test]
     fn vaddr_stable_across_growth() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let root = b.insert_root(0); let root = b.p2v(root);
         //insert after the last each time, pinning the root. spread/grow preserve all
         //vaddrs; slides preserve only the pin, so check root + roundtrip (v2p/p2v/vget
         //consistency) per step, not every recorded vaddr (displaced ones remap).
         for i in 1..40 {
             let last = b.last_vaddr().unwrap();
-            let ms = b.find_slot(b.v2p(last), true, Some(b.v2p(root))).slide.expect("slot");
-            let slot = b.slide_none(ms, Some(b.v2p(root)));
+            let ms = b.find_slot(b.v2p(last), true).slide.expect("slot");
+            let slot = b.slide_none(ms);
             b.insert(i, slot);
             assert_eq!(*b.vget(root), 0, "root moved at i={i}");
             roundtrip(&b);
@@ -103,13 +94,12 @@ mod uniform {
 
     #[test]
     fn len_pow2_throughout() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let _ = b.insert_root(0);
         for i in 1..20 {
             let last = b.last_vaddr().unwrap();
-            let first = b.first_vaddr().unwrap();
-            let ms = b.find_slot(b.v2p(last), true, Some(b.v2p(first))).slide.expect("slot");
-            let slot = b.slide_none(ms, Some(b.v2p(first)));
+            let ms = b.find_slot(b.v2p(last), true).slide.expect("slot");
+            let slot = b.slide_none(ms);
             b.insert(i, slot);
             assert!(b.len().is_power_of_two(), "len {} not pow2", b.len());
         }
@@ -118,10 +108,10 @@ mod uniform {
     //todo : fix
     // #[test]
     // fn remove_then_reuse() {
-    //     let mut b: Blk = BlockMutTrait::new();
+    //     let mut b: Blk = Blk::new();
     //     let root = b.insert_root(0); let root = b.p2v(root);
-    //     let ms = b.find_slot(b.v2p(root), true, Some(b.v2p(root))).slide.expect("slot");
-    //     let slot = b.slide_none(ms, Some(b.v2p(root)));
+    //     let ms = b.find_slot(b.v2p(root), true).slide.expect("slot");
+    //     let slot = b.slide_none(ms);
     //     let v = b.insert(1, slot);
     //     let removed = b.remove(v);
     //     assert_eq!(removed, 1);
@@ -131,39 +121,39 @@ mod uniform {
     //     roundtrip(&b);
     // }
 
-    type Small = RawBlock<'static, u64, u16, Uniform<InOrder>, VecStore<u64, 4>>;
+    type Small = Block<'static, u64, u16, VecStore<u64, 4>, FixedRoot<InOrder>>;
 
     #[test]
     fn exhaustion_returns_none() {
-        let mut b: Small = BlockMutTrait::new();
+        let mut b: Small = Small::new();
         let root = b.insert_root(0); let root = b.p2v(root);
         // InOrder root sits at phys len/2. Fill around it with the pin keeping root
         // put: two before (leftward slides use phys1 then phys0) and one after (phys3),
         // reaching occupied=4=len=cap=max_capacity.
         let first = b.first_vaddr().unwrap();
         for i in 1..=2 {
-            let ms = b.find_slot(b.v2p(first), false, Some(b.v2p(root))).slide.expect("slot before");
-            let slot = b.slide_none(ms, Some(b.v2p(root)));
+            let ms = b.find_slot(b.v2p(first), false).slide.expect("slot before");
+            let slot = b.slide_none(ms);
             b.insert(i, slot);
         }
         let last = b.last_vaddr().unwrap();
-        let ms = b.find_slot(b.v2p(last), true, Some(b.v2p(root))).slide.expect("slot after");
-        let slot = b.slide_none(ms, Some(b.v2p(root)));
+        let ms = b.find_slot(b.v2p(last), true).slide.expect("slot after");
+        let slot = b.slide_none(ms);
         b.insert(3, slot);
         assert_eq!(b.occupied(), 4);
         assert_eq!(b.len(), b.max_capacity());
         let last = b.last_vaddr().unwrap();
-        assert!(b.find_slot(b.v2p(last), true, Some(b.v2p(root))).slide.is_none(), "should be exhausted");
+        assert!(b.find_slot(b.v2p(last), true).slide.is_none(), "should be exhausted");
     }
 
     #[test]
     fn pin_root_never_moves() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let root = b.insert_root(0); let root = b.p2v(root);
         for i in 1..30 {
             let last = b.last_vaddr().unwrap();
-            let ms = b.find_slot(b.v2p(last), true, Some(b.v2p(root))).slide.expect("slot");
-            let slot = b.slide_none(ms, Some(b.v2p(root)));
+            let ms = b.find_slot(b.v2p(last), true).slide.expect("slot");
+            let slot = b.slide_none(ms);
             b.insert(i, slot);
             // root vaddr stable + getable; InOrder root sits at phys len/2 (spread
             // doubles len so root phys moves 1->2->4...; the pin keeps slides off it).
@@ -174,16 +164,60 @@ mod uniform {
 }
 
 // ---------------------------------------------------------------------------
+// Uniform (u16, VecStore) — no-pin full-range block (anchor 0)
+// ---------------------------------------------------------------------------
+mod uniform {
+    use super::*;
+    type Blk = Block<'static, u64, u16, VecStore<u64, 4096>, Uniform>;
+
+    #[test]
+    fn new_empty() {
+        let b: Blk = Blk::new();
+        assert_eq!(b.len(), 0);
+        assert_eq!(b.occupied(), 0);
+        assert!(b.first_vaddr().is_none());
+        assert_eq!(b.translator().shift(), 16);
+        assert_eq!(b.translator().inner_offset(), 0);
+    }
+
+    #[test]
+    fn insert_root_at_zero() {
+        let mut b: Blk = Blk::new();
+        let p = b.insert_root(42);
+        let v = b.p2v(p);
+        assert_eq!(v, 0);
+        assert_eq!(*b.vget(v), 42);
+        roundtrip(&b);
+    }
+
+    ///no pin: the root is not special — it may move in a slide. we only check len pow2
+    ///+ translator round-trip, not root stability.
+    #[test]
+    fn mid_insert_no_pin() {
+        let mut b: Blk = Blk::new();
+        let _ = b.insert_root(0);
+        for i in 1..20 {
+            let last = b.last_vaddr().unwrap();
+            let ms = b.find_slot(b.v2p(last), true).slide.expect("slot");
+            let slot = b.slide_none(ms);
+            b.insert(i, slot);
+            assert!(b.len().is_power_of_two(), "len {} not pow2", b.len());
+            roundtrip(&b);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pluripotent (u16 + u32, DequeStore)
 // ---------------------------------------------------------------------------
 mod pluripotent {
     use super::*;
-    type Blk16 = RawBlock<'static, u64, u16, Pluripotent<InOrder>, DequeStore<u64, 256>>;
-    type Blk32 = RawBlock<'static, u64, u32, Pluripotent<InOrder>, DequeStore<u64, 256>>;
+    type Blk16 = Block<'static, u64, u16, DequeStore<u64, 256>, Pluripotent>;
+    type Blk32 = Block<'static, u64, u32, DequeStore<u64, 256>, Pluripotent>;
 
     #[test]
     fn new_empty_u16() {
-        let b: Blk16 = BlockMutTrait::new();
+        let b: Blk16 = Blk16::new();
         assert_eq!(b.translator().shift(), 7); // Half(u8)::BIT_WIDTH - 1
         assert_eq!(b.translator().inner_offset(), 0);
         assert_eq!(b.translator().outer_offset(), 32768);
@@ -191,7 +225,7 @@ mod pluripotent {
 
     #[test]
     fn new_empty_u32() {
-        let b: Blk32 = BlockMutTrait::new();
+        let b: Blk32 = Blk32::new();
         assert_eq!(b.translator().shift(), 15); // Half(u16)::BIT_WIDTH - 1
         assert_eq!(b.translator().inner_offset(), 0);
         assert_eq!(b.translator().outer_offset(), 1 << 31);
@@ -199,10 +233,10 @@ mod pluripotent {
 
     #[test]
     fn back_dense_stride() {
-        let mut b: Blk16 = BlockMutTrait::new();
+        let mut b: Blk16 = Blk16::new();
         let mut pairs = Vec::new();
         for i in 0..10 {
-            let p = b.try_insert_back(i).unwrap();
+            let p = b.try_push_back(i).unwrap();
             pairs.push((b.p2v(p), i));
         }
         assert_eq!(pairs[0].0, 32768);
@@ -213,10 +247,10 @@ mod pluripotent {
 
     #[test]
     fn back_dense_stride_u32() {
-        let mut b: Blk32 = BlockMutTrait::new();
+        let mut b: Blk32 = Blk32::new();
         let mut pairs = Vec::new();
         for i in 0..10 {
-            let p = b.try_insert_back(i).unwrap();
+            let p = b.try_push_back(i).unwrap();
             pairs.push((b.p2v(p), i));
         }
         assert_eq!(pairs[0].0, 1 << 31);
@@ -229,11 +263,11 @@ mod pluripotent {
     ///not just 0. The offset bump is `1<<shift`, not `+1`.
     #[test]
     fn front_stable_across_push() {
-        let mut b: Blk16 = BlockMutTrait::new();
-        let back = b.try_insert_back(10).unwrap(); let back = b.p2v(back);
-        let front1 = b.try_insert_front(20).unwrap(); let front1 = b.p2v(front1);
+        let mut b: Blk16 = Blk16::new();
+        let back = b.try_push_back(10).unwrap(); let back = b.p2v(back);
+        let front1 = b.try_push_front(20).unwrap(); let front1 = b.p2v(front1);
         assert_eq!(*b.vget(back), 10, "back vaddr moved after push_front");
-        let front2 = b.try_insert_front(30).unwrap(); let front2 = b.p2v(front2);
+        let front2 = b.try_push_front(30).unwrap(); let front2 = b.p2v(front2);
         assert_eq!(*b.vget(back), 10);
         assert_eq!(*b.vget(front1), 20, "front1 moved after second push_front");
         assert_eq!(*b.vget(front2), 30);
@@ -242,9 +276,9 @@ mod pluripotent {
 
     #[test]
     fn front_stable_across_push_u32() {
-        let mut b: Blk32 = BlockMutTrait::new();
-        let back = b.try_insert_back(10).unwrap(); let back = b.p2v(back);
-        let front = b.try_insert_front(20).unwrap(); let front = b.p2v(front);
+        let mut b: Blk32 = Blk32::new();
+        let back = b.try_push_back(10).unwrap(); let back = b.p2v(back);
+        let front = b.try_push_front(20).unwrap(); let front = b.p2v(front);
         assert_eq!(*b.vget(back), 10);
         assert_eq!(*b.vget(front), 20);
         roundtrip(&b);
@@ -252,22 +286,22 @@ mod pluripotent {
 
     #[test]
     fn back_exhaustion() {
-        let mut b: Blk16 = BlockMutTrait::new();
+        let mut b: Blk16 = Blk16::new();
         for i in 0..256 {
-            assert!(b.try_insert_back(i).is_ok(), "failed at {i}");
+            assert!(b.try_push_back(i).is_ok(), "failed at {i}");
         }
-        assert!(b.try_insert_back(999).is_err());
+        assert!(b.try_push_back(999).is_err());
         assert!(b.len() <= b.max_capacity());
     }
 
     #[test]
     fn mid_insert_after_two_backs() {
-        let mut b: Blk16 = BlockMutTrait::new();
-        let r0 = b.try_insert_back(0).unwrap(); let r0 = b.p2v(r0);
-        let r1 = b.try_insert_back(1).unwrap(); let r1 = b.p2v(r1);
+        let mut b: Blk16 = Blk16::new();
+        let r0 = b.try_push_back(0).unwrap(); let r0 = b.p2v(r0);
+        let r1 = b.try_push_back(1).unwrap(); let r1 = b.p2v(r1);
         // mid-insert after r0 with r0 pinned
-        let ms = b.find_slot(b.v2p(r0), true, Some(b.v2p(r0))).slide.expect("slot");
-        let slot = b.slide_none(ms, Some(b.v2p(r0)));
+        let ms = b.find_slot(b.v2p(r0), true).slide.expect("slot");
+        let slot = b.slide_none(ms);
         let v = b.insert(50, slot);
         assert_eq!(*b.vget(r0), 0);
         assert_eq!(*b.vget(r1), 1);
@@ -277,10 +311,10 @@ mod pluripotent {
 
     #[test]
     fn grow_and_spread_preserves_vaddr_even_len() {
-        let mut b: Blk16 = BlockMutTrait::new();
+        let mut b: Blk16 = Blk16::new();
         // start from len 2 (even) so spread's mid>0 path is exercised
-        let a = b.try_insert_back(1).unwrap(); let a = b.p2v(a);
-        let _ = b.try_insert_back(2).unwrap();
+        let a = b.try_push_back(1).unwrap(); let a = b.p2v(a);
+        let _ = b.try_push_back(2).unwrap();
         b.grow_and_spread().ok().unwrap();
         assert_eq!(b.len(), 4);
         assert_eq!(*b.vget(a), 1, "vaddr not stable across spread");
@@ -290,7 +324,7 @@ mod pluripotent {
     ///spread on len 1: element must remain at its vaddr, len becomes 2.
     #[test]
     fn grow_and_spread_len1() {
-        let mut b: Blk16 = BlockMutTrait::new();
+        let mut b: Blk16 = Blk16::new();
         let root = b.insert_root(7); let root = b.p2v(root);
         b.grow_and_spread().ok().unwrap();
         assert_eq!(b.len(), 2);
@@ -304,21 +338,21 @@ mod pluripotent {
 // ---------------------------------------------------------------------------
 mod append {
     use super::*;
-    type Blk = RawBlock<'static, u64, u16, Append, VecStore<u64, 512>>;
+    type Blk = Block<'static, u64, u16, VecStore<u64, 512>, Append>;
 
     #[test]
     fn new_empty() {
-        let b: Blk = BlockMutTrait::new();
+        let b: Blk = Blk::new();
         assert_eq!(b.translator().shift(), 0);
         assert_eq!(b.translator().inner_offset(), 256);
     }
 
     #[test]
     fn back_dense_low_addrs() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let mut pairs = Vec::new();
         for i in 0..20 {
-            let p = b.try_insert_back(i).unwrap();
+            let p = b.try_push_back(i).unwrap();
             pairs.push((b.p2v(p), i));
         }
         assert_eq!(pairs[0].0, 256); // p2v(0) = (0 + 256) << 0 = 256
@@ -329,15 +363,15 @@ mod append {
 
     #[test]
     fn back_stable_across_pad() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let mut pairs = Vec::new();
         for i in 0..20 {
-            let p = b.try_insert_back(i).unwrap();
+            let p = b.try_push_back(i).unwrap();
             pairs.push((b.p2v(p), i));
         }
         // crossing the BUDGET=16 boundary inserts a None pad; old vaddrs must hold
         for i in 0..40 {
-            let p = b.try_insert_back(100 + i).unwrap();
+            let p = b.try_push_back(100 + i).unwrap();
             pairs.push((b.p2v(p), 100 + i));
             stable(&b, &pairs);
         }
@@ -345,43 +379,11 @@ mod append {
     }
 
     #[test]
-    fn front_cold_into_reserved() {
-        let mut b: Blk = BlockMutTrait::new();
-        let mut pairs = Vec::new();
-        for i in 0..5 {
-            let p = b.try_insert_back(i).unwrap();
-            pairs.push((b.p2v(p), i));
-        }
-        let f0 = b.try_insert_front(100).unwrap(); let f0 = b.p2v(f0);
-        assert_eq!(f0, 255);
-        stable(&b, &pairs);
-        let f1 = b.try_insert_front(101).unwrap(); let f1 = b.p2v(f1);
-        assert_eq!(f1, 254);
-        stable(&b, &pairs);
-        assert_eq!(*b.vget(f0), 100);
-        roundtrip(&b);
-    }
-
-    #[test]
-    fn front_exhaustion_at_min_offset() {
-        let mut b: Blk = BlockMutTrait::new();
-        let mut count = 0;
-        loop {
-            match b.try_insert_front(1) {
-                Ok(_) => count += 1,
-                Err(_) => break,
-            }
-        }
-        // inner starts 256; each prepend -1; Err when inner hits MIN (0)
-        assert_eq!(count, 256);
-    }
-
-    #[test]
     fn back_respects_max_cap() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let mut ok = 0;
         for i in 0..2000 {
-            match b.try_insert_back(i) {
+            match b.try_push_back(i) {
                 Ok(_) => ok += 1,
                 Err(_) => break,
             }
@@ -396,21 +398,21 @@ mod append {
 // ---------------------------------------------------------------------------
 mod prepend {
     use super::*;
-    type Blk = RawBlock<'static, u64, u16, Prepend, VecStore<u64, 512>>;
+    type Blk = Block<'static, u64, u16, VecStore<u64, 512>, Prepend>;
 
     #[test]
     fn new_empty() {
-        let b: Blk = BlockMutTrait::new();
+        let b: Blk = Blk::new();
         assert_eq!(b.translator().shift(), 0);
         assert_eq!(b.translator().inner_offset(), 256);
     }
 
     #[test]
     fn front_hot_high_addrs() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         let mut pairs = Vec::new();
         for i in 0..10 {
-            let p = b.try_insert_front(i).unwrap();
+            let p = b.try_push_front(i).unwrap();
             pairs.push((b.p2v(p), i));
         }
         assert_eq!(pairs[0].0, 256);
@@ -420,41 +422,14 @@ mod prepend {
 
     #[test]
     fn iter_is_reverse_insertion_order() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         for i in 0..5 {
-            b.try_insert_front(i).unwrap();
+            b.try_push_front(i).unwrap();
         }
         let vals: Vec<u64> = b.iter().copied().collect();
         assert_eq!(vals, vec![4, 3, 2, 1, 0]);
     }
 
-    #[test]
-    fn back_cold_into_reserved() {
-        let mut b: Blk = BlockMutTrait::new();
-        let mut pairs = Vec::new();
-        for i in 0..5 {
-            let p = b.try_insert_front(i).unwrap();
-            pairs.push((b.p2v(p), i));
-        }
-        let b0 = b.try_insert_back(100).unwrap(); let b0 = b.p2v(b0);
-        assert_eq!(b0, 255);
-        stable(&b, &pairs);
-        assert_eq!(*b.vget(b0), 100);
-        roundtrip(&b);
-    }
-
-    #[test]
-    fn back_exhaustion_at_min_offset() {
-        let mut b: Blk = BlockMutTrait::new();
-        let mut count = 0;
-        loop {
-            match b.try_insert_back(1) {
-                Ok(_) => count += 1,
-                Err(_) => break,
-            }
-        }
-        assert_eq!(count, 256);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +441,7 @@ mod prepend {
 // "does the op maintain pointers" check the split path needs.
 mod split {
     use super::*;
-    type Blk = RawBlock<'static, u32, u32, Uniform<PreOrder>, VecStore<u32, 16>>;
+    type Blk = Block<'static, u32, u32, VecStore<u32, 16>, FixedRoot<PreOrder>>;
 
     ///fill to cap-full (dummy values), then a self-pointer pass: now that no more slides
     ///will run, set each occupied slot's value to its own vaddr. slides during the fill
@@ -476,8 +451,8 @@ mod split {
         let root = b.p2v(root);
         loop {
             let Some(last) = b.last_vaddr() else { break };
-            let Some(ns) = b.find_slot(b.v2p(last), true, Some(b.v2p(root))).slide else { break };
-            let slot = b.slide_none(ns, Some(b.v2p(root)));
+            let Some(ns) = b.find_slot(b.v2p(last), true).slide else { break };
+            let slot = b.slide_none(ns);
             b.insert(0, slot);
         }
         for phys in 0..b.len() {
@@ -500,7 +475,7 @@ mod split {
 
     #[test]
     fn split_preserves_self_pointers() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         fill_self_pointers(&mut b);
         assert_eq!(b.len(), b.max_capacity(), "precondition: block cap-full");
         let at = b.len() / 2;
@@ -518,7 +493,7 @@ mod split {
     #[ignore]
     #[test]
     fn split_and_rotate_left_half_preserves_self_pointers() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         fill_self_pointers(&mut b);
         assert_eq!(b.len(), b.max_capacity());
         let at = b.len() / 2;
@@ -536,7 +511,7 @@ mod split {
     #[ignore]
     #[test]
     fn split_and_rotate_right_half_preserves_self_pointers() {
-        let mut b: Blk = BlockMutTrait::new();
+        let mut b: Blk = Blk::new();
         fill_self_pointers(&mut b);
         assert_eq!(b.len(), b.max_capacity());
         let at = b.len() / 2;
@@ -549,7 +524,7 @@ mod split {
     //rotation both preserves vaddrs AND places the right half in the upper half
     //(no inner=at needed). built directly (set shift=0 + grow_back + insert) to
     //skip the O(n^2) find_slot fill. this is the arena-tier block-split regime.
-    type FullBlk = RawBlock<'static, u16, u16, Uniform<PreOrder>, VecStore<u16, 65536>>;
+    type FullBlk = Block<'static, u16, u16, VecStore<u16, 65536>, FixedRoot<PreOrder>>;
 
     fn fill_full_self_pointers(b: &mut FullBlk) {
         b.translator_mut().set_shift(0); //fully-grown: inner=0, outer=0 => vaddr == phys
@@ -571,7 +546,7 @@ mod split {
 
     #[test]
     fn split_and_rotate_full_address_space() {
-        let mut b: FullBlk = BlockMutTrait::new();
+        let mut b: FullBlk = FullBlk::new();
         fill_full_self_pointers(&mut b);
         assert_eq!(b.len(), b.max_capacity());
         assert_eq!(b.translator().shift(), 0);
@@ -601,7 +576,7 @@ mod split {
     ///and nets `at`, so the right half preserves and starts at vaddr `at`.
     #[test]
     fn split_and_rotate_non_midpoint_at() {
-        let mut b: FullBlk = BlockMutTrait::new();
+        let mut b: FullBlk = FullBlk::new();
         b.translator_mut().set_shift(0);
         b.store_mut().grow_back(32768);
         for p in 0..32768 {
@@ -632,7 +607,7 @@ mod split {
     ///distribution holds.
     #[test]
     fn split_and_rotate_repeated_rot1() {
-        let mut b: FullBlk = BlockMutTrait::new();
+        let mut b: FullBlk = FullBlk::new();
         b.translator_mut().set_shift(0);
         b.translator_mut().set_rotation(1);
         b.translator_mut().set_outer_offset(0); //right half of a first at=MIDPOINT split
@@ -664,13 +639,13 @@ mod split {
     //(MIDPOINT/2 << sh = MIDPOINT) so q<<sh and at<<sh are disjoint — no carry, sound
     //for any R. this is the user's proposal: test split_and_rotate across generations
     //(increasing R) and various single-bit `at` values.
-    type HalfBlk = RawBlock<'static, u16, u16, Uniform<PreOrder>, VecStore<u16, 32768>>;
+    type HalfBlk = Block<'static, u16, u16, VecStore<u16, 32768>, FixedRoot<PreOrder>>;
     const HALF_CAP: usize = 32768; //MIDPOINT for u16
 
     ///build a full (len = HALF_CAP) block at the given (rot, outer), shift=1, dense
     ///self-pointers. simulates a half-cap block that filled up at generation `rot`.
     fn make_half(rot: u32, outer: u16) -> HalfBlk {
-        let mut b: HalfBlk = BlockMutTrait::new();
+        let mut b: HalfBlk = HalfBlk::new();
         b.translator_mut().set_shift(1);
         b.translator_mut().set_rotation(rot);
         b.translator_mut().set_outer_offset(outer);
@@ -717,7 +692,7 @@ mod split {
     #[test]
     fn split_and_rotate_half_cap_various_ats() {
         for &at in &[4096usize, 8192, 16384] {
-            let mut b: HalfBlk = BlockMutTrait::new();
+            let mut b: HalfBlk = HalfBlk::new();
             b.translator_mut().set_shift(1);
             b.store_mut().grow_back(2 * at);
             for p in 0..(2 * at) {

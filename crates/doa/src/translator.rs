@@ -1,8 +1,8 @@
-use crate::index::UnsignedNum;
+use crate::{index::UnsignedNum};
 
 /// virtual <-> physical address translation. P is the in-block pointer type;
 /// physical slots are usize. v2p is the hot lookup path, p2v runs on remap.
-pub(crate) trait AddressTranslator<P>: Sized {
+pub trait AddressTranslator<P>: Sized {
     ///virtual address to physical slot
     fn v2p(&self, virt: P) -> usize;
 
@@ -15,13 +15,8 @@ pub(crate) trait AddressTranslator<P>: Sized {
 
 // p2v(p) = ((p + inner_offset) << shift) ror rotation + outer_offset.
 // v2p(v) = ((v - outer_offset) rol rotation) >> shift - inner_offset   (exact
-// inverse on canonical slots). outer_offset lives in VIRTUAL space, AFTER the
-// rotation (so it survives a rotation bump unchanged as a vaddr anchor — but to
-// absorb a physical delta like the split's `at` it must be de-rotated, added, then
-// re-rotated; and on a rotation bump it is itself rotated to keep its anchor, see
-// split_and_rotate). inner_offset lives in PHYSICAL space (added before the shift,
-// unaffected by rotation). p2v rotates RIGHT so the vaddr follows the physical
-// spread. Each op whose param is 0 is a runtime no-op the CPU does NOT elide (see
+// inverse on canonical slots). 
+// Each op whose param is 0 is a runtime no-op the CPU does NOT elide (see
 // bench notes), so specialize picks a pre-baked body that skips zero-param ops
 // entirely — straight-line, no per-iter branch, no mispredict risk. Dispatch
 // happens once per set_*, not per lookup; the call target is constant for the
@@ -85,7 +80,7 @@ variant!(v2p_1111 / p2v_1111, inner = nz, outer = nz, shift = nz, rot = nz);
 ///change (grow/spread/graduate). for a statically-known strategy, a const-generic
 ///block inlines the math and beats even this — Translator is for the adaptive tier.
 #[derive(Clone)]
-pub(crate) struct Translator<P: UnsignedNum> {
+pub struct Translator<P> {
     inner_offset: P,
     outer_offset: P,
     shift:        u32,

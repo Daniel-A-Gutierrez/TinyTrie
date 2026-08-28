@@ -14,6 +14,7 @@ Notably in crates theres
 - Consider that communications with the user are the primary bottleneck for development. 
 - The second is thinking and planning.
 - Keep responses as short as possible, keep comments in code to the absolute minimum length - panics, invariants, caller guarantees, important things that cant be gleaned from a glance at the function signature. No need for complete sentences. Doc comments written for library consumers are a different story.
+- Brevity calibration for prose: lead with the verdict (agree/disagree/sound/defer), one short clause of why, then the caveat or condition. No preamble, no restating the question, no "here's my take". For multi-point responses: one labeled point each, 1-2 sentences, opinionated but tight. Drop hedging and filler. Long is fine when the content earns it (a real trade-off, a design fork); short when it's a single fact or yes/no. The user will ask for more if they want it.
 - Don't go off thinking on your own for minutes at a time unless instructed to, if there's confusion or you suspect a problem with the prompt ask questions or give feedback quickly. 
 - Code quality and performance are of the utmost importance.
 - Its not necessary for things to compile at each iteration - use the compiler errors to guide you, its faster and can tell you where problems lie after a change faster than you can pre-emptively look for all the call sites/uses.

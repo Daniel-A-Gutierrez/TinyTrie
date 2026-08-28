@@ -45,7 +45,7 @@ pub trait CursorMut<'cursor, T: 'cursor, P: BlockIndex> : Cursor<'cursor,T,P> {
 ///block-backed cursor: holds a block ref (`&B` or `&mut B`) via `R`, scans the
 ///store's slots through `R: Deref`, translates phys↔vaddr through `block.translator()`.
 ///`R = &'cursor B` gives a shared read cursor; `R = &'cursor mut B` gives a mut cursor.
-pub struct BlockCursor<'block, 'cursor, B: BlockTrait<'block>, R>
+pub struct BlockCursor<'block, 'cursor, B: BlockBase<'block>, R>
 where
     'block: 'cursor,
     R: Deref<Target = B> + 'cursor,
@@ -55,13 +55,13 @@ where
     _m: PhantomData<(&'block (), &'cursor ())>,
 }
 
-impl<'block, 'cursor, B: BlockTrait<'block>, R: Deref<Target = B>>
+impl<'block, 'cursor, B: BlockBase<'block>, R: Deref<Target = B>>
     BlockCursor<'block, 'cursor, B, R>
 where
     'block: 'cursor,
     R: 'cursor,
 {
-    pub(crate) fn new(block: R) -> Self {
+    pub fn new(block: R) -> Self {
         let mut c = Self { block, pos: None, _m: PhantomData };
         let _ = c.first();
         c
@@ -70,91 +70,51 @@ where
     ///decompose: yield the block ref back plus the current phys (no translation —
     ///the consumer indexes the block physically). `None` if the cursor was at-end.
     ///(for a handle that survives store mutations, use the vaddr via `from_parts`.)
-    pub(crate) fn into_parts(self) -> (R, Option<usize>) {
+    pub fn into_parts(self) -> (R, Option<usize>) {
         (self.block, self.pos)
     }
 
     ///rebuild by detranslating the stable vaddr back to a (possibly new) phys.
     ///`v == None` rebuilds an at-end cursor.
-    pub(crate) fn from_parts(block: R, v: Option<B::P>) -> Self {
+    pub fn from_parts(block: R, v: Option<B::P>) -> Self {
         let pos = v.map(|v| block.translator().v2p(v));
         Self { block, pos, _m: PhantomData }
     }
 
     ///position at vaddr `v`. if its slot is empty (e.g. an unpopulated root) the
     ///cursor is at-end (`pos = None`) rather than seeking a `None` slot.
-    pub(crate) fn new_at(block: R, v: B::P) -> Self {
+    pub fn new_at(block: R, v: B::P) -> Self {
         let phys = block.translator().v2p(v);
         let pos = (phys < block.store().len() && block.store().slot(phys).is_some()).then_some(phys);
         Self { block, pos, _m: PhantomData }
     }
 
-    pub(crate) fn p2v(&self, phys: usize) -> B::P {
+    pub fn p2v(&self, phys: usize) -> B::P {
         self.block.p2v(phys)
     }
-    pub(crate) fn v2p(&self, v: B::P) -> usize {
+    pub fn v2p(&self, v: B::P) -> usize {
         self.block.v2p(v)
     }
 
     ///is phys an occupied slot? (non-panicking, unlike `seek`).
-    pub(crate) fn slot_occupied(&self, phys: usize) -> bool {
+    pub fn slot_occupied(&self, phys: usize) -> bool {
         phys < self.block.store().len() && self.block.store().slot(phys).is_some()
     }
 
-    ///physical slot of the tree root (the find_slot pin — root must never move).
-    pub(crate) fn root_phys(&self) -> usize
-    where
-        B: crate::tree_block::TreeBlockMut<'block>,
-        B::T: crate::node::Node,
-    {
-        self.block.v2p(self.block.root())
+    ///block meta (read pass-through). tree root/height live here (e.g. `BTreeMeta`).
+    pub fn meta(&self) -> &B::Meta {
+        self.block.meta()
     }
 }
 
-impl<'block, 'cursor, B: BlockMutTrait<'block>, R: DerefMut<Target = B>>
+impl<'block, 'cursor, B: BlockBaseMut<'block>, R: DerefMut<Target = B>>
     BlockCursor<'block, 'cursor, B, R>
 where
     'block: 'cursor,
     R: 'cursor,
 {
-    ///find a free slot or grow. `pos`/`pin` are physical and NOT the cursor's tracked
-    ///element. applies the block's grew fixup to the tracked element so it survives the
-    ///spread. the pending slide (`found.slide`) is NOT applied here — call `slide_none`
-    ///with it to perform the shift.
-    pub(crate) fn find_slot(&mut self, pos: usize, dir: bool, pin: Option<usize>) -> FoundSlot {
-        let found = self.block.find_slot(pos, dir, pin);
-        if let Some(grew) = &found.grew
-            && let Some(phys) = self.pos.as_mut()
-        {
-            grew.fix_p(phys);
-        }
-        found
-    }
-
-    ///perform the slide. `pin` is physical. the tracked element shifts by the slide's
-    ///delta iff it lies in the moved run (between `ns.from` and `ns.to`, exclusive of the
-    ///None at `ns.from`); the pin is kept out of the run by `find_slot`, so a tracked pin
-    ///stays put.
-    pub(crate) fn slide_none(&mut self, ns: NoneSlide, pin: Option<usize>) -> OpenSlot {
-        let opened = self.block.slide_none(ns, pin);
-        if let Some(phys) = self.pos.as_mut() {
-            let lo = ns.from.min(ns.to);
-            let hi = ns.from.max(ns.to);
-            if *phys != ns.from && *phys >= lo && *phys <= hi {
-                ns.fix_p(phys);
-            }
-        }
-        opened
-    }
-
-    ///place `t` at the opened slot; returns its phys. insert fills a None slot and moves
-    ///no other element (auto-grow lives in `find_slot`), so the tracked phys is unchanged.
-    pub(crate) fn insert(&mut self, t: B::T, slot: OpenSlot) -> usize {
-        self.block.insert(t, slot)
-    }
-
     ///remove the element at phys `phys`. if it was the tracked element, the cursor goes at-end.
-    pub(crate) fn remove(&mut self, phys: usize) -> (B::T,OpenSlot) {
+    pub fn remove(&mut self, phys: usize) -> (B::T,OpenSlot) {
         let t = self.block.remove(phys);
         if self.pos == Some(phys) {
             self.next();
@@ -164,7 +124,7 @@ where
 
     ///swap the contents at two phys slots. the tracked element follows its data: if at
     ///`a` it moves to `b`, and vice versa.
-    pub(crate) fn swap(&mut self, a: usize, b: usize) {
+    pub fn swap(&mut self, a: usize, b: usize) {
         self.block.swap(a, b);
         match self.pos {
             Some(phys) if phys == a => self.pos = Some(b),
@@ -176,7 +136,7 @@ where
     ///swap the record at phys `src` with the None at `open`. returns the freed slot at
     ///`src`'s phys and the phys the record moved to. the tracked element follows: if at
     ///`src` it is now at the returned phys.
-    pub(crate) fn swap_open(&mut self, src: usize, open: OpenSlot) -> (OpenSlot, usize) {
+    pub fn swap_open(&mut self, src: usize, open: OpenSlot) -> (OpenSlot, usize) {
         let (freed, new_phys) = self.block.swap_open(src, open);
         if self.pos == Some(src) {
             self.pos = Some(new_phys);
@@ -188,7 +148,7 @@ where
     ///phys). panics if `a_v == b_v` or either slot is `None`. the returned refs are tied
     ///to `&mut self`, so the cursor can't be moved while they live — drop them before
     ///seeking/inserting again.
-    pub(crate) fn get_disjoint(
+    pub fn get_disjoint(
         &mut self,
         a_v: B::P,
         b_v: B::P,
@@ -199,35 +159,59 @@ where
     }
 
     ///mut access by phys (not the cursor's tracked pos). panics if `None`.
-    pub(crate) fn get_mut_phys(&mut self, phys: usize) -> &mut B::T {
+    pub fn get_mut_phys(&mut self, phys: usize) -> &mut B::T {
         self.block.get_mut(phys)
     }
 
-    ///TreeBlock pass-throughs the split driver needs (root management).
-    pub(crate) fn set_root(&mut self, v: B::P)
-    where
-        B: crate::tree_block::TreeBlockMut<'block>,
-        B::T: crate::node::Node,
-    {
-        self.block.set_root(v)
-    }
-    pub(crate) fn set_meta(&mut self, m: B::Meta)
-    where
-        B: crate::tree_block::TreeBlockMut<'block>,
-        B::T: crate::node::Node,
-    {
+    ///block meta (write pass-through).
+    pub fn set_meta(&mut self, m: B::Meta) {
         self.block.set_meta(m)
-    }
-    pub(crate) fn root_v(&self) -> B::P
-    where
-        B: crate::tree_block::TreeBlockMut<'block>,
-        B::T: crate::node::Node,
-    {
-        self.block.root()
     }
 }
 
-impl<'block, 'cursor, B: BlockTrait<'block>, R: Deref<Target = B>> Cursor<'cursor, B::T, B::P>
+///sparse mid-insert cursor surface: `find_slot`/`slide_none`/`insert` track the cursor's
+///element across the grow/slide. requires `B: SparseBlock` (Uniform/Pluripotent/FixedRoot).
+impl<'block, 'cursor, B: SparseBlock<'block>, R: DerefMut<Target = B>>
+    BlockCursor<'block, 'cursor, B, R>
+where
+    'block: 'cursor,
+    R: 'cursor,
+{
+    ///find a free slot or grow. `pos` is physical and NOT the cursor's tracked element.
+    ///applies the block's grew fixup to the tracked element so it survives the spread.
+    ///the pending slide (`found.slide`) is NOT applied here — call `slide_none` with it.
+    pub fn find_slot(&mut self, pos: usize, dir: bool) -> FoundSlot {
+        let found = self.block.find_slot(pos, dir);
+        if let Some(grew) = &found.grew
+            && let Some(phys) = self.pos.as_mut()
+        {
+            grew.fix_p(phys);
+        }
+        found
+    }
+
+    ///perform the slide. the tracked element shifts by the slide's delta iff it lies in
+    ///the moved run (between `ns.from` and `ns.to`, exclusive of the None at `ns.from`).
+    pub fn slide_none(&mut self, ns: NoneSlide) -> OpenSlot {
+        let opened = self.block.slide_none(ns);
+        if let Some(phys) = self.pos.as_mut() {
+            let lo = ns.from.min(ns.to);
+            let hi = ns.from.max(ns.to);
+            if *phys != ns.from && *phys >= lo && *phys <= hi {
+                ns.fix_p(phys);
+            }
+        }
+        opened
+    }
+
+    ///place `t` at the opened slot (None→Some); returns its phys. the tracked phys is
+    ///unchanged (insert fills a None, moves no other element).
+    pub fn insert(&mut self, t: B::T, slot: OpenSlot) -> usize {
+        self.block.insert(t, slot)
+    }
+}
+
+impl<'block, 'cursor, B: BlockBase<'block>, R: Deref<Target = B>> Cursor<'cursor, B::T, B::P>
     for BlockCursor<'block, 'cursor, B, R>
 where
     'block: 'cursor,
@@ -310,7 +294,7 @@ where
     }
 }
 
-impl<'block, 'cursor, B: BlockMutTrait<'block>, R: DerefMut<Target = B>>
+impl<'block, 'cursor, B: BlockBaseMut<'block>, R: DerefMut<Target = B>>
     CursorMut<'cursor, B::T, B::P> for BlockCursor<'block, 'cursor, B, R>
 where
     'block: 'cursor,

@@ -1,8 +1,7 @@
 use std::cmp::Ordering::*;
-use crate::Fixup;
 use std::collections::VecDeque;
 
-///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that limits max cap and provides
+///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that provides
 ///access/shift semantics
 ///address translation
 ///dumb insertion
@@ -59,18 +58,16 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
 
     fn swap(&mut self, a: usize, b: usize);
 
-    ///increases occupancy, may not increase cap beyond max
+    ///increases occupancy.
     fn push_front(&mut self, v: T);
 
-    ///increases occupancy, may not increase cap beyond max
+    ///increases occupancy.
     fn push_back(&mut self, v: T) -> usize;
 
-    ///increases len, may not increase cap beyond max.
-    ///inserts n Nones up to cap max, returns max addr
+    ///increases len, inserts n Nones, returns max addr.
     fn grow_front(&mut self, n: usize);
 
-    ///increases len, may not increase cap beyond max.
-    ///inserts n Nones up to cap max, returns max addr.
+    ///increases len, inserts n Nones, returns max addr.
     fn grow_back(&mut self, n: usize) -> usize;
 
     ///number of Some slots
@@ -120,8 +117,6 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
     where
         'a: 'b;
 
-    fn max_capacity() -> usize; //the maximum capacity of the store type.
-
     fn new() -> Self;
 
     ///build a store of `n` Nones — a fresh, empty (occupied=0) buffer of length `n`.
@@ -143,20 +138,14 @@ pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
 ///right ⇒ +1. from<to ⇒ items move left ⇒ -1. equal ⇒ 0.
 #[derive(Clone, Copy)]
 pub struct NoneSlide {
-    pub(crate) from: usize,
-    pub(crate) to:   usize,
-    pub(crate) delta : isize,
+    pub from: usize,
+    pub to:   usize,
+    pub delta: isize,
 }
 
 impl NoneSlide {
     pub(crate) fn new(from: usize, to: usize) -> Self {
         Self { from, to, delta: (from as isize - to as isize).signum() }
-    }
-}
-
-impl Fixup for NoneSlide {
-    fn fix_p(&self, p: &mut usize) {
-        *p = p.wrapping_add(self.delta as usize); //delta=-1 ⇒ usize::MAX ⇒ p-1
     }
 }
 
@@ -258,20 +247,13 @@ fn dual_scan_outward<T: Sized, const D: bool>(
     NearestNone::NotFound
 }
 
-///bounded Vec-backed store. MAX_CAP bounds logical capacity.
-pub(crate) struct VecStore<T, const MAX_CAP: usize> {
+///Vec-backed store.
+pub struct VecStore<T> {
     buf:      Vec<Option<T>>,
     occupied: usize,
 }
 
-impl<T, const MAX_CAP: usize> VecStore<T, MAX_CAP> {
-    const ASSERT_POW2: () = assert!(
-        MAX_CAP != 0 && (MAX_CAP & (MAX_CAP - 1)) == 0,
-        "MAX_CAP must be a power of two"
-    );
-}
-
-impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_CAP> {
+impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
     fn new() -> Self {
         Self { buf: Vec::new(), occupied: 0 }
     }
@@ -429,10 +411,9 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
 
     fn push_front(&mut self, v: T) {
         let len = self.buf.len();
-        assert!(len < MAX_CAP, "max capacity");
         if len == self.buf.capacity() {
             let c = self.buf.capacity();
-            let target = (c * 2).max(1).min(MAX_CAP);
+            let target = (c * 2).max(1);
             self.buf.reserve(target - c);
         }
         self.buf.insert(0, Some(v));
@@ -441,10 +422,9 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
 
     fn push_back(&mut self, v: T) -> usize {
         let len = self.buf.len();
-        assert!(len < MAX_CAP, "max capacity");
         if len == self.buf.capacity() {
             let c = self.buf.capacity();
-            let target = (c * 2).max(1).min(MAX_CAP);
+            let target = (c * 2).max(1);
             self.buf.reserve(target - c);
         }
         self.buf.push(Some(v));
@@ -453,14 +433,10 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
     }
 
     fn grow_front(&mut self, n: usize) {
-        let len = self.buf.len();
-        assert!(len + n <= MAX_CAP, "max capacity");
         self.buf.splice(0..0, (0..n).map(|_| None));
     }
 
     fn grow_back(&mut self, n: usize) -> usize {
-        let len = self.buf.len();
-        assert!(len + n <= MAX_CAP, "max capacity");
         self.buf.extend((0..n).map(|_| None));
         self.buf.len() - 1
     }
@@ -479,7 +455,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
 
     fn grow(&mut self) {
         let c = self.buf.capacity();
-        let target = (c * 2).min(MAX_CAP).max(c + 1);
+        let target = (c * 2).max(c + 1);
         if target > c {
             self.buf.reserve(target - c);
         }
@@ -488,7 +464,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
     fn spread(&mut self, offset: usize) {
         let len = self.buf.len();
         debug_assert!(offset < 2, "spread: offset must be 0 or 1");
-        assert!(len * 2 <= MAX_CAP, "spread: exceeds max cap");
         if self.buf.capacity() < len * 2 {
             self.buf.reserve(len * 2 - self.buf.capacity());
         }
@@ -588,12 +563,9 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for VecStore<T, MAX_C
         std::iter::empty::<&'b Option<T>>()
     }
 
-    fn max_capacity() -> usize {
-        MAX_CAP
-    }
 }
 
-impl<T, const MAX_CAP: usize> VecStore<T, MAX_CAP> {
+impl<T> VecStore<T> {
     /// SAFETY: ptr must be in-bounds and occupied.
     pub(crate) unsafe fn get_unchecked(&self, ptr: usize) -> &T {
         unsafe { self.buf.get_unchecked(ptr).as_ref().unwrap_unchecked() }
@@ -605,20 +577,13 @@ impl<T, const MAX_CAP: usize> VecStore<T, MAX_CAP> {
     }
 }
 
-///bounded VecDeque-backed store. MAX_CAP bounds logical capacity.
-pub(crate) struct DequeStore<T, const MAX_CAP: usize> {
+///VecDeque-backed store.
+pub struct DequeStore<T> {
     buf:      VecDeque<Option<T>>,
     occupied: usize,
 }
 
-impl<T, const MAX_CAP: usize> DequeStore<T, MAX_CAP> {
-    const ASSERT_POW2: () = assert!(
-        MAX_CAP != 0 && (MAX_CAP & (MAX_CAP - 1)) == 0,
-        "MAX_CAP must be a power of two"
-    );
-}
-
-impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX_CAP> {
+impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
     fn new() -> Self {
         Self { buf: VecDeque::new(), occupied: 0 }
     }
@@ -970,10 +935,9 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
 
     fn push_front(&mut self, v: T) {
         let len = self.buf.len();
-        assert!(len < MAX_CAP, "max capacity");
         if len == self.buf.capacity() {
             let c = self.buf.capacity();
-            let target = (c * 2).min(MAX_CAP).max(c + 1);
+            let target = (c * 2).max(c + 1);
             let _ = self.buf.reserve(target - c);
         }
         self.buf.push_front(Some(v));
@@ -982,10 +946,9 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
 
     fn push_back(&mut self, v: T) -> usize {
         let len = self.buf.len();
-        assert!(len < MAX_CAP, "max capacity");
         if len == self.buf.capacity() {
             let c = self.buf.capacity();
-            let target = (c * 2).min(MAX_CAP).max(c + 1);
+            let target = (c * 2).max(c + 1);
             let _ = self.buf.reserve(target - c);
         }
         self.buf.push_back(Some(v));
@@ -994,16 +957,12 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
     }
 
     fn grow_front(&mut self, n: usize) {
-        let len = self.buf.len();
-        assert!(len + n <= MAX_CAP, "max capacity");
         for _ in 0..n {
             self.buf.push_front(None);
         }
     }
 
     fn grow_back(&mut self, n: usize) -> usize {
-        let len = self.buf.len();
-        assert!(len + n <= MAX_CAP, "max capacity");
         self.buf.extend((0..n).map(|_| None));
         self.buf.len() - 1
     }
@@ -1022,7 +981,7 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
 
     fn grow(&mut self) {
         let c = self.buf.capacity();
-        let target = (c * 2).min(MAX_CAP).max(c + 1);
+        let target = (c * 2).max(c + 1);
         if target > c {
             let _ = self.buf.reserve(target - c);
         }
@@ -1031,7 +990,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
     fn spread(&mut self, offset: usize) {
         let len = self.buf.len();
         debug_assert!(offset < 2, "spread: offset must be 0 or 1");
-        assert!(len * 2 <= MAX_CAP, "spread: exceeds max cap");
         //odd len (e.g. len==1, the pow2 base): the mid=len/2 phase split is invalid
         //(it would move the lone element into the upper half). direct i->2i+offset move.
         if len % 2 != 0 {
@@ -1143,10 +1101,6 @@ impl<'a, T: Sized + 'a, const MAX_CAP: usize> Store<'a, T> for DequeStore<T, MAX
         T: 'b,
     {
         std::iter::empty::<&'b Option<T>>()
-    }
-
-    fn max_capacity() -> usize {
-        MAX_CAP
     }
 }
 

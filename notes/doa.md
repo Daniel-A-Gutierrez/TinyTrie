@@ -1,6 +1,215 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Fixable scope — what fixup can't cover (design note, deferred, AI Feedback session)
+Pressure-tested whether `Fixable`/`Fixup` (address-only: `fix_p`/`fix_v` + `affects_p`) covers everything a block/walker might carry.
+
+Note left in notes/doa.md (newest on top, under "Fixable scope — what fixup can't cover (design note, deferred)"):
+- Fixable is pointer-only; latent scalar gap (distances, cached shift) — recompute, don't cache; possible generalize-Fixup escape hatch.
+- Aggregates are consumer-maintained; treeblock must surface the structural path; arena auto-split must surface structural changes.
+- Extra intra-block P pointers → T: Fixable<P> + bidirectional edges + a graph-fixup driver to generalize to graph-block.
+- Disproved: BFO tier boundaries (covered as phys or counts).
+- Optimization question deferred - Fixable::applies(&self, fixup : SpecificFixup) to elide unnecessary runtime checks. 
+
+# Checklist completion: 
+- fixup is mostly working on P's, id rather have it on usizes.
+- ancestry can be generic over O, lets us make some optimizations - in order and postorder will have a sorted ancestry, so we dont have to check 'affects_p' for every single one.
+- ask questoin about Self : 'walker on treeblock. 
+- treewalker no longer needs to be generic over O since the treeblock its generic over is - its redundant. 
+- ask question : when is it worth splitting a trait into a const and mut variant? TreeBlock has type W and WM now, 
+which i dont mind, but a hard rule would be nice. Is a treeblock mut necessary or good? 
+- should insert root maybe not exist? its a bit of a smell i think. new should just init with an empty root. so TreeBlock::T should be default? 
+- regarding the O on the non tree blocks - should there maybe be a Sorted : Ordering, then TreeBlock requires O:TreeOrdering? 
+
+# Checklist
+- fixable trait
+    - add block data and walker data to block and walker respectively
+    - bound them by fixable
+    - create default metadata types - ancestry, root, height, depth, 
+    - impl fixable on them
+- walker
+    - step by step add what walker needs to support treeblock's minimal functionality
+    - treeblock needs insert_child, remove_child, insert_root, tbh thats a good start. 
+        - maybe the block primitives should be alloc/free then treeblock is insert_child etc. just a thought. 
+        - we need a lineage for those fns. maybe instead of having them on walker we can have a fn on treeblock that consumes a walker and returns one. 
+        - all the walker really has to do then is...walk. and mask node functionality like parent() and set_child(). 
+- split walker/ splittreeblock
+    - needs split_child, split_root, split_at / split, 
+    - 
+so, insert_child(w : Walker, k: Key, child: T) where Walker::WD : Position {
+    parent_pos = w.position();
+    assert!(w.has_space());
+    child_idx = w.lookup(k);
+    let depth = w.depth();
+
+    //go to previous node
+    if Some(idx) = w.children().seek(child_idx).prev() {
+        w.descend(prev);
+        w.descend_rightmost();
+    }
+    else {
+        w.descend_leftmost();
+    }
+    pos = w.position()
+    found = w.block.find_slot(pos,after)
+    found.grew_fixup(&mut parent_pos)
+    found.grew_fixup(&mut w)
+    //perform the slide
+    let open = walker.slide_none(noneslide); //walker is fixed up internally
+    found.ns.fixup(&mut parent_pos)
+    let v = w.block.insert(open, T);
+    w.seek(parent_pos);
+    w.insert_child(key, v)
+    return w
+}
+
+# Treeblock
+I guess this needs to be a trait because it needs to be implemented various ways depending on ordering over specific structs `Block<Uniform>, Block<Pluripotent>...` .
+If we just do pluripotent, uniform, and anchored, thats 9 impls. We'll start with uniform i guess. 
+if those 3 were unified by the sparse trait would it be different? Maybe... lets interrogate the split logic. 
+
+actually the latest split function works regardless of inner offset right? 
+So how the walker partitions the block is up to ordering... maybe i should just do one first so we can see. 
+
+Also fixups - if our node functions are gated behind the walker impl, set child/parent...
+treeblock.insert<W>(&mut self,k,v) ...
+treeblock generic over the walker of itself? 
+The walker holds &mut B though... walker.block.do_stuff()->Fixup, then walker.fixup(Fixup)? 
+D also needs fixup then? 
+
+So then the treeblocks interface is the core of a tree's mutable interface, walker just navs and updates itself.
+Treeblock has insert, remove, split. 
+
+also maybe blocktraitmut should have rotate and spread? 
+
+So what does a consumer really need? They need to impl walker so we can use it within treeblock to perform fixups on the tree as we mutate it. 
+
+To impl walker they need lookup(key)->usize, nav (next,prev,ascend,descend,current), 
+as well as is_leaf, is_root, is_full, has_parent_ref, insert_child, remove_child, set_child, set_parent, current_mut
+we could also use has_child, has_value
+split_child may also need to be there, as well as split_root
+we use both consts that can be Yes/No/Maybe as well as fns which return bool. 
+
+## Split Child? 
+blocks have to be splittable... right? Maybe not necessarily. Its one way of growing certainly but not the only one. 
+if a blocks nodes are splittable, does that mean the block has to be splittable? Yes, all children of a node should be either all in the same block or all in a different block, or differentiated by an enum but thats confusing. 
+
+certainly not all blocks are splittable. 
+
+Ok i think its SplittableBlock implies Splittable Node. Splitting a block requires splitting the root afterall. 
+So TreeBlock isnt our only trait, SplittableBlock is on top of that and is impled when `TreeBlock<W : SplitBlockWalker> `
+
+## Walker and Node
+Treeblock won't care about T, but Nav will be auto impled for walker when T:Node. 
+Nodes defining feature aught to be lookup... then again leafnodes dont support it. 
+Its fine though if we dont call it when we're not supposed to, using is_leaf(). 
+
+Node exists to help auto impl stuff for walker, its not a bound of treeblock. Treeblock's bound is walker, which hides node. 
+
+## Separating Treeblock
+TreeBlock<O> is impled specifically based on Mode, for the specific block type alias. 
+SplittableBlock requires Walker : SplittableWalker and Self:TreeBlock. 
+SplittableWalker is auto impled when T : SplittableNode.
+I think a subset of walker can be auto impled by ordering when T is Node - ascend, descend, prev, next, current. 
+Nah we still need the walker data for all that. We can impl it if WalkerData impls Ancestry, and when it doesnt, but thats specialization... impl 2 ancestries, one relies on the node one doesnt, bound on Node::HAS_PARENT? 
+
+## Fixup
+we need some trait Fixable for any arbitrary data that could be affected by any of the tree ops that hand back something that impls fixup, so that it can be applied to the data to keep it up to date. Itll be a bound on the walker and on WalkerData, as well as BlockData. 
+
+# Simplification? 
+would moving storage into just... block, simplify things? 
+a type is data with a fixed name and structure
+a trait is useful when multiple types of data should have similar functionality
+the split makes sense for vec/vecdeque i think. 
+
+what about when you want one data structure to have different distinct names and functionalities?
+phantom data right? 
+
+what if you want one trait to have multiple distinct extensions - say youve got a trait that has some 'data' field, as well as a 'push(item)' , 'get(idx)->&item', and 'pop()->item'. the trait on its own doesnt do much, but on top of that you could build a stack or a queue. thats multiple impls on a struct that has some base impl. 
+
+but what if we're blind to the struct, we just have `'pushable<T>'` . any trait extending it also has to expose its underlying interface, which we dont want. so we compose over it? `Queue<P : Pushable>`? or a Q with get_inner(&self) -> Pushable where Pushable is an associated type? I guess the difference is if different types of pushables are allowed. 
+
+For btree, i think the full composition is 
+
+```rust 
+type MapBlock<K, V, P, const CAP: usize> =
+    crate::block::Block<'static, BNode<K, V, P>, P, VecStore<BNode<K, V, P>, CAP>, Uniform, BTreeMeta<P>>;
+
+pub struct BTreeMap<K, V, P = u16, const CAP: usize = 4096>
+where
+    K: D + Copy + Ord,
+    V: D + Copy,
+    P: BlockIndex,
+{
+    block: MapBlock<K, V, P, CAP>,
+    len: usize,
+}
+```
+
+if store becomes an associated type of each block mode, that falls out.
+but `block<mode>` needs to be a concrete type.
+
+really uniform,append,prepend, etc. as traits are pointless because we won't have multiple structs implementing them, theyre unit types containing block. 
+
+then we have the sparse trait or whatever that they can implement for code deduplication. 
+
+so the traits for a block are more or less, splittable, push_front, push_back, sparse
+uniform, pluripotent, and fixedroot are all sparse and splittable but in different ways
+push front and push back are append and prepend as well as pluripotent. 
+
+treeblock should be impled for uniform, but uniform does have to be a concrete type - should it be `struct UniformBlock(block : Block)` or 
+`type UniformBlock = Block<UniformMode>` ? 
+The former loses the block and blockmut methods. I like the flexibility of 2 also, it lets me take different generic args for different kinds of blocks. 
+
+`type AnchorBlock<O : Ordering> = Block<FixedRoot<O>>`
+`type UniformBlock = Block<Uniform>`
+
+also probe/walker can be composed into 
+`Walker<WD,B>{wd : WalkerData, cursor : &B::Cursor}` and `WalkerMut`, instead of 4 different ones we get 2, Walker is just a probe where wm is `AncestorStack(Vec<usize>)`, probe is one where wd is Depth+TreeHeight. 
+
+We're getting ahead of ourselves, TreeBlock first.
+Since we put meta on block, treeblock is a type def.
+`Type UTreeBlock<O> = Block<Meta=RootPos,Mode=Uniform>`,
+`Type ATreeBlock<O> = Block<Meta=RootPos,Mode=FixedRoot<O>>`
+
+then we define a trait `TreeBlock<O>` and impl it for the various treeblocks. 
+`Walker<B: TreeBlock>` defines new(tree : &B) -> Self, and WalkerMut<B> defines new_mut(tree: &mut B) 
+
+hmm still need to fit blockcursor into this... must i though? Why cant walker just store usize + &B ? 
+
+in the course of walking itll pick up state linked to the tree, that needs to be updated when the tree is updated. so theyre linked. I think though, the block interface may be where we want to 'end' the crate. its functions provide the necessary interface to keep any state the walker may hold up to date, but we cant impl or even define walker, unless we want to define every possible walker, otherwise the consumer cant. 
+
+perhaps we define the trait? as well as ancestor stack, height, depth, useful bits that could be used in metadata... maybe maybe not. 
+
+split functions then are not on the walker but on treeblock - ordering sensitive splits. 
+were not concerned with maintaining a walker across a split, they take self and return 2 blocks. 
+
+is the node file necessary? Its only used by walker. i suppose if the trait stays so can the node traits? But is there a point? Well, the split needs to be able to update ptrs (off midpoint), so we need a way to goto a nodes parent and to update its children, and goto a child and update the parent. 
+
+so node needs get/update children / parent, treeblock needs split(self), since splitting requires fixup that means it needs the ability to construct a walker. It can take a callback that takes &mut self and returns a walker, to navigate, find the split point, drain the lesser sized half into a new vec then build a block from that, move its excess onto one side while updating their parents, then move the rest to their rotated position and upate the translator. 
+
+## What should walker contain? 
+i dont see the point in hiding block interfaces from the walker impl. 
+we're already making consumers implement the walker using the block, so if having a block(&self) -> Self::B lets us auto impl methods thats just convenient. 
+
+we could also have a FixupSelf(&mut self, f : Fixup) that applies something that impls fixup to whatevers in the walkerdata. Or have walkerdata be a trait that impls Fixable that works with all the fixup implementors in the crate. 
+
+## Node parentage
+If we always use walker to get a nodes parent, then node and walker are impled by the consumer, we dont need to care about parent on the node type. just children. the walker uses the specific impl. nice!
+
+if we cover getting/setting children in the same way, we get rid of the node trait almost entirely. 
+
+so walker needs a 'has_children' function that can tell a consumer if the current node has children/is a leaf, as well as set_child(usize,p); 
+
+# Splitting working!
+also spread offset is dead, its unnecessary since rotations arent simply spreads with offset 1 when src is >MIDPOINT. 
+
+## Updated doa review
+blockbasemut has too much stuff. find slot, etc. 
+also split block? doesnt belong there. only stuff common to all block modes ie remove and swap. 
+
+append should only have push back, prepend only push front, uniform gets find slot etc, fixed gets find slot but neither expose pin, they set it on their own .
+
 # Vaddr Wrapping Note
 if cap >> shift >= len , we've overlapped vaddrs (bad). 
 So push front and back need to check that ptr::max >> shift < len. 
@@ -45,7 +254,7 @@ Is there a point though, to making the mutable bits composable by trait?
 picking back up, im not sure about the degree of parameterization of the alloc strategies. 
 Also i think instead of fixing roots itd be better to have the consumer of the block have to handle whatever 'fixed' points they have shifting in their fixup logic. 
 Append/prepend just grow like normal vecs, dont bother filling with none preemptively, just insert 1 none at the end after an insertion. 
-This view makes alloc strat a performance consideration rather than a correctness requirement.
+This view makes alloc strat a performance consideration rather than a correctness requirement. (outdated now)
 
 push back / front should be equivalent to before first and after last, reversed for prepend. 
 pluripotent is the trickier one, inner offset has to be midpoint intially, decrementing by `1<<shift` on push_front. 

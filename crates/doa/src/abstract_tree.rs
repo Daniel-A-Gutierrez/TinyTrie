@@ -1,1 +1,0 @@
-trait TreeNode<IDX, PTR> {}
