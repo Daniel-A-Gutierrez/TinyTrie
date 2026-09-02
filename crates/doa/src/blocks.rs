@@ -115,9 +115,8 @@ pub trait BlockTrait<'block>  : Sized {
     where 'block: 'b {
         self.store().cap()
     }
-}
 
-pub trait BlockTraitMut<'block>: BlockTrait<'block> {
+    // ---- mut surface ----
     fn store_mut(&mut self) -> &mut Self::S;
     fn translator_mut(&mut self) -> &mut Translator<Self::P>;
     fn set_data(&mut self, m: Self::BlockData);
@@ -235,24 +234,13 @@ where
     fn data(&self) -> &D {
         &self.block_data
     }
-}
 
-impl<'block,T,P,S,M,D,O> BlockTraitMut<'block> for Block<'block,T,P,S,M,D,O> where 
-    T: Sized + 'block,
-    P: BlockIndex,
-    M: Mode<P>,
-    S: Store<'block, T> + 'block,
-    D: 'block + Default + Clone + Fixable<P>,
-    O: Ordering
-{
     fn store_mut(&mut self) -> &mut Self::S {
         &mut self.store
     }
-
     fn translator_mut(&mut self) -> &mut Translator<Self::P> {
         &mut self.translator
     }
-
     fn set_data(&mut self, m: Self::BlockData) {
         self.block_data = m;
     }

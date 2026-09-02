@@ -1,6 +1,207 @@
 # Structure
 The most recent top level entries are towards the top.
 
+# Updates for the agent : 
+A block intrinsically holds a treelike structure. Graphs cant be trivially ordered, an arena for them and other unordered nodes may as well be a Vec<T>. 
+DOA is for ordered nodes. middle insertion requires the ability to get referents and referers of a continuous run of nodes, which requires a tree like structure and a 
+traversal state which can be used to track the referers of the current node while going next/prev in a manner dependent on the ordering.
+
+So - append and prepend push front/back are in actuality still just insertion before/after the first/last element, push_front and push_back are the wrong signature. 
+Its all middle insert. But the way they spread is dependent on degree - it'll be complex, we'll defer them for now. 
+
+Mode determines store so Mode becomes Mode<P,T>. 
+Block needs to hold an ordering so it can bound walkers over it that do insert/removal to a matching ordering. 
+
+NodeCursor, NodeWalker, and NodeWalkerMut will be impled on some struct or structs defined by the consumer, which will mask the node operations so we don't have to know if node is a union/enum/etc.
+NodeWalkerMut will have to have an associated type for the 'payload' it gives to insert_child(), B Trees store 1 value per key whereas Binary trees store none and B+Trees store them but only on leaves. 
+
+The merit of a node cursor vs node walker is that a node cursor may be stackless even for trees that dont store a parent pointer, at the cost of not being able to ascend. 
+
+TreeOrdering is redundant, all the orderings are tree orderings now. 
+T as the generic type Block contains can be replaced with N for Node. 
+
+
+
+# Generic param flow
+
+struct Block<N,Mode,Meta,O> : Generic over Mode, T - 
+trait NodeCursor<N : Node, B: BlockTrait> : Uses block to dereference stored pointers, goto child. impled by consumer. no prev/next. useful for immutable lookup. 
+trait NodeWalker<N : Node, B: BlockTrait> : NodeCursor  - capable of ascend. 
+trait NodeWalkerMut<N: Node, B: BlockTrait> : NodeWalker + Fixup - Tracks state which may need fixup when the treeblock mutates. impled by consumer on a struct. 
+    allows mutation of node. holds &mut B. 
+struct Walker<NW,O>(NW,O)
+impl nodecursor, nodewalker on Walker where NW : NodeWalker, Node Cursor, etc. 
+impl nodewalkermut as well when NW: NodeWalkerMut. 
+
+trait OrderedWalker<O> : NodeWalker { // specific impls for each O
+    prev, 
+    next, 
+    insert_pos(child_idx, before/after subtree) -> RelTo(pos) //faster than always descending prev child rightmost. 
+}
+
+impl on walker<NW> for each ordering where NW : NodeWalker
+
+trait TreeWalker : OrderedWalker
+    impl where OW : OrderedWalker , B::O = OWM::O
+    fn lookup(&mut self, &T::K) -> TW
+
+    impl where OW : OrderedWalkerMut
+    fn lookup_mut(&mut self, &T::K) -> TWM
+    fn insert_child(&mut self) 
+
+trait SplitTreeWalker : TreeWalker where T : SplitNode
+
+considerations : 
+construction : 
+Block::cursor<C : Cursor>(&self) -> NodeCursor<C,O> which impls NodeCursor
+Block::walker<NW : NodeWalker>(&self) -> Walker<NW,O> which impls NodeWalker
+Block::walker_mut<NWM : NodeWalkerMut>(&mut self) -> Walker<NWM,O> which impls TreeWalkerMut
+
+So everything needs to be constructable from a & or &mut B. 
+
+# Constraints
+Ok i think i see why ive been struggling
+Middle insertion *requires* a way to get the referrer and referent for a node which is being moved, as is necessary to update them. 
+If the edges are 1 directional parent->child like, we need the parent, if theyre bidirectional, we need to update both parent and children. 
+Append/prepend never have to update any, theyre fundamentally just a slab allocator, they maybe dont belong in the crate, but lets leave that aside for now.
+
+In the case of a treeblock, referers are parents, referents are children, unless theres backptrs. Walker is how we get the nodes related to a node at a position, we have a precondition
+that the walker has to get to the node from the root and track some state, in most cases, but not necessarily. 
+
+A tree can exist where there's no state necessary to update it - the node fully encapsulates all the information necessary, like a plain old binary tree with no rebalancing, or a graph.  
+
+so the uniform/pluripotent/fixedroot blocks dont really make sense on their own. Append and prepend dont require any of the complex machinery in the crate, theyre afterthoughts. Itd be another story if they supported middle insert and just werent optimized for it though, but i have a hard time thinking about how a structure could even take advantage of that. A Btree would have to prewire empty nodes and double its size, putting all the empty ones on one side... may as well be an S tree? idk anyway..
+
+maybe instead of block being the 'idk anything' its a graphblock. treeblock is a specialization of that. the graphblock needs some way to get the referrers and referents for any position within itself, potentially taking in a third argument (the walker , in treeblock's case). 
+
+I suppose even graphs have walkers. And it does serve to mask the node operations. so the defining fns would be get/set/remove/insert referers/referents  + len. 
+the treewalker is a special case where an ordering is imposed in addition to that, and referers.len()=1, except for the root. 
+so ordering is only a property on a walker, walker is the param of block - reverse of what we've done. 
+
+I do want a specific walker impl to be associated with a concrete block type, but if the concrete type handles splitting/inserting/removing, i think the walker can be generic over the rest of the parameters in B besides T. `MyWalker walks Block<MyNode>` so to say. 
+
+So then, `Mode<Order>` ? Or is walker whats generic over order? 
+If walker tells us where to insert things, before or after a given occupied position, order belongs on walker. If treeblock decides that, and just uses walker to goto positions...
+preorder- prev := childidx == 0 parent else prev sibling's rightmost descendant
+inorder - prev := childidx == degree/2 parent else prev sibling's rightmost descendant
+postorder - prev := childidx == degree parent else next sibling's leftmost descendant??
+
+so treewalker has insert child, which, depending on child_idx and degree, walks to *a position*, finds/makes an open space *before or after* it, then puts the child there.
+i think this got tricky in the past because splitting requires upkeep, we can't rely on the consumer to point the parent at the child afterward if split may have to recursively split parents and maintain ptrs.
+or can we? 
+
+if split_position just gave us a position to split a node into then left the consumer to fixup their nodes internal refs, things do get simpler for us. 
+If thats the case, walker is a multi tiered thing - Ordering<Walker> in a sense. Walker provides us the ability to access fields of the nodes like child and parent, ordering gives semantics to the positions of
+those things. 
+
+So we have BlockWalker, NodeWalker<T:Node> : BlockWalker, and TreeWalker<NodeWalker,Ordering>
+
+BlockWalker {get referents/referers, current, position}
+NodeWalker {const degree, get children/parent?, is_leaf, is_root(), lookup(k)->usize, descend(usize), ascend} //maybe the missing function is 'first/last(child_idx)->P' to go to a subtree boundary? 
+TreeWalker<O,NW> {prev/next, boundary(child_idx,before/after), first, last} // auto impled. 
+
+NodeWalkerMut<K,V,P,CD> { set_child, set_parent, insert_child(child_idx, position : P, payload:CD), remove_child(child_idx) } 
+TreeWalkerMut<O,NW>{insert_child, remove_leaf}
+SplitTreeWalker<O,NW>{split_node, unsplit_leaves}
+
+does that provide any way of dealing with the root for a split? I dont think i can get out of updating ptrs tbh but making it generic over ordering helps.
+a split also requires extensive updating of children so 'get child position' isnt the full story , its just the interface given by a Ordering specific tree walker. 
+
+regarding insert_child - 
+in postorder itll be faster to go to the previous child and go last(), whereas in preorder itll be faster to go next child then prev(). 
+in order is equal in both cases. 
+so 'between' i think is better than first/last. 
+for a node with no children though, where do we insert? in postorder, itd be before parent, in pre and inorder, its after parent. 
+i guess insert is getting (child_idx, relto) , so we could just do boundary(child_idx,relto) and let the specific impl figure it out. 
+
+boundary(after,5) -> (relto, P) : 
+in order :  
+    if idx == degree/2 { before, self.pos }
+    else if idx == degree/2 + 1 { after self.pos }
+    else { self.child[idx].last() }
+preorder 
+    if idx==0 {after, self.pos}
+    else if idx < len - 1 {before, self.children[idx+1]}
+    else {self.last()}
+postorder : etc.
+
+## Review
+ok actually middle insert moves a continuous slice of some elements, which are navicable via next/prev on a walker with an ordering that ties some logical ordering to the physical ordering.
+Either the nodes are 'fixable' without any walker state, or it requires a tree. 
+So graph block is just a walkerless block, i guess - one where prev/next dont exist, we just wrap node functionality, and a node contains all it needs for get_referrers/get_referents. 
+
+for each position in the none slide we can just say 'for p in ns { for referer in block[p].referers {ns.fixup(referer.referents().find(|x| x==p))}}' or something. 
+an ordering becomes necessary when not every edge is bidirectional. 
+
+nodewalker doesnt extend blockwalker, blockwalker is actually graphwalker, and it can be impled by the consumer.
+node walker... maybe doesnt hold a & or &mut block but just stores a usize. 
+So if we do the treeblock functionality in `treewalker<nodewalker,O>` ie insert,remove
+Treeblock::walk(&mut self) -> TreeWalker<nodewalker,O> ?
+Or is it MyTree::get(&mut self, key) -> &T {
+    TreeWalker<MyWalker,O>::new(&mut self.block).lookup(key).current().value(); //probably more verbose than this. 
+}
+
+Would be cleaner if the block could say 
+```rust 
+block.lookup(&self, key) -> Option<T> { 
+    let w = TreeWalker::<Self::NW, Self::O>::new(self.root_pos());
+    w.lookup(key)
+}
+
+...
+
+MyTree::get(&self, key) {
+    self.block.lookup(key).map(|t| t.get_value(key))
+}
+```
+
+so i'd like the interface to lie on the block. 
+the treewalker should be constructable by the block from a &self, as should the nodewalker, and the treeblock needs to give root_position() and blockdata.
+alternatively, block.lookup returns a walker. solves most of the hairy cases. treewalker can be the interface then.
+but block.split needs to consume a walker to know where to split at still. 
+
+So lets collect the changes im gonna make.
+define traits: 
+NodeWalker, GraphWalker, TreeWalker, NodeWalkerMut, TreeWalkerMut, GraphWalkerMut, 
+TreeBlock {fn lookup, fn root_pos} where T : Node
+
+Update Block: 
+drop O, instead we're generic over a Walker type. 
+actually, graphs arent really... ordered. so idk if they fit either. 
+its possible to do em but there isnt really a point.
+i think we're trees only for block.
+so append and prepend either support middle insert or they dont exist, i guess. 
+idk how we could always append nodes that are greater than the previous one tho. 
+lets just scrap em. pluripotent does the job.
+when leaf block becomes a thing itll be a job for that. actually wait for sorted data thatll split right over and over... every degree splits we'll have a parent split. 
+or degree/2. 
+so what we'd actually want is not to just put empty space at the end, but bias it towards the end...
+1 empty space after the root, degree/2 spaces after the degree+2th space, ... just think how a btree that only appends grows. like bfo. 
+
+ok so append and prepend are valid but not what i thought they were, and also are complex so specifics later .
+we wont be pushing back, we'll be inserting after last repeatedly, which is basically equivalent, but we *will* have a prior node to position ourselves after. 
+anyway, block is generic over T, mode, ordering, and nodewalker. 
+this isnt leafblock, thatll be a separate thing, so we can assume T: Node for block. 
+
+so we're not dropping O, we're adding NodeWalker, and internally using/returning TreeWalker<O,NW>. 
+Both O and NW are phantom data on the struct i guess?
+They need to be on the trait, but theyre not associated types. Maybe TreeWalker<O,NW> is the GAT for the trait?
+Then idk if it needs to be phantom data on the struct. maybe not. 
+
+# Design notes
+- Generic params for traits vs associated types 
+    - params are appropriate when the implementing type is *not* also generic over that param. 
+    - associated types are appropriate when other things may want to know the ... associated type, and when a struct's generic params include it.
+- Bounds on generic types on structs
+    - generally not appropriate, besides structural stuff like Send/Sync/Sized when necessary
+- Mutability Trait Splitting
+    - appropriate when the implementor is expected to hold a reference that may be immutable/mutable.
+- if something needs a generic param it either needs to be implemented 
+    - as a generic on the fns
+    - as an associated type of a trait
+    - as a generic of a concrete type. 
+    a trait cant be generic over something that is neither an associated type nor a param of the concrete type...
+
 # Fixable scope — what fixup can't cover (design note, deferred, AI Feedback session)
 Pressure-tested whether `Fixable`/`Fixup` (address-only: `fix_p`/`fix_v` + `affects_p`) covers everything a block/walker might carry.
 

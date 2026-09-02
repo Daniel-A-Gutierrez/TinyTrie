@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 ///access/shift semantics
 ///address translation
 ///dumb insertion
-pub(crate) trait Store<'a, T: Sized + 'a>: Sized + 'a {
+pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///in-bounds occupied slot. bounds-checks; panics if the slot is None (contract violation).
     fn get<'b>(&'b self, ptr: usize) -> &'b T;
 
