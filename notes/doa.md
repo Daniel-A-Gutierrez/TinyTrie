@@ -20,7 +20,11 @@ The merit of a node cursor vs node walker is that a node cursor may be stackless
 TreeOrdering is redundant, all the orderings are tree orderings now. 
 T as the generic type Block contains can be replaced with N for Node. 
 
-
+## Review of agent work 
+1. the double grow case of find_slot - just panic, logically impossible to not find a space in BUDGET spaces when we're inserting a none on every other space. 
+2. cleave and spread would be handy to have in addition to cleave and rotate. 
+3. treeblock could use fn cursor in addition to walker
+4. why order ops? Why not just make treewalker generic over O and have the struct keep O as a phantom data? Or project it from B and do specific impls for each ordering? 
 
 # Generic param flow
 
@@ -41,7 +45,7 @@ trait OrderedWalker<O> : NodeWalker { // specific impls for each O
 
 impl on walker<NW> for each ordering where NW : NodeWalker
 
-trait TreeWalker : OrderedWalker
+trait TreeWalker : OrderedWalker<O>
     impl where OW : OrderedWalker , B::O = OWM::O
     fn lookup(&mut self, &T::K) -> TW
 

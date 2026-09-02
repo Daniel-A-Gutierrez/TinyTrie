@@ -1,56 +1,32 @@
-//pub mod block;
-//pub mod block_cursor;
 pub mod index;
 mod inline_leafblock;
 mod leafblock;
 mod blocks;
 pub mod metadata;
 mod treeblock;
-//pub mod node;
 pub mod store;
 pub mod translator;
 pub mod walker;
-use crate::leafblock::{PtrUnion, SlicePtr};
-use crate::translator::{AddressTranslator, Translator};
-use blocks::*;
-use index::*;
-//use node::*;
-use std::{cmp::Ordering::{Equal, Greater, Less},
-          collections::VecDeque,
-          marker::PhantomData,
-          ops::Range};
 
-pub struct BFO;
 pub struct InOrder;
 pub struct PreOrder;
 pub struct PostOrder;
-///non-tree ordering: a sorted sequence block (no tree root; `ROOT_POS` unused).
-pub struct Sorted;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootPos { Beginning, Middle, End }
 
+///where the tree root lives in a fresh block.
 pub trait Ordering: 'static {
-    ///where the tree root lives in a fresh block.
     const ROOT_POS: RootPos;
 }
-
-///tree ordering: defines a root position + an in-order traversal the block lays out
-///contiguously. `TreeBlock`/`TreeWalker` gate `O` on this; non-tree blocks may use a plain
-///`Ordering` (e.g. `Sorted`).
-pub trait TreeOrdering: Ordering {}
 
 ///easiest to split, iteration OK
 impl Ordering for InOrder   { const ROOT_POS: RootPos = RootPos::Middle; }
 impl Ordering for PreOrder  { const ROOT_POS: RootPos = RootPos::Beginning; }
 impl Ordering for PostOrder { const ROOT_POS: RootPos = RootPos::End; }
-impl TreeOrdering for InOrder {}
-impl TreeOrdering for PreOrder {}
-impl TreeOrdering for PostOrder {}
-///non-tree: ROOT_POS is a placeholder, never read by a sorted-array block.
-impl Ordering for Sorted   { const ROOT_POS: RootPos = RootPos::Beginning; }
 
-enum RelTo<T> {
+///a position taken relative to another (insert-side resolution, boundary results).
+pub enum RelTo<T> {
     Before(T),
     After(T),
 }

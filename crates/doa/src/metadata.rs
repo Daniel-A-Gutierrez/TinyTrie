@@ -19,13 +19,6 @@ pub trait Fixup {
     }
 }
 
-///`find_slot` result: an optional grow fixup (apply to live phys) + an optional pending slide.
-///todo: this should go back to store or block, wherever uses it. 
-pub struct FoundSlot {
-    pub grew: Option<GrewFixup>,
-    pub slide: Option<NoneSlide>,
-}
-
 ///spread remap `p → p<<shl + shift_offset` (grow doubles the store; vaddrs stay stable).
 pub struct GrewFixup {
     pub shl: u32,
