@@ -1,9 +1,9 @@
 pub mod index;
 mod inline_leafblock;
 mod leafblock;
-mod blocks;
+pub mod blocks;
 pub mod metadata;
-mod treeblock;
+pub mod treeblock;
 pub mod store;
 pub mod translator;
 pub mod walker;

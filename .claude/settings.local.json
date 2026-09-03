@@ -1,4 +1,7 @@
 {
+  "env": {
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000"
+  },
   "permissions": {
     "allow": [
       "Bash(cargo check *)",
@@ -16,8 +19,8 @@
       "WebFetch(domain:github.com)",
       "Bash(awk *)",
       "mcp__ide__getDiagnostics",
-      "Bash(rtk proxy *)"
+      "Bash(rtk proxy *)",
+      "Bash(cargo build *)"
     ]
-  },
-  "env": { "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000" }
+  }
 }

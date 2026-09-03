@@ -29,13 +29,14 @@ crate owns ordered traversal and tree ops):
 - `index.rs` — numeric trait ladder + type-level const facts underpinning all address math.
 - `translator.rs` — `v2p`/`p2v` address translation, fn-ptr-specialized over zero/nonzero params.
 - `store.rs` — unbounded `Option<T>` slot backends + slide/find/grow/spread/split primitives.
-- `metadata.rs` — the fixup protocol (`Fixup`/`Fixable`) + default block/walker data types.
+- `metadata.rs` — the fixup protocol (`Fixup`/`Fixable`) + default block/walker data types (incl. the standard walker state `PosAncestry`).
 - `blocks.rs` — `Block` (store + translator + block data + mode) + `BlockTrait`/`BlockOps` + the three modes.
 - `walker.rs` — `Node`/`SplittableNode` + the three walker layers.
-- `treeblock.rs` — `TreeBlock`/`SplitTreeBlock`: the consumer-implemented block trait naming their walker types.
+- `treeblock.rs` — `TreeBlock` (param-less tree-block marker) + the `walker`/`search` free-fn constructors over consumer `From` impls.
 - `lib.rs` — module wiring + `Ordering`/orderings + `RelTo` + sketches.
 - disabled/stubs — `block.rs` + `block_cursor.rs` (pre-refactor reference code, not
-  compiled), `examples/btree/` (archived consumer, all commented), `leafblock.rs` /
+  compiled), `examples/old_btree/` (archived consumer, all commented; the live
+  consumer is `examples/btree.rs`), `leafblock.rs` /
   `inline_leafblock.rs` (dead sketches), `src/archive/`.
 
 ## index.rs
@@ -93,7 +94,7 @@ slide ⇒ `NoneSlide`); any tracked state (`BlockData`, walker data) that impls
 - `GrewFixup { shl, shift_offset }` — spread remap `p → p<<shl + offset`. `GrewFixup { shl: 0, shift_offset: 1 }` doubles as the plain `p → p+1` (pluripotent front-edge grow).
 - `Fixable<P>` — `fixup(&mut self, f: &Fixup, tr)`. Implementors must fix every address they hold.
 - `HasRoot<P>: Fixable` — block data exposing a movable root (read from `BlockData` by movable-root modes' `TreeBlock::root_position`).
-- `Height`/`Depth` — pointer-free no-op-fixable meta. `Root(usize)` — phys root. `Ancestry` — stackful walker's `(parent phys, child idx)` stack, one entry per level.
+- `Height`/`Depth` — pointer-free no-op-fixable meta. `Root(usize)` — phys root. `Ancestry` — stackful walker's `(parent phys, child idx)` stack, one entry per level (+`push`/`pop`/`last`/`len` helpers). `PosAncestry { pos, ancestry }` — the standard stackful walker state, satisfies the `NodeWalkerMut::State` (`Fixable` + `Clone`) contract; consumers embed it instead of reimplementing the fixup loop.
 
 ## blocks.rs
 
@@ -134,13 +135,14 @@ would overlap. `find_slot` order: budgeted scan → spread + rescan → edge gro
 never a param — it is always `B::O`.
 
 - `Node { K, V, P, DEGREE }` — the node identity; `SplittableNode: Node` — `split(&mut self) -> Self` (drain right half).
-- **Layer 1** `NodeCursor<'block,'walker,B>` — consumer stackless read: `from_block`(rooted at root)/`block`/`position`(phys)/`is_leaf`/`current`/`child_count`/`child(idx)->P`/`lookup(k)->child idx`/`descend`; default `walk_to` (root→leaf descent).
-- `NodeWalker: NodeCursor + Fixable<P>` — adds `ascend`/`depth`/`parent() -> (parent phys, child idx)`. `Fixable` is load-bearing: tree ops hand the walker every grow/slide fixup; it must correct position + ancestry.
-- `NodeWalkerMut: NodeWalker` — assoc `Payload` (what `insert_child` places in a node — node-shape-specific) + `child_payload(k, ptr)`; `from_block_mut`/`block_mut`/`current_mut`/`has_space`/`set_child(up, child_idx, ptr)` (ancestry-aware, position-stable — the fixup path rewrites a parent's entry while standing on the child)/`set_parent` (no-op for parent-free shapes)/`insert_child` (node-level wire)/`remove_child` (node-level unwire).
+- **Layer 1** `NodeCursor<'block,B>` — consumer stackless read: `block`/`position`(phys)/`is_leaf`/`current`/`child_count`/`child(idx)->P`/`lookup(k) -> (usize, Ordering)` (**position + comparison**: `pos` = the child `search` descends to by default; `cmp` = `k` vs that child — `Less` = before it, a new child takes slot `pos`; `Equal` = addressed by it / within its key span, slot `pos+1`; `Greater` = after it, slot `pos+1`; `(len-1, Greater)` = the append case — replaces the unreturnable `Some(len)`)/`descend`/`search` (root→terminal descent; **required, no default** — the meaning of `Equal` is a per-shape routing policy (value-storing inode stops on Eq, B+ equal-right descends), so a default would bake in one shape's semantics; the consumer interprets `lookup`'s pair). All ref returns tie to the `&self`/`&mut self` borrow (NOT `'walker` — a mut-holding cursor can't vend `'walker` shared refs; this way it reborrow safely). **No `'walker` param on the ladder** — vestigial once ref returns elided (it survived only in where-clauses, guarding nothing); the consumer's *struct* keeps its own borrow lifetime (the block stays IN the walker), but the trait bound is satisfiable at any borrow. **No constructors on the traits**: a mut-holding walker can't be built from a shared borrow, so construction lives on `From` bounds at the free fns (`impl From<&'a MyBlock> for MyCursor` — local type, orphan-safe).
+- `NodeWalker<'block,B>: NodeCursor` — adds `ascend`/`depth`/`parent() -> (parent phys, child idx)`.
+- `NodeWalkerMut: NodeWalker` — assoc `Payload` (what `insert_child` places in a node — node-shape-specific) + `child_payload(k, ptr)`; assoc **`State: Fixable<P> + Clone`** (the walker's fixable tracked state — position + ancestry; `Clone` is for `fixup`'s snapshot/restore; `Fixable` lives here, NOT on the walker: the block ref is never fixable) + `parts() -> (&mut State, &B)` / `parts_mut() -> (&mut State, &mut B)` (**one call returning the pair** — two separate accessors would reintroduce the state-vs-block borrow conflict; the crate's fixup path is `let (state, block) = nw.parts(); state.fixup(f, block.translator())`); `block_mut`/`current_mut`/`has_space`/`set_child(up, child_idx, ptr)` (ancestry-aware, position-stable — the fixup path rewrites a parent's entry while standing on the child)/`set_parent` (no-op for parent-free shapes)/`insert_child` (node-level wire)/`remove_child` (node-level unwire).
 - **Layer 2** `TreeWalker<O, NW>` — wrapper carrying `O` as **phantom data**: it tags the Self type so the per-ordering `TreeWalk` impls (`for TreeWalker<PreOrder, NW>` etc.) sit on distinct types and pass coherence (three impls differing only in a `B::O = X` where-bound on a shared Self type hit E0119). The wrapper's `O` is bound to the block's at every use (`B: BlockTrait<O = O>`); `TreeBlock` projects it (`TreeWalker<Self::O, …>`).
-- `TreeWalk<'block,'walker,NW,B>` — the traversal surface: `next`/`prev`/`first`/`last`/`boundary(child_idx, after) -> (RelTo<anchor phys>, levels descended)`. One impl per ordering.
-- Ordering semantics: **preorder** node-first (new child 0 → after self; child k → before `child(k)`; append → rightmost-deepest). **in-order** B-tree: node in the gap between `child[cc/2-1]` and `child[cc/2]` (mid = cc>>1, dynamic); gap inserts land **after** the parent (both gap-side queries are the same gap → fast path); general case = descend + leftmost/rightmost leaf walk. **postorder** node-last (mirror of preorder; child k → after `child(k-1)` — no descent).
-- **Layer 3** `TreeWalkMut: TreeWalk` (crate impl) — `insert_child(k, node) -> Result<P, InsertErr>`: `has_space` check → `lookup(k)` → `boundary` → `find_slot` → apply `grew` to walker → run-parent-fixup → `slide_none` → walker fixup → `insert` → ascend `levels` → node-level wire. `remove_child(idx) -> (N, OpenSlot)` — unwire + slot free, no fixups. `fixup(&NoneSlide)` — run-parent-fixup **before** the slide: walk the moved run (next for delta>0, prev for delta<0; forward-only walking can't re-enter a processed subtree, so entries read on the way are unprocessed/correct); per moved node rewrite the parent's child entry via `set_child(1, idx, new_v)` (idx from ancestry — authoritative, no value scan) + repoint the node's stored parent field when the parent also moved; position-neutral (walks back). The impl is **generic over `O`**: the supertrait obligation (`TreeWalker<O, NW>: TreeWalk`) is *supplied as a where-clause* rather than proven — it discharges only for a concrete `B`/`O` pair (one of the per-ordering `TreeWalk` impls), same coverage as the per-ordering impls without copying the bodies.
+- `Suggested` — the insertion-anchor plan (pure choice, no walking — `insert_child` executes it): `Parent { before }` (anchor = the current node, no walk) / `Child { idx, before }` (descend `idx`, then `subtree_first`/`subtree_last` by side).
+- `TreeWalk<'block,NW,B>` — the traversal surface: `next`/`prev`/`first`/`last` (at_root + a subtree edge)/`subtree_first`/`subtree_last`/`suggest_insertion(child_idx) -> Suggested`. One impl per ordering.
+- Ordering semantics: **preorder** node-first — `subtree_first` = the node itself, `subtree_last` = rightmost leaf; suggest: childless/gap 0 → after the parent, mid gap → before `child(k)` (one descend), append → after the rightmost leaf. **in-order** — both subtree edges are outermost leaves; a node sits between `child[cc/2-1]` and `child[cc/2]` (mid = cc>>1, dynamic) — a gap AT mid is the parent's own → anchor at the parent (no walk), else the adjacent child's edge leaf. **postorder** node-last — `subtree_last` = the node itself, `subtree_first` = leftmost leaf; suggest: childless → before the parent, gap 0 → before child 0's leftmost leaf, gap k → after `child(k-1)` (one descend).
+- **Layer 3** `TreeWalkMut: TreeWalk` (crate impl) — `insert_child(k, node) -> Result<P, InsertErr>`: `has_space` check → `lookup(k)` → slot (`Less` ⇒ `pos`, `Equal`/`Greater` ⇒ `pos+1`; the caller guarantees a child-accepting internal — the consumer's `search` stops at terminals) → `suggest_insertion` → execute it (Parent: anchor = current position, no walk; Child: descend + subtree edge) — **the walker ends standing on the anchor** (the old boundary's phantom-phys paths are gone) → `find_slot` → apply `grew` to the walker's `State` (via `parts()`) → run-parent-fixup → `slide_none` → `State` fixup → `insert` → ascend `levels` → node-level wire. `remove_child(idx) -> (N, OpenSlot)` — unwire + slot free, no fixups. `fixup(&NoneSlide)` — run-parent-fixup **before** the slide: walk the moved run (next for delta>0, prev for delta<0; forward-only walking can't re-enter a processed subtree, so entries read on the way are unprocessed/correct); per moved node rewrite the parent's child entry via `set_child(1, idx, new_v)` (idx from ancestry — authoritative, no value scan) + repoint the node's stored parent field when the parent also moved; position-neutral via **State snapshot/restore** — a walk back would descend through just-rewritten (post-slide) child pointers over the still-pre-slide layout. The impl is **generic over `O`**: the supertrait obligation (`TreeWalker<O, NW>: TreeWalk`) is *supplied as a where-clause* rather than proven — it discharges only for a concrete `B`/`O` pair (one of the per-ordering `TreeWalk` impls), same coverage as the per-ordering impls without copying the bodies.
 - `InsertErr { NodeFull, BlockExhausted }` — splits are future work; the caller handles both by splitting and retrying.
 - `SplitTreeWalker` — declared sketch (`split_child`), unwired.
 
@@ -150,20 +152,21 @@ never intersect.
 
 ## treeblock.rs
 
-`TreeBlock` — a block whose stored type is a node, naming the consumer's walker
-types. **Consumer-implemented** for their block alias (`MyWalker walks
-Block<MyNode>`): supplying the two GATs + `root_position` is the whole impl; the
-constructors are defaults.
+`TreeBlock` — a block whose stored type is a node. **Param-less marker trait** (the
+old `C`/`W`/`WM` params existed only to feed constructor defaults; killing the defaults
+killed the params, and with them the E0283 ambiguity). **Crate-impl'd for `Block` per
+mode** (`impl_tree_block!` macro × `Uniform`/`Pluripotent`/`Anchored<O>`).
 
-- `TreeBlock<'block>: BlockTrait + BlockOps` (where `Self::N: Node + Default`) — GATs `NW<'walker>: NodeWalker` / `NWM<'walker>: NodeWalkerMut`; `root_position` (Anchored derives it from the translator; movable-root modes read it from `BlockData: HasRoot`); default `walker`/`walker_mut`/`lookup`/`lookup_mut` returning positioned `TreeWalker`s.
-- `SplitTreeBlock` — declared sketch (`split_root`), unwired.
+- `TreeBlock<'block>: BlockTrait + BlockOps` (where `Self::N: Node + Default`, `Self::BlockData: HasRoot`) — `root_position` (defaulted from `BlockData::root`).
+- Free fns (construction lives here, over the consumer's `From` impls — `impl From<&'a MyBlock> for MyCursor`, local type, orphan-safe): `walker::<NW>(b)` — walker at the root, `NW: NodeWalker + From<R>`; `search::<NW>(b, k)` — walker routed to `k`'s terminal, `NW: NodeCursor + From<R>` (stackless cursors work — descent only). `R` is the borrow (`&B` or `&mut B`; both `Deref<Target = B>`), so one fn covers shared and mut — the named walker type's `From` impl picks the borrow.
+- `SplitTreeBlock` — declared sketch (`split_root`), unwired, bounds at the `BlockOps` level.
 
 ## lib.rs
 
 Module wiring + ordering markers + sketches.
 
 - `Ordering { const ROOT_POS: RootPos }` — where the tree root lives in a fresh block; impl'd by `InOrder` (Middle)/`PreOrder` (Beginning)/`PostOrder` (End). No `TreeOrdering` marker (all orderings are tree orderings now) and no `Sorted` — deleted.
-- `RelTo<T>` — `Before(T)`/`After(T)` (insert-side resolution; `boundary`'s return).
+- `RelTo<T>` — `Before(T)`/`After(T)` (insert-side resolution; exported for consumers — in-crate the insertion plan is `Suggested` now).
 - `FractalForest`/`BTree` — old sketches (dead).
 
 ## Testing
@@ -176,15 +179,25 @@ the past — run targeted tests.
 
 ## Status
 
-Compiles (lib + workspace). Realized: the three-layer walker hierarchy
-(consumer node mask / `OrderOps` per-ordering traversal / `TreeWalkMut` tree ops);
-`Mode` owns the store type; unified `BlockOps` surface with the Pluripotent
-edge-grow (no block-level push); `TreeBlock` with consumer-named walker GATs +
-default constructors; fixups applied to the block's own `BlockData` on every
-grow/slide; `compose_grew` for multi-grow `find_slot` calls.
+Compiles (lib + workspace; `examples/btree.rs` — a B+ tree consumer — runs green).
+Realized: the three-layer walker hierarchy (consumer node mask / `TreeWalk`
+per-ordering traversal / `TreeWalkMut` tree ops); relative-position `lookup`
+(`(pos, cmp)` — pos = default descent, cmp = k vs that child; append expressible as
+`(len-1, Greater)`) with `search` as a **required consumer method** (no default —
+the `Equal` interpretation is a per-shape routing policy); the
+`Suggested`/`suggest_insertion` + `subtree_first`/`subtree_last` insertion surface
+(replacing `boundary`; the walker lands on the anchor); `Mode` owns the store type;
+unified `BlockOps` surface with the Pluripotent edge-grow (no block-level push);
+param-less `TreeBlock` marker + `walker`/`search` free-fn constructors (E0283 gone —
+no qualified-path helpers needed); `PosAncestry` standard walker state (the example
+embeds it instead of hand-rolling a `Fixable` loop); fixups applied to
+the block's own `BlockData` on every grow/slide; `compose_grew` for multi-grow
+`find_slot` calls; preorder `prev` first-child fix (returns the parent — it
+precedes its first child); fixup position-neutrality via State snapshot/restore
+(replacing the walk back). The example's `two_level_demo` covers every anchor kind
+plus in-run and out-of-run slides.
 
-Not wired: **any consumer** (the btree example is archived; the ladder's
-implementability is exercised when it is rebuilt), **splits** (`SplitTreeWalker`/
+Not wired: **splits** (`SplitTreeWalker`/
 `SplitTreeBlock` declared only), the arena tier, `leafblock`/`inline_leafblock`.
 
 ## Historical (do not revive)
@@ -197,10 +210,12 @@ covers them); `TreeOrdering`/`Sorted`; `O` as a generic param on walkers.
 ## Future Work
 
 - splits — `split_child`/`split_root` on `SplitTreeWalker`/`SplitTreeBlock` (clone-split driver, root promotion, block cleave; see the split design below).
-- rebuild the btree consumer over the new ladder (impl `NodeCursor`/`NodeWalker`/`NodeWalkerMut` + `TreeBlock` for `UniformBlock<...,PreOrder>`), then adapt the archived tests.
+- extend the btree consumer (`examples/btree.rs` — currently leaf-only map inserts + a hand-assembled two-level demo) once splits land, then adapt the archived tests.
 - arena tier — infallible insert (absorb exhaustion via spread/cleave/readdress), adaptive runtime strategy switching, overprovisioning, subtrees & forwarding (block_id roots), ordering across splits.
 - graduation — pluripotent → concrete strategy at len == half_ptr.
 - `Fixup::applies` optimization (elide unnecessary runtime checks) — deferred.
+- `keys()` iter hook on the cursor (no slice — representation stays free) so B+ shapes share the child-min fetch / separator re-derivation / equal-right routing in-crate; land with or after splits (the split driver is the heaviest consumer of exactly that logic).
+- ordered iteration over K/V (`IntoIterator` on the walker + consumer `is_leaf` filter; a crate-side leaf-items hook) + a range surface — deferred, but a goal.
 - trie integration.
 
 ## Tree split invariants (design — in progress; predates this refactor's naming)
@@ -228,9 +243,9 @@ non-degenerate halves + a separator). **DEGREE is now 3.**
   slide run (pinned in Anchored).
 - **In-order gap convention (current):** a node sits between `child[cc/2 - 1]` and
   `child[cc/2]` (mid = cc>>1, dynamic); gap inserts land **after** the parent (the
-  parent hops later if a split demands it). NOTE: doa.md's two boundary special-case
-  lines read mirrored against this — flagged for review when the btree consumer
-  lands and boundary behavior is testable.
+  parent hops later if a split demands it). Now encoded in inorder
+  `suggest_insertion` (gap at mid → parent anchor); doa.md's old boundary
+  special-case lines are superseded by it.
 
 # Updating the Claude.md
 Keep the structure a breadth first tree of the subsections - at the top the 'root' tells a reader what this crate is and what its purpose is. There should then be a 1 line description of each subsection that will follow.

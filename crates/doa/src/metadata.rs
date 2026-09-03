@@ -100,16 +100,50 @@ pub struct Ancestor {
 
 ///stackful walker's ancestor stack, one entry per level. stores phys (not vaddr): fixup
 ///applies `fix_p` directly, no translator; O(height) per op.
-///todo : optimization : ancestry is sorted for preorder and postorder, those shouldnt have to check every item every time. 
+///todo : optimization : ancestry is sorted for preorder and postorder, those shouldnt have to check every item every time.
 #[derive(Clone, Debug, Default)]
 pub struct Ancestry {
     pub stack: Vec<Ancestor>,
+}
+impl Ancestry {
+    pub fn push(&mut self, parent: usize, child: usize) {
+        self.stack.push(Ancestor { parent, child });
+    }
+    pub fn pop(&mut self) -> Option<Ancestor> {
+        self.stack.pop()
+    }
+    pub fn last(&self) -> Option<&Ancestor> {
+        self.stack.last()
+    }
+    pub fn len(&self) -> usize {
+        self.stack.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
 }
 impl<P: BlockIndex> Fixable<P> for Ancestry {
     fn fixup<F: Fixup + ?Sized>(&mut self, f: &F, _: &Translator<P>) {
         for a in &mut self.stack {
             if f.affects_p(a.parent) { f.fix_p(&mut a.parent); }
         }
+    }
+}
+
+///pos + ancestry — the standard stackful walker state: satisfies the
+///`NodeWalkerMut::State` (`Fixable` + `Clone`) contract for any stackful walker, so
+///consumers embed it instead of reimplementing the fixup loop.
+#[derive(Clone, Debug, Default)]
+pub struct PosAncestry {
+    pub pos:      usize,
+    pub ancestry: Ancestry,
+}
+impl<P: BlockIndex> Fixable<P> for PosAncestry {
+    fn fixup<F: Fixup + ?Sized>(&mut self, f: &F, tr: &Translator<P>) {
+        if f.affects_p(self.pos) {
+            f.fix_p(&mut self.pos);
+        }
+        self.ancestry.fixup(f, tr);
     }
 }
 
