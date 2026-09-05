@@ -181,28 +181,28 @@ impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<MaybeUninit<T>>>> Doubl
     for SomeIter<'b, T, I> {}
 ///L0280
 impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {}
-///L0611
+///L0612
 impl<T> Drop for VecStore<T> {}
-///L0625
+///L0626
 impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {}
-///L1171
+///L1173
 impl<T> Drop for DequeStore<T> {}
-///L1187
+///L1189
 ///`Some` ⇒ written (the alloc-write-read contract: a slot is read only after its
 ///reservation's write has completed — the exclusive `&mut` handed out by `alloc`
 ///enforces the ordering in practice). SAFETY: `m` comes from an occupied slot.
 #[inline]
 unsafe fn assume_ref<'a, T>(m: &'a MaybeUninit<T>) -> &'a T;
-///L1192
+///L1194
 ///mut variant. SAFETY: as `assume_ref`.
 #[inline]
 unsafe fn assume_mut<'a, T>(m: &'a mut MaybeUninit<T>) -> &'a mut T;
-///L1199
+///L1201
 ///the pair can't apply independently: affected spans overlap (a shared slot would
 ///double-move, or one slide's None-hole lies inside the other's run) or one slide
 ///moves the other's anchor. spans are closed — conservative.
 fn slides_interfere(s1: &NoneSlide, s2: &NoneSlide, a1: usize, a2: usize) -> bool;
-///L1214
+///L1216
 ///outward nearest-None scan: `left` at `l0, l0-1, …` (lcnt slots, decreasing) and
 ///`right` at `r0, r0+1, …` (rcnt slots, increasing). D tie-breaks equidistant hits
 ///(false⇒left, true⇒right). the caller checks the anchor slot separately, so l0/r0
@@ -220,7 +220,7 @@ fn dual_scan_outward<T: Sized, const D: bool>(
     lcnt: usize,
     rcnt: usize,
 ) -> NearestNone;
-///L1252
+///L1254
 #[cfg(test)]
 #[path = "tests/store.rs"]
 mod tests;

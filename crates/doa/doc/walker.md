@@ -3,13 +3,15 @@
 //! split driver. layer 1 — `NodeCursor`/`NodeWalker`/`NodeWalkerMut`: the
 //! consumer-implemented mask over the node representation (the crate never sees
 //! union/enum/whatever). layer 2 — `TreeWalker<O, NW>` + `TreeWalk`: ordered
-//! traversal, one impl per ordering. layer 3 — `TreeWalkMut` + the split
-//! machinery: tree ops over the unified `BlockOps` surface. `B` is a trait param
+//! traversal, one impl per ordering. layer 3 — `TreeWalkMut` (the tree-level
+//! verbs) + `TreeWalkHelper` (crate-internal choreography: slide engine, hop,
+//! reparent machinery) + the split machinery: tree ops over the unified
+//! `BlockOps` surface. `B` is a trait param
 //! at every level; `O` is never a param — it is always `B::O` (the wrapper
 //! carries it as phantom data). no `insert_child` name collision:
 //! `NodeWalkerMut` is impl'd on the consumer's `NW`, `TreeWalkMut` on the
 //! wrapper — different `Self` types, method sets never intersect.
-///L0024
+///L0026
 ///ordering-aware wrapper over any consumer `NW`. `O` is phantom — it tags the wrapper
 /// so the per-ordering impls sit on distinct self types (coherence), and is bound to
 /// the block's ordering at every use (`B: BlockTrait<O = O>`).
@@ -17,7 +19,7 @@ pub struct TreeWalker<O, NW> {
     pub nw: NW,
     _o:     PhantomData<O>,
 }
-///L0033
+///L0035
 ///the insertion-anchor plan: the cheapest name for the gap a new child at slot
 ///`child_idx` occupies (between `child[idx-1]` and `child[idx]`). pure choice, no
 ///walking — `TreeWalkMut::insert_child` executes it.
@@ -29,7 +31,7 @@ pub enum Suggested {
     ///(before) / `subtree_last` (after).
     Child { idx: usize, before: bool },
 }
-///L0045
+///L0047
 ///`TreeWalkMut::insert_child` failure modes. the caller handles both by splitting
 ///(a level up / the root) and retrying; `BlockExhausted` remains the arena tier's
 ///cleave hook.
@@ -40,7 +42,7 @@ pub enum InsertErr {
     ///the block is exhausted — no slot, no spread, no edge room (split the block).
     BlockExhausted,
 }
-///L0052
+///L0054
 pub trait Node {
     type K;
     type V;
@@ -50,7 +52,8 @@ pub trait Node {
     ///separator.
     const DEGREE: usize;
     ///do nodes store parent-pointer fields? gates the reparent machinery
-    ///(`swap_current`, the NoneSlide fixup, `insert_new_root`); false shapes pay
+    ///(`TreeWalkHelper`: `swap_current`, the NoneSlide fixup, `promote_new_root`);
+    ///false shapes pay
     ///nothing (the const check folds away). obligations, all const-gated: slides
     ///⇒ `reparent_run` (in `apply_slide`); swaps ⇒ `swap_current`; fresh/moved
     ///nodes ⇒ `adopt_node` (Y at every split site — its drained children name X;
@@ -61,7 +64,7 @@ pub trait Node {
     ///B+ inode = `()`.
     type Payload;
 }
-///L0073
+///L0076
 pub trait SplittableNode: Node + Sized {
     ///the promoted root for `split_root`, **pre-wired with its first child = the old
     ///root** (vaddr `r_v`). absorbing the child-0 wire here — the only wire with no
@@ -78,7 +81,7 @@ pub trait SplittableNode: Node + Sized {
 // layer 1 — consumer-implemented node mask. the consumer's walker struct implements
 // these; the crate never sees the node representation (union/enum/whatever).
 // ---------------------------------------------------------------------------
-///L0095
+///L0098
 ///stackless positioned reader over a block's nodes. no ascend — trees without stored
 ///parent pointers can still implement this (lookup needs descent only). no constructor
 ///here: a mut-holding walker can't be built from a shared borrow, so construction lives
@@ -130,7 +133,7 @@ where
     ///per-shape decision.
     fn search(&mut self, k: &<B::N as Node>::K) -> Option<&B::N>;
 }
-///L0162
+///L0165
 ///ascend-capable cursor — the consumer's stackful walker. `ascend`/`parent` are
 ///required consumer methods because where parent knowledge lives is per-shape:
 ///a stackful state pops/peeks its records (`PosAncestry`), a parent-pointer tree
@@ -149,7 +152,7 @@ where
     ///it without a scan choose their own strategy there.
     fn parent(&self) -> Option<(usize, usize)>;
 }
-///L0177
+///L0180
 ///consumer mut surface: node-level reads/writes masked behind the walker.
 pub trait NodeWalkerMut<'block, B>: NodeWalker<'block, B>
 where
@@ -193,32 +196,8 @@ where
         &mut self,
         child_idx: usize,
     ) -> (Option<<B::N as Node>::K>, Option<<B::N as Node>::Payload>, B::P);
-    ///point the current node's children's stored parent fields at `new_v`.
-    ///`STORES_PARENTS`-gated: false shapes return immediately (the const check
-    ///folds away). only sound when the current node's child entries are
-    ///consistent with the layout — post-swap, post-slide.
-    fn reparent_children(&mut self, new_v: B::P);
-    ///the slide-companion to `reparent_children`: after `ns` is APPLIED, point each
-    ///moved node's children's parent fields at the node's post-slide vaddr. must run
-    ///post-slide — mid-fixup it would descend through just-rewritten (post-slide)
-    ///entries over the still-pre-slide layout (subtle_bugs.md §3); post-slide every
-    ///entry is consistent (in-run children were rewritten to where they now are,
-    ///out-of-run children never moved). position-based over the shifted run — no
-    ///tree walk, no collection. position-restoring.
-    fn reparent_run(&mut self, ns: &NoneSlide);
-    ///finish a freshly created or freshly moved node at phys `p`: its own parent
-    ///field points at `parent_v`, its children's stored parent fields point at it.
-    ///STORES_PARENTS-gated; position-restoring.
-    fn adopt_node(&mut self, p: usize, parent_v: B::P);
-    ///swap the CURRENT node into the open slot: the node's content moves, the
-    ///walker follows (position + ancestry via `SwapFixup`), the parent's entry is
-    ///repointed (ancestry-authoritative; skipped at the root), and the node's
-    ///children's stored parent fields follow (STORES_PARENTS). returns the
-    ///vacated slot. the BLOCK ROOT is not updated — tree-level callers that move
-    ///the root do it themselves (`HasRoot`).
-    fn swap_current(&mut self, open: OpenSlot) -> OpenSlot;
 }
-///L0303
+///L0233
 ///ordered traversal in the block's layout ordering, over the wrapper; one impl per
 ///ordering. the per-ordering contributions: `next`/`prev`, the subtree edge walks,
 ///and the insertion-anchor suggestion; `first`/`last` are at_root + a subtree edge.
@@ -249,11 +228,79 @@ where
     ///`child[mid]` (X relocated there; Y inherits X's slot).
     fn suggest_split(&self) -> Suggested;
 }
-///L0334
-///layer 3 — tree ops, crate-implemented over the unified `BlockOps` surface; the
-///per-ordering `suggest_insertion`/subtree edges come in via the `TreeWalk`
-///supertrait. `B::BlockData: HasRoot` — the hop may move the block root.
-pub trait TreeWalkMut<'block, NW, B>: TreeWalk<'block, NW, B>
+///L0268
+///layer 3 — crate-internal choreography over the unified `BlockOps` surface: the
+///slide engine (`fixup`/`apply_slide` + the slot openers), the in-order hop, and
+///the reparent machinery moved off `NodeWalkerMut` — machinery the consumer never
+///calls, only the crate's tree ops do (the `SplitWalkHelper` precedent: pub
+///in-module, not consumer surface). the per-ordering suggestions/subtree edges
+///come in via the `TreeWalk` supertrait. `B::BlockData: HasRoot` — the hop may
+///move the block root.
+pub trait TreeWalkHelper<'block, NW, B>: TreeWalk<'block, NW, B>
+where
+    NW: NodeWalkerMut<'block, B>,
+    B: BlockTrait<'block> + 'block + BlockOps<'block>,
+    B::N: Node,
+    B::BlockData: HasRoot<B::P>,
+{
+    ///point the current node's children's stored parent fields at `new_v`.
+    ///`STORES_PARENTS`-gated: false shapes return immediately (the const check
+    ///folds away). only sound when the current node's child entries are
+    ///consistent with the layout — post-swap, post-slide.
+    fn reparent_children(&mut self, new_v: B::P);
+    ///the slide-companion to `reparent_children`: after `ns` is APPLIED, point each
+    ///moved node's children's parent fields at the node's post-slide vaddr. must run
+    ///post-slide — mid-fixup it would descend through just-rewritten (post-slide)
+    ///entries over the still-pre-slide layout (subtle_bugs.md §3); post-slide every
+    ///entry is consistent (in-run children were rewritten to where they now are,
+    ///out-of-run children never moved). position-based over the shifted run — no
+    ///tree walk, no collection. position-restoring.
+    fn reparent_run(&mut self, ns: &NoneSlide);
+    ///finish a freshly created or freshly moved node at phys `p`: its own parent
+    ///field points at `parent_v`, its children's stored parent fields point at it.
+    ///STORES_PARENTS-gated; position-restoring.
+    fn adopt_node(&mut self, p: usize, parent_v: B::P);
+    ///swap the CURRENT node into the open slot: the node's content moves, the
+    ///walker follows (position + ancestry via `SwapFixup`), the parent's entry is
+    ///repointed (ancestry-authoritative; skipped at the root), and the node's
+    ///children's stored parent fields follow (STORES_PARENTS). returns the
+    ///vacated slot. the BLOCK ROOT is not updated — tree-level callers that move
+    ///the root do it themselves (`HasRoot`).
+    fn swap_current(&mut self, open: OpenSlot) -> OpenSlot;
+    ///run-parent-fixup for a pending slide `ns` — BEFORE the slide is applied, rewrite
+    ///each moved node's parent→child pointer (and the moved node's stored parent field
+    ///when its parent also moved; no-op for parent-free shapes). the walker must be
+    ///positioned at the slide's anchor with valid ancestry. `far_short`: the caller
+    ///knows the run walk ends ONE below the far edge — the in-order hop's skewed run
+    ///(the misplaced hoppee, when it is the far-edge member, is visited first).
+    fn fixup(&mut self, ns: &NoneSlide, far_short: bool);
+    ///apply a pending slide: run-parent-fixup → `slide_none` → walker-state fixup →
+    ///`reparent_run` (STORES_PARENTS). THE chokepoint — every slide in the tree ops
+    ///goes through here. `far_short` as `fixup`. returns the opened slot.
+    fn apply_slide(&mut self, ns: &NoneSlide, far_short: bool) -> OpenSlot;
+    ///walk to `sug`'s anchor: (anchor phys, open side, levels back to the current
+    ///node). the walker is left AT the anchor — pair with `back_from_anchor`.
+    fn walk_to_anchor(&mut self, sug: Suggested) -> (usize, bool, usize);
+    ///ascend `levels` — the inverse of `walk_to_anchor`.
+    fn back_from_anchor(&mut self, levels: usize);
+    ///open a slot adjacent-after the current node (find_slot + grow fixups). ends
+    ///standing on the current node.
+    fn open_after(&mut self) -> Result<OpenSlot, InsertErr>;
+    ///open a slot at `sug`'s anchor (evaluated against the CURRENT node); ends
+    ///standing on the current node.
+    fn open_suggested(&mut self, sug: Suggested) -> Result<OpenSlot, InsertErr>;
+    ///in-order: relocate the CURRENT node (a left child insert/split shifted its
+    ///boundary children's identity) to the gap before `child[b]`. ends standing on
+    ///it at the new position. the grandparent entry is repointed via `swap_current`
+    ///unless this is a tree-parentless node — and if the node is the BLOCK ROOT the
+    ///root pointer is repointed (`HasRoot`; subtle_bugs.md §4).
+    fn hop_current(&mut self) -> Result<(), InsertErr>;
+}
+///L0332
+///layer 3 — tree ops, crate-implemented: the tree-level verbs the consumer drives.
+///everything else (the slide engine, the reparent machinery, the hop) is
+///`TreeWalkHelper` above.
+pub trait TreeWalkMut<'block, NW, B>: TreeWalkHelper<'block, NW, B>
 where
     NW: NodeWalkerMut<'block, B>,
     B: BlockTrait<'block> + 'block + BlockOps<'block>,
@@ -280,40 +327,13 @@ where
     ///remove child `child_idx` of the current node: node-level unwire + block slot free.
     ///returns the removed node and its freed slot. no slide involved — no fixups.
     fn remove_child(&mut self, child_idx: usize) -> (B::N, OpenSlot);
-    ///run-parent-fixup for a pending slide `ns` — BEFORE the slide is applied, rewrite
-    ///each moved node's parent→child pointer (and the moved node's stored parent field
-    ///when its parent also moved; no-op for parent-free shapes). the walker must be
-    ///positioned at the slide's anchor with valid ancestry.
-    fn fixup(&mut self, ns: &NoneSlide);
-    ///apply a pending slide: run-parent-fixup → `slide_none` → walker-state fixup →
-    ///`reparent_run` (STORES_PARENTS). THE chokepoint — every slide in the tree ops
-    ///goes through here. returns the opened slot.
-    fn apply_slide(&mut self, ns: &NoneSlide) -> OpenSlot;
-    ///walk to `sug`'s anchor: (anchor phys, open side, levels back to the current
-    ///node). the walker is left AT the anchor — pair with `back_from_anchor`.
-    fn walk_to_anchor(&mut self, sug: Suggested) -> (usize, bool, usize);
-    ///ascend `levels` — the inverse of `walk_to_anchor`.
-    fn back_from_anchor(&mut self, levels: usize);
-    ///open a slot adjacent after the CURRENT node (find_slot + grow fixups; the
-    ///slide can't move the current node — the run is right of it). ends standing
-    ///on the current node.
-    fn open_after(&mut self) -> Result<OpenSlot, InsertErr>;
-    ///open a slot at `sug`'s anchor (evaluated against the CURRENT node); ends
-    ///standing on the current node.
-    fn open_suggested(&mut self, sug: Suggested) -> Result<OpenSlot, InsertErr>;
-    ///in-order: relocate the CURRENT node (a left child insert/split shifted its
-    ///boundary children's identity) to the gap before `child[b]`. ends standing on
-    ///it at the new position. the grandparent entry is repointed via `swap_current`
-    ///unless this is a tree-parentless node — and if the node is the BLOCK ROOT the
-    ///root pointer is repointed (`HasRoot`; subtle_bugs.md §4).
-    fn hop_current(&mut self) -> Result<(), InsertErr>;
 }
-///L0393
+///L0364
 ///layer 3 — splits (place-then-split driver: no clone, no placeholder — the
 ///split node drains its right half straight into a reserved block place, after
 ///every slide, so no orphan is ever unreached by a fixup walk).
 pub trait SplitTreeWalker<'block, NW, B>:
-    TreeWalkMut<'block, NW, B> + SplitWalkerExt<'block, NW, B>
+    TreeWalkMut<'block, NW, B> + SplitWalkHelper<'block, NW, B>
 where
     NW: NodeWalkerMut<'block, B>,
     B: BlockTrait<'block> + 'block + BlockOps<'block>,
@@ -333,13 +353,13 @@ where
     ///block data and this walker are already fixed. ends standing on the new root.
     fn split_root(&mut self) -> Result<SwapFixup, InsertErr>;
 }
-///L0420
+///L0391
 ///split machinery — declared here (an inherent impl on the wrapper can't name `B`),
 ///implemented once for the wrapper where `O`/`B` are both in scope and `self.nw` is
 ///reachable. not consumer surface. the split machinery binds `Node<P = B::P>`.
-///slot-opening/`apply_slide`/`hop_current` live on `TreeWalkMut` (insert machinery
+///slot-opening/`apply_slide`/`hop_current` live on `TreeWalkHelper` (insert machinery
 ///the splits borrow).
-pub trait SplitWalkerExt<'block, NW, B>: TreeWalkMut<'block, NW, B>
+pub trait SplitWalkHelper<'block, NW, B>: TreeWalkMut<'block, NW, B>
 where
     NW: NodeWalkerMut<'block, B>,
     B: BlockTrait<'block> + 'block + BlockOps<'block>,
@@ -369,36 +389,36 @@ where
     ///Y = `open`: drain the CURRENT node's right half into it, wire at
     ///`child_idx+1` in the parent one level up. ends on the parent.
     fn split_into_open(&mut self, child_idx: usize, open: OpenSlot) -> Result<(), InsertErr>;
-    ///insert a fresh root above the old one (which the walker stands on) into the
-    ///opened slot — NOT a move of an existing node: `new_root` is placed and the
-    ///old root demotes to its pre-wired child 0. bumps height. pre/post: swap with
-    ///the old root — NR takes its phys (under the walker's feet; root pointer and
-    ///vaddr untouched, R lands at `open`). in-order: R keeps its slot (no swap puts
-    ///NR right of R under the walker's feet) — repoint the root pointer and step
-    ///the walker to NR.
-    fn insert_new_root(&mut self, open: OpenSlot);
+    ///place a fresh root above the old one (which the walker stands on). NOT a move
+    ///of an existing node: `new_root` is placed and the old root demotes to its
+    ///pre-wired child 0. bumps height. where `open` ends up is per-ordering:
+    ///in-order — NR takes `open`, R keeps its slot; repoint the root pointer and
+    ///step the walker to NR. pre/post — NR is written at `open`, then swapped onto
+    ///R's old phys (root pointer and vaddr untouched, walker follows), so R lands
+    ///at `open`. ends standing on NR.
+    fn promote_new_root(&mut self, open: OpenSlot);
 }
-///L0460
+///L0431
 impl<O, NW> TreeWalker<O, NW> {}
-///L0466
+///L0437
 impl<'block, NW, B> TreeWalk<'block, NW, B> for TreeWalker<PreOrder, NW>
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block, O = PreOrder> + 'block,
     B::N: Node {}
-///L0554
+///L0525
 impl<'block, NW, B> TreeWalk<'block, NW, B> for TreeWalker<InOrder, NW>
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block, O = InOrder> + 'block,
     B::N: Node {}
-///L0673
+///L0657
 impl<'block, NW, B> TreeWalk<'block, NW, B> for TreeWalker<PostOrder, NW>
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block, O = PostOrder> + 'block,
     B::N: Node {}
-///L0769
+///L0753
 ///generic over `O`: the supertrait obligation (`TreeWalker<O, NW>: TreeWalk`) is
 ///supplied as a where-clause rather than proven — it only discharges for a concrete
 ///`B`/`O` pair (one of the per-ordering `TreeWalk` impls), so the coverage is identical
@@ -411,8 +431,17 @@ where
     B::N: Node,
     B::BlockData: HasRoot<B::P>,
     TreeWalker<O, NW>: TreeWalk<'block, NW, B> {}
-///L0967
-impl<'block, O, NW, B> SplitWalkerExt<'block, NW, B> for TreeWalker<O, NW>
+///L0824
+impl<'block, O, NW, B> TreeWalkHelper<'block, NW, B> for TreeWalker<O, NW>
+where
+    O: crate::Ordering,
+    NW: NodeWalkerMut<'block, B>,
+    B: BlockTrait<'block> + 'block + BlockOps<'block>,
+    B::N: Node,
+    B::BlockData: HasRoot<B::P>,
+    TreeWalker<O, NW>: TreeWalk<'block, NW, B> {}
+///L1075
+impl<'block, O, NW, B> SplitWalkHelper<'block, NW, B> for TreeWalker<O, NW>
 where
     O: crate::Ordering,
     NW: NodeWalkerMut<'block, B>,
@@ -421,7 +450,7 @@ where
     B::N: SplittableNode,
     B::BlockData: HasRoot<B::P>,
     TreeWalker<O, NW>: TreeWalk<'block, NW, B> {}
-///L1083
+///L1194
 impl<'block, O, NW, B> SplitTreeWalker<'block, NW, B> for TreeWalker<O, NW>
 where
     O: crate::Ordering,
@@ -432,32 +461,36 @@ where
     B::BlockData: HasRoot<B::P>,
     TreeWalker<O, NW>: TreeWalk<'block, NW, B> {}
 // ---- shared walk helpers (free fns over the consumer walker) ----
-///L1222
+///L1347
 ///in-order position boundary: the node sits between child[b-1] and child[b],
 ///`b = min(cc, DEGREE/2)` — after all children when cc ≤ DEGREE/2 (fixed by DEGREE,
 ///not cc: a full node's boundary is exactly its kept-left-half's edge, so splits
 ///never move the split node).
 fn in_boundary<'block, B: BlockTrait<'block>>(cc: usize) -> usize
 where B::N: Node;
-///L1227
+///L1352
 fn at_root<'block, NW, B>(nw: &mut NW)
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L1238
+///L1363
 fn leftmost_leaf<'block, NW, B>(nw: &mut NW) -> usize
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L1252
+///L1377
 fn rightmost_leaf<'block, NW, B>(nw: &mut NW) -> usize
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
+///L1393
+#[cfg(test)]
+#[path = "tests/walker.rs"]
+mod tests;
 ```
