@@ -1,16 +1,12 @@
+```rust
 //! random leafblock: fixed-cap leaf slices scattered across one block's address space — compiled, unwired, predates the BlockOps refactor (half the surface is commented out).
-
-use crate::index::*;
-use std::{collections::VecDeque,
-          marker::PhantomData,
-          ops::{Index, IndexMut}};
-
+///L0009
 ///max node cap = 256
 const MAX_NODE_CAP: usize = 16;
-
+///L0012
 ///block cap = full P range. u16 -> 65536 slots.
 const MAX_BLOCK_CAP: usize = 65536;
-
+///L0018
 ///ptr into a leafblock + the leaf's len/cap. header lives in the consumer
 ///(btree inode's terminal PtrUnion), NOT in the block. cap slots starting at
 ///ptr form the leaf; len of them are occupied.
@@ -19,7 +15,7 @@ pub struct SlicePtr<P: BlockIndex> {
     pub ptr: P,
     pub len: P,
 }
-
+///L0027
 ///inode child pointer. internal -> another inode (in the inode block);
 ///terminal -> a leaf SlicePtr in the leafblock. PtrUnion<u32,u16> is 4 bytes
 ///either way: u32 internal, SlicePtr<u16> = 2+1+1.
@@ -32,7 +28,7 @@ where
     pub internal: P1,
     pub terminal: SlicePtr<P2>,
 }
-
+///L0041
 ///random leafblock: leaves scattered across the address space with None gaps
 ///between them so a leaf can grow by claiming adjacent gaps. no append/prepend
 ///optimization (the btree forest doesn't need them). block-level reorg on
@@ -50,114 +46,28 @@ where
     rotate:      u32,
     _phantom:    PhantomData<P>,
 }
-
 // phys = (virt + virt_offset).rotate_left(rotate) >> addr_shift
 // virt = (phys << addr_shift).rotate_right(rotate) - virt_offset
 // steady state: addr_shift=0, rotate=0 -> consecutive virt = consecutive phys,
 // so a leaf's [ptr, ptr+cap) is a contiguous phys run (may wrap the deque -> 2 slices).
+///L0058
 pub enum GrowErr {
     ///no adjacent gap within budget; caller may spread or split.
     NoBudget,
-
     ///next address not representable in P; caller must split_and_rotate.
     AddressExhaustion,
 }
-
-impl<P: BlockIndex> SlicePtr<P> {
-    fn new(ptr: P, len: P) -> Self {
-        Self { ptr, len }
-    }
-
-    fn get_ptr(&self) -> P {
-        self.ptr
-    }
-
-    fn get_len(&self) -> P {
-        self.len
-    }
-}
-
+///L0066
+impl<P: BlockIndex> SlicePtr<P> {}
 //implicitly in-order, root is at phys_to_virt(MIDPOINT) insert cant cross it or shift it.
+///L0083
 ///root node has some special cases to consider.
 ///theyre all leaves so im only calling it a root.
 impl<K, V, P> LeafBlock<K, V, P>
 where
     K: Ord + Clone + Sized,
     V: Sized,
-    P: BlockIndex,
-{
-    /*
-
-    //new empty random block, addr_shift=ptr::bit_width rotate=0 , v_offset=0
-    fn new();
-
-    //use index for unwrapping get.
-    fn get(P) -> &Option<T>;
-
-    fn get_mut(P) -> &mut Option<T>;
-
-    //get an iter capable of seek forward or backward, not a cursor though.
-    //only exposes T, skips None internally.
-    fn iter(&self);
-
-    fn iter_mut(&mut self);
-
-    //infallible, caller guarantees node has space
-    fn insert_between(&mut self, kv : (K,V), node : &mut SP, next : P);
-
-    fn phys_to_virt(P) -> P;
-
-    ///dumb insert, searches the entirety of the block for the correct place to put K.
-    ///assumes no slice pointers exist. shifts elements and grows freely, making no stability guarantees.
-    ///panics if len is >= MAX
-    fn root_insert<MAX>(&mut self, K, V);
-
-    fn root_node(&self, &sp) -> &[Option<T>];
-
-    fn virt_to_phys(P)->P;
-
-    ///new addresses need to be recalculated using the blocks parameters.
-    fn next_virt(&self, P) -> P;
-
-    fn prev_virt(&self, P) -> P;
-
-    ///inode ordering matters here, we'll assume pre-order for now so subtrees arecontinuous.
-    ///in-order could work too but the maths a bit different. basically just not BF.
-    fn grow_and_spread(&mut self);
-
-    ///left node stays in place, right gets a new buffer of the same size.
-    fn split_and_rotate(&mut self)-> Self;
-
-    //node management
-
-    //calculate num of physical slots in p1..p2
-    fn distance(&self, p1,p2)
-
-    fn slice(&self, p, p2) -> & [Option(K,V)];
-
-    fn slice_mut(&self, p, p2) -> &mut [Option(K,V)];
-
-    //move a none from this to next
-    fn lend_right(&mut self, this : &mut sp, next : &mut sp)
-
-    //move a none from this to prev
-    fn lend_left(&mut self, prev : &mut sp, this : &mut sp)
-
-    //move an element from this to next
-    fn shove_right(&mut self, this: &mut sp, next : &mut sp)
-
-    //move an element from prev to this
-    fn shove_left(&mut self, prev : &mut sp, this : &mut sp)
-
-    //split the node at sp, move half its Some elements into the right half
-    //of its cap and return a new ptr to it.
-    fn split_node(&mut self, &mut sp, next : p) -> sp
-
-    //infallible insert, panics if node doesnt have space.
-    fn node_insert(&mut self, &mut sp, next : p)
-    */
-}
-
+    P: BlockIndex {}
 //borrowed window over a leaf's [ptr, ptr+cap). the run may wrap the VecDeque,
 //so it's two slices: logical index 0..a.len() in `a`, the rest in `b`.
 //cap = a.len() + b.len(). read-only; indexes directly, no per-index translation.
@@ -271,3 +181,4 @@ where
 // where K: Ord + Clone + Sized, V: Sized {
 //     pub fn next(&mut self) -> Option<(&K, &mut V)> { todo!() }
 // }
+```

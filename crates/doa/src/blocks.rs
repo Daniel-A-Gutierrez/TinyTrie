@@ -1,3 +1,12 @@
+//!`Block` = store + translator + block data, carrying a `Mode` by type. two
+//!surfaces: `BlockTrait` (shared read + basic mut) and `BlockOps` (the per-mode
+//!slot surface — a trait, not inherent methods, so the tree-ops layer can call it
+//!generically). `Mode` owns the store type and the initial translator params.
+//!invariants: `find_slot`/`find_2_slots` re-translate `pos`/`pin` after a grow
+//!(vaddrs stable, phys remap via the returned composed `GrewFixup`); every
+//!find/slide applies its fixup to the block's own `BlockData` before returning (a
+//!bare `grow_and_spread` does not — its caller applies the fixup); physical order
+//!(phys 0 = min) is preserved by every op.
 use crate::{Ordering, RootPos,
             index::*,
             metadata::{Fixable, Fixup, GrewFixup, TwoSlide},
@@ -6,17 +15,60 @@ use crate::{Ordering, RootPos,
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 
-///no-pin full-range block (no insertion pin). used by trees that grow by splitting
-///(the root can't stay at a fixed position anyway) and other consumers that don't pin.
+pub type UniformBlock<'block, N, P, D, O> = Block<'block, N, P, Uniform, D, O>;
+pub type AnchoredBlock<'block, N, P, D, O> = Block<'block, N, P, Anchored<O>, D, O>;
+pub type PluripotentBlock<'block, N, P, D, O> = Block<'block, N, P, Pluripotent, D, O>;
+
+///no-pin full-range block (no insertion pin; VecStore, `SHIFT = BIT_WIDTH`). used
+///by trees that grow by splitting (the root can't stay at a fixed position anyway)
+///and other consumers that don't pin.
 pub struct Uniform;
 ///root pinned at a fixed vaddr determined by `O` (preorder=0, inorder=MIDPOINT,
-///postorder=MAX); `find_slot`/`slide_none` implicitly pin `v2p(root_vaddr)`. the caller
-///has no choice but to pin.
+///postorder=MAX; VecStore); `find_slot`/`slide_none`/`find_2_slots` implicitly pin
+///`v2p(root_vaddr)` — the root never moves. the caller has no choice but to pin.
 pub struct Anchored<O: Ordering>(PhantomData<O>);
-///sparse both-ends-growable block with an overprovisioned pointer type. edge inserts
-///(before-first / after-last) grow the store edge and compensate the translator —
-///no element ever moves and vaddrs stay stable in that case.
+///sparse both-ends-growable block (DequeStore, `MAX_CAP = 1 << Half::BIT_WIDTH`).
+///edge inserts (before-first / after-last) grow the store edge and compensate the
+///translator — no element ever moves and vaddrs stay stable in that case.
+///`find_slot` order: budgeted scan → spread + rescan → edge grow.
 pub struct Pluripotent;
+
+///store + translator + block data, carrying a `Mode` by type.
+pub struct Block<'block, N, P, M, D, O>
+where
+    N: Sized + 'block,
+    P: BlockIndex,
+    M: Mode<'block, P, N>,
+    D: 'block + Default + Clone + Fixable<P>,
+    O: Ordering,
+{
+    store:      M::S,
+    translator: Translator<P>,
+    block_data: D,
+    _phantom:   PhantomData<(&'block N, O)>,
+}
+
+///the grow-fail error.
+pub struct InsufficientMaxCapacity();
+
+///a `None` slot opened for insert (physical).
+#[derive(Clone, Copy)]
+pub struct OpenSlot(pub usize);
+
+///`find_slot` result: an optional grow fixup (apply to live phys) + an optional pending
+///slide (apply via `slide_none`). `grew` is the composition of every grow this call did.
+///`slide == None` ⇒ exhausted (caller must split).
+pub struct FoundSlot {
+    pub grew:  Option<GrewFixup>,
+    pub slide: Option<NoneSlide>,
+}
+
+///`find_2_slots` result: the (single) grow this call did, if any, + both slides as
+///ONE composed fixup (`TwoSlide`) — apply the slides in either order.
+pub struct Found2Slots {
+    pub grew:   Option<GrewFixup>,
+    pub slides: TwoSlide,
+}
 
 ///block mode: the store backend + initial translator params, a bet on a workload.
 ///consts are the *initial* params — vaddrs may wrap; offsets come into play at splits.
@@ -34,87 +86,8 @@ pub trait Mode<'block, P: BlockIndex, N: 'block> {
     }
 }
 
-impl<'block, P: BlockIndex, N: 'block> Mode<'block, P, N> for Uniform {
-    type S = VecStore<N>;
-    const SHIFT: u32 = P::BIT_WIDTH as u32;
-}
-
-
-
-///(shift, inner_offset, outer_offset, init_cap) pinning the root at `O`'s fixed vaddr.
-const fn fr_params<P: BlockIndex, O: Ordering>() -> (u32, P, P, usize) {
-    match O::ROOT_POS {
-        RootPos::Beginning => (P::BIT_WIDTH as u32, P::ZERO, P::ZERO, 1),
-        RootPos::Middle => (P::BIT_WIDTH as u32 - 1, P::ZERO, P::ZERO, 2),
-        RootPos::End => (P::BIT_WIDTH as u32, P::ZERO, P::MAX, 1),
-    }
-}
-
-impl<'block, O: Ordering, P: BlockIndex, N: 'block> Mode<'block, P, N> for Anchored<O> {
-    type S = VecStore<N>;
-    const SHIFT: u32 = fr_params::<P, O>().0;
-    const INNER_OFFSET: P = fr_params::<P, O>().1;
-    const OUTER_OFFSET: P = fr_params::<P, O>().2;
-    const INIT_CAP: usize = fr_params::<P, O>().3;
-}
-impl<'block, P: BlockIndex, N: 'block> Mode<'block, P, N> for Pluripotent {
-    type S = DequeStore<N>;
-    const SHIFT: u32 = P::BIT_WIDTH as u32 / 2;
-    const MAX_CAP: usize = 1 << P::Half::BIT_WIDTH;
-}
-
-pub struct Block<'block, N, P, M, D, O>
-where
-    N: Sized + 'block,
-    P: BlockIndex,
-    M: Mode<'block, P, N>,
-    D: 'block + Default + Clone + Fixable<P>,
-    O: Ordering,
-{
-    store: M::S,
-    translator: Translator<P>,
-    block_data: D,
-    _phantom: PhantomData<(&'block N, O)>,
-}
-
-pub struct InsufficientMaxCapacity();
-
-///a `None` slot opened for insert (physical).
-#[derive(Clone, Copy)]
-pub struct OpenSlot(pub usize);
-
-///`find_slot` result: an optional grow fixup (apply to live phys) + an optional pending
-///slide (apply via `slide_none`). `grew` is the composition of every grow this call did.
-pub struct FoundSlot {
-    pub grew: Option<GrewFixup>,
-    pub slide: Option<NoneSlide>,
-}
-
-///`find_2_slots` result: the (single) grow this call did, if any, + both slides as
-///ONE composed fixup (`TwoSlide`) — apply the slides in either order.
-pub struct Found2Slots {
-    pub grew:   Option<GrewFixup>,
-    pub slides: TwoSlide,
-}
-
-///apply a grow remap to `pos`/`pin` + the block's own data, recording it in `grew`.
-fn grew_step<P: BlockIndex, D: Fixable<P>>(
-    grew: &mut Option<GrewFixup>,
-    g: GrewFixup,
-    pos: &mut usize,
-    pin: &mut Option<usize>,
-    data: &mut D,
-    tr: &Translator<P>,
-) {
-    g.fix_p(pos);
-    if let Some(p) = pin.as_mut() {
-        g.fix_p(p);
-    }
-    data.fixup(&g, tr);
-    *grew = Some(g);
-}
-
-
+///shared read + basic mut surface over store+translator+block data; the per-mode
+///slot surface (sparse mid-insert, splits) is `BlockOps`.
 pub trait BlockTrait<'block>: Sized {
     type N: Sized + 'block;
     type P: BlockIndex;
@@ -181,7 +154,11 @@ pub trait BlockTrait<'block>: Sized {
     fn data_mut(&mut self) -> &mut Self::BlockData;
     ///(`a` occupied, `b` free) — the drain handoff: `b` is reserved (flip
     ///inside). see `Store::alloc_disjoint_mut`.
-    fn alloc_disjoint_mut<'b>(&'b mut self, a: usize, b: OpenSlot) -> (&'b mut Self::N, &'b mut MaybeUninit<Self::N>)
+    fn alloc_disjoint_mut<'b>(
+        &'b mut self,
+        a: usize,
+        b: OpenSlot,
+    ) -> (&'b mut Self::N, &'b mut MaybeUninit<Self::N>)
     where
         'block: 'b,
     {
@@ -190,9 +167,7 @@ pub trait BlockTrait<'block>: Sized {
     ///reserve an opened slot; the caller writes through the returned place.
     /// see `Store::alloc`.
     fn alloc<'b>(&'b mut self, slot: OpenSlot) -> &'b mut MaybeUninit<Self::N>
-    where
-        'block: 'b,
-    {
+    where 'block: 'b {
         self.store_mut().alloc(slot.0)
     }
 
@@ -208,8 +183,14 @@ pub trait BlockTrait<'block>: Sized {
         self.store_mut().get_mut(p)
     }
     ///two disjoint `&mut` to occupied physical slots. panics if `a == b` or either is `None`.
-    fn get_disjoint_mut<'b>(&'b mut self, a: usize, b: usize) -> (&'b mut Self::N, &'b mut Self::N)
-    where 'block: 'b {
+    fn get_disjoint_mut<'b>(
+        &'b mut self,
+        a: usize,
+        b: usize,
+    ) -> (&'b mut Self::N, &'b mut Self::N)
+    where
+        'block: 'b,
+    {
         self.store_mut().get_disjoint_mut(a, b)
     }
     fn free(&mut self, p: usize) -> (Self::N, OpenSlot) {
@@ -226,19 +207,12 @@ pub trait BlockTrait<'block>: Sized {
     }
 }
 
-///fixed root vaddr for an ordering (the `Anchored` pin target).
-fn root_vaddr<O: Ordering, P: BlockIndex>() -> P {
-    match O::ROOT_POS {
-        RootPos::Beginning => P::ZERO,
-        RootPos::Middle => P::MIDPOINT,
-        RootPos::End => P::MAX,
-    }
-}
-
 ///unified per-mode op surface: sparse mid-insert + split. inherent per-mode methods
-/// can't be called from generic code (the tree-ops layer) — this trait is that surface.
-/// every tree-capable mode impls it; `find_slot`/`find_2_slots`/`slide_none`/
-/// `grow_and_spread`/`cleave*` are per-`Mode` (or mode-overridden defaults).
+///can't be called from generic code (the tree-ops layer) — this trait is that surface.
+///every tree-capable mode impls it; `find_slot`/`find_2_slots`/`slide_none`/
+///`grow_and_spread`/`cleave*` are per-`Mode` (or mode-overridden defaults).
+///every find/slide applies its fixup to the block's own `BlockData` before
+///returning; a bare `grow_and_spread` does not — its caller applies the fixup.
 pub trait BlockOps<'block>: BlockTrait<'block> {
     ///find a free slot or make space near phys `pos` (occupied by contract) on the
     ///`after`(true)/before(false) side. returns the pending grow fixup + slide; `slide ==
@@ -246,7 +220,7 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
     fn find_slot(&mut self, pos: usize, after: bool) -> FoundSlot;
     ///apply a pending slide; returns the opened slot.
     fn slide_none(&mut self, ms: NoneSlide) -> OpenSlot;
-///spread: double len, halve shift. vaddrs stable (translator remaps). fails when
+    ///spread: double len, halve shift. vaddrs stable (translator remaps). fails when
     ///shift is exhausted or the mode's MAX_CAP would be exceeded.
     fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity>;
     ///two disjoint reservations near `pos_a` (side `dir_a`) and `pos_b` (side
@@ -263,7 +237,9 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
         dir_b: bool,
     ) -> Result<Found2Slots, InsufficientMaxCapacity> {
         let budget = Self::P::BIT_WIDTH as usize;
-        if let Some(slides) = self.store().find_2_slots(pos_a, dir_a, pos_b, dir_b, budget, None) {
+        if let Some(slides) =
+            self.store().find_2_slots(pos_a, dir_a, pos_b, dir_b, budget, None)
+        {
             return Ok(Found2Slots { grew: None, slides });
         }
         let (mut ga, mut gb) = (pos_a, pos_b);
@@ -308,6 +284,24 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
     }
 }
 
+impl<'block, P: BlockIndex, N: 'block> Mode<'block, P, N> for Uniform {
+    type S = VecStore<N>;
+    const SHIFT: u32 = P::BIT_WIDTH as u32;
+}
+
+impl<'block, O: Ordering, P: BlockIndex, N: 'block> Mode<'block, P, N> for Anchored<O> {
+    type S = VecStore<N>;
+    const SHIFT: u32 = fr_params::<P, O>().0;
+    const INNER_OFFSET: P = fr_params::<P, O>().1;
+    const OUTER_OFFSET: P = fr_params::<P, O>().2;
+    const INIT_CAP: usize = fr_params::<P, O>().3;
+}
+impl<'block, P: BlockIndex, N: 'block> Mode<'block, P, N> for Pluripotent {
+    type S = DequeStore<N>;
+    const SHIFT: u32 = P::BIT_WIDTH as u32 / 2;
+    const MAX_CAP: usize = 1 << P::Half::BIT_WIDTH;
+}
+
 impl<'block, N, P, M, D, O> Block<'block, N, P, M, D, O>
 where
     N: Sized + 'block,
@@ -319,10 +313,10 @@ where
     ///fresh block: empty store (INIT_CAP Nones) + the mode's initial translator + default data.
     pub fn new() -> Self {
         Self {
-            store: M::S::with_capacity(M::INIT_CAP),
+            store:      M::S::with_capacity(M::INIT_CAP),
             translator: M::make_translator(),
             block_data: D::default(),
-            _phantom: PhantomData,
+            _phantom:   PhantomData,
         }
     }
 
@@ -345,10 +339,10 @@ where
     }
 
     ///forward iteration over `Some` slots (exact size = occupied).
-    pub fn iter<'b>(&'b self) -> impl DoubleEndedIterator<Item = &'b N> + ExactSizeIterator<Item = &'b N> + 'b
-    where
-        'block: 'b,
-    {
+    pub fn iter<'b>(
+        &'b self,
+    ) -> impl DoubleEndedIterator<Item = &'b N> + ExactSizeIterator<Item = &'b N> + 'b
+    where 'block: 'b {
         self.store.iter()
     }
 }
@@ -413,9 +407,17 @@ where
         let mut found = FoundSlot { grew: None, slide: None };
         if self.occupied() * 4 > self.len() * 3 && self.translator().shift() > 0 {
             if let Ok(g) = self.grow_and_spread() {
-                grew_step(&mut found.grew, g, &mut pos, &mut pin, &mut self.block_data, &self.translator);
+                grew_step(
+                    &mut found.grew,
+                    g,
+                    &mut pos,
+                    &mut pin,
+                    &mut self.block_data,
+                    &self.translator,
+                );
                 found.slide = Some(
-                    self.store().find_slot(pos, after, P::BIT_WIDTH as usize, None)
+                    self.store()
+                        .find_slot(pos, after, P::BIT_WIDTH as usize, None)
                         .expect("find_slot: nothing in budget after spread"),
                 );
                 return found;
@@ -429,9 +431,17 @@ where
             return found; //genuine exhaustion
         }
         if let Ok(g) = self.grow_and_spread() {
-            grew_step(&mut found.grew, g, &mut pos, &mut pin, &mut self.block_data, &self.translator);
+            grew_step(
+                &mut found.grew,
+                g,
+                &mut pos,
+                &mut pin,
+                &mut self.block_data,
+                &self.translator,
+            );
             found.slide = Some(
-                self.store().find_slot(pos, after, self.len(), None)
+                self.store()
+                    .find_slot(pos, after, self.len(), None)
                     .expect("find_slot: full scan missed after spread"),
             );
             return found;
@@ -461,7 +471,8 @@ where
         let right = self.store_mut().split(at);
         let mut translator = self.translator.clone();
         //preserve right-half vaddrs: p2v_new(p-at) == p2v_old(p) => io_new = io_old + at
-        translator.set_inner_offset(self.translator().inner_offset().wrapping_add(P::from_usize(at)));
+        translator
+            .set_inner_offset(self.translator().inner_offset().wrapping_add(P::from_usize(at)));
         Self::from_parts(right, translator, self.block_data.clone())
     }
 
@@ -499,9 +510,17 @@ where
         let mut found = FoundSlot { grew: None, slide: None };
         if self.occupied() * 4 > self.len() * 3 && self.translator().shift() > 0 {
             if let Ok(g) = self.grow_and_spread() {
-                grew_step(&mut found.grew, g, &mut pos, &mut pin, &mut self.block_data, &self.translator);
+                grew_step(
+                    &mut found.grew,
+                    g,
+                    &mut pos,
+                    &mut pin,
+                    &mut self.block_data,
+                    &self.translator,
+                );
                 found.slide = Some(
-                    self.store().find_slot(pos, after, P::BIT_WIDTH as usize, pin)
+                    self.store()
+                        .find_slot(pos, after, P::BIT_WIDTH as usize, pin)
                         .expect("find_slot: nothing in budget after spread"),
                 );
                 return found;
@@ -515,9 +534,17 @@ where
             return found; //genuine exhaustion
         }
         if let Ok(g) = self.grow_and_spread() {
-            grew_step(&mut found.grew, g, &mut pos, &mut pin, &mut self.block_data, &self.translator);
+            grew_step(
+                &mut found.grew,
+                g,
+                &mut pos,
+                &mut pin,
+                &mut self.block_data,
+                &self.translator,
+            );
             found.slide = Some(
-                self.store().find_slot(pos, after, self.len(), pin)
+                self.store()
+                    .find_slot(pos, after, self.len(), pin)
                     .expect("find_slot: full scan missed after spread"),
             );
             return found;
@@ -543,7 +570,8 @@ where
     ) -> Result<Found2Slots, InsufficientMaxCapacity> {
         let pin = Some(self.v2p(root_vaddr::<O, P>()));
         let budget = P::BIT_WIDTH as usize;
-        if let Some(slides) = self.store().find_2_slots(pos_a, dir_a, pos_b, dir_b, budget, pin) {
+        if let Some(slides) = self.store().find_2_slots(pos_a, dir_a, pos_b, dir_b, budget, pin)
+        {
             return Ok(Found2Slots { grew: None, slides });
         }
         let (mut ga, mut gb) = (pos_a, pos_b);
@@ -582,7 +610,8 @@ where
         debug_assert!(at <= self.store().len(), "cleave: at out of range");
         let right = self.store_mut().split(at);
         let mut translator = self.translator.clone();
-        translator.set_inner_offset(self.translator().inner_offset().wrapping_add(P::from_usize(at)));
+        translator
+            .set_inner_offset(self.translator().inner_offset().wrapping_add(P::from_usize(at)));
         Self::from_parts(right, translator, self.block_data.clone())
     }
 
@@ -626,9 +655,17 @@ where
             return found;
         }
         if let Ok(g) = self.grow_and_spread() {
-            grew_step(&mut found.grew, g, &mut pos, &mut pin, &mut self.block_data, &self.translator);
+            grew_step(
+                &mut found.grew,
+                g,
+                &mut pos,
+                &mut pin,
+                &mut self.block_data,
+                &self.translator,
+            );
             found.slide = Some(
-                self.store().find_slot(pos, after, self.len(), None)
+                self.store()
+                    .find_slot(pos, after, self.len(), None)
                     .expect("find_slot: full scan missed after spread"),
             );
             return found;
@@ -659,7 +696,8 @@ where
             );
         }
         found.slide = Some(
-            self.store().find_slot(pos, after, self.len(), None)
+            self.store()
+                .find_slot(pos, after, self.len(), None)
                 .expect("find_slot: full scan missed the fresh edge None"),
         );
         found
@@ -686,7 +724,8 @@ where
         debug_assert!(at <= self.store().len(), "cleave: at out of range");
         let right = self.store_mut().split(at);
         let mut translator = self.translator.clone();
-        translator.set_inner_offset(self.translator().inner_offset().wrapping_add(P::from_usize(at)));
+        translator
+            .set_inner_offset(self.translator().inner_offset().wrapping_add(P::from_usize(at)));
         Self::from_parts(right, translator, self.block_data.clone())
     }
 
@@ -708,6 +747,37 @@ where
     }
 }
 
-pub type UniformBlock<'block, N, P, D, O> = Block<'block, N, P, Uniform, D, O>;
-pub type AnchoredBlock<'block, N, P, D, O> = Block<'block, N, P, Anchored<O>, D, O>;
-pub type PluripotentBlock<'block, N, P, D, O> = Block<'block, N, P, Pluripotent, D, O>;
+///(shift, inner_offset, outer_offset, init_cap) pinning the root at `O`'s fixed vaddr.
+const fn fr_params<P: BlockIndex, O: Ordering>() -> (u32, P, P, usize) {
+    match O::ROOT_POS {
+        RootPos::Beginning => (P::BIT_WIDTH as u32, P::ZERO, P::ZERO, 1),
+        RootPos::Middle => (P::BIT_WIDTH as u32 - 1, P::ZERO, P::ZERO, 2),
+        RootPos::End => (P::BIT_WIDTH as u32, P::ZERO, P::MAX, 1),
+    }
+}
+
+///apply a grow remap to `pos`/`pin` + the block's own data, recording it in `grew`.
+fn grew_step<P: BlockIndex, D: Fixable<P>>(
+    grew: &mut Option<GrewFixup>,
+    g: GrewFixup,
+    pos: &mut usize,
+    pin: &mut Option<usize>,
+    data: &mut D,
+    tr: &Translator<P>,
+) {
+    g.fix_p(pos);
+    if let Some(p) = pin.as_mut() {
+        g.fix_p(p);
+    }
+    data.fixup(&g, tr);
+    *grew = Some(g);
+}
+
+///fixed root vaddr for an ordering (the `Anchored` pin target).
+fn root_vaddr<O: Ordering, P: BlockIndex>() -> P {
+    match O::ROOT_POS {
+        RootPos::Beginning => P::ZERO,
+        RootPos::Middle => P::MIDPOINT,
+        RootPos::End => P::MAX,
+    }
+}

@@ -1,26 +1,62 @@
+//!unbounded slot backends (`VecStore`/`DequeStore`) — cap grows on demand; the
+//!addressable limit lives in `Mode::MAX_CAP`, not the store.
+//!invariants: `occupied ≤ len ≤ cap`; `push_*`/`grow_*`/`spread` operate on logical
+//!slots; `find_slot`/`slide_none` honor a `pin` (kept out of the moved run).
+//!slots are `Option<MaybeUninit<T>>`: the discriminant is the occupancy flag
+//!(store-internal, flipped only by `alloc`), the payload exempt from validity until
+//!written — the alloc-write-read contract: a slot is read only after its
+//!reservation's write completes (the exclusive `&mut MaybeUninit<T>` `alloc`
+//!hands out enforces the ordering). both stores impl `Drop` (`assume_init_drop`
+//!over `Some` — `MaybeUninit` never drops `T` on its own); dropping a store with a
+//!pending reservation is UB — the contract's one sharp edge (subtle_bugs.md §7).
 use std::cmp::Ordering::*;
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 
 use crate::metadata::{Fixup, TwoSlide};
 
-///`Some` ⇒ written (the alloc-write-read contract: a slot is read only after its
-///reservation's write has completed — the exclusive `&mut` handed out by `alloc`
-///enforces the ordering in practice). SAFETY: `m` comes from an occupied slot.
-#[inline]
-unsafe fn assume_ref<'a, T>(m: &'a MaybeUninit<T>) -> &'a T {
-    unsafe { m.assume_init_ref() }
-}
-///mut variant. SAFETY: as `assume_ref`.
-#[inline]
-unsafe fn assume_mut<'a, T>(m: &'a mut MaybeUninit<T>) -> &'a mut T {
-    unsafe { m.assume_init_mut() }
+///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
+///delta: shift each moved item's phys by. from>to ⇒ None moves left ⇒ items move
+///right ⇒ +1. from<to ⇒ items move left ⇒ -1. equal ⇒ 0.
+///impls `Fixup` (`fix_p`: `p += delta`) — see metadata.rs.
+#[derive(Clone, Copy, Debug)]
+pub struct NoneSlide {
+    pub from:  usize,
+    pub to:    usize,
+    pub delta: isize,
 }
 
-///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that provides
-///access/shift semantics
-///address translation
-///dumb insertion
+///which side the nearest None was found on (slice-relative index).
+pub enum NearestNone {
+    Left(usize),
+    Right(usize),
+    NotFound,
+}
+
+///forward-only `ExactSizeIterator` over a store's `Some` refs. `len()` is the `Some` count
+///(set at construction from `occupied`), so it stays exact despite filtering.
+pub(crate) struct SomeIter<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> {
+    inner:     I,
+    remaining: usize,
+}
+
+///Vec-backed store. slots are `Option<MaybeUninit<T>>`: the discriminant is the
+///occupancy flag (store-internal — flipped by `alloc`), the payload is exempt
+///from validity until its reservation's write completes (alloc-write-read).
+pub struct VecStore<T> {
+    buf:      Vec<Option<MaybeUninit<T>>>,
+    occupied: usize,
+}
+
+///VecDeque-backed store. wrap-aware: cross-slice logic for find/slide/spread/split
+///at the wrap boundary. slots are `Option<MaybeUninit<T>>` (see `VecStore`).
+pub struct DequeStore<T> {
+    buf:      VecDeque<Option<MaybeUninit<T>>>,
+    occupied: usize,
+}
+
+///slot-backend surface: slot access, slide/find/grow/spread/split primitives, and
+///the reservation surface.
 pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///in-bounds occupied slot. bounds-checks; panics if the slot is None (contract violation).
     fn get<'b>(&'b self, ptr: usize) -> &'b T;
@@ -44,9 +80,9 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///slot is read (the alloc-write-read contract). the flag never leaves the store.
     fn alloc(&mut self, i: usize) -> &mut MaybeUninit<T>;
     ///(`a` occupied, `b` free) two disjoint muts: the node at `a` plus the
-    ///write place at `b`, which is RESERVED here (flip + occupied). the split's
-    ///drain into `b` is the reservation's write. panics if `a == b`, `a` is None,
-    ///or `b` is Some.
+    ///write place at `b`, which is RESERVED here (flip + occupied) — the drain
+    ///handoff. the split's drain into `b` is the reservation's write. panics
+    ///if `a == b`, `a` is None, or `b` is Some.
     fn alloc_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut MaybeUninit<T>);
 
     ///slide the None at `from` to `to`; returns `to`. `from==to` => no slide. `pin`, if set, is a
@@ -190,46 +226,15 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     fn into_vec(self) -> Vec<Option<T>>;
 }
 
-///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
-///delta: shift each moved item's phys by. from>to ⇒ None moves left ⇒ items move
-///right ⇒ +1. from<to ⇒ items move left ⇒ -1. equal ⇒ 0.
-#[derive(Clone, Copy, Debug)]
-pub struct NoneSlide {
-    pub from: usize,
-    pub to:   usize,
-    pub delta: isize,
-}
-
 impl NoneSlide {
     pub(crate) fn new(from: usize, to: usize) -> Self {
         Self { from, to, delta: (from as isize - to as isize).signum() }
     }
 }
 
-///the pair can't apply independently: affected spans overlap (a shared slot would
-///double-move, or one slide's None-hole lies inside the other's run) or one slide
-///moves the other's anchor. spans are closed — conservative.
-fn slides_interfere(s1: &NoneSlide, s2: &NoneSlide, a1: usize, a2: usize) -> bool {
-    let (lo1, hi1) = (s1.from.min(s1.to), s1.from.max(s1.to));
-    let (lo2, hi2) = (s2.from.min(s2.to), s2.from.max(s2.to));
-    lo1 <= hi2 && lo2 <= hi1 || s1.affects_p(a2) || s2.affects_p(a1)
-}
-
-///which side the nearest None was found on (slice-relative index).
-pub enum NearestNone {
-    Left(usize),
-    Right(usize),
-    NotFound,
-}
-
-///forward-only `ExactSizeIterator` over a store's `Some` refs. `len()` is the `Some` count
-///(set at construction from `occupied`), so it stays exact despite filtering.
-pub(crate) struct SomeIter<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> {
-    inner:     I,
-    remaining: usize,
-}
-
-impl<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> Iterator for SomeIter<'b, T, I> {
+impl<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> Iterator
+    for SomeIter<'b, T, I>
+{
     type Item = &'b T;
 
     fn next(&mut self) -> Option<&'b T> {
@@ -248,7 +253,9 @@ impl<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> Iterator for Som
     }
 }
 
-impl<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> ExactSizeIterator for SomeIter<'b, T, I> {
+impl<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> ExactSizeIterator
+    for SomeIter<'b, T, I>
+{
     #[inline]
     fn len(&self) -> usize {
         self.remaining
@@ -268,59 +275,6 @@ impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<MaybeUninit<T>>>> Doubl
         }
         None
     }
-}
-
-///outward nearest-None scan: `left` at `l0, l0-1, …` (lcnt slots, decreasing) and
-///`right` at `r0, r0+1, …` (rcnt slots, increasing). D tie-breaks equidistant hits
-///(false⇒left, true⇒right). the caller checks the anchor slot separately, so l0/r0
-///are the first real candidates and neither equals the anchor.
-///
-/// SAFETY: every accessed left index is in `[0, left.len())` and every right index
-/// in `[0, right.len())`. accessed left = `l0-k` for k in `[0,lcnt)` ⇒ in
-/// `[l0-lcnt+1, l0]`; accessed right = `r0+k` for k in `[0,rcnt)` ⇒ in `[r0, r0+rcnt-1]`.
-#[inline]
-fn dual_scan_outward<T: Sized, const D: bool>(
-    left: &[Option<T>],
-    right: &[Option<T>],
-    l0: usize,
-    r0: usize,
-    lcnt: usize,
-    rcnt: usize,
-) -> NearestNone {
-    let m = lcnt.min(rcnt);
-    for k in 0..m {
-        // SAFETY: see function-level invariant; l0-k and r0+k are in-bounds.
-        let l_none = unsafe { left.get_unchecked(l0 - k).is_none() };
-        let r_none = unsafe { right.get_unchecked(r0 + k).is_none() };
-        if l_none & r_none {
-            return if D { NearestNone::Right(r0 + k) } else { NearestNone::Left(l0 - k) };
-        }
-        if l_none {
-            return NearestNone::Left(l0 - k);
-        }
-        if r_none {
-            return NearestNone::Right(r0 + k);
-        }
-    }
-    for k in m..lcnt {
-        if unsafe { left.get_unchecked(l0 - k).is_none() } {
-            return NearestNone::Left(l0 - k);
-        }
-    }
-    for k in m..rcnt {
-        if unsafe { right.get_unchecked(r0 + k).is_none() } {
-            return NearestNone::Right(r0 + k);
-        }
-    }
-    NearestNone::NotFound
-}
-
-///Vec-backed store. slots are `Option<MaybeUninit<T>>`: the discriminant is the
-///occupancy flag (store-internal — flipped by `alloc`), the payload is exempt
-///from validity until its reservation's write completes (alloc-write-read).
-pub struct VecStore<T> {
-    buf:      Vec<Option<MaybeUninit<T>>>,
-    occupied: usize,
 }
 
 impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
@@ -343,11 +297,17 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
     }
 
     fn get(&self, ptr: usize) -> &T {
-        self.buf[ptr].as_ref().map(|m| unsafe { assume_ref(m) }).expect("store: None at occupied ptr")
+        self.buf[ptr]
+            .as_ref()
+            .map(|m| unsafe { assume_ref(m) })
+            .expect("store: None at occupied ptr")
     }
 
     fn get_mut(&mut self, ptr: usize) -> &mut T {
-        self.buf[ptr].as_mut().map(|m| unsafe { assume_mut(m) }).expect("store: None at occupied ptr")
+        self.buf[ptr]
+            .as_mut()
+            .map(|m| unsafe { assume_mut(m) })
+            .expect("store: None at occupied ptr")
     }
 
     fn slot(&self, p: usize) -> Option<&T> {
@@ -362,8 +322,14 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
         assert!(a != b, "get_disjoint_mut: a == b");
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
         let (left, right) = self.buf.split_at_mut(hi);
-        let lo_ref = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
-        let hi_ref = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
+        let lo_ref = left[lo]
+            .as_mut()
+            .map(|m| unsafe { assume_mut(m) })
+            .expect("get_disjoint_mut: None slot");
+        let hi_ref = right[0]
+            .as_mut()
+            .map(|m| unsafe { assume_mut(m) })
+            .expect("get_disjoint_mut: None slot");
         if a < b { (lo_ref, hi_ref) } else { (hi_ref, lo_ref) }
     }
 
@@ -382,12 +348,18 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
         let (left, right) = self.buf.split_at_mut(hi);
         if a < b {
-            let x = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            let x = left[lo]
+                .as_mut()
+                .map(|m| unsafe { assume_mut(m) })
+                .expect("alloc_disjoint_mut: None slot");
             let cell = right[0].insert(MaybeUninit::uninit());
             (x, cell)
         } else {
             let cell = left[lo].insert(MaybeUninit::uninit());
-            let x = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            let x = right[0]
+                .as_mut()
+                .map(|m| unsafe { assume_mut(m) })
+                .expect("alloc_disjoint_mut: None slot");
             (x, cell)
         }
     }
@@ -443,12 +415,8 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
         } else {
             dual_scan_outward::<_, false>(buf, buf, pos.wrapping_sub(1), pos + 1, lcnt, rcnt)
         } {
-            NearestNone::Left(l) => {
-                Some(NoneSlide::new(l, if !dir { pos - 1 } else { pos }))
-            }
-            NearestNone::Right(r) => {
-                Some(NoneSlide::new(r, if dir { pos + 1 } else { pos }))
-            }
+            NearestNone::Left(l) => Some(NoneSlide::new(l, if !dir { pos - 1 } else { pos })),
+            NearestNone::Right(r) => Some(NoneSlide::new(r, if dir { pos + 1 } else { pos })),
             NearestNone::NotFound => None,
         }
     }
@@ -645,19 +613,13 @@ impl<T> Drop for VecStore<T> {
         //Some ⇒ written (the alloc-write-read contract) — `MaybeUninit` never
         //drops `T` on its own, so payloads must be dropped here. dropping a
         //store with a pending reservation (Some not yet written) violates that
-        //contract and is UB — the one place it turns dangerous.
+        //contract and is UB — the one place it turns dangerous (subtle_bugs.md §7).
         for slot in &mut self.buf {
             if let Some(m) = slot {
                 unsafe { m.assume_init_drop() };
             }
         }
     }
-}
-
-///VecDeque-backed store. slots are `Option<MaybeUninit<T>>` (see `VecStore`).
-pub struct DequeStore<T> {
-    buf:      VecDeque<Option<MaybeUninit<T>>>,
-    occupied: usize,
 }
 
 impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
@@ -680,11 +642,17 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
     }
 
     fn get(&self, ptr: usize) -> &T {
-        self.buf[ptr].as_ref().map(|m| unsafe { assume_ref(m) }).expect("store: None at occupied ptr")
+        self.buf[ptr]
+            .as_ref()
+            .map(|m| unsafe { assume_ref(m) })
+            .expect("store: None at occupied ptr")
     }
 
     fn get_mut(&mut self, ptr: usize) -> &mut T {
-        self.buf[ptr].as_mut().map(|m| unsafe { assume_mut(m) }).expect("store: None at occupied ptr")
+        self.buf[ptr]
+            .as_mut()
+            .map(|m| unsafe { assume_mut(m) })
+            .expect("store: None at occupied ptr")
     }
 
     fn slot(&self, p: usize) -> Option<&T> {
@@ -701,8 +669,14 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
         //make the deque's logical range contiguous (indices stable), then split.
         let slice = self.buf.make_contiguous();
         let (left, right) = slice.split_at_mut(hi);
-        let lo_ref = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
-        let hi_ref = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
+        let lo_ref = left[lo]
+            .as_mut()
+            .map(|m| unsafe { assume_mut(m) })
+            .expect("get_disjoint_mut: None slot");
+        let hi_ref = right[0]
+            .as_mut()
+            .map(|m| unsafe { assume_mut(m) })
+            .expect("get_disjoint_mut: None slot");
         if a < b { (lo_ref, hi_ref) } else { (hi_ref, lo_ref) }
     }
 
@@ -722,12 +696,18 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
         let slice = self.buf.make_contiguous();
         let (left, right) = slice.split_at_mut(hi);
         if a < b {
-            let x = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            let x = left[lo]
+                .as_mut()
+                .map(|m| unsafe { assume_mut(m) })
+                .expect("alloc_disjoint_mut: None slot");
             let cell = right[0].insert(MaybeUninit::uninit());
             (x, cell)
         } else {
             let cell = left[lo].insert(MaybeUninit::uninit());
-            let x = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            let x = right[0]
+                .as_mut()
+                .map(|m| unsafe { assume_mut(m) })
+                .expect("alloc_disjoint_mut: None slot");
             (x, cell)
         }
     }
@@ -1190,13 +1170,81 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
 
 impl<T> Drop for DequeStore<T> {
     fn drop(&mut self) {
-        //as `VecStore`'s: Some ⇒ written (alloc-write-read).
+        //as `VecStore`'s: Some ⇒ written (alloc-write-read); a pending reservation
+        //at drop is UB (subtle_bugs.md §7).
         for slot in &mut self.buf {
             if let Some(m) = slot {
                 unsafe { m.assume_init_drop() };
             }
         }
     }
+}
+
+///`Some` ⇒ written (the alloc-write-read contract: a slot is read only after its
+///reservation's write has completed — the exclusive `&mut` handed out by `alloc`
+///enforces the ordering in practice). SAFETY: `m` comes from an occupied slot.
+#[inline]
+unsafe fn assume_ref<'a, T>(m: &'a MaybeUninit<T>) -> &'a T {
+    unsafe { m.assume_init_ref() }
+}
+///mut variant. SAFETY: as `assume_ref`.
+#[inline]
+unsafe fn assume_mut<'a, T>(m: &'a mut MaybeUninit<T>) -> &'a mut T {
+    unsafe { m.assume_init_mut() }
+}
+
+///the pair can't apply independently: affected spans overlap (a shared slot would
+///double-move, or one slide's None-hole lies inside the other's run) or one slide
+///moves the other's anchor. spans are closed — conservative.
+fn slides_interfere(s1: &NoneSlide, s2: &NoneSlide, a1: usize, a2: usize) -> bool {
+    let (lo1, hi1) = (s1.from.min(s1.to), s1.from.max(s1.to));
+    let (lo2, hi2) = (s2.from.min(s2.to), s2.from.max(s2.to));
+    lo1 <= hi2 && lo2 <= hi1 || s1.affects_p(a2) || s2.affects_p(a1)
+}
+
+///outward nearest-None scan: `left` at `l0, l0-1, …` (lcnt slots, decreasing) and
+///`right` at `r0, r0+1, …` (rcnt slots, increasing). D tie-breaks equidistant hits
+///(false⇒left, true⇒right). the caller checks the anchor slot separately, so l0/r0
+///are the first real candidates and neither equals the anchor.
+///
+/// SAFETY: every accessed left index is in `[0, left.len())` and every right index
+/// in `[0, right.len())`. accessed left = `l0-k` for k in `[0,lcnt)` ⇒ in
+/// `[l0-lcnt+1, l0]`; accessed right = `r0+k` for k in `[0,rcnt)` ⇒ in `[r0, r0+rcnt-1]`.
+#[inline]
+fn dual_scan_outward<T: Sized, const D: bool>(
+    left: &[Option<T>],
+    right: &[Option<T>],
+    l0: usize,
+    r0: usize,
+    lcnt: usize,
+    rcnt: usize,
+) -> NearestNone {
+    let m = lcnt.min(rcnt);
+    for k in 0..m {
+        // SAFETY: see function-level invariant; l0-k and r0+k are in-bounds.
+        let l_none = unsafe { left.get_unchecked(l0 - k).is_none() };
+        let r_none = unsafe { right.get_unchecked(r0 + k).is_none() };
+        if l_none & r_none {
+            return if D { NearestNone::Right(r0 + k) } else { NearestNone::Left(l0 - k) };
+        }
+        if l_none {
+            return NearestNone::Left(l0 - k);
+        }
+        if r_none {
+            return NearestNone::Right(r0 + k);
+        }
+    }
+    for k in m..lcnt {
+        if unsafe { left.get_unchecked(l0 - k).is_none() } {
+            return NearestNone::Left(l0 - k);
+        }
+    }
+    for k in m..rcnt {
+        if unsafe { right.get_unchecked(r0 + k).is_none() } {
+            return NearestNone::Right(r0 + k);
+        }
+    }
+    NearestNone::NotFound
 }
 
 #[cfg(test)]

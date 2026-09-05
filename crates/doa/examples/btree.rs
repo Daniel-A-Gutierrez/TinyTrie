@@ -5,15 +5,13 @@
 //! drives them bottom-up, and `two_level_demo` hand-assembles with `insert_child`.
 
 use arrays::tiny_array::TinyArray;
+use doa::PreOrder;
 use doa::blocks::{BlockTrait, UniformBlock};
 use doa::metadata::{Ancestry, Fixable, Fixup, HasRoot, PosAncestry};
 use doa::translator::Translator;
 use doa::treeblock::{search, walker};
-use doa::walker::{
-    InsertErr, Node, NodeCursor, NodeWalker, NodeWalkerMut, SplittableNode, SplitTreeWalker,
-    TreeWalk, TreeWalkMut, TreeWalker,
-};
-use doa::PreOrder;
+use doa::walker::{InsertErr, Node, NodeCursor, NodeWalker, NodeWalkerMut, SplitTreeWalker,
+                  SplittableNode, TreeWalk, TreeWalkMut, TreeWalker};
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 
@@ -179,8 +177,7 @@ struct Cursor<'block, 'walker> {
 }
 
 impl<'block, 'a> From<&'a BlockT<'block>> for Cursor<'block, 'a>
-where
-    'block: 'a,
+where 'block: 'a
 {
     fn from(b: &'a BlockT<'block>) -> Self {
         Self { b, state: root_state(b) }
@@ -269,9 +266,7 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for Cursor<'block, 'wal
 //ascend/parent: per-shape — parent knowledge is the `PosAncestry` stack.
 impl<'block, 'walker> NodeWalker<'block, BlockT<'block>> for Cursor<'block, 'walker> {
     fn ascend<'b>(&'b mut self) -> &'b BNode
-    where
-        'block: 'b,
-    {
+    where 'block: 'b {
         let a = self.state.ancestry.pop().expect("ascend: at root");
         self.state.pos = a.parent;
         self.b.get(a.parent)
@@ -287,8 +282,7 @@ struct CursorMut<'block, 'walker> {
 }
 
 impl<'block, 'a> From<&'a mut BlockT<'block>> for CursorMut<'block, 'a>
-where
-    'block: 'a,
+where 'block: 'a
 {
     fn from(b: &'a mut BlockT<'block>) -> Self {
         let state = root_state(b);
@@ -381,9 +375,7 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for CursorMut<'block, '
 //stack (a parent-pointer tree would read the node's stored field instead).
 impl<'block, 'walker> NodeWalker<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
     fn ascend<'b>(&'b mut self) -> &'b BNode
-    where
-        'block: 'b,
-    {
+    where 'block: 'b {
         let a = self.state.ancestry.pop().expect("ascend: at root");
         self.state.pos = a.parent;
         self.block().get(a.parent)
@@ -425,13 +417,7 @@ impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block
     ///node-level wire. the separator is re-derived from the placed child's own min
     ///(B+ separators are child mins, not the caller's routing key): children stay
     ///sorted, keys[i] = min(children[i+1]) holds.
-    fn insert_child(
-        &mut self,
-        child_idx: usize,
-        _k: &u64,
-        _payload: (),
-        ptr: u16,
-    ) {
+    fn insert_child(&mut self, child_idx: usize, _k: &u64, _payload: (), ptr: u16) {
         //separator from the placed child's own min; new leftmost's separator
         //is the OLD leftmost's min
         let (m, old_left) = {
@@ -458,7 +444,9 @@ impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block
         }
     }
     fn remove_child(&mut self, child_idx: usize) -> (Option<u64>, Option<()>, u16) {
-        let BNode::Internal(n) = self.current_mut() else { panic!("remove_child: not internal") };
+        let BNode::Internal(n) = self.current_mut() else {
+            panic!("remove_child: not internal")
+        };
         let p = n.children.remove(child_idx);
         let sep = (child_idx > 0).then(|| *n.keys.get(child_idx - 1));
         let _ = n.keys.remove(child_idx.saturating_sub(1));
@@ -500,7 +488,11 @@ impl BTreeMap {
     ///re-search. every split shifts indices, so retrying from the top is simpler and
     ///sounder than tracking the path.
     pub fn insert(&mut self, k: u64, v: u64) -> Result<(), InsertErr> {
-        enum Step { Done, Placed, Full }
+        enum Step {
+            Done,
+            Placed,
+            Full,
+        }
         loop {
             let mut w: TreeWalker<PreOrder, CursorMut<'_, '_>> = search(&mut self.block, &k);
             let step = match w.nw.current_mut() {
@@ -510,7 +502,12 @@ impl BTreeMap {
                     Step::Done //overwrite: no len change
                 }
                 BNode::Leaf(n) if !n.keys.is_full() => {
-                    let pos = n.keys.as_slice().iter().position(|&key| k < key).unwrap_or(n.keys.len());
+                    let pos = n
+                        .keys
+                        .as_slice()
+                        .iter()
+                        .position(|&key| k < key)
+                        .unwrap_or(n.keys.len());
                     n.keys.insert_at(pos, k);
                     n.values.insert_at(pos, v);
                     Step::Placed
@@ -619,7 +616,9 @@ fn map_demo() {
         w
     };
     assert_eq!(pairs, want);
-    println!("map demo: ok (100 keys, splits + multi root promotions, get/overwrite/remove/iter)");
+    println!(
+        "map demo: ok (100 keys, splits + multi root promotions, get/overwrite/remove/iter)"
+    );
 }
 
 ///hand-assembled two-level tree: root inode + five leaves placed via the crate's
@@ -660,23 +659,18 @@ fn two_level_demo() {
     }
     assert_eq!(order, vec![1005, 20, 25, 30, 35, 40]);
 
-    for (k, v) in [
-        (20, 201),
-        (25, 251),
-        (30, 303),
-        (33, 331),
-        (35, 351),
-        (37, 372),
-        (40, 400),
-        (42, 421),
-    ] {
+    for (k, v) in
+        [(20, 201), (25, 251), (30, 303), (33, 331), (35, 351), (37, 372), (40, 400), (42, 421)]
+    {
         assert_eq!(block_get(&block, &k), Some(v), "get({k})");
     }
     assert_eq!(block_get(&block, &22), None);
     assert_eq!(block_get(&block, &28), None);
     assert_eq!(block_get(&block, &50), None);
 
-    println!("two-level demo: ok (insert_child x5, all anchor kinds, in-run + out-of-run slides, preorder placement, cross-leaf get)");
+    println!(
+        "two-level demo: ok (insert_child x5, all anchor kinds, in-run + out-of-run slides, preorder placement, cross-leaf get)"
+    );
 }
 
 fn main() {

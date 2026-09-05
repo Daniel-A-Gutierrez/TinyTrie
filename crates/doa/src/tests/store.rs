@@ -574,7 +574,7 @@
 //         assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
 //         assert_eq!(right.iter().copied().collect::<Vec<_>>(), vec![3, 4, 5]);
 //     }
-    
+
 //     #[test]
 //     fn slide_none_matches_ref_all_pairs_wrapped() {
 //         let orig: Vec<Option<u64>> = {

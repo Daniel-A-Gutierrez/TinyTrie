@@ -1,13 +1,6 @@
+```rust
 //! positioned cursor over a block's `Some` slots — compiled, unwired (not declared in lib.rs); predates the BlockTrait/BlockOps refactor.
-
-use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
-
-use crate::block::*;
-use crate::store::{NoneSlide, Store};
-use crate::translator::*;
-use crate::{Fixup, index::*};
-
+///L0014
 ///block-backed cursor: holds a block ref (`&B` or `&mut B`) via `R`, scans the
 ///store's slots through `R: Deref`, translates phys↔vaddr through `block.translator()`.
 ///`R = &'cursor B` gives a shared read cursor; `R = &'cursor mut B` gives a mut cursor.
@@ -20,7 +13,7 @@ where
     pos: Option<usize>,
     _m: PhantomData<(&'block (), &'cursor ())>,
 }
-
+///L0028
 ///positioned reader over a block's `Some` slots. the cursor tracks a **physical**
 ///slot internally. `T: 'cursor` is the arena validity bound. returned `&T` tie to the
 ///`&self`/`&mut self` call borrow (not `'cursor`): navigate, read, advance — not a
@@ -36,19 +29,7 @@ pub trait Cursor<'cursor, T: 'cursor, P: BlockIndex> {
     ///`store.get` panics on an out-of-bounds or `None` slot (the store's responsibility).
     fn seek(&mut self, phys: usize) -> Option<&T>;
     ///O(1) jump to vaddr `v` (translated to phys via `v2p`); convenience over `seek`.
-    fn vseek(&mut self, v: P) -> Option<&T> { self.seek(self.v2p(v)) }
-    ///advance to the next `Some` slot. returns the new element, or `None` if at-end.
-    fn next(&mut self) -> Option<&T>;
-    ///advance to the previous `Some` slot. returns the new element, or `None` if at the first.
-    fn prev(&mut self) -> Option<&T>;
-    ///seek to the first occupied slot; returns its element, or `None` if empty.
-    fn first(&mut self) -> Option<&T>;
-    ///seek to the last occupied slot; returns its element, or `None` if empty.
-    fn last(&mut self) -> Option<&T>;
-    fn p2v(&self, phys: usize) -> P ;
-    fn v2p(&self, v: P) -> usize ;
-}
-
+    fn vseek(&mut self, v: P) -> Option<&T> { self.seek(self.v2p(v));
 /// positioned mut reader over a block's `Some` slots.
 ///`'cursor` = the block borrow the cursor holds (`'block: 'cursor`); returned
 /// `&mut T` are tied to the `&mut self` call borrow (≤ `'cursor`), so it is not a
@@ -56,7 +37,6 @@ pub trait Cursor<'cursor, T: 'cursor, P: BlockIndex> {
 pub trait CursorMut<'cursor, T: 'cursor, P: BlockIndex> : Cursor<'cursor,T,P> {
     fn current_mut(&mut self) -> Option<&mut T>;
 }
-
 impl<'block, 'cursor, B: BlockBase<'block>, R: Deref<Target = B>>
     BlockCursor<'block, 'cursor, B, R>
 where
@@ -68,21 +48,18 @@ where
         let _ = c.first();
         c
     }
-
     ///decompose: yield the block ref back plus the current phys (no translation —
     ///the consumer indexes the block physically). `None` if the cursor was at-end.
     ///(for a handle that survives store mutations, use the vaddr via `from_parts`.)
     pub fn into_parts(self) -> (R, Option<usize>) {
         (self.block, self.pos)
     }
-
     ///rebuild by detranslating the stable vaddr back to a (possibly new) phys.
     ///`v == None` rebuilds an at-end cursor.
     pub fn from_parts(block: R, v: Option<B::P>) -> Self {
         let pos = v.map(|v| block.translator().v2p(v));
         Self { block, pos, _m: PhantomData }
     }
-
     ///position at vaddr `v`. if its slot is empty (e.g. an unpopulated root) the
     ///cursor is at-end (`pos = None`) rather than seeking a `None` slot.
     pub fn new_at(block: R, v: B::P) -> Self {
@@ -90,25 +67,21 @@ where
         let pos = (phys < block.store().len() && block.store().slot(phys).is_some()).then_some(phys);
         Self { block, pos, _m: PhantomData }
     }
-
     pub fn p2v(&self, phys: usize) -> B::P {
         self.block.p2v(phys)
     }
     pub fn v2p(&self, v: B::P) -> usize {
         self.block.v2p(v)
     }
-
     ///is phys an occupied slot? (non-panicking, unlike `seek`).
     pub fn slot_occupied(&self, phys: usize) -> bool {
         phys < self.block.store().len() && self.block.store().slot(phys).is_some()
     }
-
     ///block meta (read pass-through). tree root/height live here (e.g. `BTreeMeta`).
     pub fn meta(&self) -> &B::Meta {
         self.block.meta()
     }
 }
-
 impl<'block, 'cursor, B: BlockBaseMut<'block>, R: DerefMut<Target = B>>
     BlockCursor<'block, 'cursor, B, R>
 where
@@ -123,7 +96,6 @@ where
         }
         t
     }
-
     ///swap the contents at two phys slots. the tracked element follows its data: if at
     ///`a` it moves to `b`, and vice versa.
     pub fn swap(&mut self, a: usize, b: usize) {
@@ -134,7 +106,6 @@ where
             _ => {}
         }
     }
-
     ///swap the record at phys `src` with the None at `open`. returns the freed slot at
     ///`src`'s phys and the phys the record moved to. the tracked element follows: if at
     ///`src` it is now at the returned phys.
@@ -145,7 +116,6 @@ where
         }
         (freed, new_phys)
     }
-
     ///two disjoint `&mut` to the occupied slots at vaddrs `a_v`, `b_v` (translated to
     ///phys). panics if `a_v == b_v` or either slot is `None`. the returned refs are tied
     ///to `&mut self`, so the cursor can't be moved while they live — drop them before
@@ -159,18 +129,15 @@ where
         let b = self.block.v2p(b_v);
         self.block.get_disjoint_mut(a, b)
     }
-
     ///mut access by phys (not the cursor's tracked pos). panics if `None`.
     pub fn get_mut_phys(&mut self, phys: usize) -> &mut B::T {
         self.block.get_mut(phys)
     }
-
     ///block meta (write pass-through).
     pub fn set_meta(&mut self, m: B::Meta) {
         self.block.set_meta(m)
     }
 }
-
 ///sparse mid-insert cursor surface: `find_slot`/`slide_none`/`insert` track the cursor's
 ///element across the grow/slide. requires `B: SparseBlock` (Uniform/Pluripotent/FixedRoot).
 impl<'block, 'cursor, B: SparseBlock<'block>, R: DerefMut<Target = B>>
@@ -191,7 +158,6 @@ where
         }
         found
     }
-
     ///perform the slide. the tracked element shifts by the slide's delta iff it lies in
     ///the moved run (between `ns.from` and `ns.to`, exclusive of the None at `ns.from`).
     pub fn slide_none(&mut self, ns: NoneSlide) -> OpenSlot {
@@ -205,39 +171,32 @@ where
         }
         opened
     }
-
     ///place `t` at the opened slot (None→Some); returns its phys. the tracked phys is
     ///unchanged (insert fills a None, moves no other element).
     pub fn insert(&mut self, t: B::T, slot: OpenSlot) -> usize {
         self.block.insert(t, slot)
     }
 }
-
 impl<'block, 'cursor, B: BlockBase<'block>, R: Deref<Target = B>> Cursor<'cursor, B::T, B::P>
     for BlockCursor<'block, 'cursor, B, R>
 where
     'block: 'cursor,
     R: 'cursor,
 {
-
     fn address(&self) -> Option<B::P> {
         self.pos.map(|phys| self.block.translator().p2v(phys))
     }
-
     fn position(&self) -> Option<usize> {
         self.pos
     }
-
     fn current(&self) -> Option<&B::T> {
         let phys = self.pos?;
         Some(self.block.get(phys))
     }
-
     fn seek(&mut self, phys: usize) -> Option<&T> {
         self.pos = Some(phys);
         Some(self.block.get(phys))
     }
-
     fn next(&mut self) -> Option<&B::T> {
         let Some(phys) = self.pos else { return None };
         let s = self.block.store();
@@ -250,7 +209,6 @@ where
         self.pos = None;
         None
     }
-
     fn prev(&mut self) -> Option<&B::T> {
         let Some(phys) = self.pos else { return None };
         let s = self.block.store();
@@ -262,7 +220,6 @@ where
         }
         None
     }
-
     fn first(&mut self) -> Option<&B::T> {
         let s = self.block.store();
         for phys in 0..s.len() {
@@ -274,7 +231,6 @@ where
         self.pos = None;
         None
     }
-
     fn last(&mut self) -> Option<&B::T> {
         let s = self.block.store();
         for phys in (0..s.len()).rev() {
@@ -286,16 +242,13 @@ where
         self.pos = None;
         None
     }
-
     fn p2v(&self, phys: usize) -> B::P  {
         self.block.p2v(phys)
     }
-
     fn v2p(&self, v: B::P) -> usize  {
         self.block.v2p(v)
     }
 }
-
 impl<'block, 'cursor, B: BlockBaseMut<'block>, R: DerefMut<Target = B>>
     CursorMut<'cursor, B::T, B::P> for BlockCursor<'block, 'cursor, B, R>
 where
@@ -307,3 +260,4 @@ where
         Some(self.block.get_mut(phys))
     }
 }
+```
