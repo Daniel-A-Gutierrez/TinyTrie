@@ -1,9 +1,8 @@
 //! B+ tree consumer over doa's three-layer walker ladder.
 //! u16 pointers, `Uniform` block, `PreOrder` layout.
 //!
-//! Splits are not wired in the crate (`TreeWalkMut::insert_child` returns `NodeFull`
-//! for a full parent), so the map's `insert` is leaf-only and the two-level tree in
-//! `two_level_demo` is hand-assembled with `insert_child` (no split driver).
+//! Splits are wired (`SplitTreeWalker::split_child`/`split_root`): the map's insert
+//! drives them bottom-up, and `two_level_demo` hand-assembles with `insert_child`.
 
 use arrays::tiny_array::TinyArray;
 use doa::blocks::{BlockTrait, UniformBlock};
@@ -11,10 +10,12 @@ use doa::metadata::{Ancestry, Fixable, Fixup, HasRoot, PosAncestry};
 use doa::translator::Translator;
 use doa::treeblock::{search, walker};
 use doa::walker::{
-    InsertErr, Node, NodeCursor, NodeWalker, NodeWalkerMut, TreeWalk, TreeWalkMut, TreeWalker,
+    InsertErr, Node, NodeCursor, NodeWalker, NodeWalkerMut, SplittableNode, SplitTreeWalker,
+    TreeWalk, TreeWalkMut, TreeWalker,
 };
 use doa::PreOrder;
 use std::cmp::Ordering;
+use std::mem::MaybeUninit;
 
 const DEGREE: usize = 6; //max children per inode; leaves hold up to DEGREE pairs
 
@@ -46,17 +47,66 @@ impl BNode {
     }
 }
 
-impl Default for BNode {
-    fn default() -> Self {
-        BNode::leaf(&[])
-    }
-}
-
 impl Node for BNode {
     type K = u64;
     type V = u64;
     type P = u16;
     const DEGREE: usize = DEGREE;
+    const STORES_PARENTS: bool = false; //nodes carry no parent fields
+    type Payload = (); //B+ separators are child mins — nothing promotes besides them
+}
+
+impl SplittableNode for BNode {
+    ///promoted root, pre-wired with its first child = the old root.
+    fn new_root(r_v: u16) -> Self {
+        let mut children = TinyArray::new();
+        children.push(r_v);
+        BNode::Internal(INode { keys: TinyArray::new(), children })
+    }
+
+    ///drain the right half into the reserved `slot`. leaf: promote the right
+    ///half's min (copied up — leaves keep all keys); internal: move the boundary
+    ///separator up.
+    fn split(&mut self, slot: &mut MaybeUninit<Self>) -> (Self::K, Self::Payload) {
+        match self {
+            BNode::Leaf(n) => {
+                let len = n.keys.len();
+                let mid = len >> 1;
+                let mut r = LNode { keys: TinyArray::new(), values: TinyArray::new() };
+                for i in mid..len {
+                    r.keys.push(*n.keys.get(i));
+                    r.values.push(*n.values.get(i));
+                }
+                for _ in mid..len {
+                    n.keys.remove(mid);
+                    n.values.remove(mid);
+                }
+                let sep = *r.keys.get(0);
+                slot.write(BNode::Leaf(r));
+                (sep, ())
+            }
+            BNode::Internal(n) => {
+                let cc = n.children.len();
+                let mid = cc >> 1;
+                let mut r = INode { keys: TinyArray::new(), children: TinyArray::new() };
+                let sep = *n.keys.get(mid - 1); //min of child[mid] — the boundary
+                for i in mid..cc {
+                    r.children.push(*n.children.get(i));
+                }
+                for i in mid..cc - 1 {
+                    r.keys.push(*n.keys.get(i));
+                }
+                for _ in mid..cc {
+                    n.children.remove(mid);
+                }
+                for _ in mid - 1..cc - 1 {
+                    n.keys.remove(mid - 1);
+                }
+                slot.write(BNode::Internal(r));
+                (sep, ())
+            }
+        }
+    }
 }
 
 ///root phys + tree height (B+ leaves sit at depth == height).
@@ -81,17 +131,25 @@ impl HasRoot<u16> for BTreeMeta {
     fn set_root(&mut self, root: usize) {
         self.root = root;
     }
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn set_height(&mut self, height: u32) {
+        self.height = height;
+    }
 }
 
 ///the crate impls `TreeBlock` for `Block<…, Uniform, …>` directly — no newtype, no
 ///forwarding; the walker types enter the constructors as fn generics.
 type BlockT<'block> = UniformBlock<'block, BNode, u16, BTreeMeta, PreOrder>;
 
-///min key of the child at vaddr `c` (leaf children only — the demo's height is 1).
-fn child_min(b: &BlockT<'_>, c: u16) -> u64 {
-    match b.vget(c) {
-        BNode::Leaf(n) => *n.keys.get(0),
-        _ => panic!("child_min: internal child (demo supports leaf children only)"),
+///min key of the subtree rooted at vaddr `c` — its leftmost leaf's first key.
+fn child_min(b: &BlockT<'_>, mut c: u16) -> u64 {
+    loop {
+        match b.vget(c) {
+            BNode::Leaf(n) => return *n.keys.get(0),
+            BNode::Internal(n) => c = *n.children.get(0),
+        }
     }
 }
 
@@ -130,17 +188,19 @@ where
 }
 
 impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for Cursor<'block, 'walker> {
+    type State = PosAncestry;
+
+    fn state(&self) -> &PosAncestry {
+        &self.state
+    }
+    fn state_mut(&mut self) -> &mut PosAncestry {
+        &mut self.state
+    }
     fn block(&self) -> &BlockT<'block> {
         self.b
     }
-    fn position(&self) -> usize {
-        self.state.pos
-    }
     fn is_leaf(&self) -> bool {
         self.state.ancestry.len() == self.b.data().height as usize
-    }
-    fn current(&self) -> &BNode {
-        self.b.get(self.state.pos)
     }
     fn child_count(&self) -> usize {
         match self.current() {
@@ -203,23 +263,18 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for Cursor<'block, 'wal
         }
         Some(self.current())
     }
-    fn descend(&mut self, child_idx: usize) -> &BNode {
-        let child = self.child(child_idx);
-        let phys = self.b.v2p(child);
-        self.state.ancestry.push(self.state.pos, child_idx);
-        self.state.pos = phys;
-        self.b.get(phys)
-    }
 }
 
+//position/current/descend: crate defaults over the state traits.
+//ascend/parent: per-shape — parent knowledge is the `PosAncestry` stack.
 impl<'block, 'walker> NodeWalker<'block, BlockT<'block>> for Cursor<'block, 'walker> {
-    fn depth(&self) -> usize {
-        self.state.ancestry.len()
-    }
-    fn ascend(&mut self) -> &BNode {
+    fn ascend<'b>(&'b mut self) -> &'b BNode
+    where
+        'block: 'b,
+    {
         let a = self.state.ancestry.pop().expect("ascend: at root");
         self.state.pos = a.parent;
-        self.b.get(self.state.pos)
+        self.b.get(a.parent)
     }
     fn parent(&self) -> Option<(usize, usize)> {
         self.state.ancestry.last().map(|a| (a.parent, a.child))
@@ -244,17 +299,19 @@ where
 //the mut cursor reborrows its `&'walker mut B` down to shared through `&self` — all the
 //read methods are safe since their returns tie to the `&self` borrow, not `'walker`.
 impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
+    type State = PosAncestry;
+
+    fn state(&self) -> &PosAncestry {
+        &self.state
+    }
+    fn state_mut(&mut self) -> &mut PosAncestry {
+        &mut self.state
+    }
     fn block(&self) -> &BlockT<'block> {
         self.b
     }
-    fn position(&self) -> usize {
-        self.state.pos
-    }
     fn is_leaf(&self) -> bool {
         self.state.ancestry.len() == self.block().data().height as usize
-    }
-    fn current(&self) -> &BNode {
-        self.block().get(self.state.pos)
     }
     fn child_count(&self) -> usize {
         match self.current() {
@@ -317,45 +374,26 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for CursorMut<'block, '
         }
         Some(self.current())
     }
-    fn descend(&mut self, child_idx: usize) -> &BNode {
-        let child = self.child(child_idx);
-        let phys = self.block().v2p(child);
-        self.state.ancestry.push(self.state.pos, child_idx);
-        self.state.pos = phys;
-        self.block().get(phys)
-    }
 }
 
+//position/current/descend: crate defaults over the state traits.
+//ascend/parent: per-shape — this walker's parent knowledge is its `PosAncestry`
+//stack (a parent-pointer tree would read the node's stored field instead).
 impl<'block, 'walker> NodeWalker<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
-    fn depth(&self) -> usize {
-        self.state.ancestry.len()
-    }
-    fn ascend(&mut self) -> &BNode {
+    fn ascend<'b>(&'b mut self) -> &'b BNode
+    where
+        'block: 'b,
+    {
         let a = self.state.ancestry.pop().expect("ascend: at root");
         self.state.pos = a.parent;
-        self.block().get(self.state.pos)
+        self.block().get(a.parent)
     }
     fn parent(&self) -> Option<(usize, usize)> {
         self.state.ancestry.last().map(|a| (a.parent, a.child))
     }
 }
 
-///what the node-level `insert_child` places. the separator is re-derived from the
-///placed child's own min — no key carried.
-#[allow(dead_code)] //Value: no leaf-level caller goes through the trait yet
-enum Payload {
-    Value(u64, u64),
-    Child(u16),
-}
-
 impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
-    type Payload = Payload;
-    type State = PosAncestry;
-
-    fn child_payload(&self, _k: &u64, ptr: u16) -> Payload {
-        Payload::Child(ptr)
-    }
-
     fn parts(&mut self) -> (&mut PosAncestry, &BlockT<'block>) {
         (&mut self.state, &*self.b)
     }
@@ -366,9 +404,7 @@ impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block
     fn block_mut(&mut self) -> &mut BlockT<'block> {
         self.b
     }
-    fn current_mut(&mut self) -> &mut BNode {
-        self.b.get_mut(self.state.pos)
-    }
+    //current_mut/set_position: crate defaults over `CursorState`.
     fn has_space(&self) -> bool {
         match self.current() {
             BNode::Internal(n) => !n.children.is_full(),
@@ -386,50 +422,47 @@ impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block
         }
     }
     fn set_parent(&mut self, _ptr: u16) {} //nodes store no parent fields
-    ///node-level wire. `child_idx` is the crate-routed gap (lookup); the separator is
-    ///re-derived from the placed child's own min (B+ separators are child mins, not the
-    ///caller's routing key): children stay sorted, keys[i] = min(children[i+1]) holds.
-    fn insert_child(&mut self, child_idx: usize, payload: Payload) {
-        match payload {
-            Payload::Value(k, v) => {
-                let BNode::Leaf(n) = self.current_mut() else { panic!("insert_child: value into non-leaf") };
-                let pos = n.keys.as_slice().iter().position(|&key| k < key).unwrap_or(n.keys.len());
-                n.keys.insert_at(pos, k);
-                n.values.insert_at(pos, v);
+    ///node-level wire. the separator is re-derived from the placed child's own min
+    ///(B+ separators are child mins, not the caller's routing key): children stay
+    ///sorted, keys[i] = min(children[i+1]) holds.
+    fn insert_child(
+        &mut self,
+        child_idx: usize,
+        _k: &u64,
+        _payload: (),
+        ptr: u16,
+    ) {
+        //separator from the placed child's own min; new leftmost's separator
+        //is the OLD leftmost's min
+        let (m, old_left) = {
+            let shared = self.block();
+            let m = child_min(shared, ptr);
+            let BNode::Internal(n) = shared.get(self.state.pos) else {
+                panic!("insert_child: child into non-internal")
+            };
+            let old_left = if child_idx == 0 && n.children.len() > 0 {
+                Some(child_min(shared, *n.children.get(0)))
+            } else {
+                None
+            };
+            (m, old_left)
+        };
+        let BNode::Internal(n) = self.current_mut() else { panic!() };
+        n.children.insert_at(child_idx, ptr);
+        if child_idx == 0 {
+            if let Some(sep) = old_left {
+                n.keys.insert_at(0, sep);
             }
-            Payload::Child(ptr) => {
-                //separator from the placed child's own min; new leftmost's separator
-                //is the OLD leftmost's min
-                let (m, old_left) = {
-                    let shared = self.block();
-                    let m = child_min(shared, ptr);
-                    let BNode::Internal(n) = shared.get(self.state.pos) else {
-                        panic!("insert_child: child into non-internal")
-                    };
-                    let old_left = if child_idx == 0 && n.children.len() > 0 {
-                        Some(child_min(shared, *n.children.get(0)))
-                    } else {
-                        None
-                    };
-                    (m, old_left)
-                };
-                let BNode::Internal(n) = self.current_mut() else { panic!() };
-                n.children.insert_at(child_idx, ptr);
-                if child_idx == 0 {
-                    if let Some(sep) = old_left {
-                        n.keys.insert_at(0, sep);
-                    }
-                } else {
-                    n.keys.insert_at(child_idx - 1, m);
-                }
-            }
+        } else {
+            n.keys.insert_at(child_idx - 1, m);
         }
     }
-    fn remove_child(&mut self, child_idx: usize) -> Payload {
+    fn remove_child(&mut self, child_idx: usize) -> (Option<u64>, Option<()>, u16) {
         let BNode::Internal(n) = self.current_mut() else { panic!("remove_child: not internal") };
         let p = n.children.remove(child_idx);
+        let sep = (child_idx > 0).then(|| *n.keys.get(child_idx - 1));
         let _ = n.keys.remove(child_idx.saturating_sub(1));
-        Payload::Child(p)
+        (sep, None, p)
     }
 }
 
@@ -445,7 +478,7 @@ pub struct BTreeMap {
 impl BTreeMap {
     pub fn new() -> Self {
         let mut block = BlockT::new();
-        let root = block.insert_root(BNode::default());
+        let root = block.insert_root(BNode::leaf(&[])); //fresh tree root = a leaf
         block.set_data(BTreeMeta { root, height: 0 });
         Self { block, len: 0 }
     }
@@ -462,24 +495,50 @@ impl BTreeMap {
         }
     }
 
-    ///leaf-level insert only — no split driver in the crate yet; a full leaf errors.
+    ///insert with the split driver: on a full leaf, ascend to the nearest node with
+    ///room and split its full child on the path (`split_root` at the top), then
+    ///re-search. every split shifts indices, so retrying from the top is simpler and
+    ///sounder than tracking the path.
     pub fn insert(&mut self, k: u64, v: u64) -> Result<(), InsertErr> {
-        {
+        enum Step { Done, Placed, Full }
+        loop {
             let mut w: TreeWalker<PreOrder, CursorMut<'_, '_>> = search(&mut self.block, &k);
-            let BNode::Leaf(n) = w.nw.current_mut() else { panic!("insert: not at a leaf") };
-            if let Some(pos) = n.keys.as_slice().iter().position(|&key| key == k) {
-                *n.values.get_mut(pos) = v;
-                return Ok(());
+            let step = match w.nw.current_mut() {
+                BNode::Leaf(n) if n.keys.as_slice().contains(&k) => {
+                    let pos = n.keys.as_slice().iter().position(|&key| key == k).unwrap();
+                    *n.values.get_mut(pos) = v;
+                    Step::Done //overwrite: no len change
+                }
+                BNode::Leaf(n) if !n.keys.is_full() => {
+                    let pos = n.keys.as_slice().iter().position(|&key| k < key).unwrap_or(n.keys.len());
+                    n.keys.insert_at(pos, k);
+                    n.values.insert_at(pos, v);
+                    Step::Placed
+                }
+                _ => Step::Full, //full leaf: split the path below
+            };
+            match step {
+                Step::Done => return Ok(()),
+                Step::Placed => {
+                    self.len += 1;
+                    return Ok(());
+                }
+                Step::Full => {}
             }
-            if n.keys.is_full() {
-                return Err(InsertErr::NodeFull);
+            //walk up to the first node with room; split the full child we came from
+            //(the root has no parent — split it itself)
+            loop {
+                let Some((_, idx)) = w.nw.parent() else {
+                    w.split_root()?;
+                    break;
+                };
+                w.nw.ascend();
+                if w.nw.has_space() {
+                    w.split_child(idx)?;
+                    break;
+                }
             }
-            let pos = n.keys.as_slice().iter().position(|&key| k < key).unwrap_or(n.keys.len());
-            n.keys.insert_at(pos, k);
-            n.values.insert_at(pos, v);
         }
-        self.len += 1;
-        Ok(())
     }
 
     pub fn remove(&mut self, k: &u64) -> Option<u64> {
@@ -528,25 +587,39 @@ impl Default for BTreeMap {
 
 fn map_demo() {
     let mut m = BTreeMap::new();
-    for (k, v) in [(10, 100), (5, 50), (20, 200), (15, 150), (25, 250), (30, 300)] {
-        m.insert(k, v).unwrap();
+    //enough inserts to split the leaf root (root promotion) and split leaves under
+    //a two-level tree — DEGREE 6, so 100 keys ⇒ ≥3 leaves
+    let items: Vec<(u64, u64)> = (0..100u64).map(|i| (i * 13 + 1, i * 100 + 7)).collect();
+    for (k, v) in &items {
+        m.insert(*k, *v).unwrap();
     }
-    assert_eq!(m.insert(35, 350), Err(InsertErr::NodeFull)); //leaf full, splits unwired
+    assert!(m.block.data().height >= 2); //multiple root promotions
 
-    for (k, v) in [(10, 100), (5, 50), (20, 200), (15, 150), (25, 250), (30, 300)] {
-        assert_eq!(m.get(&k), Some(v));
+    for (k, v) in &items {
+        assert_eq!(m.get(k), Some(*v), "get({k})");
     }
-    assert_eq!(m.get(&7), None);
-    assert_eq!(m.get(&22), None);
+    assert_eq!(m.get(&0), None);
+    assert_eq!(m.get(&2), None); //between 1 and 14
 
-    assert_eq!(m.remove(&15), Some(150));
-    assert_eq!(m.get(&15), None);
-    assert_eq!(m.len(), 5);
+    //overwrite
+    m.insert(40, 999).unwrap();
+    assert_eq!(m.get(&40), Some(999));
+    assert_eq!(m.len(), 100);
+
+    assert_eq!(m.remove(&14), Some(107));
+    assert_eq!(m.get(&14), None);
+    assert_eq!(m.len(), 99);
 
     let pairs = m.pairs();
-    let want: Vec<(u64, u64)> = [(5, 50), (10, 100), (20, 200), (25, 250), (30, 300)].to_vec();
+    let want: Vec<(u64, u64)> = {
+        let mut w = items.clone();
+        w.retain(|&(k, _)| k != 14 && k != 40); //14 removed; 40 overwritten
+        w.push((40, 999));
+        w.sort();
+        w
+    };
     assert_eq!(pairs, want);
-    println!("map demo: ok (get/insert/full/remove/iter over a leaf root)");
+    println!("map demo: ok (100 keys, splits + multi root promotions, get/overwrite/remove/iter)");
 }
 
 ///hand-assembled two-level tree: root inode + five leaves placed via the crate's
@@ -563,11 +636,11 @@ fn two_level_demo() {
 
     {
         let mut w: TreeWalker<PreOrder, CursorMut<'_, '_>> = walker(&mut block); //at the root
-        w.insert_child(&40, BNode::leaf(&[(40, 400), (42, 421)])).unwrap();
-        w.insert_child(&30, BNode::leaf(&[(30, 303), (33, 331)])).unwrap();
-        w.insert_child(&35, BNode::leaf(&[(35, 351), (37, 372)])).unwrap();
-        w.insert_child(&25, BNode::leaf(&[(25, 251)])).unwrap();
-        w.insert_child(&20, BNode::leaf(&[(20, 201)])).unwrap();
+        w.insert_child(&40, (), BNode::leaf(&[(40, 400), (42, 421)])).unwrap();
+        w.insert_child(&30, (), BNode::leaf(&[(30, 303), (33, 331)])).unwrap();
+        w.insert_child(&35, (), BNode::leaf(&[(35, 351), (37, 372)])).unwrap();
+        w.insert_child(&25, (), BNode::leaf(&[(25, 251)])).unwrap();
+        w.insert_child(&20, (), BNode::leaf(&[(20, 201)])).unwrap();
     }
 
     //preorder node order: root then leaves in key order

@@ -20,7 +20,8 @@
       "Bash(awk *)",
       "mcp__ide__getDiagnostics",
       "Bash(rtk proxy *)",
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "Bash(cargo run *)"
     ]
   }
 }

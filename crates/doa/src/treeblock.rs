@@ -10,7 +10,7 @@ use crate::walker::{Node, NodeCursor, NodeWalker, SplittableNode, TreeWalker};
 ///`TreeBlock` and `Block` are doa's).
 pub trait TreeBlock<'block>: BlockTrait<'block> + BlockOps<'block>
 where
-    Self::N: Node + Default,
+    Self::N: Node,
     Self::BlockData: HasRoot<Self::P>,
 {
     ///phys slot of the root node.
@@ -23,7 +23,7 @@ macro_rules! impl_tree_block {
     ($m:ty) => {
         impl<'block, N, P, D, O> TreeBlock<'block> for Block<'block, N, P, $m, D, O>
         where
-            N: Node + Default + 'block,
+            N: Node + 'block,
             P: BlockIndex,
             D: 'block + Default + Clone + Fixable<P> + HasRoot<P>,
             O: crate::Ordering,
@@ -40,7 +40,7 @@ impl_tree_block!(crate::blocks::Anchored<O>);
 ///`NW` must be ascend-capable (`TreeWalk` traverses).
 pub fn walker<'block, NW, B, R>(b: R) -> TreeWalker<B::O, NW>
 where
-    B: BlockTrait<'block>,
+    B: BlockTrait<'block> + 'block,
     B::N: Node,
     NW: NodeWalker<'block, B> + From<R>,
     R: std::ops::Deref<Target = B>,
@@ -52,7 +52,7 @@ where
 /// descent only); `walker` for a positioned-at-root start.
 pub fn search<'block, NW, B, R>(b: R, k: &<B::N as Node>::K) -> TreeWalker<B::O, NW>
 where
-    B: BlockTrait<'block>,
+    B: BlockTrait<'block> + 'block,
     B::N: Node,
     NW: NodeCursor<'block, B> + From<R>,
     R: std::ops::Deref<Target = B>,
@@ -62,13 +62,14 @@ where
     w
 }
 
-///splits (clone-split driver, root promotion, block cleave) — declared, unwired.
-///see the split design notes; requires `SplittableNode` nodes.
+///block-level splits (cleave on `BlockExhausted`, arena handoff) — declared,
+///unwired. the node-level split driver lives on `SplitTreeWalker` (it needs the
+///walker's fixup machinery); this surface is the future arena tier's.
 pub trait SplitTreeBlock<'block>: BlockTrait<'block> + BlockOps<'block>
 where
-    Self::N: SplittableNode + Default,
+    Self::N: SplittableNode,
 {
-    ///split the root node; promotes a new root. returns the separator the caller wires
-    ///under an arena parent when the block itself also splits.
+    ///cleave the block; returns the separator the caller wires under an arena
+    ///parent when the block itself splits.
     fn split_root(&mut self) -> <Self::N as Node>::K;
 }

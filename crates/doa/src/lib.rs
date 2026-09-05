@@ -15,78 +15,21 @@ pub struct PostOrder;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootPos { Beginning, Middle, End }
 
+///which tree ordering a block uses. a const so tree ops can `match` on it and
+///monomorphize into a per-ordering flow that differs in *steps* (splits), not just
+///values (`suggest_*` methods cover those).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order { Pre, In, Post }
+
 ///where the tree root lives in a fresh block.
 pub trait Ordering: 'static {
     const ROOT_POS: RootPos;
+    const ORDER: Order;
 }
 
 ///easiest to split, iteration OK
-impl Ordering for InOrder   { const ROOT_POS: RootPos = RootPos::Middle; }
-impl Ordering for PreOrder  { const ROOT_POS: RootPos = RootPos::Beginning; }
-impl Ordering for PostOrder { const ROOT_POS: RootPos = RootPos::End; }
-
-///a position taken relative to another (insert-side resolution, boundary results).
-pub enum RelTo<T> {
-    Before(T),
-    After(T),
-}
-pub(crate) type BPtr = i32;
-pub(crate) type IPtr = u32;
-pub(crate) type LPtr = u16;
+impl Ordering for InOrder   { const ROOT_POS: RootPos = RootPos::Middle; const ORDER: Order = Order::In; }
+impl Ordering for PreOrder  { const ROOT_POS: RootPos = RootPos::Beginning; const ORDER: Order = Order::Pre; }
+impl Ordering for PostOrder { const ROOT_POS: RootPos = RootPos::End; const ORDER: Order = Order::Post; }
 
 pub use metadata::Fixup;
-
-
-
-//fractal forest
-struct FractalForest<K: Ord + Sized + Clone, V: Sized> {
-    ///root is at trees[0]
-    root:   BTree<K, BPtr>, //map key to a terminal block
-    ltrees: Vec<BTree<K, V>>,
-    len:    usize,
-}
-
-struct BTree<K: Sized + Ord + Clone, V: Sized> {
-    // inodes : block::Block<INode<K, IPtr, LPtr>,IPtr,PreOrder,Pluripotent>, //require preorder and fixed root, and pluripotent
-    leaves: leafblock::LeafBlock<K, V, LPtr>, //leafblock is random so it can guarantee capacity so long as inodes max size is 4096 (for u16, fanout 16)
-    height: u32,
-    next:   u32,
-    prev:   u32,
-}
-
-impl<K, V> BTree<K, V>
-where
-    K: Sized + Ord + Clone,
-    V: Sized,
-{
-    /*
-
-    fn new() -> Self {}
-
-    fn insert(&mut self, K , V ) {
-        if self.height==0 {self.leaves.root_insert(K,V));}
-        if self.len == MAX { panic }
-        let iroot = self.inodes.root_node();
-
-        //do tree traversal to get terminal node in inodes
-        let terminal_inode = //stuff;
-        let leaf = terminal_inode.map(K).terminal;
-        let next = //stuff to get next ptr after leaf.
-
-        //check that there's enough space between next and leaf
-        //if not, scan for a open space using the inode cursor and leaves.distance() up to some max distance.
-        //if that fails, grow&spread, guaranteeing there's space between leaf and next.
-        self.leaves.insert_between(leaf,(K,V),next.ptr)
-    }
-
-    fn remove
-
-    fn get
-
-    fn leaves_iter
-
-    fn range
-
-    fn split
-    */
-}

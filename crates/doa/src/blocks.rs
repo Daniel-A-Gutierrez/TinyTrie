@@ -1,9 +1,10 @@
 use crate::{Ordering, RootPos,
             index::*,
-            metadata::{Fixable, Fixup, GrewFixup},
+            metadata::{Fixable, Fixup, GrewFixup, TwoSlide},
             store::{DequeStore, NoneSlide, Store, VecStore},
             translator::{AddressTranslator, Translator}};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 
 ///no-pin full-range block (no insertion pin). used by trees that grow by splitting
 ///(the root can't stay at a fixed position anyway) and other consumers that don't pin.
@@ -79,6 +80,7 @@ where
 pub struct InsufficientMaxCapacity();
 
 ///a `None` slot opened for insert (physical).
+#[derive(Clone, Copy)]
 pub struct OpenSlot(pub usize);
 
 ///`find_slot` result: an optional grow fixup (apply to live phys) + an optional pending
@@ -86,6 +88,13 @@ pub struct OpenSlot(pub usize);
 pub struct FoundSlot {
     pub grew: Option<GrewFixup>,
     pub slide: Option<NoneSlide>,
+}
+
+///`find_2_slots` result: the (single) grow this call did, if any, + both slides as
+///ONE composed fixup (`TwoSlide`) — apply the slides in either order.
+pub struct Found2Slots {
+    pub grew:   Option<GrewFixup>,
+    pub slides: TwoSlide,
 }
 
 ///apply a grow remap to `pos`/`pin` + the block's own data, recording it in `grew`.
@@ -169,6 +178,23 @@ pub trait BlockTrait<'block>: Sized {
     fn store_mut(&mut self) -> &mut Self::S;
     fn translator_mut(&mut self) -> &mut Translator<Self::P>;
     fn set_data(&mut self, m: Self::BlockData);
+    fn data_mut(&mut self) -> &mut Self::BlockData;
+    ///(`a` occupied, `b` free) — the drain handoff: `b` is reserved (flip
+    ///inside). see `Store::alloc_disjoint_mut`.
+    fn alloc_disjoint_mut<'b>(&'b mut self, a: usize, b: OpenSlot) -> (&'b mut Self::N, &'b mut MaybeUninit<Self::N>)
+    where
+        'block: 'b,
+    {
+        self.store_mut().alloc_disjoint_mut(a, b.0)
+    }
+    ///reserve an opened slot; the caller writes through the returned place.
+    /// see `Store::alloc`.
+    fn alloc<'b>(&'b mut self, slot: OpenSlot) -> &'b mut MaybeUninit<Self::N>
+    where
+        'block: 'b,
+    {
+        self.store_mut().alloc(slot.0)
+    }
 
     ///physical mut get. panics if the slot is `None`.
     fn get_mut<'b>(&'b mut self, p: usize) -> &'b mut Self::N
@@ -186,8 +212,8 @@ pub trait BlockTrait<'block>: Sized {
     where 'block: 'b {
         self.store_mut().get_disjoint_mut(a, b)
     }
-    fn remove(&mut self, p: usize) -> (Self::N, OpenSlot) {
-        (self.store_mut().remove(p), OpenSlot(p))
+    fn free(&mut self, p: usize) -> (Self::N, OpenSlot) {
+        (self.store_mut().free(p), OpenSlot(p))
     }
     fn swap(&mut self, a: usize, b: usize) {
         self.store_mut().swap(a, b);
@@ -211,8 +237,8 @@ fn root_vaddr<O: Ordering, P: BlockIndex>() -> P {
 
 ///unified per-mode op surface: sparse mid-insert + split. inherent per-mode methods
 /// can't be called from generic code (the tree-ops layer) — this trait is that surface.
-/// every tree-capable mode impls it; `find_slot`/`slide_none`/`grow_and_spread`/`cleave*`
-/// are per-`Mode`, `insert` is mode-agnostic.
+/// every tree-capable mode impls it; `find_slot`/`find_2_slots`/`slide_none`/
+/// `grow_and_spread`/`cleave*` are per-`Mode` (or mode-overridden defaults).
 pub trait BlockOps<'block>: BlockTrait<'block> {
     ///find a free slot or make space near phys `pos` (occupied by contract) on the
     ///`after`(true)/before(false) side. returns the pending grow fixup + slide; `slide ==
@@ -220,14 +246,37 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
     fn find_slot(&mut self, pos: usize, after: bool) -> FoundSlot;
     ///apply a pending slide; returns the opened slot.
     fn slide_none(&mut self, ms: NoneSlide) -> OpenSlot;
-    ///place `v` at the opened slot (None→Some). returns its phys.
-    fn insert(&mut self, v: Self::N, slot: OpenSlot) -> usize {
-        self.store_mut().insert(v, slot.0);
-        slot.0
-    }
-    ///spread: double len, halve shift. vaddrs stable (translator remaps). fails when
+///spread: double len, halve shift. vaddrs stable (translator remaps). fails when
     ///shift is exhausted or the mode's MAX_CAP would be exceeded.
     fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity>;
+    ///two disjoint reservations near `pos_a` (side `dir_a`) and `pos_b` (side
+    ///`dir_b`) — the slides apply independently in either order, composed as one
+    ///`TwoSlide` fixup. default ladder: pair-scan → forced spread + rescan →
+    ///genuine exhaustion. one spread max per call. modes with constraints
+    ///override (Anchored pins its root; Pluripotent's edge-grow is not tried by
+    ///the default).
+    fn find_2_slots(
+        &mut self,
+        pos_a: usize,
+        dir_a: bool,
+        pos_b: usize,
+        dir_b: bool,
+    ) -> Result<Found2Slots, InsufficientMaxCapacity> {
+        let budget = Self::P::BIT_WIDTH as usize;
+        if let Some(slides) = self.store().find_2_slots(pos_a, dir_a, pos_b, dir_b, budget, None) {
+            return Ok(Found2Slots { grew: None, slides });
+        }
+        let (mut ga, mut gb) = (pos_a, pos_b);
+        let g = self.grow_and_spread()?;
+        g.fix_p(&mut ga);
+        g.fix_p(&mut gb);
+        let tr = self.translator().clone();
+        self.data_mut().fixup(&g, &tr);
+        match self.store().find_2_slots(ga, dir_a, gb, dir_b, self.len(), None) {
+            Some(slides) => Ok(Found2Slots { grew: Some(g), slides }),
+            None => Err(InsufficientMaxCapacity()),
+        }
+    }
     ///split [at, len) into a new block (right), self keeps [0, at). right's translator:
     ///inner += at (preserves right-half vaddrs). right's `BlockData` is cloned as-is —
     ///its phys are left-relative; the caller re-points it. caller guarantees no
@@ -291,7 +340,7 @@ where
         assert!(self.store().occupied() == 0, "insert_root: block not empty");
         debug_assert!(self.store().len() > M::INIT_CAP / 2, "insert_root: store too short");
         let mid = M::INIT_CAP / 2;
-        self.store_mut().insert(v, mid);
+        self.store_mut().alloc(mid).write(v);
         mid
     }
 
@@ -337,6 +386,9 @@ where
     }
     fn set_data(&mut self, m: D) {
         self.block_data = m;
+    }
+    fn data_mut(&mut self) -> &mut D {
+        &mut self.block_data
     }
 }
 
@@ -423,8 +475,8 @@ where
         while i != end {
             let v = self.translator().p2v(i);
             let new_phys = new_trans.v2p(v);
-            let elem = self.store_mut().remove(i);
-            new_store.insert(elem, new_phys);
+            let elem = self.store_mut().free(i);
+            new_store.alloc(new_phys).write(elem);
             i = (i + 1) % len;
         }
         Self::from_parts(new_store, new_trans, self.block_data.clone())
@@ -481,6 +533,32 @@ where
         open
     }
 
+    ///as the default, but the root is pinned in every scan.
+    fn find_2_slots(
+        &mut self,
+        pos_a: usize,
+        dir_a: bool,
+        pos_b: usize,
+        dir_b: bool,
+    ) -> Result<Found2Slots, InsufficientMaxCapacity> {
+        let pin = Some(self.v2p(root_vaddr::<O, P>()));
+        let budget = P::BIT_WIDTH as usize;
+        if let Some(slides) = self.store().find_2_slots(pos_a, dir_a, pos_b, dir_b, budget, pin) {
+            return Ok(Found2Slots { grew: None, slides });
+        }
+        let (mut ga, mut gb) = (pos_a, pos_b);
+        let g = self.grow_and_spread()?;
+        g.fix_p(&mut ga);
+        g.fix_p(&mut gb);
+        let pin = Some(self.v2p(root_vaddr::<O, P>())); //grew remaps it
+        let tr = self.translator().clone();
+        self.data_mut().fixup(&g, &tr);
+        match self.store().find_2_slots(ga, dir_a, gb, dir_b, self.len(), pin) {
+            Some(slides) => Ok(Found2Slots { grew: Some(g), slides }),
+            None => Err(InsufficientMaxCapacity()),
+        }
+    }
+
     fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity> {
         let shift = self.translator().shift();
         if shift == 0 || self.store().len() * 2 > <Anchored<O> as Mode<'block, P, N>>::MAX_CAP {
@@ -518,8 +596,8 @@ where
         while i != end {
             let v = self.translator().p2v(i);
             let new_phys = new_trans.v2p(v);
-            let elem = self.store_mut().remove(i);
-            new_store.insert(elem, new_phys);
+            let elem = self.store_mut().free(i);
+            new_store.alloc(new_phys).write(elem);
             i = (i + 1) % len;
         }
         Self::from_parts(new_store, new_trans, self.block_data.clone())
@@ -622,8 +700,8 @@ where
         while i != end {
             let v = self.translator().p2v(i);
             let new_phys = new_trans.v2p(v);
-            let elem = self.store_mut().remove(i);
-            new_store.insert(elem, new_phys);
+            let elem = self.store_mut().free(i);
+            new_store.alloc(new_phys).write(elem);
             i = (i + 1) % len;
         }
         Self::from_parts(new_store, new_trans, self.block_data.clone())

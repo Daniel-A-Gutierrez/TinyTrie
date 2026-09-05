@@ -76,9 +76,9 @@ variant!(v2p_0111 / p2v_0111, inner = z, outer = nz, shift = nz, rot = nz);
 variant!(v2p_1111 / p2v_1111, inner = nz, outer = nz, shift = nz, rot = nz);
 
 ///address translator using fn-ptr specialization (see bench notes / v2p_fnptr).
-///adaptive tier shape: re-point v2p/p2v in set_params when the block's params
-///change (grow/spread/graduate). for a statically-known strategy, a const-generic
-///block inlines the math and beats even this — Translator is for the adaptive tier.
+///`set_*` re-points v2p/p2v when the block's params change (grow/spread/graduate).
+///for a statically-known strategy, a const-generic block inlines the math and
+///beats even this — Translator is for the adaptive tier.
 #[derive(Clone)]
 pub struct Translator<P> {
     inner_offset: P,
@@ -112,22 +112,6 @@ impl<P: UnsignedNum> Translator<P> {
     }
     pub(crate) fn rotation(&self) -> u32 {
         self.rotation
-    }
-
-    ///re-point the specialized bodies after a param change (one indirect call
-    ///per lookup thereafter, no per-iter branch).
-    pub(crate) fn set_params(
-        &mut self,
-        inner_offset: P,
-        outer_offset: P,
-        shift: u32,
-        rotation: u32,
-    ) {
-        self.inner_offset = inner_offset;
-        self.outer_offset = outer_offset;
-        self.shift = shift;
-        self.rotation = rotation;
-        self.specialize_into(inner_offset, outer_offset, shift, rotation);
     }
 
     ///per-field setters: re-specialize only when that field's zero/nonzero

@@ -1,5 +1,21 @@
 use std::cmp::Ordering::*;
 use std::collections::VecDeque;
+use std::mem::MaybeUninit;
+
+use crate::metadata::{Fixup, TwoSlide};
+
+///`Some` ⇒ written (the alloc-write-read contract: a slot is read only after its
+///reservation's write has completed — the exclusive `&mut` handed out by `alloc`
+///enforces the ordering in practice). SAFETY: `m` comes from an occupied slot.
+#[inline]
+unsafe fn assume_ref<'a, T>(m: &'a MaybeUninit<T>) -> &'a T {
+    unsafe { m.assume_init_ref() }
+}
+///mut variant. SAFETY: as `assume_ref`.
+#[inline]
+unsafe fn assume_mut<'a, T>(m: &'a mut MaybeUninit<T>) -> &'a mut T {
+    unsafe { m.assume_init_mut() }
+}
 
 ///realistically this is a wrapper over vec<Option<T>> and vecdeque<Option<T>> that provides
 ///access/shift semantics
@@ -22,6 +38,16 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///either slot is `None` (contract violation). for `split_into` between two
     ///in-block nodes.
     fn get_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut T);
+
+    ///reserve slot `i` (must be None): flip to `Some(uninit)`, occupied += 1, and
+    ///hand back the place to write — the caller MUST write through it before the
+    ///slot is read (the alloc-write-read contract). the flag never leaves the store.
+    fn alloc(&mut self, i: usize) -> &mut MaybeUninit<T>;
+    ///(`a` occupied, `b` free) two disjoint muts: the node at `a` plus the
+    ///write place at `b`, which is RESERVED here (flip + occupied). the split's
+    ///drain into `b` is the reservation's write. panics if `a == b`, `a` is None,
+    ///or `b` is Some.
+    fn alloc_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut MaybeUninit<T>);
 
     ///slide the None at `from` to `to`; returns `to`. `from==to` => no slide. `pin`, if set, is a
     ///slot whose element must not move.
@@ -56,6 +82,51 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         pin: Option<usize>,
     ) -> Option<NoneSlide>;
 
+    ///two reservations near `pos_a` (side `dir_a`) and `pos_b` (side `dir_b`) whose
+    ///slides apply independently in EITHER order — non-overlapping runs, neither
+    ///moves the other's anchor. returns `TwoSlide` (one fixup call covers both).
+    ///designed for away-pointing sides (each slot opens on its anchor's own side
+    ///of the other). two passes: (1) sphere scan — `find_slot` confined to radius
+    ///`(|pos_a-pos_b|-1)/2` around each anchor (both its DIR scan and its fallback
+    ///are budget-bounded, so nothing escapes the sphere): disjoint spheres ⇒
+    ///disjoint runs — independent BY CONSTRUCTION; skipped when the anchors sit
+    ///closer than 3 slots (radius 0 finds nothing — including the same-anchor
+    ///subtree-first/last case). (2) one requested-side `find_slot` per anchor (a
+    ///fallback slide shifts its anchor, preserving the walk-order side — the
+    ///wrong-side None is already covered). away-pointing scans that interfere mean
+    ///both fell onto the same lone None in budget range ⇒ no pair exists ⇒ None —
+    ///the caller spreads and retries. `pin` as `find_slot`.
+    fn find_2_slots(
+        &self,
+        pos_a: usize,
+        dir_a: bool,
+        pos_b: usize,
+        dir_b: bool,
+        budget: usize,
+        pin: Option<usize>,
+    ) -> Option<TwoSlide> {
+        let dist = pos_a.abs_diff(pos_b);
+        if dist >= 3 {
+            let r = (dist - 1) / 2;
+            if let (Some(sa), Some(sb)) = (
+                self.find_slot(pos_a, dir_a, r.min(budget), pin),
+                self.find_slot(pos_b, dir_b, r.min(budget), pin),
+            ) {
+                debug_assert!(
+                    !slides_interfere(&sa, &sb, pos_a, pos_b),
+                    "sphere pass: disjoint by construction"
+                );
+                return Some(TwoSlide { a: sa, b: sb });
+            }
+        }
+        let sa = self.find_slot(pos_a, dir_a, budget, pin)?;
+        let sb = self.find_slot(pos_b, dir_b, budget, pin)?;
+        if slides_interfere(&sa, &sb, pos_a, pos_b) {
+            return None;
+        }
+        Some(TwoSlide { a: sa, b: sb })
+    }
+
     fn swap(&mut self, a: usize, b: usize);
 
     ///increases occupancy.
@@ -86,11 +157,8 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///1 = odds). the gap slot is the other of the {2i, 2i+1} pair.
     fn spread(&mut self, offset: usize);
 
-    ///The space at i must be None or panic.
-    fn insert(&mut self, v: T, i: usize);
-
-    ///the space at i must be Some or panic. returns the removed element.
-    fn remove(&mut self, i: usize) -> T;
+    ///the space at i must be Some or panic. frees it and returns the value.
+    fn free(&mut self, i: usize) -> T;
 
     ///split buf at `at`: [at, len) move into a new store, drained from self; self keeps [0, at).
     fn split(&mut self, at: usize) -> Self;
@@ -105,17 +173,6 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         &'b self,
     ) -> impl DoubleEndedIterator<Item = &'b T> + ExactSizeIterator<Item = &'b T> + 'b
     where 'a: 'b;
-
-    fn slots<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where 'a: 'b;
-
-    fn slice_iter<'b>(
-        &'b self,
-        from: usize,
-        to: usize,
-    ) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where
-        'a: 'b;
 
     fn new() -> Self;
 
@@ -136,7 +193,7 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
 ///delta: shift each moved item's phys by. from>to ⇒ None moves left ⇒ items move
 ///right ⇒ +1. from<to ⇒ items move left ⇒ -1. equal ⇒ 0.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct NoneSlide {
     pub from: usize,
     pub to:   usize,
@@ -149,6 +206,15 @@ impl NoneSlide {
     }
 }
 
+///the pair can't apply independently: affected spans overlap (a shared slot would
+///double-move, or one slide's None-hole lies inside the other's run) or one slide
+///moves the other's anchor. spans are closed — conservative.
+fn slides_interfere(s1: &NoneSlide, s2: &NoneSlide, a1: usize, a2: usize) -> bool {
+    let (lo1, hi1) = (s1.from.min(s1.to), s1.from.max(s1.to));
+    let (lo2, hi2) = (s2.from.min(s2.to), s2.from.max(s2.to));
+    lo1 <= hi2 && lo2 <= hi1 || s1.affects_p(a2) || s2.affects_p(a1)
+}
+
 ///which side the nearest None was found on (slice-relative index).
 pub enum NearestNone {
     Left(usize),
@@ -158,19 +224,20 @@ pub enum NearestNone {
 
 ///forward-only `ExactSizeIterator` over a store's `Some` refs. `len()` is the `Some` count
 ///(set at construction from `occupied`), so it stays exact despite filtering.
-pub(crate) struct SomeIter<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> {
+pub(crate) struct SomeIter<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> {
     inner:     I,
     remaining: usize,
 }
 
-impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> Iterator for SomeIter<'b, T, I> {
+impl<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> Iterator for SomeIter<'b, T, I> {
     type Item = &'b T;
 
     fn next(&mut self) -> Option<&'b T> {
         for slot in self.inner.by_ref() {
-            if let Some(v) = slot {
+            if let Some(m) = slot {
                 self.remaining -= 1;
-                return Some(v);
+                //SAFETY: occupied ⇒ written (alloc-write-read)
+                return Some(unsafe { assume_ref(m) });
             }
         }
         None
@@ -181,21 +248,22 @@ impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> Iterator for SomeIter<'b, T, 
     }
 }
 
-impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> ExactSizeIterator for SomeIter<'b, T, I> {
+impl<'b, T: 'b, I: Iterator<Item = &'b Option<MaybeUninit<T>>>> ExactSizeIterator for SomeIter<'b, T, I> {
     #[inline]
     fn len(&self) -> usize {
         self.remaining
     }
 }
 
-impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterator
+impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<MaybeUninit<T>>>> DoubleEndedIterator
     for SomeIter<'b, T, I>
 {
     fn next_back(&mut self) -> Option<&'b T> {
         for slot in self.inner.by_ref().rev() {
-            if let Some(v) = slot {
+            if let Some(m) = slot {
                 self.remaining -= 1;
-                return Some(v);
+                //SAFETY: occupied ⇒ written (alloc-write-read)
+                return Some(unsafe { assume_ref(m) });
             }
         }
         None
@@ -247,9 +315,11 @@ fn dual_scan_outward<T: Sized, const D: bool>(
     NearestNone::NotFound
 }
 
-///Vec-backed store.
+///Vec-backed store. slots are `Option<MaybeUninit<T>>`: the discriminant is the
+///occupancy flag (store-internal — flipped by `alloc`), the payload is exempt
+///from validity until its reservation's write completes (alloc-write-read).
 pub struct VecStore<T> {
-    buf:      Vec<Option<T>>,
+    buf:      Vec<Option<MaybeUninit<T>>>,
     occupied: usize,
 }
 
@@ -260,36 +330,66 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
 
     fn from_vec(v: Vec<Option<T>>) -> Self {
         let occupied = v.iter().filter(|s| s.is_some()).count();
-        Self { buf: v, occupied }
+        Self { buf: v.into_iter().map(|o| o.map(MaybeUninit::new)).collect(), occupied }
     }
 
-    fn into_vec(self) -> Vec<Option<T>> {
-        self.buf
+    ///take the buf out (Drop would block a plain move) — the payloads leave via
+    ///`assume_init_read`, so the leftover buf drops empty.
+    fn into_vec(mut self) -> Vec<Option<T>> {
+        std::mem::take(&mut self.buf)
+            .into_iter()
+            .map(|o| o.map(|m| unsafe { m.assume_init_read() }))
+            .collect()
     }
 
     fn get(&self, ptr: usize) -> &T {
-        self.buf[ptr].as_ref().expect("store: None at occupied ptr")
+        self.buf[ptr].as_ref().map(|m| unsafe { assume_ref(m) }).expect("store: None at occupied ptr")
     }
 
     fn get_mut(&mut self, ptr: usize) -> &mut T {
-        self.buf[ptr].as_mut().expect("store: None at occupied ptr")
+        self.buf[ptr].as_mut().map(|m| unsafe { assume_mut(m) }).expect("store: None at occupied ptr")
     }
 
     fn slot(&self, p: usize) -> Option<&T> {
-        self.buf[p].as_ref()
+        self.buf[p].as_ref().map(|m| unsafe { assume_ref(m) })
     }
 
     fn slot_mut(&mut self, p: usize) -> Option<&mut T> {
-        self.buf[p].as_mut()
+        self.buf[p].as_mut().map(|m| unsafe { assume_mut(m) })
     }
 
     fn get_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut T) {
         assert!(a != b, "get_disjoint_mut: a == b");
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
         let (left, right) = self.buf.split_at_mut(hi);
-        let lo_ref = left[lo].as_mut().expect("get_disjoint_mut: None slot");
-        let hi_ref = right[0].as_mut().expect("get_disjoint_mut: None slot");
+        let lo_ref = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
+        let hi_ref = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
         if a < b { (lo_ref, hi_ref) } else { (hi_ref, lo_ref) }
+    }
+
+    fn alloc(&mut self, i: usize) -> &mut MaybeUninit<T> {
+        let slot = &mut self.buf[i];
+        assert!(slot.is_none(), "alloc into occupied");
+        self.occupied += 1;
+        slot.insert(MaybeUninit::uninit())
+    }
+
+    fn alloc_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut MaybeUninit<T>) {
+        assert!(a != b, "alloc_disjoint_mut: a == b");
+        debug_assert!(self.buf[a].is_some(), "alloc_disjoint_mut: a is None");
+        debug_assert!(self.buf[b].is_none(), "alloc_disjoint_mut: b is Some");
+        self.occupied += 1; //reserve b — the split's drain is the write
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let (left, right) = self.buf.split_at_mut(hi);
+        if a < b {
+            let x = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            let cell = right[0].insert(MaybeUninit::uninit());
+            (x, cell)
+        } else {
+            let cell = left[lo].insert(MaybeUninit::uninit());
+            let x = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            (x, cell)
+        }
     }
 
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
@@ -416,7 +516,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
             let target = (c * 2).max(1);
             self.buf.reserve(target - c);
         }
-        self.buf.insert(0, Some(v));
+        self.buf.insert(0, Some(MaybeUninit::new(v)));
         self.occupied += 1;
     }
 
@@ -427,7 +527,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
             let target = (c * 2).max(1);
             self.buf.reserve(target - c);
         }
-        self.buf.push(Some(v));
+        self.buf.push(Some(MaybeUninit::new(v)));
         self.occupied += 1;
         len
     }
@@ -495,19 +595,11 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
         }
     }
 
-    fn insert(&mut self, v: T, i: usize) {
+    fn free(&mut self, i: usize) -> T {
         let slot = &mut self.buf[i];
-        assert!(slot.is_none(), "insert into occupied");
-        *slot = Some(v);
-        self.occupied += 1;
-    }
-
-    fn remove(&mut self, i: usize) -> T {
-        let slot = &mut self.buf[i];
-        assert!(slot.is_some(), "remove empty");
-        let v = slot.take().unwrap();
+        assert!(slot.is_some(), "free empty");
         self.occupied -= 1;
-        v
+        unsafe { slot.take().expect("free empty").assume_init_read() }
     }
 
     fn split(&mut self, at: usize) -> Self {
@@ -525,7 +617,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
         if v.is_some() {
             self.occupied -= 1;
         }
-        v
+        v.map(|m| unsafe { m.assume_init_read() })
     }
 
     fn pop_back(&mut self) -> Option<T> {
@@ -537,7 +629,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
         if v.is_some() {
             self.occupied -= 1;
         }
-        v
+        v.map(|m| unsafe { m.assume_init_read() })
     }
 
     fn iter<'b>(
@@ -546,40 +638,25 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
     where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
     }
-
-    fn slots<'b>(&self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where T: 'b {
-        std::iter::empty::<&'b Option<T>>()
-    }
-
-    fn slice_iter<'b>(
-        &'b self,
-        _from: usize,
-        _to: usize,
-    ) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where
-        T: 'b,
-    {
-        std::iter::empty::<&'b Option<T>>()
-    }
-
 }
 
-impl<T> VecStore<T> {
-    /// SAFETY: ptr must be in-bounds and occupied.
-    pub(crate) unsafe fn get_unchecked(&self, ptr: usize) -> &T {
-        unsafe { self.buf.get_unchecked(ptr).as_ref().unwrap_unchecked() }
-    }
-
-    /// SAFETY: ptr must be in-bounds and occupied.
-    pub(crate) unsafe fn get_unchecked_mut(&mut self, ptr: usize) -> &mut T {
-        unsafe { self.buf.get_unchecked_mut(ptr).as_mut().unwrap_unchecked() }
+impl<T> Drop for VecStore<T> {
+    fn drop(&mut self) {
+        //Some ⇒ written (the alloc-write-read contract) — `MaybeUninit` never
+        //drops `T` on its own, so payloads must be dropped here. dropping a
+        //store with a pending reservation (Some not yet written) violates that
+        //contract and is UB — the one place it turns dangerous.
+        for slot in &mut self.buf {
+            if let Some(m) = slot {
+                unsafe { m.assume_init_drop() };
+            }
+        }
     }
 }
 
-///VecDeque-backed store.
+///VecDeque-backed store. slots are `Option<MaybeUninit<T>>` (see `VecStore`).
 pub struct DequeStore<T> {
-    buf:      VecDeque<Option<T>>,
+    buf:      VecDeque<Option<MaybeUninit<T>>>,
     occupied: usize,
 }
 
@@ -590,27 +667,32 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
 
     fn from_vec(v: Vec<Option<T>>) -> Self {
         let occupied = v.iter().filter(|s| s.is_some()).count();
-        Self { buf: v.into(), occupied }
+        Self { buf: v.into_iter().map(|o| o.map(MaybeUninit::new)).collect(), occupied }
     }
 
-    fn into_vec(self) -> Vec<Option<T>> {
-        self.buf.into()
+    ///take the buf out (Drop would block a plain move) — the payloads leave via
+    ///`assume_init_read`, so the leftover buf drops empty.
+    fn into_vec(mut self) -> Vec<Option<T>> {
+        std::mem::take(&mut self.buf)
+            .into_iter()
+            .map(|o| o.map(|m| unsafe { m.assume_init_read() }))
+            .collect()
     }
 
     fn get(&self, ptr: usize) -> &T {
-        self.buf[ptr].as_ref().expect("store: None at occupied ptr")
+        self.buf[ptr].as_ref().map(|m| unsafe { assume_ref(m) }).expect("store: None at occupied ptr")
     }
 
     fn get_mut(&mut self, ptr: usize) -> &mut T {
-        self.buf[ptr].as_mut().expect("store: None at occupied ptr")
+        self.buf[ptr].as_mut().map(|m| unsafe { assume_mut(m) }).expect("store: None at occupied ptr")
     }
 
     fn slot(&self, p: usize) -> Option<&T> {
-        self.buf[p].as_ref()
+        self.buf[p].as_ref().map(|m| unsafe { assume_ref(m) })
     }
 
     fn slot_mut(&mut self, p: usize) -> Option<&mut T> {
-        self.buf[p].as_mut()
+        self.buf[p].as_mut().map(|m| unsafe { assume_mut(m) })
     }
 
     fn get_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut T) {
@@ -619,9 +701,35 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
         //make the deque's logical range contiguous (indices stable), then split.
         let slice = self.buf.make_contiguous();
         let (left, right) = slice.split_at_mut(hi);
-        let lo_ref = left[lo].as_mut().expect("get_disjoint_mut: None slot");
-        let hi_ref = right[0].as_mut().expect("get_disjoint_mut: None slot");
+        let lo_ref = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
+        let hi_ref = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("get_disjoint_mut: None slot");
         if a < b { (lo_ref, hi_ref) } else { (hi_ref, lo_ref) }
+    }
+
+    fn alloc(&mut self, i: usize) -> &mut MaybeUninit<T> {
+        let slot = &mut self.buf[i];
+        assert!(slot.is_none(), "alloc into occupied");
+        self.occupied += 1;
+        slot.insert(MaybeUninit::uninit())
+    }
+
+    fn alloc_disjoint_mut(&mut self, a: usize, b: usize) -> (&mut T, &mut MaybeUninit<T>) {
+        assert!(a != b, "alloc_disjoint_mut: a == b");
+        debug_assert!(self.buf[a].is_some(), "alloc_disjoint_mut: a is None");
+        debug_assert!(self.buf[b].is_none(), "alloc_disjoint_mut: b is Some");
+        self.occupied += 1; //reserve b — the split's drain is the write
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let slice = self.buf.make_contiguous();
+        let (left, right) = slice.split_at_mut(hi);
+        if a < b {
+            let x = left[lo].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            let cell = right[0].insert(MaybeUninit::uninit());
+            (x, cell)
+        } else {
+            let cell = left[lo].insert(MaybeUninit::uninit());
+            let x = right[0].as_mut().map(|m| unsafe { assume_mut(m) }).expect("alloc_disjoint_mut: None slot");
+            (x, cell)
+        }
     }
 
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<usize>) -> usize {
@@ -940,7 +1048,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
             let target = (c * 2).max(c + 1);
             let _ = self.buf.reserve(target - c);
         }
-        self.buf.push_front(Some(v));
+        self.buf.push_front(Some(MaybeUninit::new(v)));
         self.occupied += 1;
     }
 
@@ -951,7 +1059,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
             let target = (c * 2).max(c + 1);
             let _ = self.buf.reserve(target - c);
         }
-        self.buf.push_back(Some(v));
+        self.buf.push_back(Some(MaybeUninit::new(v)));
         self.occupied += 1;
         len
     }
@@ -1035,19 +1143,11 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
         }
     }
 
-    fn insert(&mut self, v: T, i: usize) {
+    fn free(&mut self, i: usize) -> T {
         let slot = &mut self.buf[i];
-        assert!(slot.is_none(), "insert into occupied");
-        *slot = Some(v);
-        self.occupied += 1;
-    }
-
-    fn remove(&mut self, i: usize) -> T {
-        let slot = &mut self.buf[i];
-        assert!(slot.is_some(), "remove empty");
-        let v = slot.take().unwrap();
+        assert!(slot.is_some(), "free empty");
         self.occupied -= 1;
-        v
+        unsafe { slot.take().expect("free empty").assume_init_read() }
     }
 
     fn split(&mut self, at: usize) -> Self {
@@ -1065,7 +1165,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
         if v.is_some() {
             self.occupied -= 1;
         }
-        v
+        v.map(|m| unsafe { m.assume_init_read() })
     }
 
     fn pop_back(&mut self) -> Option<T> {
@@ -1077,7 +1177,7 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
         if v.is_some() {
             self.occupied -= 1;
         }
-        v
+        v.map(|m| unsafe { m.assume_init_read() })
     }
 
     fn iter<'b>(
@@ -1086,21 +1186,16 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
     where T: 'b {
         SomeIter { inner: self.buf.iter(), remaining: self.occupied }
     }
+}
 
-    fn slots<'b>(&'b self) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where T: 'b {
-        std::iter::empty::<&'b Option<T>>()
-    }
-
-    fn slice_iter<'b>(
-        &'b self,
-        _from: usize,
-        _to: usize,
-    ) -> impl ExactSizeIterator<Item = &'b Option<T>> + 'b
-    where
-        T: 'b,
-    {
-        std::iter::empty::<&'b Option<T>>()
+impl<T> Drop for DequeStore<T> {
+    fn drop(&mut self) {
+        //as `VecStore`'s: Some ⇒ written (alloc-write-read).
+        for slot in &mut self.buf {
+            if let Some(m) = slot {
+                unsafe { m.assume_init_drop() };
+            }
+        }
     }
 }
 
