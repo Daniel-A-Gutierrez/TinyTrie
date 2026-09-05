@@ -82,6 +82,16 @@ if some ordering of the mutations keeps the tree walk-safe, write-early
 suffices; if *no* ordering does (postorder's internal root split), all slots
 must be reserved before any mutation.
 
+**Addendum (found by the postorder leaf root split): a WRITTEN slot can't be
+stolen, but it can MOVE.** An intermediate `find_slot` between opening a slot
+and using it may grow (spread), remapping every live phys — the walker state
+gets the `found.grew` fixup, but so must every `OpenSlot` and every captured
+node phys the flow still holds (the postorder leaf split's `y_open`/`r_phys`,
+the internal split's `r_phys` after `open_two`). Miss one and the flow adopts
+or drains at the vacated slot — a `None`-read panic at best, corruption at
+worst. The rule: a `find_slot` inside a flow is a phys-remapping event for
+everything the flow holds, not just for the walker.
+
 ---
 
 ## 3. Reparenting during the run walk: post-slide entries, pre-slide layout
@@ -190,17 +200,27 @@ a ghost Some (G) inside a run being walked:
 
    slots:   [ A ][ G ][ B ][ C ][ · ]     G not wired into the tree
    the walk visits only WIRED slots — next() skips G:
-   steps = hi - lo covers 4 slots, but the walk can't land on G, so the
-   endpoint lands short (or long) of the run's far edge.
+   steps = hi - lo covers 4 slots, but the walk can't land on G, so a visit
+   lands outside the run (the walk runs long past the far edge).
 ```
 
-**The fix:** one always-on `assert!` at the end of the fixup's run walk —
-after `steps` walk steps the position must be the run's far edge *exactly*.
-The walk only lands on wired slots, so any ghost inside the run moves the
-endpoint and fires the assert **at the moment of the inconsistency**, with a
-message naming the likely cause. Cheap (one integer compare) and load-bearing
-precisely because the store is `MaybeUninit`-backed (§7) and the failure mode
-is otherwise UB rather than a panic.
+**The fix:** two always-on asserts in the fixup's run walk. Per visit: every
+one of the `steps` visits must land inside the closed run `[lo, hi]` — the run
+is None-free by `find_slot`'s construction, and the walk is forward-only, so
+`steps` in-range visits are exactly the members. At the end: the walk's
+position must be the run's far edge exactly — against a consistent layout the
+walk visits the run in slot order, so any ghost lands the endpoint short or
+long. Both fire **at the moment of the inconsistency**. Cheap (integer
+compares) and load-bearing precisely because the store is `MaybeUninit`-backed
+(§7) and the failure mode is otherwise UB rather than a panic.
+
+The endpoint check has ONE sanctioned skew: the in-order hop's slide (§11)
+walks its run in LOGICAL order — the misplaced hoppee is visited first — so
+when the hoppee is itself the far-edge member the walk ends one below far.
+`fixup`/`apply_slide` take a `far_short` parameter the hop passes exactly
+then; every other caller passes false and gets the strict invariant. (The
+skew is only one: a mid-run hoppee is visited first but the walk still ends
+on the far member.)
 
 ---
 
@@ -313,6 +333,75 @@ canary (§6) on a later insert.
 
 Fix: ascend *first*, descend into the previous sibling's subtree only when
 `idx > 0`.
+
+---
+
+## 11. The hop's fixup walk: the anchor must follow the None
+
+**The trap.** The in-order hop relocates the one node whose logical gap
+(`in_boundary` over its post-insert children) no longer matches its physical
+slot — mid-hop, walk order and slot order *legitimately* diverge at that
+node. The hop's slot-opening slide therefore needs a fixup walk whose anchor
+depends on **where the None landed relative to the hoppee**:
+
+```
+gap before child[b]; hoppee H physically past it; None found to the right of the gap:
+
+case A — None BEYOND H (H inside the run):
+   slots: [ .. child[b-1] ][ members.. ][ H ][ .. ][ ·None ]
+   anchor LEFT edge (after subtree_last(child[b-1])): next() of child[b-1] IS
+   H via the ancestry stack — no entry read, position-true — then descents run
+   through unprocessed entries only. anchoring at the right edge instead, the
+   walk starts inside the run and can never reach H (H is logically BEFORE
+   child[b]) — it walks off the block.
+
+case B — None BETWEEN gap and H (H outside the run):
+   slots: [ .. child[b-1] ][ members.. ][ ·None ][ H ]
+   anchor RIGHT edge (subtree_first(child[b]) — exactly the slide's `to`):
+   the walk starts on the run's first member and never crosses H. anchoring
+   at the left edge instead, next() of child[b-1] is H — a NON-member —
+   consuming a visit and rewriting its entries with a phantom delta.
+
+identity or None left of the anchor: the run is at/below the left anchor and
+the walker is in it — left edge both times.
+```
+
+**The rule:** `hop_current` probes with the left-edge anchor, then picks the
+walk side by comparing `ns.from` against the hoppee's phys. The general
+principle is §1's — no walk may run over a node whose logical position
+disagrees with its slot — except the hoppee itself, whose visit must be
+arranged to be entry-free (via the stack) and first, or avoided entirely.
+Case A's walk ends on the far edge as usual UNLESS the hoppee IS the far-edge
+member (it was visited first, so the last logical member is one below) — the
+one `far_short` skew of §6; `hop_current` passes it exactly then
+(`ns.from == hoppee + 1 && steps > 1`).
+
+---
+
+## 12. In-order `prev`/`subtree_last`: an after-all node IS the region's last
+
+**The trap.** The in-order impls reused postorder's `rightmost_leaf` for
+`prev` and `subtree_last`. But in-order, a node at `b == cc` sits *after all*
+its children — it is its region's LAST node, and a bare rightmost-leaf
+descent walks right past it:
+
+```
+node X, cc = 2 ≤ DEGREE/2 ⇒ b == 2 ⇒ after-all:
+   walk order:  [ child0's region ][ child1's region ][ X ]
+   subtree_last = X — but rightmost_leaf returns child1's rightmost leaf,
+   two slots short. prev() of the node after child1's region lands past X —
+   X is never visited, and a fixup run walk over the region SKIPS it.
+```
+
+**Why it was easy to miss:** preorder's subtree-last is a rightmost leaf and
+postorder's is the node itself — in-order is the *conditional* (stop on
+after-all, descend right otherwise), so the borrowed helper is wrong exactly
+when a rightmost-path internal is underfull. The fixup canary (§6) is what
+surfaced it: the skipped member moved a walk visit out of the run.
+
+**The fix:** in-order `subtree_last` descends `child[cc-1]` only while
+`b < cc`, stopping on the after-all node; `prev` uses it (not the bare leaf
+descent) in both its descend and ascend-loop arms.
 
 ---
 

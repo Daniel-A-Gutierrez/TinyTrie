@@ -19,7 +19,6 @@ pub struct GrewFixup {
 ///record's phys remaps (from → to). swaps emit no self-fixup — the mover applies
 ///this by hand to block data + walker state, and `split_root` returns it as the
 ///old-root→new-root remap for external vaddr holders (arena parents) to apply.
-///`identity(p)` for no-op remaps.
 #[derive(Clone, Copy, Debug)]
 pub struct SwapFixup {
     pub from: usize,
@@ -162,7 +161,9 @@ impl Fixup for NoneSlide {
 }
 
 impl SwapFixup {
-    pub fn identity(p: usize) -> Self {
+    ///`from == to` — a remap that moves nothing (the new root kept the old
+    ///root's address; external holders apply it as a no-op).
+    pub fn no_op(p: usize) -> Self {
         Self { from: p, to: p }
     }
 }

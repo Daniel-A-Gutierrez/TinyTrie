@@ -1,5 +1,20 @@
 # Structure
 The most recent top level entries are towards the top.
+This file used to be notes/doa.md
+
+# What next
+testing
+splitting
+testing
+bfo
+leafblock & inline leafblock
+readdress?  cross block fixup? 
+
+tests are annoying, i dont want to worry about compilation errors from them when making changes. 
+id rather only link them in when we change something, then archive them after the commit. 
+
+
+# Did devops / workflow stuff
 
 # Updates for the agent : 
 A block intrinsically holds a treelike structure. Graphs cant be trivially ordered, an arena for them and other unordered nodes may as well be a Vec<T>. 

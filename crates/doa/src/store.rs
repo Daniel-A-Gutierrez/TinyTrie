@@ -532,8 +532,9 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
     fn spread(&mut self, offset: usize) {
         let len = self.buf.len();
         debug_assert!(offset < 2, "spread: offset must be 0 or 1");
+        //reserve is relative to len: `len` more slots makes cap ≥ 2*len
         if self.buf.capacity() < len * 2 {
-            self.buf.reserve(len * 2 - self.buf.capacity());
+            self.buf.reserve(len);
         }
 
         // one pass: take src i -> value to dst=2i+offset, None to the pair gap.
@@ -985,7 +986,8 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
                     && let Some(l) =
                         back.get(blo..bp).and_then(|s| s.iter().rposition(|o| o.is_none()))
                 {
-                    return Some(fl + l);
+                    //rposition is relative to `blo`, not the back slice's start
+                    return Some(fl + blo + l);
                 }
                 if min < fl {
                     front

@@ -51,9 +51,15 @@ I'd split them into three kinds — worldview shifts, choreography, and sharp ed
 6. The modes as workload bets (breadth, not depth). Uniform, Anchored, Pluripotent aren't three algorithms so much as three answers to "where will space be needed next?" — answered with different initial translator knobs, different store backends, and different find-space ladders. None is individually hard, but their interaction surface (which one pins the root implicitly, which one grows at the edges and compensates the translator instead of moving anything) is a lot of context to hold at once.
 
 
+## Style
+- comment at every call that alters the walker's position or the node it points
+  to (`descend`/`ascend`/`set_position`/`swap_current`, raw `block_mut().swap`,
+  the post-slide state restores) — say what the walker names afterward. flows
+  read as choreography; silent repositioning is where the bugs hide.
+
 ## Workflow
 
-- sessions start from a clean tree: the previous session ends with a commit.
+- sessions start from a clean tree: the previous session ends with a commit. remind the user before making code edits if the git diff is dirty. 
 - session-end routine, in order: run `skeletonize.py` (regenerates the doc/
   outlines), spawn a **fresh** review agent (not a fork) on the session's diff —
   it reads this file and subtle_bugs.md first so it doesn't re-flag intentional
@@ -64,12 +70,16 @@ I'd split them into three kinds — worldview shifts, choreography, and sharp ed
   never auto-applied.
 - "defer" means written into this file's Status or into subtle_bugs.md — never
   "remembered".
+- do not update the claude.toml until the session is ending. 
 
 # Style
 - doc comments are the single source of truth for item outlines - keep them minimal, don't make them a summary, just purpose, invariants, and panics. 
 - single line comments may be introduced in long functions to concisely explain what a block of code does
 - a comment must never be longer than the source it applies to. 
-- function names and variables should be concise but explanatory - avoid arbitrary letters and abbreviations. 
+- function names and variables should be concise but explanatory - avoid arbitrary letters and abbreviations.
+- module item order: `use` → `mod` → structs → types → traits → impls → macro
+  invocations. a macro is defined where its output class lives — one generating
+  structs sits with the structs, one generating impls with the impls.
 - each file's `//!` header carries its purpose + invariants. this file keeps the conceptual
   map only — item inventories live in doc/ and are generated, never hand-edited.
 
@@ -90,8 +100,11 @@ files' `//!` headers restate purpose + invariants next to the code.
   grow/spread/split/reservation primitives; the alloc-write-read contract.
 - `blocks.rs` — `Block` (store + translator + block data + mode) + the shared
   `BlockTrait`/per-mode `BlockOps` surfaces + the three modes.
-- `walker.rs` — `Node`/`SplittableNode` contract + the three walker layers +
-  the split driver; `B` is a trait param at every level, `O` is always `B::O`.
+- `walker.rs` — `Node`/`SplittableNode` contract + the three walker layers
+  (`NodeWalkerMut` = the primitive mask, `TreeWalkMut` = the tree-level verbs,
+  `TreeWalkHelper` = crate-internal choreography: slide engine, hop, reparent
+  machinery) + the split driver; `B` is a trait param at every level, `O` is
+  always `B::O`.
 - `treeblock.rs` — `TreeBlock` (param-less tree-block marker) + the `walker`/
   `search` free-fn constructors over consumer `From` impls.
 - `subtle_bugs.md` — nuanced correctness issues solved, with diagrams; the rules
@@ -102,10 +115,19 @@ files' `//!` headers restate purpose + invariants next to the code.
 
 ## Testing
 
-`src/tests/` — `store.rs` (fully commented; `store.rs` still wires its `#[cfg(test)]`
-module) and `block.rs` (live but unwired code against the deleted pre-refactor API —
-needs adaptation, not uncommenting). No btree test file exists. When the block op
-surface stabilizes, adapt the store/block invariant tests to the current API.
+`src/tests/` — `store.rs` (live: reference-model torture + exhaustive slide/find/
+find-2 matrices for both backends incl. wrapped-deque paths, spread/split/pop
+coverage, drop accounting, contract panics; wired via `store.rs`'s `#[cfg(test)]`
+`#[path]` module) and `walker.rs` (live: a parent-storing B+ consumer run under
+all three orderings — 240-key split-driver torture (ascending/descending/stride)
++ hand-assembled `insert_child`, validated by structural DFS (stored parent
+fields, separator re-derivation, leaf order, reachable == occupied) and
+`TreeWalk` order vs a reference DFS with strictly increasing phys; wired via
+`walker.rs` the same way). `block.rs` stays unwired (pre-refactor API — needs
+adaptation). Run targeted: `cargo test -p doa --lib store::tests` /
+`walker::tests`; uninit/leaks: `cargo +nightly miri test -p doa --lib <filter>`
+(slow — recompiles + interprets). Tests are commented out when API churn would
+break compilation mid-development; they are live now.
 ⚠ Running the full `cargo test` in this crate has crashed the IDE out of memory in
 the past — run targeted tests.
 
@@ -115,19 +137,26 @@ Compiles (lib + workspace); `examples/btree.rs` — a B+ tree consumer — runs 
 100 keys through the split driver (leaf/internal splits, multiple root promotions,
 height ≥ 2), all anchor kinds, in-run + out-of-run slides.
 
-Untested (compile-verified only, no consumer): the in-order parent hop (split and
-insert triggers), the postorder split arms, the `STORES_PARENTS` reparent machinery
-(`swap_current`/`reparent_run`/`adopt_node`), `find_2_slots`/`open_two`/`TwoSlide`.
-The example is preorder + parent-free; an in/post consumer example, ideally
-parent-storing, is the natural next test and would exercise all of them at once.
+`src/tests/walker.rs` exercises, under all three orderings with a parent-storing
+consumer: the split driver's arms (leaf/internal/root, pre/in/post), the in-order
+parent hop (insert + split triggers), the postorder X-relocation swaps,
+`find_2_slots`/`open_two`/`TwoSlide`, and the reparent matrix
+(`swap_current`/`reparent_run`/`adopt_node`) — miri-clean. Testing flushed out
+and fixed: `VecStore::spread`'s reserve (len-relative, not cap-relative — OOB
+write); `DequeStore::find_slot`'s back-slice `blo` offset; in-order `split_root`'s
+childless-root underflow; in-order `prev`/`subtree_last` overshooting after-all
+nodes (subtle_bugs §12); the hop's walk anchor picked by None-side (§11); the §6
+canary recast (per-visit range + endpoint assert with the hop's one-slot
+`far_short` skew); stale live-phys across intermediate
+find_slot grows in both postorder root splits (§2 addendum).
 
 Not designed/wired: the walker-driven union-node `drop_tree` (design deferred);
 `BlockExhausted` cleave handling (arena); deletion rebalancing/merges;
-serialization; the test suites; `leafblock`/`inline_leafblock`.
+serialization; `leafblock`/`inline_leafblock`; the `block.rs` test adaptation.
 
 ## Future Work
 
-- split hardening — in/post consumer examples (parent-storing) exercising the hop, the postorder arms, and the reparent matrix; a canary negative test (alloc-in-run-without-wire → expect the panic).
+- split hardening — a canary negative test (alloc-in-run-without-wire → expect the panic); grow/double-slide coverage beyond `Uniform` (Anchored/Pluripotent consumers).
 - extend the btree consumer (deletes with leaf removal via `remove_child`, underfull merges) and adapt the archived tests.
 - `keys()` iter hook on the cursor so B+ shapes share the child-min fetch / separator re-derivation / equal-right routing in-crate.
 - ordered iteration over K/V (`IntoIterator` on the walker + `is_leaf` filter) + a range surface.
@@ -135,9 +164,3 @@ serialization; the test suites; `leafblock`/`inline_leafblock`.
 - graduation — pluripotent → concrete strategy at len == half_ptr.
 - `Fixup::applies` optimization (elide unnecessary runtime checks).
 - trie integration.
-
-# Updating the Claude.md
-Keep the structure a breadth first tree of the subsections - at the top the 'root' tells a reader what this crate is and what its purpose is. There should then be a 1 line description of each subsection that will follow.
-Each per-file section is conceptual only: what the file is, its broad purpose, the invariants it maintains - a few lines at most. Item inventories are NOT maintained here: they live in `doc/<name>.md`, generated by `skeletonize.py` from the source doc comments. To change an outline, change the source comments and rerun `skeletonize.py`.
-The document should be ordered so as to maintain a contextual foothold for the reader - the root covered big picture, so ordering the subsections to build up from the lowest level -> highest level makes sense logically.
-Maintain this section at the end of the claude.md .

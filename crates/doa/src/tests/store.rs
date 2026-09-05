@@ -1,782 +1,926 @@
-// use super::*;
+//!store tests: reference-model torture + exhaustive slide/find matrices for both
+//!backends, drop-counted leak checks. run targeted (full-crate test runs have
+//!OOM'd the IDE): `cargo test -p doa --lib store::tests`. miri (uninit reads +
+//!leaks): `cargo +nightly miri test -p doa --lib store::tests`.
+use std::cell::Cell;
+use std::rc::Rc;
 
-// ///store-agnostic invariants after any mutation.
-// fn assert_inv<S: Store<'static, u64>>(s: &S, max_cap: usize) {
-//     let occ = s.occupied();
-//     let len = s.len();
-//     let cap = s.cap();
-//     assert!(occ <= len, "occ={occ} > len={len}");
-//     assert!(len <= cap, "len={len} > cap={cap}");
-//     assert!(cap <= max_cap, "cap={cap} > max={max_cap}");
-//     assert_eq!(s.iter().count(), occ, "fwd iter count != occupied");
-//     assert_eq!(s.iter().rev().count(), occ, "rev iter count != occupied");
-// }
+use super::*;
+use crate::metadata::TwoSlide;
 
-// ///reference slide: rotate [lo,hi] so the element at `from` lands at `to`.
-// fn ref_slide(buf: &mut [Option<u64>], from: usize, to: usize) {
-//     if from == to {
-//         return;
-//     }
-//     let (lo, hi) = if from > to { (to, from) } else { (from, to) };
-//     if from > to {
-//         buf[lo..=hi].rotate_right(1);
-//     } else {
-//         buf[lo..=hi].rotate_left(1);
-//     }
-// }
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
 
-// ///reference find_slot — faithful to VecStore::find_slot's DIR-biased, budget-bounded,
-// ///pin-clamped contract. (from,to) == NoneSlide{from,to}.
-// fn ref_find_slot(
-//     buf: &[Option<u64>],
-//     pos: usize,
-//     dir: bool,
-//     budget: usize,
-//     pin: Option<usize>,
-// ) -> Option<(usize, usize)> {
-//     let max = (u32::MAX as usize).min(buf.len()).min(pos + budget);
-//     let min = pos.saturating_sub(budget);
-//     let (min, max) = match pin {
-//         Some(p) if p == pos => {
-//             if dir {
-//                 (pos, max)
-//             } else {
-//                 (min, pos)
-//             }
-//         }
-//         Some(p) if p < pos => (min.max(p + 1), max),
-//         Some(p) => (min, max.min(p)),
-//         None => (min, max),
-//     };
-//     let lcnt = pos - min;
-//     let rcnt = max.saturating_sub(pos + 1);
-//     if dir {
-//         if rcnt > 0
-//             && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
-//         {
-//             return Some((pos + 1 + r, pos + 1));
-//         }
-//         if lcnt > 0
-//             && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
-//         {
-//             return Some((min + l, pos));
-//         }
-//         None
-//     } else {
-//         if lcnt > 0
-//             && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
-//         {
-//             return Some((min + l, pos - 1));
-//         }
-//         if rcnt > 0
-//             && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
-//         {
-//             return Some((pos + 1 + r, pos));
-//         }
-//         None
-//     }
-// }
+///store-agnostic invariants after any mutation.
+fn assert_inv<S: Store<'static, u64>>(s: &S) {
+    let (occ, len, cap) = (s.occupied(), s.len(), s.cap());
+    assert!(occ <= len, "occ={occ} > len={len}");
+    assert!(len <= cap, "len={len} > cap={cap}");
+    assert_eq!(s.iter().copied().count(), occ, "iter count != occupied");
+    assert_eq!(s.iter().rev().copied().count(), occ, "rev iter count != occupied");
+    assert_eq!(s.iter().len(), occ, "ExactSizeIterator len != occupied");
+}
 
-// ///reference find_nearest_slot — outward dual scan, dir tie-break, same `to` rules.
-// fn ref_nearest(
-//     buf: &[Option<u64>],
-//     pos: usize,
-//     dir: bool,
-//     budget: usize,
-//     pin: Option<usize>,
-// ) -> Option<(usize, usize)> {
-//     let max = (u32::MAX as usize).min(buf.len()).min(pos + budget);
-//     let min = pos.saturating_sub(budget);
-//     let (min, max) = match pin {
-//         Some(p) if p == pos => {
-//             if dir {
-//                 (pos, max)
-//             } else {
-//                 (min, pos)
-//             }
-//         }
-//         Some(p) if p < pos => (min.max(p + 1), max),
-//         Some(p) => (min, max.min(p)),
-//         None => (min, max),
-//     };
-//     let lcnt = pos - min;
-//     let rcnt = max.saturating_sub(pos + 1);
-//     let m = lcnt.min(rcnt);
-//     for k in 0..m {
-//         let l = buf[pos - 1 - k].is_none();
-//         let r = buf[pos + 1 + k].is_none();
-//         if l && r {
-//             return if dir {
-//                 Some((pos + 1 + k, pos + 1))
-//             } else {
-//                 Some((pos - 1 - k, pos - 1))
-//             };
-//         }
-//         if l {
-//             return Some((pos - 1 - k, if !dir { pos - 1 } else { pos }));
-//         }
-//         if r {
-//             return Some((pos + 1 + k, if dir { pos + 1 } else { pos }));
-//         }
-//     }
-//     for k in m..lcnt {
-//         if buf[pos - 1 - k].is_none() {
-//             return Some((pos - 1 - k, if !dir { pos - 1 } else { pos }));
-//         }
-//     }
-//     for k in m..rcnt {
-//         if buf[pos + 1 + k].is_none() {
-//             return Some((pos + 1 + k, if dir { pos + 1 } else { pos }));
-//         }
-//     }
-//     None
-// }
+///logical slot contents, None holes included.
+fn snap<S: Store<'static, u64>>(s: &S) -> Vec<Option<u64>> {
+    let len = s.len();
+    let mut v = Vec::with_capacity(len);
+    for i in 0..len {
+        v.push(s.slot(i).copied());
+    }
+    v
+}
 
-// // ---------------------------------------------------------------------------
-// // VecStore
-// // ---------------------------------------------------------------------------
-// mod vec {
-//     use super::*;
+///reference slide: rotate [lo,hi] so the element at `from` lands at `to`.
+fn ref_slide(buf: &mut [Option<u64>], from: usize, to: usize) {
+    if from == to {
+        return;
+    }
+    let (lo, hi) = if from > to { (to, from) } else { (from, to) };
+    if from > to {
+        buf[lo..=hi].rotate_right(1);
+    } else {
+        buf[lo..=hi].rotate_left(1);
+    }
+}
 
-//     const MC: usize = 16;
+///reference find_slot — faithful to VecStore::find_slot's DIR-biased, budget-bounded,
+///pin-clamped contract. returns (from, to).
+fn ref_find_slot(
+    buf: &[Option<u64>],
+    pos: usize,
+    dir: bool,
+    budget: usize,
+    pin: Option<usize>,
+) -> Option<(usize, usize)> {
+    let max = (u32::MAX as usize).min(buf.len()).min(pos + budget);
+    let min = pos.saturating_sub(budget);
+    let (min, max) = match pin {
+        Some(p) if p == pos => {
+            if dir {
+                (pos, max)
+            } else {
+                (min, pos)
+            }
+        }
+        Some(p) if p < pos => (min.max(p + 1), max),
+        Some(p) => (min, max.min(p)),
+        None => (min, max),
+    };
+    let lcnt = pos - min;
+    let rcnt = max.saturating_sub(pos + 1);
+    if dir {
+        if rcnt > 0
+            && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
+        {
+            return Some((pos + 1 + r, pos + 1));
+        }
+        if lcnt > 0
+            && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
+        {
+            return Some((min + l, pos));
+        }
+        None
+    } else {
+        if lcnt > 0
+            && let Some(l) = buf[min..pos].iter().rposition(|o| o.is_none())
+        {
+            return Some((min + l, pos - 1));
+        }
+        if rcnt > 0
+            && let Some(r) = buf[pos + 1..max].iter().position(|o| o.is_none())
+        {
+            return Some((pos + 1 + r, pos));
+        }
+        None
+    }
+}
 
-//     #[test]
-//     fn push_back_returns_index() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         assert_eq!(s.len(), 0);
-//         for i in 0..8 {
-//             let p = s.push_back(i * 10);
-//             assert_eq!(p, i as usize);
-//             assert_eq!(*s.get(p), i * 10);
-//             assert_inv(&s, MC);
-//         }
-//         assert_eq!(s.occupied(), 8);
-//     }
+///reference find_nearest_slot — outward dual scan, dir tie-break, same `to` rules.
+fn ref_nearest(
+    buf: &[Option<u64>],
+    pos: usize,
+    dir: bool,
+    budget: usize,
+    pin: Option<usize>,
+) -> Option<(usize, usize)> {
+    let max = (u32::MAX as usize).min(buf.len()).min(pos + budget);
+    let min = pos.saturating_sub(budget);
+    let (min, max) = match pin {
+        Some(p) if p == pos => {
+            if dir {
+                (pos, max)
+            } else {
+                (min, pos)
+            }
+        }
+        Some(p) if p < pos => (min.max(p + 1), max),
+        Some(p) => (min, max.min(p)),
+        None => (min, max),
+    };
+    let lcnt = pos - min;
+    let rcnt = max.saturating_sub(pos + 1);
+    let m = lcnt.min(rcnt);
+    for k in 0..m {
+        let l = buf[pos - 1 - k].is_none();
+        let r = buf[pos + 1 + k].is_none();
+        if l && r {
+            return if dir {
+                Some((pos + 1 + k, pos + 1))
+            } else {
+                Some((pos - 1 - k, pos - 1))
+            };
+        }
+        if l {
+            return Some((pos - 1 - k, if !dir { pos - 1 } else { pos }));
+        }
+        if r {
+            return Some((pos + 1 + k, if dir { pos + 1 } else { pos }));
+        }
+    }
+    for k in m..lcnt {
+        if buf[pos - 1 - k].is_none() {
+            return Some((pos - 1 - k, if !dir { pos - 1 } else { pos }));
+        }
+    }
+    for k in m..rcnt {
+        if buf[pos + 1 + k].is_none() {
+            return Some((pos + 1 + k, if dir { pos + 1 } else { pos }));
+        }
+    }
+    None
+}
 
-//     #[test]
-//     fn push_front_shifts_existing() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_front(0);
-//         assert_eq!(s.buf[0], Some(0));
-//         assert_eq!(s.buf[1], Some(1));
-//         assert_eq!(s.buf[2], Some(2));
-//         assert_eq!(s.occupied(), 3);
-//         assert_inv(&s, MC);
-//     }
+///reference spread: element i -> 2i+offset, everything else None, len doubles.
+fn ref_spread(buf: &[Option<u64>], offset: usize) -> Vec<Option<u64>> {
+    let mut out = vec![None; buf.len() * 2];
+    for (i, o) in buf.iter().enumerate() {
+        out[2 * i + offset] = *o;
+    }
+    out
+}
 
-//     #[test]
-//     #[should_panic(expected = "max capacity")]
-//     fn push_back_past_max_panics() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for _ in 0..MC {
-//             s.push_back(0);
-//         }
-//         s.push_back(0);
-//     }
+struct Rng(u64);
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 % n
+    }
+}
 
-//     #[test]
-//     fn insert_remove_slot() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for i in 0..5 {
-//             s.push_back(i);
-//         }
-//         s.remove(2);
-//         assert_eq!(s.buf[2], None);
-//         assert_eq!(s.occupied(), 4);
-//         assert_eq!(s.len(), 5);
-//         s.insert(99, 2);
-//         assert_eq!(s.buf[2], Some(99));
-//         assert_eq!(s.occupied(), 5);
-//         assert_eq!(s.len(), 5);
-//         assert_inv(&s, MC);
-//     }
+///random index of a slot in state `want_some`, if any exists.
+fn idx_where(model: &[Option<u64>], want_some: bool, rng: &mut Rng) -> Option<usize> {
+    let hits: Vec<usize> = model
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.is_some() == want_some)
+        .map(|(i, _)| i)
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    hits.get(rng.below(hits.len() as u64) as usize).copied()
+}
 
-//     #[test]
-//     #[should_panic(expected = "insert into occupied")]
-//     fn insert_occupied_panics() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         s.push_back(1);
-//         s.insert(2, 0);
-//     }
+fn p1() -> Vec<Option<u64>> {
+    vec![Some(0), None, Some(2), Some(3), None, Some(5), Some(6), None, Some(8)]
+}
 
-//     #[test]
-//     #[should_panic(expected = "remove empty")]
-//     fn remove_empty_panics() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         s.push_back(1);
-//         s.remove(0);
-//         s.remove(0);
-//     }
+///find (find_slot or find_nearest_slot per `biased`), compare against the
+///reference, then perform the full insert workflow: slide, alloc, write.
+fn insert_via<S: Store<'static, u64>>(
+    s: &mut S,
+    model: &mut Vec<Option<u64>>,
+    pos: usize,
+    biased: bool,
+    rng: &mut Rng,
+    val: &mut u64,
+    step: usize,
+) {
+    let dir = rng.below(2) == 1;
+    let budget = [0usize, 1, 2, 3, 5, 8, 16, 64][rng.below(8) as usize];
+    let pin =
+        if rng.below(2) == 1 { Some(rng.below(model.len() as u64) as usize) } else { None };
+    let (got, exp) = if biased {
+        (
+            s.find_slot(pos, dir, budget, pin).map(|m| (m.from, m.to)),
+            ref_find_slot(model, pos, dir, budget, pin),
+        )
+    } else {
+        (
+            s.find_nearest_slot(pos, dir, budget, pin).map(|m| (m.from, m.to)),
+            ref_nearest(model, pos, dir, budget, pin),
+        )
+    };
+    assert_eq!(got, exp, "step {step} pos={pos} dir={dir} b={budget} pin={pin:?}");
+    if let Some((from, to)) = exp {
+        s.slide_none(NoneSlide::new(from, to), pin);
+        ref_slide(model, from, to);
+        s.alloc(to).write(*val);
+        model[to] = Some(*val);
+        *val += 1;
+    }
+}
 
-//     #[test]
-//     fn pop_front_back() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for i in 0..5 {
-//             s.push_back(i);
-//         }
-//         assert_eq!(s.pop_front(), Some(0));
-//         assert_eq!(s.pop_back(), Some(4));
-//         assert_eq!(s.occupied(), 3);
-//         assert_eq!(s.len(), 5);
-//         assert_eq!(s.buf[0], None);
-//         assert_eq!(s.buf[4], None);
-//         assert_inv(&s, MC);
-//     }
+///combined torture: random op stream against a shadow model, full content
+///comparison after every op. covers push/pop/grow/spread/slide/find/alloc/
+///free/swap and both find fns' full contract (dir bias, budget, pin).
+fn torture<S: Store<'static, u64>>() {
+    let mut s = S::with_capacity(8);
+    let mut model: Vec<Option<u64>> = vec![None; 8];
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut val = 0u64;
+    const MAX_LEN: usize = 32;
+    for step in 0..120 {
+        let op = rng.below(12);
+        match op {
+            0 if s.len() < MAX_LEN => {
+                let p = s.push_back(val);
+                assert_eq!(p, model.len(), "step {step}");
+                model.push(Some(val));
+                val += 1;
+            }
+            1 if s.len() < MAX_LEN => {
+                s.push_front(val);
+                model.insert(0, Some(val));
+                val += 1;
+            }
+            2 => {
+                if let Some(i) = idx_where(&model, true, &mut rng) {
+                    assert_eq!(s.free(i), model[i].unwrap(), "step {step}");
+                    model[i] = None;
+                }
+            }
+            3 if !model.is_empty() => {
+                assert_eq!(s.pop_front(), model[0].take(), "step {step}");
+            }
+            4 if !model.is_empty() => {
+                let last = model.len() - 1;
+                assert_eq!(s.pop_back(), model[last].take(), "step {step}");
+            }
+            5 if s.len() + 3 <= MAX_LEN => {
+                let n = (rng.below(3) + 1) as usize;
+                let mx = s.grow_back(n);
+                for _ in 0..n {
+                    model.push(None);
+                }
+                assert_eq!(mx, model.len() - 1, "step {step}");
+            }
+            6 if s.len() + 3 <= MAX_LEN => {
+                let n = (rng.below(3) + 1) as usize;
+                s.grow_front(n);
+                for _ in 0..n {
+                    model.insert(0, None);
+                }
+            }
+            7 => {
+                if let Some(pos) = idx_where(&model, true, &mut rng) {
+                    insert_via::<S>(&mut s, &mut model, pos, true, &mut rng, &mut val, step);
+                }
+            }
+            8 => {
+                if let Some(pos) = idx_where(&model, true, &mut rng) {
+                    insert_via::<S>(&mut s, &mut model, pos, false, &mut rng, &mut val, step);
+                }
+            }
+            9 if s.len() > 0 && s.len() * 2 <= MAX_LEN => {
+                let off = rng.below(2) as usize;
+                s.spread(off);
+                model = ref_spread(&model, off);
+            }
+            10 if !model.is_empty() => {
+                let n = model.len() as u64;
+                let (a, b) = (rng.below(n) as usize, rng.below(n) as usize);
+                s.swap(a, b);
+                model.swap(a, b);
+            }
+            11 => {
+                if let Some(i) = idx_where(&model, false, &mut rng) {
+                    s.alloc(i).write(val);
+                    model[i] = Some(val);
+                    val += 1;
+                }
+            }
+            _ => {}
+        }
+        assert_inv(&s);
+        assert_eq!(snap(&s), model, "model mismatch at step {step} op {op}");
+    }
+}
 
-//     #[test]
-//     fn pop_none_slot() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         s.push_back(1);
-//         s.remove(0);
-//         assert_eq!(s.pop_front(), None);
-//         assert_eq!(s.pop_back(), None);
-//         assert_eq!(s.occupied(), 0);
-//     }
+///all (from,to) pairs vs the reference rotation, both directions, plus restore.
+fn exhaustive_slides<S: Store<'static, u64>>(s: &mut S) {
+    let orig = snap(s);
+    let n = s.len();
+    for from in 0..n {
+        for to in 0..n {
+            let before = snap(s);
+            assert_eq!(s.slide_none(NoneSlide::new(from, to), None), to);
+            let mut exp = before;
+            ref_slide(&mut exp, from, to);
+            assert_eq!(snap(s), exp, "slide {from}->{to}");
+            let _ = s.slide_none(NoneSlide::new(to, from), None);
+        }
+    }
+    assert_eq!(snap(s), orig, "slide-back did not restore");
+}
 
-//     #[test]
-//     fn spread_doubles_gaps() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for i in 0..4 {
-//             s.push_back(i);
-//         }
-//         s.spread(0);
-//         assert_eq!(s.len(), 8);
-//         assert_eq!(s.occupied(), 4);
-//         for i in 0..4 {
-//             assert_eq!(s.buf[2 * i], Some(i as u64), "even slot {i}");
-//             assert_eq!(s.buf[2 * i + 1], None, "odd slot {i}");
-//         }
-//         assert_inv(&s, MC);
-//     }
+///exhaustive find_slot + find_nearest_slot config matrix vs references:
+///every occupied pos, both dirs, budgets incl. 0 and over-length, pins incl.
+///pos itself.
+fn check_finds<S: Store<'static, u64>>(s: &S, pattern: &[Option<u64>], label: &str) {
+    let n = pattern.len();
+    for pos in 0..n {
+        if pattern[pos].is_none() {
+            continue; // contract: pos occupied
+        }
+        for dir in [false, true] {
+            for &b in &[0usize, 1, 2, 3, 100] {
+                for pin in [None, Some(0), Some(n - 1), Some(pos)] {
+                    let fs = s.find_slot(pos, dir, b, pin).map(|m| (m.from, m.to));
+                    assert_eq!(
+                        fs,
+                        ref_find_slot(pattern, pos, dir, b, pin),
+                        "{label} find_slot pos={pos} dir={dir} b={b} pin={pin:?}"
+                    );
+                    let ns = s.find_nearest_slot(pos, dir, b, pin).map(|m| (m.from, m.to));
+                    assert_eq!(
+                        ns,
+                        ref_nearest(pattern, pos, dir, b, pin),
+                        "{label} nearest pos={pos} dir={dir} b={b} pin={pin:?}"
+                    );
+                }
+            }
+        }
+    }
+}
 
-//     #[test]
-//     fn grow_front_back() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         s.push_back(7);
-//         s.grow_front(2);
-//         assert_eq!(s.len(), 3);
-//         assert_eq!(s.buf[0], None);
-//         assert_eq!(s.buf[1], None);
-//         assert_eq!(s.buf[2], Some(7));
-//         let last = s.grow_back(3);
-//         assert_eq!(last, 5);
-//         assert_eq!(s.len(), 6);
-//         assert_eq!(s.buf[5], None);
-//         assert_eq!(s.occupied(), 1);
-//         assert_inv(&s, MC);
-//     }
+///find_2_slots matrix. on Some: slides must not interfere (the crate's own
+///debug_assert guards the sphere pass; this covers the fallback pass too), the
+///pair applies independently in either order on the real store, both `to` slots
+///end up None, the element multiset is conserved, and a pinned slot keeps its
+///element. on None: the two single-anchor find_slots must either fail or
+///interfere (no valid pair existed).
+fn check_find2<S: Store<'static, u64>>(
+    s: &S,
+    pattern: &[Option<u64>],
+    label: &str,
+    dirs: &[(bool, bool)],
+    budgets: &[usize],
+    pins: &[Option<usize>],
+) {
+    let n = pattern.len();
+    let mut sorted: Vec<u64> = pattern.iter().filter_map(|o| *o).collect();
+    sorted.sort_unstable();
+    let base: Vec<Option<u64>> = pattern.to_vec();
+    for pos_a in 0..n {
+        if pattern[pos_a].is_none() {
+            continue;
+        }
+        for pos_b in 0..n {
+            if pattern[pos_b].is_none() || pos_b < pos_a {
+                continue; // mirrored pairs are assertion-redundant (both orders applied)
+            }
+            for &(dir_a, dir_b) in dirs {
+                for &budget in budgets {
+                    for &pin in pins {
+                        // lazy: format! is the hot op under miri
+                        let ctx = || {
+                            format!(
+                                "{label} pa={pos_a} da={dir_a} pb={pos_b} db={dir_b} \
+                                 b={budget} pin={pin:?}"
+                            )
+                        };
+                        match s.find_2_slots(pos_a, dir_a, pos_b, dir_b, budget, pin) {
+                            Some(ts) => {
+                                assert!(
+                                    !slides_interfere(&ts.a, &ts.b, pos_a, pos_b),
+                                    "interfering pair accepted: {}",
+                                    ctx()
+                                );
+                                if let Some(p) = pin {
+                                    assert_ne!(ts.a.to, p, "a.to == pin: {}", ctx());
+                                    assert_ne!(ts.b.to, p, "b.to == pin: {}", ctx());
+                                }
+                                let mut s1 = S::from_vec(base.clone());
+                                let mut s2 = S::from_vec(base.clone());
+                                s1.slide_none(ts.a, pin);
+                                s1.slide_none(ts.b, pin);
+                                s2.slide_none(ts.b, pin);
+                                s2.slide_none(ts.a, pin);
+                                let (m1, m2) = (snap(&s1), snap(&s2));
+                                assert_eq!(m1, m2, "order-dependent: {}", ctx());
+                                assert!(
+                                    m1[ts.a.to].is_none() && m1[ts.b.to].is_none(),
+                                    "to not open: {}",
+                                    ctx()
+                                );
+                                let mut got: Vec<u64> = m1.iter().filter_map(|o| *o).collect();
+                                got.sort_unstable();
+                                assert_eq!(got, sorted, "conservation: {}", ctx());
+                                if let Some(p) = pin
+                                    && let Some(v) = pattern[p]
+                                {
+                                    assert_eq!(m1[p], Some(v), "pin moved: {}", ctx());
+                                }
+                            }
+                            None => {
+                                let sa = s.find_slot(pos_a, dir_a, budget, pin);
+                                let sb = s.find_slot(pos_b, dir_b, budget, pin);
+                                if let (Some(sa), Some(sb)) = (sa, sb) {
+                                    assert!(
+                                        slides_interfere(&sa, &sb, pos_a, pos_b),
+                                        "false negative: {}",
+                                        ctx()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
-//     #[test]
-//     fn split_partitions() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for i in 0..6 {
-//             s.push_back(i);
-//         }
-//         let right = s.split(3);
-//         assert_eq!(s.len(), 3);
-//         assert_eq!(right.len(), 3);
-//         assert_eq!(s.occupied(), 3);
-//         assert_eq!(right.occupied(), 3);
-//         for i in 0..3 {
-//             assert_eq!(s.buf[i], Some(i as u64));
-//             assert_eq!(right.buf[i], Some((i + 3) as u64));
-//         }
-//     }
+fn spread_matches<S: Store<'static, u64>>(mut s: S, off: usize) {
+    let pattern = snap(&s);
+    let len = s.len();
+    s.spread(off);
+    assert_eq!(s.len(), len * 2, "off={off}");
+    assert_inv(&s);
+    assert_eq!(snap(&s), ref_spread(&pattern, off), "off={off}");
+}
 
-//     #[test]
-//     fn slide_none_both_dirs() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for i in 1..=4 {
-//             s.push_back(i);
-//         }
-//         s.remove(2); // [1,2,None,4]
-//         let to = s.slide_none(NoneSlide::new(2, 0), None);
-//         assert_eq!(to, 0);
-//         assert_eq!(s.buf[0], None);
-//         assert_eq!(s.buf[1], Some(1));
-//         assert_eq!(s.buf[2], Some(2));
-//         assert_eq!(s.buf[3], Some(4));
-//         // reverse: slide None 0 -> 2
-//         let to = s.slide_none(NoneSlide::new(0, 2), None);
-//         assert_eq!(to, 2);
-//         assert_eq!(s.buf[2], None);
-//         assert_eq!(s.buf[0], Some(1));
-//         assert_eq!(s.buf[1], Some(2));
-//     }
+///split partitions content, occupancy, and iter streams.
+fn split_matches<S: Store<'static, u64>>(pattern: Vec<Option<u64>>, at: usize) {
+    let mut s = S::from_vec(pattern.clone());
+    let right = s.split(at);
+    let (l_pat, r_pat) = pattern.split_at(at);
+    assert_eq!(snap(&s), l_pat.to_vec());
+    assert_eq!(snap(&right), r_pat.to_vec());
+    assert_eq!(s.occupied(), l_pat.iter().filter(|o| o.is_some()).count());
+    assert_eq!(right.occupied(), r_pat.iter().filter(|o| o.is_some()).count());
+    assert_eq!(
+        s.iter().copied().collect::<Vec<_>>(),
+        l_pat.iter().filter_map(|o| *o).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        right.iter().copied().collect::<Vec<_>>(),
+        r_pat.iter().filter_map(|o| *o).collect::<Vec<_>>()
+    );
+    assert_inv(&s);
+    assert_inv(&right);
+}
 
-//     #[test]
-//     fn slide_none_pin_outside_run_untouched() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for i in 1..=4 {
-//             s.push_back(i);
-//         }
-//         s.remove(2); // [1,2,None,4]
-//         let _ = s.slide_none(NoneSlide::new(2, 0), Some(3));
-//         assert_eq!(s.buf[3], Some(4), "pinned slot moved");
-//         assert_eq!(s.buf[0], None);
-//     }
+fn into_vec_roundtrip<S: Store<'static, u64>>(pattern: Vec<Option<u64>>) {
+    let s = S::from_vec(pattern.clone());
+    assert_eq!(s.into_vec(), pattern);
+}
 
-//     #[test]
-//     fn find_slot_dir_bias_and_pin() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         // [1,None,2,None,3]
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_back(3);
-//         s.push_back(4);
-//         s.push_back(5);
-//         s.remove(1);
-//         s.remove(3);
-//         // pos=2 (Some 2), dir=true => nearest right None at 3
-//         let ms = s.find_slot(2, true, 10, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (3, 3));
-//         // dir=false => nearest left None at 1
-//         let ms = s.find_slot(2, false, 10, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (1, 1));
-//     }
+fn basics<S: Store<'static, u64>>() {
+    let mut s = S::new();
+    assert_eq!((s.len(), s.occupied()), (0, 0));
+    for i in 0..8u64 {
+        let p = s.push_back(i * 10);
+        assert_eq!(p as u64, i);
+        assert_eq!(*s.get(p), i * 10);
+    }
+    s.push_front(99);
+    assert_eq!(*s.get(0), 99);
+    assert_eq!(*s.get(1), 0);
 
-//     #[test]
-//     fn find_slot_pin_clamp_pos_eq() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         // [1,None,2,None,3]
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_back(3);
-//         s.push_back(4);
-//         s.push_back(5);
-//         s.remove(1);
-//         s.remove(3);
-//         // pos=2, pin=2: dir=true searches right only -> None at 3
-//         let ms = s.find_slot(2, true, 10, Some(2)).unwrap();
-//         assert_eq!((ms.from, ms.to), (3, 3));
-//         // dir=false searches left only -> None at 1
-//         let ms = s.find_slot(2, false, 10, Some(2)).unwrap();
-//         assert_eq!((ms.from, ms.to), (1, 1));
-//     }
+    // grow_front/back insert Nones; grow_back returns the max addr
+    s.grow_front(2);
+    assert!(s.slot(0).is_none() && s.slot(1).is_none());
+    assert_eq!(*s.get(2), 99);
+    let last = s.grow_back(2);
+    assert_eq!(last, s.len() - 1);
+    assert!(s.slot(s.len() - 1).is_none());
+    assert_inv(&s);
 
-//     #[test]
-//     fn find_slot_pin_clamp_left() {
-//         // None left of pin must not be chosen.
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         // [None,1,2,None,3]
-//         s.push_back(0);
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_back(3);
-//         s.push_back(4);
-//         s.push_back(5);
-//         s.remove(0);
-//         s.remove(3);
-//         // pos=2 (Some 2), pin=1 (Some 1), dir=false (before): clamp min=max(2)=2,
-//         // no left None in [2,2); fall to right None at 3 -> slide 3->2.
-//         let ms = s.find_slot(2, false, 10, Some(1)).unwrap();
-//         assert_eq!((ms.from, ms.to), (3, 2));
-//     }
+    // slot / slot_mut / get_mut
+    assert_eq!(s.slot(2).copied(), Some(99));
+    *s.slot_mut(2).unwrap() = 77;
+    assert_eq!(*s.get(2), 77);
+    *s.get_mut(2) = 88;
+    assert_eq!(*s.get(2), 88);
 
-//     #[test]
-//     fn find_slot_pin_clamp_right() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         // [1,None,2,None,3]
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_back(3);
-//         s.push_back(4);
-//         s.push_back(5);
-//         s.remove(1);
-//         s.remove(3);
-//         // pos=2, pin=3, dir=true: clamp max=min(3)=3, no right None in [3,3);
-//         // fall to left None at 1 -> slide 1->2.
-//         let ms = s.find_slot(2, true, 10, Some(3)).unwrap();
-//         assert_eq!((ms.from, ms.to), (1, 2));
-//     }
+    // disjoint both argument orders, occupied slots
+    let len = s.len();
+    {
+        let (a, b) = s.get_disjoint_mut(2, 3);
+        assert_eq!((*a, *b), (88, 0));
+        *a += 1;
+        *b += 1;
+    }
+    {
+        let (a, b) = s.get_disjoint_mut(3, 2);
+        assert_eq!(*a, 1);
+        assert_eq!(*b, 89);
+    }
 
-//     #[test]
-//     fn find_slot_budget_exhaustion() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         // [1,2,3,4,5] all occupied, None far away
-//         for i in 0..5 {
-//             s.push_back(i);
-//         }
-//         // pos=2, budget=1: window [1,4) -> [1,2,3] all Some -> None
-//         assert!(s.find_slot(2, true, 1, None).is_none());
-//         assert!(s.find_slot(2, false, 1, None).is_none());
-//     }
+    // pop on Some and on None
+    assert_eq!(s.pop_back(), None); // grown tail
+    assert_eq!(s.pop_front(), None); // grown head
+    s.push_front(5);
+    assert_eq!(s.pop_front(), Some(5));
+    assert_inv(&s);
 
-//     #[test]
-//     fn find_nearest_tiebreak() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         // [1,None,2,None,3]
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_back(3);
-//         s.push_back(4);
-//         s.push_back(5);
-//         s.remove(1);
-//         s.remove(3);
-//         // pos=2: left None at 1 (dist1), right None at 3 (dist1) -> tie. dir=true=>right.
-//         let ms = s.find_nearest_slot(2, true, 10, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (3, 3));
-//         let ms = s.find_nearest_slot(2, false, 10, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (1, 1));
-//     }
+    // iter skips Nones, double-ended, exact size
+    let it = S::from_vec(vec![Some(1), None, Some(3), None, Some(5)]);
+    assert_eq!(it.iter().copied().collect::<Vec<_>>(), vec![1, 3, 5]);
+    assert_eq!(it.iter().rev().copied().collect::<Vec<_>>(), vec![5, 3, 1]);
+    let mut i = it.iter();
+    assert_eq!(i.next(), Some(&1));
+    assert_eq!(i.next_back(), Some(&5));
+    assert_eq!(i.len(), 1);
+    assert_eq!(i.next(), Some(&3));
+    assert_eq!(i.next(), None);
+    assert_eq!(i.next_back(), None);
 
-//     #[test]
-//     fn iter_skips_nones_rev() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_back(3);
-//         s.remove(1); // [1,None,3]
-//         assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![1, 3]);
-//         assert_eq!(s.iter().rev().copied().collect::<Vec<_>>(), vec![3, 1]);
-//     }
+    // alloc-write-read: reservation then write then read
+    let mut s = S::from_vec(vec![Some(1), None]);
+    s.alloc(1).write(7);
+    assert_eq!(*s.get(1), 7);
+    assert_eq!(s.occupied(), 2);
+    // alloc_disjoint_mut: a<b and a>b, drain handoff write
+    s.grow_back(1);
+    let (x, cell) = s.alloc_disjoint_mut(1, 2);
+    assert_eq!(*x, 7);
+    cell.write(9);
+    assert_eq!(*s.get(2), 9);
+    s.grow_front(1); // slot 0 -> None, contents shift right
+    let (x, cell) = s.alloc_disjoint_mut(2, 0);
+    assert_eq!(*x, 7);
+    cell.write(5);
+    assert_eq!(*s.get(0), 5);
+    assert_inv(&s);
 
-//     #[test]
-//     fn swap_slots() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.swap(0, 1);
-//         assert_eq!(s.buf[0], Some(2));
-//         assert_eq!(s.buf[1], Some(1));
-//     }
+    // swap
+    let mut s = S::from_vec(vec![Some(1), Some(2)]);
+    s.swap(0, 1);
+    assert_eq!((s.slot(0).copied(), s.slot(1).copied()), (Some(2), Some(1)));
+}
 
-//     #[test]
-//     fn fuzz_invariants() {
-//         let mut s: VecStore<u64, MC> = VecStore::new();
-//         for op in 0..300u64 {
-//             match op % 6 {
-//                 0 if s.len() < MC => {
-//                     s.push_back(op);
-//                 }
-//                 1 if s.len() < MC => {
-//                     s.push_front(op);
-//                 }
-//                 2 if s.occupied() > 0 => {
-//                     let idx = s.buf.iter().position(|o| o.is_some()).unwrap();
-//                     s.remove(idx);
-//                 }
-//                 3 if s.len() + 2 <= MC => {
-//                     s.grow_back(1);
-//                 }
-//                 _ => {}
-//             }
-//             assert_inv(&s, MC);
-//         }
-//     }
-// }
+// ---------------------------------------------------------------------------
+// both backends
+// ---------------------------------------------------------------------------
 
-// // ---------------------------------------------------------------------------
-// // DequeStore — same surface, plus wrap-path coverage for slide_none / find_*.
-// // ---------------------------------------------------------------------------
-// mod deq {
-//     use super::*;
+macro_rules! suite {
+    ($m:ident, $S:ty) => {
+        mod $m {
+            use super::*;
 
-//     const MC: usize = 64;
+            #[test]
+            fn basics() {
+                super::basics::<$S>();
+            }
 
-//     ///build a wrapped deque (as_slices returns two non-empty slices).
-//     fn wrapped() -> DequeStore<u64, MC> {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for i in 0..16 {
-//             s.push_back(i);
-//         }
-//         for _ in 0..6 {
-//             s.pop_front();
-//         }
-//         for i in 0..6 {
-//             s.push_front(100 + i);
-//         }
-//         let (f, b) = s.buf.as_slices();
-//         assert!(!f.is_empty() && !b.is_empty(), "fixture not wrapped");
-//         s
-//     }
+            #[test]
+            fn torture() {
+                super::torture::<$S>();
+            }
 
-//     #[test]
-//     fn push_back_returns_index() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for i in 0..10 {
-//             let p = s.push_back(i);
-//             assert_eq!(p, i as usize);
-//             assert_eq!(*s.get(p), i);
-//             assert_inv(&s, MC);
-//         }
-//     }
+            #[test]
+            fn slides_exhaustive() {
+                let mut s = <$S>::from_vec(p1());
+                super::exhaustive_slides(&mut s);
+            }
 
-//     #[test]
-//     fn push_front_shifts_existing() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         s.push_back(1);
-//         s.push_back(2);
-//         s.push_front(0);
-//         // logical order [0,1,2]
-//         assert_eq!(s.buf[0], Some(0));
-//         assert_eq!(s.buf[1], Some(1));
-//         assert_eq!(s.buf[2], Some(2));
-//         assert_eq!(s.occupied(), 3);
-//         assert_inv(&s, MC);
-//     }
+            #[test]
+            fn finds_matrix() {
+                let s = <$S>::from_vec(p1());
+                super::check_finds(&s, &p1(), "p1");
+            }
 
-//     #[test]
-//     #[should_panic(expected = "max capacity")]
-//     fn push_back_past_max_panics() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for _ in 0..MC {
-//             s.push_back(0);
-//         }
-//         s.push_back(0);
-//     }
+            #[test]
+            fn find2_matrix() {
+                let pat = p1();
+                let s = <$S>::from_vec(pat.clone());
+                // (F,F) dropped: mirror-image of (T,T) on the palindromic p1
+                super::check_find2(
+                    &s,
+                    &pat,
+                    "p1",
+                    &[(true, false), (false, true), (true, true)],
+                    &[100],
+                    &[None, Some(pat.len() / 2)],
+                );
+            }
 
-//     #[test]
-//     fn spread_doubles_gaps() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for i in 0..4 {
-//             s.push_back(i);
-//         }
-//         s.spread(0);
-//         assert_eq!(s.len(), 8);
-//         assert_eq!(s.occupied(), 4);
-//         let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//         for i in 0..4 {
-//             assert_eq!(snap[2 * i], Some(i as u64), "even {i}");
-//             assert_eq!(snap[2 * i + 1], None, "odd {i}");
-//         }
-//     }
+            #[test]
+            fn spread_odd() {
+                super::spread_matches(<$S>::from_vec(p1()), 0);
+                super::spread_matches(<$S>::from_vec(p1()), 1);
+            }
 
-//     #[test]
-//     fn spread_wrapped_path() {
-//         // force a wrapped deque then spread — exercises the deque-index branch.
-//         let mut s = wrapped();
-//         let len_before = s.len();
-//         s.spread(0);
-//         assert_eq!(s.len(), len_before * 2);
-//         assert_eq!(s.occupied(), s.occupied()); // tautology guard; real check below
-//         // logical content: original Somes in order at even slots, None at odds.
-//         let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//         let somes: Vec<u64> = snap.iter().filter_map(|o| *o).collect();
-//         // original occupied count preserved, order preserved by iter
-//         assert_eq!(somes.len(), s.occupied());
-//         assert_inv(&s, MC);
-//     }
+            #[test]
+            fn spread_even() {
+                let pat = vec![Some(0), Some(1), None, Some(3)];
+                super::spread_matches(<$S>::from_vec(pat.clone()), 0);
+                super::spread_matches(<$S>::from_vec(pat), 1);
+            }
 
-//     #[test]
-//     fn split_partitions() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for i in 0..6 {
-//             s.push_back(i);
-//         }
-//         let right = s.split(3);
-//         assert_eq!(s.len(), 3);
-//         assert_eq!(right.len(), 3);
-//         assert_eq!(s.occupied(), 3);
-//         assert_eq!(right.occupied(), 3);
-//         assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2]);
-//         assert_eq!(right.iter().copied().collect::<Vec<_>>(), vec![3, 4, 5]);
-//     }
+            #[test]
+            fn spread_empty() {
+                super::spread_matches(<$S>::new(), 0);
+                super::spread_matches(<$S>::new(), 1);
+            }
 
-//     #[test]
-//     fn slide_none_matches_ref_all_pairs_wrapped() {
-//         let orig: Vec<Option<u64>> = {
-//             let s = wrapped();
-//             s.buf.iter().cloned().collect()
-//         };
-//         let n = orig.len();
-//         let mut s = wrapped();
-//         for from in 0..n {
-//             for to in 0..n {
-//                 let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//                 let _ = s.slide_none(NoneSlide::new(from, to), None);
-//                 let mut exp = snap.clone();
-//                 ref_slide(&mut exp, from, to);
-//                 let got: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//                 assert_eq!(got, exp, "slide {from}->{to} (wrapped)");
-//                 // restore
-//                 let _ = s.slide_none(NoneSlide::new(to, from), None);
-//             }
-//         }
-//         // fully restored
-//         let final_: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//         assert_eq!(final_, orig, "slide-back did not restore");
-//     }
+            #[test]
+            fn split() {
+                super::split_matches::<$S>(p1(), 4); // split on a None
+                super::split_matches::<$S>(p1(), 3); // split on a Some
+                super::split_matches::<$S>(p1(), 0);
+                super::split_matches::<$S>(p1(), 9);
+            }
 
-//     #[test]
-//     fn slide_none_matches_ref_contiguous() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for i in 0..8 {
-//             s.push_back(i);
-//         }
-//         s.remove(2);
-//         s.remove(5);
-//         let orig: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//         let n = s.len();
-//         for from in 0..n {
-//             for to in 0..n {
-//                 let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//                 let _ = s.slide_none(NoneSlide::new(from, to), None);
-//                 let mut exp = snap.clone();
-//                 ref_slide(&mut exp, from, to);
-//                 let got: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//                 assert_eq!(got, exp, "slide {from}->{to} (contiguous)");
-//                 let _ = s.slide_none(NoneSlide::new(to, from), None);
-//             }
-//         }
-//         let final_: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//         assert_eq!(final_, orig);
-//     }
+            #[test]
+            fn into_vec_roundtrip() {
+                super::into_vec_roundtrip::<$S>(p1());
+            }
+        }
+    };
+}
 
-//     ///compare a DequeStore find fn against a reference over many configs, including
-//     ///pos at the front/back boundary (Less/Equal/Greater than flen).
-//     fn check_find<F, R>(find: F, ref_fn: R, is_wrapped: bool)
-//     where
-//         F: Fn(
-//             &DequeStore<u64, MC>,
-//             usize,
-//             bool,
-//             usize,
-//             Option<usize>,
-//         ) -> Option<(usize, usize)>,
-//         R: Fn(&[Option<u64>], usize, bool, usize, Option<usize>) -> Option<(usize, usize)>,
-//     {
-//         let mut s = if is_wrapped { wrapped() } else { DequeStore::new() };
-//         if !is_wrapped {
-//             for i in 0..10 {
-//                 s.push_back(i);
-//             }
-//         }
-//         // punch some Nones
-//         s.remove(2);
-//         s.remove(5);
-//         if !is_wrapped {
-//             s.remove(7);
-//         }
-//         let snap: Vec<Option<u64>> = s.buf.iter().cloned().collect();
-//         let n = s.len();
-//         let budgets = [1usize, 2, 3, 5, 8, 16, 100];
-//         for pos in 0..n {
-//             if snap[pos].is_none() {
-//                 continue; // contract: pos occupied
-//             }
-//             for &dir in &[false, true] {
-//                 for &b in &budgets {
-//                     for pin in [None, Some(0usize), Some(3), Some(n - 1), Some(pos)] {
-//                         let got = find(&s, pos, dir, b, pin);
-//                         let exp = ref_fn(&snap, pos, dir, b, pin);
-//                         assert_eq!(
-//                             got, exp,
-//                             "find pos={pos} dir={dir} b={b} pin={pin:?} wrapped={is_wrapped}"
-//                         );
-//                     }
-//                 }
-//             }
-//         }
-//     }
+suite!(vec, VecStore<u64>);
+suite!(deq, DequeStore<u64>);
 
-//     #[test]
-//     fn find_slot_matches_ref_contiguous() {
-//         check_find(
-//             |s, pos, dir, b, pin| s.find_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
-//             ref_find_slot,
-//             false,
-//         );
-//     }
+// ---------------------------------------------------------------------------
+// DequeStore wrap paths — slide straddle, boundary-adjacent find, spread
+// ---------------------------------------------------------------------------
 
-//     #[test]
-//     fn find_slot_matches_ref_wrapped() {
-//         check_find(
-//             |s, pos, dir, b, pin| s.find_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to)),
-//             ref_find_slot,
-//             true,
-//         );
-//     }
+mod deq_wrap {
+    use super::*;
 
-//     #[test]
-//     fn find_nearest_matches_ref_contiguous() {
-//         check_find(
-//             |s, pos, dir, b, pin| {
-//                 s.find_nearest_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to))
-//             },
-//             ref_nearest,
-//             false,
-//         );
-//     }
+    ///wrap helper: `grow` for spare capacity, then push `pad` Nones and
+    ///`fronts` values onto the front — head moves back without reallocating, so
+    ///`as_slices` splits. logical layout: [fronts.., pad Nones.., base..].
+    fn wrapped_from(base: &[Option<u64>], fronts: &[u64], pad: usize) -> DequeStore<u64> {
+        let mut s = DequeStore::from_vec(base.to_vec());
+        s.grow();
+        s.grow_front(pad);
+        for &v in fronts {
+            s.push_front(v);
+        }
+        let (f, b) = s.buf.as_slices();
+        assert!(
+            !f.is_empty() && !b.is_empty(),
+            "fixture not wrapped: f={} b={}",
+            f.len(),
+            b.len()
+        );
+        s
+    }
 
-//     #[test]
-//     fn find_nearest_matches_ref_wrapped() {
-//         check_find(
-//             |s, pos, dir, b, pin| {
-//                 s.find_nearest_slot(pos, dir, b, pin).map(|ms| (ms.from, ms.to))
-//             },
-//             ref_nearest,
-//             true,
-//         );
-//     }
+    ///front all Some (forces the front→back fallback), None in back past a pin.
+    fn fallback_to_back() -> DequeStore<u64> {
+        wrapped_from(
+            &[Some(10), Some(11), Some(12), Some(13), None, Some(14)],
+            &[22, 21, 20],
+            0,
+        )
+    }
 
-//     #[test]
-//     fn iter_rev_wrapped() {
-//         let s = wrapped();
-//         let fwd: Vec<u64> = s.iter().copied().collect();
-//         let mut rev = fwd.clone();
-//         rev.reverse();
-//         assert_eq!(s.iter().rev().copied().collect::<Vec<_>>(), rev);
-//     }
+    ///back all Some (forces the back→front fallback), None at logical 0.
+    fn fallback_to_front() -> DequeStore<u64> {
+        let mut s = wrapped_from(&[Some(30), Some(31), Some(32), Some(33)], &[42, 41, 40], 0);
+        s.free(0);
+        s
+    }
 
-//     ///front→back fallback under a `max` pin. front all Some (forces the fallback);
-//     ///back's nearest None is at logical 7. pin=6 clamps max to 6, so the None at 7
-//     ///must be excluded (None). without the pin the fallback finds it.
-//     #[test]
-//     fn find_nearest_front_fallback_respects_pin_max() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for v in [10u64, 11, 12, 13] {
-//             s.push_back(v);
-//         }
-//         s.grow_back(1);
-//         s.push_back(14);
-//         s.push_front(20);
-//         s.push_front(21);
-//         s.push_front(22);
-//         let (f, b) = s.buf.as_slices();
-//         assert_eq!(f.len(), 3);
-//         assert_eq!(b.len(), 6);
-//         assert!(b[4].is_none(), "fixture: back None at idx 4 (logical 7)");
-//         let pos = 1; // front[1] = 21 (Some)
-//         // no pin: fallback reaches the back None at logical 7. None is right of pos,
-//         // so to = pos+1 (dir=true) / pos (dir=false).
-//         let ms = s.find_nearest_slot(pos, true, 20, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (7, 2));
-//         let ms = s.find_nearest_slot(pos, false, 20, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (7, 1));
-//         // pin=6 (logical; back[3]=13): max clamps to 6 -> None at 7 excluded -> None.
-//         assert!(s.find_nearest_slot(pos, true, 20, Some(6)).is_none());
-//         assert!(s.find_nearest_slot(pos, false, 20, Some(6)).is_none());
-//     }
+    ///Nones in both slices, boundary slot occupied (Equal branch of find).
+    fn nones_both_sides() -> DequeStore<u64> {
+        wrapped_from(
+            &[Some(0), Some(1), None, Some(3), Some(4), None, Some(6), Some(7)],
+            &[],
+            3,
+        )
+    }
 
-//     ///back→front fallback under a `min` pin. back all Some around pos (forces the
-//     ///fallback); front has a None at logical 0. pin=2 clamps min to 3, so the None
-//     ///at 0 must be excluded (None). without the pin the fallback finds it.
-//     #[test]
-//     fn find_nearest_back_fallback_respects_pin_min() {
-//         let mut s: DequeStore<u64, MC> = DequeStore::new();
-//         for v in [30u64, 31, 32, 33] {
-//             s.push_back(v);
-//         }
-//         s.push_front(40);
-//         s.push_front(41);
-//         s.push_front(42);
-//         s.remove(0); // front[0] -> None
-//         let (f, b) = s.buf.as_slices();
-//         assert_eq!(f.len(), 3);
-//         assert!(f[0].is_none(), "fixture: front None at logical 0");
-//         assert_eq!(b.len(), 4);
-//         assert!(b.iter().all(|o| o.is_some()), "fixture: back all Some");
-//         let pos = 4; // back[1] = 31 (Some)
-//         // no pin: fallback reaches the front None at logical 0.
-//         let ms = s.find_nearest_slot(pos, true, 20, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (0, 4));
-//         let ms = s.find_nearest_slot(pos, false, 20, None).unwrap();
-//         assert_eq!((ms.from, ms.to), (0, 3));
-//         // pin=2 (logical; front[2]=40): min clamps to 3 -> None at 0 excluded -> None.
-//         assert!(s.find_nearest_slot(pos, true, 20, Some(2)).is_none());
-//         assert!(s.find_nearest_slot(pos, false, 20, Some(2)).is_none());
-//     }
-// }
+    ///even length, wrapped: the deque-indexed spread phase-2 branch.
+    fn even_wrapped() -> DequeStore<u64> {
+        wrapped_from(&[Some(0), Some(1), None, Some(3)], &[], 2)
+    }
+
+    #[test]
+    fn finds_wrapped() {
+        let cases: Vec<(&str, DequeStore<u64>)> = vec![
+            ("back-fallback", fallback_to_back()),
+            ("front-fallback", fallback_to_front()),
+            ("nones-both", nones_both_sides()),
+        ];
+        for (label, s) in cases {
+            check_finds(&s, &snap(&s), label);
+        }
+    }
+
+    #[test]
+    fn slides_wrapped() {
+        // straddle (per-step swap), back-slice rotate, front-slice rotate paths
+        let mut a = nones_both_sides();
+        exhaustive_slides(&mut a);
+        let mut b = fallback_to_back();
+        exhaustive_slides(&mut b);
+    }
+
+    #[test]
+    fn find2_wrapped() {
+        let s = nones_both_sides();
+        // full dir/pair coverage of the wrap geometry; budget/pin cross products
+        // live on the p1 matrices
+        check_find2(
+            &s,
+            &snap(&s),
+            "wrapped",
+            &[(false, false), (false, true), (true, false), (true, true)],
+            &[100],
+            &[None],
+        );
+    }
+
+    #[test]
+    fn spread_wrapped() {
+        spread_matches(nones_both_sides(), 0); // odd len: direct-move path
+        spread_matches(nones_both_sides(), 1);
+        spread_matches(even_wrapped(), 0); // even len, wrapped slices
+        spread_matches(even_wrapped(), 1);
+    }
+
+    #[test]
+    fn slide_restores_wrapped_state() {
+        // slide across the wrap boundary must not linearize the deque
+        let mut s = nones_both_sides();
+        let (f, b) = s.buf.as_slices();
+        let (fl, bl) = (f.len(), b.len());
+        let _ = s.slide_none(NoneSlide::new(0, s.len() - 1), None);
+        let (f, b) = s.buf.as_slices();
+        assert_eq!((f.len(), b.len()), (fl, bl), "slide linearized the deque");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drop accounting — leaks and double-drops
+// ---------------------------------------------------------------------------
+
+mod drops {
+    use super::*;
+
+    struct DropCtr(Rc<Cell<u32>>);
+    impl Drop for DropCtr {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    ///every path — push, spread, slide, swap, free, pop, alloc, split, store
+    ///drop — must drop each value exactly once.
+    fn drain_torture<S: Store<'static, DropCtr>>() {
+        let ctr = Rc::new(Cell::new(0));
+        let mut made = 0u32;
+        let mut s = S::new();
+        for _ in 0..4 {
+            s.push_back(DropCtr(ctr.clone()));
+            made += 1;
+        }
+        s.push_front(DropCtr(ctr.clone()));
+        made += 1;
+        s.grow_back(2);
+        s.grow_front(2);
+        s.spread(1);
+        s.spread(0);
+        s.swap(1, 4);
+        let occ = (0..s.len()).find(|&i| s.slot(i).is_some()).unwrap();
+        drop(s.free(occ));
+        drop(s.pop_front());
+        drop(s.pop_back());
+        s.grow_front(1); // open slot 0
+        s.alloc(0).write(DropCtr(ctr.clone()));
+        made += 1;
+        s.grow_back(1);
+        let mut right = s.split(3);
+        drop(s);
+        drop(right.pop_back());
+        drop(right);
+        assert_eq!(ctr.get(), made, "drop count != constructed count");
+    }
+
+    #[test]
+    fn drain_vec() {
+        drain_torture::<VecStore<DropCtr>>();
+    }
+
+    #[test]
+    fn drain_deq() {
+        drain_torture::<DequeStore<DropCtr>>();
+    }
+
+    #[test]
+    fn plain_drop_vec() {
+        let ctr = Rc::new(Cell::new(0));
+        let mut s = VecStore::new();
+        for _ in 0..3 {
+            s.push_back(DropCtr(ctr.clone()));
+        }
+        drop(s);
+        assert_eq!(ctr.get(), 3);
+    }
+
+    #[test]
+    fn plain_drop_deq() {
+        let ctr = Rc::new(Cell::new(0));
+        let mut s = DequeStore::new();
+        for _ in 0..3 {
+            s.push_back(DropCtr(ctr.clone()));
+        }
+        drop(s);
+        assert_eq!(ctr.get(), 3);
+    }
+
+    #[test]
+    fn into_vec_moves_out_vec() {
+        let ctr = Rc::new(Cell::new(0));
+        let mut s = VecStore::new();
+        for _ in 0..3 {
+            s.push_back(DropCtr(ctr.clone()));
+        }
+        let v = s.into_vec();
+        assert_eq!(ctr.get(), 0, "into_vec dropped payloads early");
+        drop(v);
+        assert_eq!(ctr.get(), 3);
+    }
+
+    #[test]
+    fn into_vec_moves_out_deq() {
+        let ctr = Rc::new(Cell::new(0));
+        let mut s = DequeStore::new();
+        for _ in 0..3 {
+            s.push_back(DropCtr(ctr.clone()));
+        }
+        let v = s.into_vec();
+        assert_eq!(ctr.get(), 0, "into_vec dropped payloads early");
+        drop(v);
+        assert_eq!(ctr.get(), 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// contract panics (debug_assert-backed ones fire in debug test builds only)
+// ---------------------------------------------------------------------------
+
+mod panics {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "alloc into occupied")]
+    fn alloc_occupied() {
+        let mut s = VecStore::from_vec(vec![Some(1u64), None]);
+        let _ = s.alloc(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "free empty")]
+    fn free_none() {
+        let mut s: VecStore<u64> = VecStore::new();
+        s.grow_back(1);
+        let _ = s.free(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "None at occupied ptr")]
+    fn get_on_none() {
+        let mut s: VecStore<u64> = VecStore::new();
+        s.grow_back(1);
+        let _ = s.get(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "a == b")]
+    fn disjoint_same_slot() {
+        let mut s = VecStore::from_vec(vec![Some(1u64), Some(2)]);
+        let _ = s.get_disjoint_mut(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "b is Some")]
+    fn alloc_disjoint_into_occupied() {
+        let mut s = VecStore::from_vec(vec![Some(1u64), Some(2)]);
+        let _ = s.alloc_disjoint_mut(0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "pinned target slot")]
+    fn slide_into_pin() {
+        let mut s = VecStore::from_vec(vec![Some(1u64), None, Some(3)]);
+        let _ = s.slide_none(NoneSlide::new(1, 2), Some(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "pin inside run")]
+    fn slide_across_pin() {
+        let mut s = VecStore::from_vec(vec![None, Some(1u64), Some(2), Some(3)]);
+        let _ = s.slide_none(NoneSlide::new(0, 3), Some(1));
+    }
+}
