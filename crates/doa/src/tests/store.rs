@@ -1,12 +1,12 @@
 //!store tests: reference-model torture + exhaustive slide/find matrices for both
 //!backends, drop-counted leak checks. run targeted (full-crate test runs have
-//!OOM'd the IDE): `cargo test -p doa --lib store::tests`. miri (uninit reads +
-//!leaks): `cargo +nightly miri test -p doa --lib store::tests`.
+//!OOM'd the IDE): `cargo test -p doa --lib store::tests`. miri (leaks):
+//!`cargo +nightly miri test -p doa --lib store::tests`.
 use std::cell::Cell;
 use std::rc::Rc;
 
 use super::*;
-use crate::metadata::TwoSlide;
+use crate::metadata::DoubleSlide;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -217,7 +217,7 @@ fn insert_via<S: Store<'static, u64>>(
     if let Some((from, to)) = exp {
         s.slide_none(NoneSlide::new(from, to), pin);
         ref_slide(model, from, to);
-        s.alloc(to).write(*val);
+        s.insert(to, *val);
         model[to] = Some(*val);
         *val += 1;
     }
@@ -297,7 +297,7 @@ fn torture<S: Store<'static, u64>>() {
             }
             11 => {
                 if let Some(i) = idx_where(&model, false, &mut rng) {
-                    s.alloc(i).write(val);
+                    s.insert(i, val);
                     model[i] = Some(val);
                     val += 1;
                 }
@@ -540,22 +540,22 @@ fn basics<S: Store<'static, u64>>() {
     assert_eq!(i.next(), None);
     assert_eq!(i.next_back(), None);
 
-    // alloc-write-read: reservation then write then read
+    // insert into a hole: place + read back
     let mut s = S::from_vec(vec![Some(1), None]);
-    s.alloc(1).write(7);
+    s.insert(1, 7);
     assert_eq!(*s.get(1), 7);
     assert_eq!(s.occupied(), 2);
-    // alloc_disjoint_mut: a<b and a>b, drain handoff write
-    s.grow_back(1);
-    let (x, cell) = s.alloc_disjoint_mut(1, 2);
-    assert_eq!(*x, 7);
-    cell.write(9);
-    assert_eq!(*s.get(2), 9);
-    s.grow_front(1); // slot 0 -> None, contents shift right
-    let (x, cell) = s.alloc_disjoint_mut(2, 0);
-    assert_eq!(*x, 7);
-    cell.write(5);
-    assert_eq!(*s.get(0), 5);
+    //dead with the reservation model — no write-place drain handoff
+    //s.grow_back(1);
+    //let (x, cell) = s.alloc_disjoint_mut(1, 2);
+    //assert_eq!(*x, 7);
+    //cell.write(9);
+    //assert_eq!(*s.get(2), 9);
+    //s.grow_front(1); // slot 0 -> None, contents shift right
+    //let (x, cell) = s.alloc_disjoint_mut(2, 0);
+    //assert_eq!(*x, 7);
+    //cell.write(5);
+    //assert_eq!(*s.get(0), 5);
     assert_inv(&s);
 
     // swap
@@ -775,7 +775,7 @@ mod drops {
         }
     }
 
-    ///every path — push, spread, slide, swap, free, pop, alloc, split, store
+    ///every path — push, spread, slide, swap, free, pop, insert, split, store
     ///drop — must drop each value exactly once.
     fn drain_torture<S: Store<'static, DropCtr>>() {
         let ctr = Rc::new(Cell::new(0));
@@ -797,7 +797,7 @@ mod drops {
         drop(s.pop_front());
         drop(s.pop_back());
         s.grow_front(1); // open slot 0
-        s.alloc(0).write(DropCtr(ctr.clone()));
+        s.insert(0, DropCtr(ctr.clone()));
         made += 1;
         s.grow_back(1);
         let mut right = s.split(3);
@@ -874,10 +874,10 @@ mod panics {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "alloc into occupied")]
-    fn alloc_occupied() {
+    #[should_panic(expected = "insert into occupied")]
+    fn insert_occupied() {
         let mut s = VecStore::from_vec(vec![Some(1u64), None]);
-        let _ = s.alloc(0);
+        let _ = s.insert(0, 9);
     }
 
     #[test]
@@ -903,12 +903,13 @@ mod panics {
         let _ = s.get_disjoint_mut(0, 0);
     }
 
-    #[test]
-    #[should_panic(expected = "b is Some")]
-    fn alloc_disjoint_into_occupied() {
-        let mut s = VecStore::from_vec(vec![Some(1u64), Some(2)]);
-        let _ = s.alloc_disjoint_mut(0, 1);
-    }
+    //dead with the reservation model — no write-place to enforce occupancy of
+    //#[test]
+    //#[should_panic(expected = "b is Some")]
+    //fn alloc_disjoint_into_occupied() {
+    //    let mut s = VecStore::from_vec(vec![Some(1u64), Some(2)]);
+    //    let _ = s.alloc_disjoint_mut(0, 1);
+    //}
 
     #[test]
     #[should_panic(expected = "pinned target slot")]

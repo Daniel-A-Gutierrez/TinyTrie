@@ -2,6 +2,446 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Vocabulary Updates
+| old (below) | now |
+|---|---|
+| vaddr, virt, virtual, vptr, `P` (the generic) | address; trait `Addr` (ex-`BlockIndex`); generic param `A` |
+| phys, physical, `p` | position; newtype `Pos(usize)` |
+| child idx / gap index (bare usize) | newtype `ChildPos(usize)` |
+| `v2p` / `p2v` / `vdist` | `a2p` / `p2a` / `adist` |
+| `vget` / `first_vaddr` / `last_vaddr` / `root_vaddr` | `aget` / `first_addr` / `last_addr` / `root_addr` |
+| `fix_p` / `affects_p` / `fix_v` / `affects_v` | `fix_pos` / `affects_pos` / `fix_addr` / `affects_addr` |
+| `as_halfptr` / `from_halfptr` | `as_half` / `from_half` |
+| `before: bool` / `after: bool` / `dir: bool` (side args) | `Rel { Before, After }` |
+| `SignedBlockIndex`, `SignedNum` | removed — unused |
+
+Semantics, so old entries still parse: `Pos` is the slot in the store's array
+(the truth — pos 0 = min, pos len−1 = max); `Addr` (u16/u32) is the stable name
+that survives relocation; `ChildPos` is a slot in the parent's child sequence, and
+as an insertion gap it may equal `child_count`.
+
+
+# Tree Operations
+structural allocs/deallocs a tree may perform. per flavor, then by slot effect.
+0-alloc rewiring ops included (rotate, borrow) - they reorder traversal, which is layout here.
+
+Binary Tree
+- Init Root - 1 slot at root pos
+- Insert Child (new leaf) - relto parent, 1 slot at subtree boundary
+- Rotate L/R - 0 alloc, rewires 3 edges
+- Double Rotate (LR/RL) - 0 alloc
+- Join / Split Tree - 0 alloc, wholesale regraft (treap/splay style)
+- Remove Leaf - 1 dealloc
+- Remove 1-child - splice child up, 1 dealloc
+- Remove 2-child - successor swap then remove-leaf elsewhere, 1 dealloc
+
+B / B+ Tree
+Init Leaf Root - 1 slot at root pos
+Split Leaf - 1 alloc, may be biased (edge insert)
+Split Inode - 1 alloc, sep promoted (B) / copied (B+)
+Split Root - 2 allocs, new root + sibling, height +1, old root may relocate
+    splits cascade up
+Redistribute (borrow) - 0 alloc, edge moves across siblings
+Merge - 1 dealloc, sep absorbed (B) / dropped (B+)
+    merges cascade up
+Root Collapse - 1 dealloc, root pos moves, height -1
+    (or dealloc empty root; consumers may keep a sentinel instead)
+Remove Entry - 0 slots, underflow triggers borrow/merge/collapse
+
+Trie
+Init Root - 1 slot at root pos
+Insert Child - relto parent, 1 slot
+Insert Parent - subdivide edge above current, 1 slot, current re-parents
+    (positioning is ordering-dependent)
+Split Edge (burst) - 2 allocs, new parent + sibling ( allocates a new internal node above the leaf that discriminates on the next character, plus a new sibling leaf to take the entries on one side of the discriminant ) 
+Splice (path compress) - 1 dealloc, inverse of insert parent, may cascade
+Prune Leaf - 1 dealloc, may cascade splices
+Graft/Prune Subtree - 0 in-block slots (cross-block = arena/forwarding)
+
+By slot effect (the doa lens - slot count drives find_slot/find_2_slots,
+root pos moves drive RootPos fixups, order changes drive slides)
+1 slot at root pos       : init root
+1 slot adjacent          : insert child, split node, insert parent
+2 slots + root pos move  : split root, burst
+1 dealloc                : remove, merge, splice
+1 dealloc + root pos move: root collapse
+0 slots, order changes   : rotate, borrow, regraft
+
+Layout cost by ordering
+preorder  : split/merge = adjacent slot, no slides; rotate/borrow = parent hop/subtree slide
+inorder   : rotate/borrow = free (seq preserved); split/merge = parent hop
+postorder : split/merge = adjacent before parent; rotate/borrow = parent hop/subtree slide
+
+## Where does the cursor wind up? 
+If we put rotation into the cursor's responsibilities, the current node moves and is ancestry changes. 
+Ugh this is so nasty. 
+Lets just record it. 
+treewalkermut
+insert_child -> winds up on child
+rotate_l/r -> winds up on subtree root
+splice_parent -> remove a node's parent, parent's children become its grandparents children. GrandParent must have space. 
+remove_leaf -> remove a node with no children. 
+insert_parent -> winds up on parent. 
+yield_l/r -> doesnt move
+
+splitwalker
+split_child -> winds up on new child
+split_root -> winds up on new root
+
+TreeWalk
+existing stuff prev/next suggest_insert_child, suggest split 
+
+
+
+# Reviewing again
+im trying to get the code to a higher level of quality and robustness.
+I think moving the responsibility of updating each abstraction level's data to that abstraction level is a good start.
+
+Beyond that, i think having the walker move in predicable ways per operation is another goal - it provides a useful invariant to users of the walker, and ourselves. 
+In general it should not change what node 'current' refers to when inserting. 
+On split, we have a bit of a conundrum.
+Lets think conceptually for a bit. 
+
+Also having a dedicated before/after enum would be nice. 
+I think save() or recording depth before descending to the proper position and returning 'before/after' would be better. 
+Another invariant i guess i want the walker to work with is locality. 
+Insert_Child should be before/after current position , and return child_idx of the new insert. 
+Insert_parent should refer to the parent of the current node.
+Since the block needs to be constructed with a root in it, we need init_root() -> Self on node right? 
+Keeping in mind a btree's first root is a leaf node.
+also is 'root_fix' a necessary fixable fn? 
+In TreeWalk, preorder, split position is calculated from current child count, not from degree. Not sure thats right. 
+Also treewalk's preorder impl, subtree first returns 0?? That seems like a giant bug. 
+
+## Split semantics
+i dont want all splits to be binary fissions.
+midpoint() - return child_idx of the median node (DEGREE/2 generally but not necessarily). 
+split_inode(idx) - idx..end children go to the right node, the rest stay left, new entry inserted in parent. 
+split_subtree(idx) - idx gets promoted as sep for a new root node, who's children are the left and right halves of the current node.
+rewiring handled by node walker with insert_child.
+split_leaf(idx) - simpler than the others, common case. 
+new_inode_root(k,payload,child,child) - used to construct a new root, needed on SplitNode. 
+
+Since split_subtree allocates space for 2 new nodes, it needs a helper from suggested. 
+split_root_suggestions -> (Suggestion, Suggestion)? 
+
+## Psuedocode for revised fns
+store layer
+find_slot(anchor, before/after, budget) -> `Option<NoneSlide>`
+slide_none(noneslide) -> OpenSlot, 
+insert(openslot) -> P 
+
+block layer : 
+find_slot(anchor, before/after) ->  FoundSlot {noneslide, GrewFixup}, noneslide + GrewFixup 
+slide_none(noneslide) -> OpenSlot, 
+insert(openslot) -> P 
+
+so the TreeWalk level wrapper is
+`insert(&mut self, before/after, B::N) -> FoundSlot, P`
+
+internally it fixes up the run, applies grew fixup and noneslide to itself, then returns the foundslot so the caller can fix up anything theyve got. 
+
+insert_child becomes : 
+    get suggested insertion spot, 
+    goto it, 
+    insert provided node at position, 
+    get P, 
+    ascend, 
+    insert_child on the parent. 
+
+for split we need a new helper - `save` -> WalkerState : Fixable
+the set_position is replaced with `load(ws)`.
+
+split child node becomes : 
+    ensure parent has space, 
+    save depth, 
+    get suggested spot to split into, 
+    goto it, 
+    need a block primitive - split_from(&mut self, from : usize, before/after) -> (P, K, Payload), 
+    insert into parent
+
+split child node for in-order when split_idx is <= DEGREE/2 && cc >= DEGREE/2: 
+    position walker on parent, 
+    save depth. 
+    walk to hop position, 
+    save, 
+    ascend back to parent, 
+    walk to suggested split position, 
+    find_2_slots( before/after, WalkerState, before/after) -> (OpenSlot, OpenSlot), 
+    ascend to parent, 
+    get position of split child, 
+    split_from(child_position, open slot). 
+
+split root: 
+    suggest split position wont work as well i think, 
+    since theres no parent. 
+    TreeWalk needs a supporter here, suggest_split_root -> 2 suggestions, one for left child and one for right. 
+        The 'leave old root at root with single child as old root' is wrong, the ordering is violated. We need find 2 slots. 
+    save depth
+    Walk to the left suggestion, 
+    save, 
+    ascend, 
+    walk to the right suggestion, 
+    find_2_slots()->(open,open), 
+    use split_node::split_root(&mut self, P left, payload left, P right, payload right) -> (Self, Self). 
+
+Also ive been getting the feeling that BlockIndex should be called address and use A instead of P. 
+
+Anywho i think that'll be a less messy and safer way of doing things - have each layer worry about keeping its own data correct by wrapping the lower level functionality in an abstraction that automatically updates it, and have the walkers support save/load , while having the saved states be fixable. All out 'allocation' bits need to be done atomically, whether its fine 1 or find 2. Continuing this tomorrow. 
+
+## Action items and principles
+Node::init_root - needs impl
+Node::new_root(children : &[(K,Payload,P)]) -> Self
+//walker must not move - it must stay on the parent, not end on the new node.
+TreeWalkHelper::get_open_slot( before/after ) -> FoundSlot
+    let ns = self.find_slot( relative )//does grewfixup automatically
+    return self.apply_slide( ns ) 
+
+Block::find_slot, find_2_slots, slide_none, all automatically upkeep blockdata, blockdata : fixable
+
+now, inorder does have to hop the parent. 
+That requires a second open slot - something we cant get while the tree is in an unwalkable state. 
+so we have to allocate 2 slots from the getgo - one at the hop position, one for the new child. 
+
+We can use save/load to do that safely. 
+Walker Save/Load -> State : Fixable
+
+InOrder insert_child when child_idx <= DEGREE/2: 
+    Save depth at parent
+    Walk to hop_to position
+    save state1
+    ascend back up to parent depth
+    walk to child insert position
+    self.block.find_2_slots( b4/after, state1.position, b4/after) -> Found2Slots
+    apply double slide -> open slot1 and 2
+    state1 fixup
+    swap_open parent to open slot 1 with helper that does swap fixup automatically
+    insert node at slot 2
+    wire to parent
+--- 
+Ok so theres some places there i see manual fixups of lower tier data, i dont wanna see any. 
+    (outdated comment referring to prior version of psuedocode which no longer exists).
+TreeWalkerHelper needs to wrap block functions and fixup itself internally
+
+open_slot(before/after) -> FoundSlot //fixes self up
+open_2_slots(&mut self, b4/after, state, b4/after) //also fixes self up
+swap_open(&mut self, open_slot) -> SwapFix, OpenSlot
+
+I think those examples show itd be nice to have one more save function for perf reasons : 
+save_new()->savept
+save_over(&mut savept)
+load(savept)
+
+//doesnt move cursor from current node
+walker.apply_slide(&mut self,ns) -> OpenSlot
+    if ns.from==ns.to { return };
+    let istate = self.save_new();
+    walk_to_slide(ns);//somehow we have to make sure we're at the 'to' side. 
+    let (fwd,bak) = if ns.from > ns.to { (Self::next, Self::prev) } else { (Self::prev,Self::next)}
+    let count = usize::AbsDiff(&ns.from,&ns.to);
+    let delta = ns.delta;
+    istate.slide_fix(ns);
+    let mut open = Open(ns); //gets the open slot at ns.from, consumes ns    
+    for _ in count {
+        if !self.is_root() {
+            let state = self.save();
+            let pos = self.position();
+            let (parent,child_idx) = self.parent();
+            self.ascend()
+            self.set_child(child_idx, pos + ns.delta);
+            self.load(state); // child now points at wrong place, have to load.
+        }
+        if !self.is_leaf() && N::HAS_PARENT {
+            let children : = self.children();
+            for child in children {
+                let state = self.save();
+                self.descend(child);
+                self.set_parent(state.position + ns.delta);
+                self.load(state); //cant use ascend cuz the child now points somewhere else
+            }
+        }
+        open = self.swap_open(open);
+        fwd(self);
+    }
+    self.load(istate);
+    return open
+    
+apply_double_slide(&mut self,ds) -> (OpenSlot,OpenSlot) {
+    let savept = self.save()
+    let open1=self.apply_slide(ns1);
+    let open2=self.apply_slide(ns2);
+    savept.fix_ns(ns1);
+    savept.fix_ns(ns2);
+    self.load(savept);
+    return (open1,open2);
+}
+
+## Splitting 
+the real test. 
+
+split_root()
+    walk, get the suggested positions for the new 2 children of the root
+    save at the first, go to the next, self.open_2_slots()->Open1,Open2
+    ascend to the root
+    let laddr = translate(open1);
+    let raddr = translate(open2)
+    let (left,right) = current.split_root(laddr,raddr)
+    let _ = insert(open1, left);
+    let _ = insert(open2, right);
+split_leaf() 
+    let open = self.open_slot(after);
+    let key,payload,right = current.split_leaf() -> (K,payload,node)
+    let raddr = self.block.insert(right,open);
+    let _,child_idx = self.ascend(); //ascend should really return position,child_idx
+    self.insert_child(K,payload,raddr);
+    self.descend(child_idx);
+split_inode()
+    let depth = self.depth();
+    let (_,child_idx) = self.parent()
+    let suggestion = self.suggest_split()
+    self.walk_to(suggestion)
+    if child_idx > DEGREE/2 && Order::InOrder
+        let savept = self.save_new();
+        while self.depth > depth { self.ascend() }
+        let hop_sug = self.suggest_hop()
+        self.walk_to(hop_sug)
+        let o1,o2 = self.open_2_slots(hop_sug.direction, savept, suggestion.direction);
+        self.swap_open(o1);
+        self.current.split_inode() -> (K,payload,node);
+        self.insert(o2, node) -> P
+        self.ascend()
+        self.insert_child(K,payload,P);
+    else 
+        let open = self.open_slot(suggestion.direction);
+        while self.depth() > depth { self.ascend() } 
+        let node = self.current().split_inode() -> (K, payload, node);
+        self.block.insert(open,node);
+        self.ascend();
+        self.current.insert_child(K,payload,node)-> child_idx;
+        self.descend(child_idx)
+
+alright some gripes with this
+1. they move the walker, thats an unncessary side effect imo and id like it not to
+2. child_idx being 0..DEGREE is an assumption i dont really like. Id rather have the node return a median child index and use that instead of DEGREE/2.
+3. ascend returning the child_idx would be nice.
+4. i wonder if a more general binary_split and tri_split would be cleaner? maybe not
+5. all the split functions should take a param, indicating the number of children that'll go into the left child. That changes the ordering bits for in-order. 
+
+
+
+# Review
+Ok lots to read. 
+walker.rs
+- node is a bundle of associated types , K,V,P,Payload, Degree:usize, Stores_parents:bool. 
+- Trait hierarchy
+- Node -> Splittable Node -> 
+- NodeCursor<B> -> NodeWalker<B> -> NodeWalkerMut<B>
+- TreeWalk<NW : NodeWalker, B> -> TreeWalkHelper<NW : NodeWalker, B> -> TreeWalkMut<NW : NodeWalker, B> -> SplitWalkHelper<NW : NodeWalker, B>
+- TreeWalker<O,NW> impls the whole ladder using NW::B, per ordering.
+
+Lets see if i can justify each division in this ladder of traits
+Node vs Splittable node - trivial
+Node Cursor x NodeWalker - node cursor saves perf by not tracking state
+NodeWalker x NodeWalkerMut - need to ascend to iterate nodes in order, but dont necessarily need &mut
+NodeWalkerMut - mutable operations require walker state. 
+TreeWalk<NW,B> - vessel for functionality we provide using our TreeWalker<NW> struct. 
+TreeWalk x TreeWalkHelper - treewalkhelper is not generic over ordering, it has to be impled specifically for each ordering type we define. Treewalkhelper gets to be impled once using treewalk, its where most of the complexity lies so that saves us a lot of code. 
+TreeWalkMut - functions that require a &mut B, TreeWalk alone doesnt. 
+SplitWalkHelper - hides functionality from the user, helper functions for splitting nodes
+SplitTreeWalker - functionality for splitting nodes, subtrees, and blocks, requiring a node to be splittable.
+
+Hoo boy ok so its complex but not overly complex damn. 
+Neat interface division - since treewalker is our struct it doesnt impl nodewalker, so the consumers functionality is hidden.
+
+Now - growth via splits vs growth via insertion. 
+lets consider the insertion case first. 
+Our first block starts empty, the users structure needs to handle first insert and create a root node. So we need a create_root, id think , but its not here.
+
+Afterward theyll want a child before and after it, for a binary tree. 
+The block and walker may store traversal data (root).
+We look left and trigger a grow and spread. 
+Our current position needs updating, as well as various bits of state.
+The root will still be at 0, so we need to move it right 1, which triggers more fixup.
+Then we insert a child node to its left. the consumer will want a &mut MaybeUninit<Node> and a P pointer pointing to that address.
+They write their new node in, its prewired to the parent...how? 
+they mustve had to call insert_child( position to insert at ) on the walker, and the node supports insert_child. 
+insert child is logic provided by the consumer, we should ask them to panic if a child would be overwritten. 
+Since we dont know what data is associated with that beyonds a Key and a Pointer, we also take payload, which can just be () if the node's inode type doesnt store values. 
+
+TreeWalkHelper helper functions : 
+reparent children - if the node stores parents, when the parent moves, repoint its children to its new location.
+reparent run - reparent children but using a noneslide instead of a entirely new address.
+adopt node - idk
+swap current (open) - swap current node to open slot. swap fixup is used to fix any state storing the current nodes position.
+fixup( none slide, far_short?) - ns fixup, in the in-order case where a child split invalidates the ordering of the tree far_short is true so it accomodates that. 
+apply_slide - apply the none slide, physically move nodes?
+walk_to_anchor - use the suggestion from treewalk to traverse to the anchor point of an insertion for a child. 
+back_from_anchor(levels) - ascend levels times, used after walk_to_anchor
+open_after - open a slot immediately after the current node (i dont think thats possible to guarantee tho).
+open_suggested - use suggested to open a slot 
+hop_current - in order minutiae, if a child is inserted in the first DEGREE/2 idx, the parent is now in the wrong position, so it needs to move. 
+
+SplitWalkHelper Fns
+Open Split Slot - use suggest split from treewalk to open a slot
+open_two - open two slots. 
+split_child_here - split current node child_idx in two, child specified is left, next goes in idx+1. 
+split_into_open : using an existing open slot, split child_idx into it. 
+promote_new_root : make a new root, old root becomes child_0 of new root. !should probably return the position of the new root. 
+
+public interface of TreeWalkMut and SPlitTreeWalker
+insert_child, remove_child,
+split_child, split_root 
+
+## Initial thoughts 
+treewalkermut - the block needs to start with an initial root node i guess, since we're not facilitating inserting a initial root. SplitNode gets that but not Node...
+and split node's isnt intended for the first root, even though we need to construct that by default. 
+
+create_root() -> Self on node would be good...
+split_root(&mut self) -> (Self,Self) would let the root and inodes differ. 
+
+also theres a *ton* of code dedicated to doing fixup stuff. 
+Makes me want to force slide_none to take a callback arg and do it manually.
+how would that look? 
+Maybe the fixable trait has 1 function per fixup type. So the fixup trait stops existing. 
+Walker's responsibility is to call block's corresponding fixup. 
+So treewalker fixup_x calls NW::fixup_x calls NW::state::fixup_x and NW::B::fixup_x. 
+Compiler optimizes out the no-ops. 
+Better yet - if find_slot applies the fixups, it just has to take something generic over fixable, then call it with the appropriate data afterward. But thatd necessitate passing a &mut F as well as a &mut self to the block/store/etc. 
+maybe block fixes up its own data? It is a layer unto itself. 
+Then walker fixes its own data afterward. 
+I mean i could just default impl some wrappers for the block functions on treewalkerhelper. seems easy and reliable. 
+
+block/blocktrait/blockops are kinda bad names. how about block,treeblock,and treeblockmut? 
+oh wait treeblock exists, and its kinda weird, it just specifies a root position. i guess how thats done depends on the mode.
+Treeblock isnt depended on anywhere ... 
+
+lets defer that but its worth looking at. TODO. 
+
+Ok so each layer handles its data? 
+Local, NodeWalkerMut, Block
+Its just one wrapping layer actually then. 
+
+## NodeCursor::State
+Lets not do this. Instead if we really want something like this we can provide a default node cursor that just stores position and implements nodewalker. 
+
+List of fixup types : 
+GrewFixup
+SwapFixup
+NoneSlide
+TwoSlide
+
+wow thats really not that bad eh. 
+
+so then Fixable would become 
+trait Fixable<P : BlockIndex> {
+    fn grew(&mut self, grew:  GrewFixup){}
+    fn swapped(&mut self, swap; SwapFixup){}
+    fn slid(&mut self, ns : NoneSlide){}
+    fn slid2(&mut self, ts : TwoSlide){} // twoslide would be better as DoubleSlide
+}
+
+then NodeWalkerMut : Fixable, TreeWalkerMut gets default impls of the wrapping functions
+
 # What next
 testing
 splitting

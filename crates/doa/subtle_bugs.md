@@ -11,8 +11,8 @@ the reasoning is here.
 
 ## 1. The postorder root split: walking a diverged tree
 
-**The trap.** Postorder walk order is *children, then node*, and physical slot
-order equals walk order. When an internal root R splits, R must relocate to the
+**The trap.** Postorder walk order is *children, then node*, and position order
+equals walk order. When an internal root R splits, R must relocate to the
 mid boundary (its kept half's edge) — but the old flow relocated R *before*
 draining, then opened Y's slot, whose slide runs a run-parent-fixup **walk**:
 
@@ -29,10 +29,10 @@ old flow, step 1: swap R to the mid boundary (R keeps [A,B]):
                          children [A,B] — but R still OWNS all four!
 
 old flow, step 2: open Y's slot → slide → fixup WALK. the walk traverses by
-child pointers; walk order still says R follows D, physically it doesn't:
+child pointers; walk order still says R follows D, positionally it doesn't:
 
    walk order ≠ slot order ⇒ the walk lands on wrong nodes and rewrites
-   entries with wrong vaddrs — corruption, silently.
+   entries with wrong addrs — corruption, silently.
 ```
 
 **Why it was easy to miss:** the window is transient — the tree is consistent
@@ -84,12 +84,12 @@ must be reserved before any mutation.
 
 **Addendum (found by the postorder leaf root split): a WRITTEN slot can't be
 stolen, but it can MOVE.** An intermediate `find_slot` between opening a slot
-and using it may grow (spread), remapping every live phys — the walker state
+and using it may grow (spread), remapping every live pos — the walker state
 gets the `found.grew` fixup, but so must every `OpenSlot` and every captured
-node phys the flow still holds (the postorder leaf split's `y_open`/`r_phys`,
-the internal split's `r_phys` after `open_two`). Miss one and the flow adopts
+node pos the flow still holds (the postorder leaf split's `y_open`/`r_pos`,
+the internal split's `r_pos` after `open_two`). Miss one and the flow adopts
 or drains at the vacated slot — a `None`-read panic at best, corruption at
-worst. The rule: a `find_slot` inside a flow is a phys-remapping event for
+worst. The rule: a `find_slot` inside a flow is a pos-remapping event for
 everything the flow holds, not just for the walker.
 
 ---
@@ -97,7 +97,7 @@ everything the flow holds, not just for the walker.
 ## 3. Reparenting during the run walk: post-slide entries, pre-slide layout
 
 **The trap.** The NoneSlide fixup walks the moved run *before* the slide and
-rewrites each moved node's parent-entry to its **post-slide** vaddr as it goes.
+rewrites each moved node's parent-entry to its **post-slide** addr as it goes.
 Parent-storing shapes also need moved nodes' *children's* parent fields fixed —
 and doing that inside the walk (descend to each child, `set_parent`) descends
 through the node's entries, which by then are a **mix**:
@@ -109,10 +109,10 @@ in-order run walk, delta = +1 (items shift right). X is visited mid-run:
              ^None
 
    X's entry for C:   C was visited EARLIER in the walk
-                      → already rewritten to C's POST-slide vaddr
-   X's entry for D:   D not yet visited → still D's PRE-slide vaddr
+                      → already rewritten to C's POST-slide addr
+   X's entry for D:   D not yet visited → still D's PRE-slide addr
 
-   descend via entry C → v2p(post vaddr) = C_old+1 → the WRONG slot,
+   descend via entry C → a2p(post addr) = C_old+1 → the WRONG slot,
    pre-slide. descend via entry D → correct. mixed!
 ```
 
@@ -136,7 +136,7 @@ itself does what a collected-Vec fixup would have.
 shifted (§8). Swaps emit no self-fixup — the mover applies `SwapFixup` by hand.
 The hop fixed the walker state and the grandparent's entry, but when the
 hoppee was *the block's root* (a root parent in in-order), nothing updated
-the block data's root phys:
+the block data's root position:
 
 ```
 in-order hop of a root parent (left split shifted its boundary):
@@ -146,7 +146,7 @@ in-order hop of a root parent (left split shifted its boundary):
                           ↑ hop target: before child[b]
 
    after:   slots: [ A ][ R' ][ B ]   data.root STILL points at R's
-            data.root ──┘ (dangling)  old phys — every fresh walker
+            data.root ──┘ (dangling)  old position — every fresh walker
                                       (constructed from data().root)
                                       starts on garbage.
 ```
@@ -168,15 +168,15 @@ does.
 **The trap.** The fixup's run walk ends at the run's far edge, but the caller
 needs the walker back at the anchor. Walking back ascends and re-descends
 through child entries — and the walk has already rewritten some of them to
-**post-slide** vaddrs, over a still-**pre-slide** layout:
+**post-slide** addrs, over a still-**pre-slide** layout:
 
 ```
 slide: None moves to the run's near edge (delta +1). the walk visits C, X, D;
-after visiting C, C's parent entry holds C's POST vaddr.
+after visiting C, C's parent entry holds C's POST addr.
 
    slots:   [ · ][ C ][ X ][ D ]
    walk back: ascend from D → descend ... through the rewritten entry:
-   v2p(post vaddr) names the wrong slot pre-slide.
+   a2p(post addr) names the wrong slot pre-slide.
 ```
 
 **The fix:** the walker state is **snapshotted at the anchor and restored**
@@ -311,7 +311,7 @@ walk A, slide A, walk B, slide B:  sound — walk B sees post-slide-A
 `TwoSlide` (the composed *fixup type*) still exists — order-independent
 address rewriting is correct for any holder applying fixups wholesale — but
 the *applying* side always walks-and-slides interleaved. The type serves the
-returned API contract (external vaddr holders get one `fixup` call), not the
+returned API contract (external addr holders get one `fixup` call), not the
 internal flow.
 
 ---
@@ -339,13 +339,13 @@ Fix: ascend *first*, descend into the previous sibling's subtree only when
 ## 11. The hop's fixup walk: the anchor must follow the None
 
 **The trap.** The in-order hop relocates the one node whose logical gap
-(`in_boundary` over its post-insert children) no longer matches its physical
+(`in_boundary` over its post-insert children) no longer matches its position
 slot — mid-hop, walk order and slot order *legitimately* diverge at that
 node. The hop's slot-opening slide therefore needs a fixup walk whose anchor
 depends on **where the None landed relative to the hoppee**:
 
 ```
-gap before child[b]; hoppee H physically past it; None found to the right of the gap:
+gap before child[b]; hoppee H positionally past it; None found to the right of the gap:
 
 case A — None BEYOND H (H inside the run):
    slots: [ .. child[b-1] ][ members.. ][ H ][ .. ][ ·None ]
@@ -367,7 +367,7 @@ the walker is in it — left edge both times.
 ```
 
 **The rule:** `hop_current` probes with the left-edge anchor, then picks the
-walk side by comparing `ns.from` against the hoppee's phys. The general
+walk side by comparing `ns.from` against the hoppee's position. The general
 principle is §1's — no walk may run over a node whose logical position
 disagrees with its slot — except the hoppee itself, whose visit must be
 arranged to be entry-free (via the stack) and first, or avoided entirely.

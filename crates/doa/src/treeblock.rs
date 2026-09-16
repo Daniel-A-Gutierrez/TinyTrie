@@ -4,17 +4,17 @@
 //!sketch of the arena-level cleave, unwired.
 
 use crate::blocks::{Block, BlockOps, BlockTrait};
-use crate::index::BlockIndex;
-use crate::metadata::{Fixable, HasRoot};
+use crate::index::Addr;
+use crate::metadata::{Fixable, HasRoot, Pos};
 use crate::walker::{Node, NodeCursor, NodeWalker, SplittableNode, TreeWalker};
 
 macro_rules! impl_tree_block {
     ($m:ty) => {
-        impl<'block, N, P, D, O> TreeBlock<'block> for Block<'block, N, P, $m, D, O>
+        impl<'block, N, A, D, O> TreeBlock<'block> for Block<'block, N, A, $m, D, O>
         where
             N: Node + 'block,
-            P: BlockIndex,
-            D: 'block + Default + Clone + Fixable<P> + HasRoot<P>,
+            A: Addr,
+            D: 'block + Default + Clone + Fixable<A> + HasRoot<A>,
             O: crate::Ordering,
         {
         }
@@ -29,10 +29,10 @@ macro_rules! impl_tree_block {
 pub trait TreeBlock<'block>: BlockTrait<'block> + BlockOps<'block>
 where
     Self::N: Node,
-    Self::BlockData: HasRoot<Self::P>,
+    Self::BlockData: HasRoot<Self::A>,
 {
-    ///phys slot of the root node. default: `BlockData::root`.
-    fn root_position(&self) -> usize {
+    ///position of the root node. default: `BlockData::root`.
+    fn root_position(&self) -> Pos {
         self.data().root()
     }
 }

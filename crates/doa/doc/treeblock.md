@@ -14,10 +14,10 @@ macro_rules! impl_tree_block;
 pub trait TreeBlock<'block>: BlockTrait<'block> + BlockOps<'block>
 where
     Self::N: Node,
-    Self::BlockData: HasRoot<Self::P>,
+    Self::BlockData: HasRoot<Self::A>,
 {
-    ///phys slot of the root node. default: `BlockData::root`.
-    fn root_position(&self) -> usize;
+    ///position of the root node. default: `BlockData::root`.
+    fn root_position(&self) -> Pos;
 }
 ///L0043
 ///block-level splits (cleave on `BlockExhausted`, arena handoff) — declared,

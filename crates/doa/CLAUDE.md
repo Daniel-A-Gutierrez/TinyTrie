@@ -10,11 +10,11 @@ So the real question DOA answers is: how do I insert into the middle of an array
 
 The two conceptual moves
 
-Move one: separate a thing's name from its shelf position. Think of it like a database: the vaddr is a logical row pointer — assigned once when a node is born, never changed — and the physical slot is where those bytes actually sit. The two are linked by the translator, which is nothing more than a tiny, invertible arithmetic formula (four numbers: two offsets, a shift, a rotation) mapping names to slots and back. The point of this separation is that shelf positions can change en masse while names stay perfectly still. When the store needs to double its capacity, it interleaves a fresh empty slot after every element — a "spread" — and every element's slot index doubles. That would normally invalidate every pointer in the tree. Instead, the translator's shift knob drops by one, and every existing name now maps to its element's new slot. Nobody was told anything. Nothing was repointed. The pointers were stable by construction, because the mapping itself absorbed the change.
+Move one: separate a thing's name from its shelf position. Think of it like a database: the addr is a logical row pointer — assigned once when a node is born, never changed — and the position is where those bytes actually sit. The two are linked by the translator, which is nothing more than a tiny, invertible arithmetic formula (four numbers: two offsets, a shift, a rotation) mapping names to slots and back. The point of this separation is that shelf positions can change en masse while names stay perfectly still. When the store needs to double its capacity, it interleaves a fresh empty slot after every element — a "spread" — and every element's slot index doubles. That would normally invalidate every pointer in the tree. Instead, the translator's shift knob drops by one, and every existing name now maps to its element's new slot. Nobody was told anything. Nothing was repointed. The pointers were stable by construction, because the mapping itself absorbed the change.
 
 This is the move that makes serialization credible: names survive relocation, so a name is a durable thing you can write to disk.
 
-There's a subtlety here that is genuinely hard to internalize, and it's worth saying slowly: the numeric order of vaddrs means nothing. They can wrap around the top of the integer range. They're names, not positions. The only thing that carries real order is the physical array — slot 0 always holds the smallest element, the last slot the largest. Every invariant in the crate is phrased over physical order, and every translation trick is judged by exactly one criterion: did it preserve physical order? Once you've absorbed that flip — "the array is the truth, the numbers are just labels" — most of the crate reads differently than it did before.
+There's a subtlety here that is genuinely hard to internalize, and it's worth saying slowly: the numeric order of addrs means nothing. They can wrap around the top of the integer range. They're names, not positions. The only thing that carries real order is the physical array — position 0 always holds the smallest element, the last position the largest. Every invariant in the crate is phrased over position order, and every translation trick is judged by exactly one criterion: did it preserve position order? Once you've absorbed that flip — "the array is the truth, the numbers are just labels" — most of the crate reads differently than it did before.
 
 Move two: mutation reports corrections; everyone else applies them. When a slide shifts a run of five elements up by one, every parent pointer into those five elements is now wrong. The conventional design has the mutator hunt down and fix the pointers itself. DOA can't do that — it has no idea what your tree looks like inside, and that's deliberate. Instead, the mutator finishes its physical work and hands back a small, closed-form description of what it did: "these slots moved by this delta," or "this range doubled its indices." Anything in the world that holds addresses — the block's own metadata, a walker's saved position, the consumer's stack of ancestors, the consumer's node fields — receives that fixup and corrects every address it holds.
 
@@ -38,7 +38,7 @@ The hardest concepts, ranked
 
 I'd split them into three kinds — worldview shifts, choreography, and sharp edges — because they fail differently: the worldview ones make everything else unreadable until they click, the choreography ones are just genuinely intricate, and the sharp edges will hurt you if you touch them without respect.
 
-1. Vaddr-as-name, phys-as-truth (worldview). The single biggest conceptual hurdle. The instinct is to treat addresses as positions — everything in computing trains you that way. Here they're opaque, possibly wrapping labels, and only the array's physical order is real. Until this clicks, the translator looks like a pointless layer of indirection and every fixup looks optional. After it clicks, the translator looks like the whole point.
+1. Addr-as-name, pos-as-truth (worldview). The single biggest conceptual hurdle. The instinct is to treat addresses as positions — everything in computing trains you that way. Here they're opaque, possibly wrapping labels, and only the array's position order is real. Until this clicks, the translator looks like a pointless layer of indirection and every fixup looks optional. After it clicks, the translator looks like the whole point.
 
 2. The fixup protocol and its ordering discipline (choreography + worldview). Not the mechanism — "apply this remap to your addresses" is easy — but the sequencing rules and why they're load-bearing: corrections must be applied to the walker's own state before it's used to walk; a two-slot reservation must have both slides computed before either moves, because you cannot walk a tree that is half-mutated to find the second one; the run of moved elements must have its parents corrected by a walk that happens before the physical slide it describes. These rules are not stylistic. Each one exists because the alternative is walking a tree in a transiently invalid state — reading a slot mid-relocation, or trusting an index that no longer means what it did.
 
@@ -46,7 +46,7 @@ I'd split them into three kinds — worldview shifts, choreography, and sharp ed
 
 4. The in-order boundary and the parent hop (the subtlest single fact). In inorder, a parent sits at a gap index fixed by DEGREE — not by how many children it currently has. That's counterintuitive (why doesn't the boundary move as children arrive?) and it's fixed that way for one reason: so a split never moves the node being split. Follow the consequence: inserting a child left of the boundary shifts which gap is "the parent's" gap — the parent's identity has to hop over a subtree. One insertion can move a node by a whole subtree's width, and the rule for when that happens (child_idx < DEGREE/2) is exactly the rule for which half a split takes. This is the crate's best illustration that ordering semantics and allocation mechanics are one subject, not two.
 
-5. The reservation model (sharp edge). Slots are Option<MaybeUninit<T>>, and the store can hand out a write-place into a slot that doesn't contain a valid T yet. The contract — a slot may be read only after its reservation's write completes — is enforced by borrowing, not by runtime checks, and the walk-==-slot-order canary is the tripwire that catches a violation before it becomes assume_init UB. Dropping a store with a pending reservation is straight-up UB. This is the one place the crate trusts the caller in a way the type system only half-remembers, and it deserves the respect it gets in subtle_bugs.md.
+5. The walk-==-slot-order canary (sharp edge). An occupied-but-unwired slot (insert without wire) is invisible to every walk — no child entry names it — yet a slide moves it like any other `Some`, so the walk desynchronizes from slot order. The per-visit + endpoint asserts in the run-walk fixup are the tripwire that catches it at the moment of inconsistency. (The old reservation model — `MaybeUninit` write-places, pending-reservation drop UB — is gone: slots are plain `Option<T>`, values always initialized, the store hands out no write-places.)
 
 6. The modes as workload bets (breadth, not depth). Uniform, Anchored, Pluripotent aren't three algorithms so much as three answers to "where will space be needed next?" — answered with different initial translator knobs, different store backends, and different find-space ladders. None is individually hard, but their interaction surface (which one pins the root implicitly, which one grows at the edges and compensates the translator instead of moving anything) is a lot of context to hold at once.
 
@@ -89,15 +89,18 @@ Item inventories live in `doc/<name>.md` — generated skeletons (fenced rust,
 `///L####` tags jump to source). This section is the conceptual map only; the
 files' `//!` headers restate purpose + invariants next to the code.
 
-- `lib.rs` — module wiring + the ordering vocabulary (`RootPos`/`Order`/`Ordering`).
-- `index.rs` — numeric trait ladder + type-level const facts underpinning all
-  address math; upholds only the numeric contract.
-- `translator.rs` — `v2p`/`p2v` translation, fn-ptr-specialized over zero/nonzero
-  params; the one hard rule is physical order (phys 0 = min, phys len−1 = max).
-- `metadata.rs` — the fixup protocol (`Fixup`/`Fixable`) + walker/block data types
-  (`Pos`, `PosAncestry`, `Root`…); `HasRoot` exposes a movable root **phys**.
-- `store.rs` — unbounded `Option<MaybeUninit<T>>` slot backends + slide/find/
-  grow/spread/split/reservation primitives; the alloc-write-read contract.
+- `lib.rs` — module wiring + the ordering/side vocabulary (`RootPos`/`Order`/`Ordering`/`Rel`).
+- `index.rs` — numeric trait ladder (`Num`/`UnsignedNum`/`Addr`, the ex-`BlockIndex`)
+  + type-level const facts underpinning all address math; upholds only the numeric
+  contract.
+- `translator.rs` — `a2p`/`p2a`/`adist` translation, fn-ptr-specialized over
+  zero/nonzero params; the one hard rule is position order (pos 0 = min, pos
+  len−1 = max).
+- `metadata.rs` — the fixup protocol (`Fixup`/`Fixable`/`CursorState`) + the
+  position/child types (`Pos`, `ChildPos`, `PosAncestry`, `Root`…); `HasRoot`
+  exposes a movable root **pos**.
+- `store.rs` — unbounded `Option<T>` slot backends (slots hold initialized values;
+  no reservation model) + slide/find/grow/spread/split primitives.
 - `blocks.rs` — `Block` (store + translator + block data + mode) + the shared
   `BlockTrait`/per-mode `BlockOps` surfaces + the three modes.
 - `walker.rs` — `Node`/`SplittableNode` contract + the three walker layers
@@ -109,33 +112,48 @@ files' `//!` headers restate purpose + invariants next to the code.
   `search` free-fn constructors over consumer `From` impls.
 - `subtle_bugs.md` — nuanced correctness issues solved, with diagrams; the rules
   they left behind.
-- unwired — `block_cursor.rs` (not even declared in lib.rs) + `leafblock.rs` /
-  `inline_leafblock.rs` (compiled, dead) + `src/archive/` + `examples/old_btree/`
-  (the live consumer is `examples/btree.rs`).
+- unwired — `block_cursor.rs` + `leafblock.rs` / `inline_leafblock.rs` (mod decls
+  commented out in lib.rs — uncompiled, unported to addr/pos) + `src/archive/` +
+  `examples/old_btree/` (the live consumer is `examples/btree.rs`).
 
 ## Testing
 
-`src/tests/` — `store.rs` (live: reference-model torture + exhaustive slide/find/
-find-2 matrices for both backends incl. wrapped-deque paths, spread/split/pop
-coverage, drop accounting, contract panics; wired via `store.rs`'s `#[cfg(test)]`
-`#[path]` module) and `walker.rs` (live: a parent-storing B+ consumer run under
-all three orderings — 240-key split-driver torture (ascending/descending/stride)
-+ hand-assembled `insert_child`, validated by structural DFS (stored parent
-fields, separator re-derivation, leaf order, reachable == occupied) and
-`TreeWalk` order vs a reference DFS with strictly increasing phys; wired via
-`walker.rs` the same way). `block.rs` stays unwired (pre-refactor API — needs
-adaptation). Run targeted: `cargo test -p doa --lib store::tests` /
-`walker::tests`; uninit/leaks: `cargo +nightly miri test -p doa --lib <filter>`
-(slow — recompiles + interprets). Tests are commented out when API churn would
-break compilation mid-development; they are live now.
+`src/tests/` — currently UNWIRED: the addr/pos/ChildPos/Rel terminology refactor
+broke their signatures, so the `#[cfg(test)] #[path]` mod wirings in store.rs and
+walker.rs are commented out; port the test files to the new surface, then
+re-enable (uncomment 2 lines per file). What they cover when live — `store.rs`:
+reference-model torture + exhaustive slide/find/find-2 matrices for both backends
+incl. wrapped-deque paths, spread/split/pop coverage, drop accounting, contract
+panics; `walker.rs`: a parent-storing B+ consumer run under all three orderings —
+240-key split-driver torture (ascending/descending/stride) + hand-assembled
+`insert_child`, validated by structural DFS (stored parent fields, separator
+re-derivation, leaf order, reachable == occupied) and `TreeWalk` order vs a
+reference DFS with strictly increasing pos. `block.rs` stays unwired
+(pre-refactor API — needs adaptation). Run targeted: `cargo test -p doa --lib
+store::tests` / `walker::tests`; uninit/leaks: `cargo +nightly miri test -p doa
+--lib <filter>` (slow — recompiles + interprets).
 ⚠ Running the full `cargo test` in this crate has crashed the IDE out of memory in
 the past — run targeted tests.
 
 ## Status
 
-Compiles (lib + workspace); `examples/btree.rs` — a B+ tree consumer — runs green:
-100 keys through the split driver (leaf/internal splits, multiple root promotions,
-height ≥ 2), all anchor kinds, in-run + out-of-run slides.
+Terminology refactor landed (2026-09-15), one vocabulary crate-wide: vaddr/virt/
+`P` → addr/`A` (`Addr`, the ex-`BlockIndex`; generic param `A`); phys → position
+(`Pos(usize)` newtype through signatures — fixups, block data, returns — derived
+`Ord` + usize-rhs `+`/`-` keep inline math bare); child idx → `ChildPos(usize)`
+newtype (mixed compares vs `child_count()`); before/after/dir side bools →
+`Rel { Before, After }`; `v2p`/`p2v`/`vdist` → `a2p`/`p2a`/`adist`; `vget` →
+`aget`, `first/last_vaddr` → `first/last_addr`, `root_vaddr` → `root_addr`;
+`as_halfptr` → `as_half`; `SignedBlockIndex` + `SignedNum` removed (unused).
+Also finished the mid-flight migration the tree was dirty with: `CursorState`
+(position/reposition/descend, `Clone` for the run-walk snapshot) defined;
+`Fixable` kept its per-kind methods (`grew_fix`/`swap_fix`/`slide_fix`/
+`two_slide` — by-value fixup args, so `GrewFixup` went `Copy`) and the call
+sites were migrated onto them; `ascend` returns `(parent node, ChildPos)`.
+
+Compiles (lib + example) and `examples/btree.rs` — a B+ tree consumer — runs
+green: 100 keys through the split driver (leaf/internal splits, multiple root
+promotions, height ≥ 2), all anchor kinds, in-run + out-of-run slides.
 
 `src/tests/walker.rs` exercises, under all three orderings with a parent-storing
 consumer: the split driver's arms (leaf/internal/root, pre/in/post), the in-order
@@ -147,20 +165,22 @@ write); `DequeStore::find_slot`'s back-slice `blo` offset; in-order `split_root`
 childless-root underflow; in-order `prev`/`subtree_last` overshooting after-all
 nodes (subtle_bugs §12); the hop's walk anchor picked by None-side (§11); the §6
 canary recast (per-visit range + endpoint assert with the hop's one-slot
-`far_short` skew); stale live-phys across intermediate
+`far_short` skew); stale live positions across intermediate
 find_slot grows in both postorder root splits (§2 addendum).
 
 Not designed/wired: the walker-driven union-node `drop_tree` (design deferred);
 `BlockExhausted` cleave handling (arena); deletion rebalancing/merges;
-serialization; `leafblock`/`inline_leafblock`; the `block.rs` test adaptation.
+serialization; `leafblock`/`inline_leafblock` (uncompiled); the `src/tests/*` +
+`block.rs` port to the new surface.
 
 ## Future Work
 
-- split hardening — a canary negative test (alloc-in-run-without-wire → expect the panic); grow/double-slide coverage beyond `Uniform` (Anchored/Pluripotent consumers).
+- split hardening — a canary negative test (occupy-in-run-without-wire → expect the panic); grow/double-slide coverage beyond `Uniform` (Anchored/Pluripotent consumers).
+- port `src/tests/{store,walker}.rs` + `block.rs` to the addr/pos/ChildPos/Rel surface, re-enable the 2-line wirings.
 - extend the btree consumer (deletes with leaf removal via `remove_child`, underfull merges) and adapt the archived tests.
 - `keys()` iter hook on the cursor so B+ shapes share the child-min fetch / separator re-derivation / equal-right routing in-crate.
 - ordered iteration over K/V (`IntoIterator` on the walker + `is_leaf` filter) + a range surface.
 - arena tier — infallible insert (absorb exhaustion via spread/cleave/readdress), adaptive runtime strategy switching, overprovisioning, subtrees & forwarding (block_id roots), ordering across splits.
-- graduation — pluripotent → concrete strategy at len == half_ptr.
-- `Fixup::applies` optimization (elide unnecessary runtime checks).
+- graduation — pluripotent → concrete strategy at len == the `Half` cap.
+- `Fixup` relevance-check optimization (elide unnecessary runtime checks).
 - trie integration.

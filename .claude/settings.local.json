@@ -21,7 +21,8 @@
       "mcp__ide__getDiagnostics",
       "Bash(rtk proxy *)",
       "Bash(cargo build *)",
-      "Bash(cargo run *)"
+      "Bash(cargo run *)",
+      "Bash(rtk git diff *)"
     ]
   }
 }

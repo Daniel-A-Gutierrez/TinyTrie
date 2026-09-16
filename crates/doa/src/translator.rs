@@ -1,30 +1,31 @@
-//!virtual↔physical address translation, fn-ptr-specialized over the 16
+//!address↔position translation, fn-ptr-specialized over the 16
 //!(inner/outer/shift/rotation × zero/nonzero) combos so a steady param is
-//!straight-line with no per-lookup branch. `v2p` is the hot path; `p2v` runs
+//!straight-line with no per-lookup branch. `a2p` is the hot path; `p2a` runs
 //!on remap.
 //!
-//!invariant: `p2v(p) = ((p + inner_offset) << shift).ror(rotation) + outer_offset`,
-//!and `v2p` is the exact inverse — round-trip exact on canonical
-//(block-handed-out) vaddrs. vaddrs may wrap; the only hard rule is physical
-//!order: phys 0 = min element, phys len−1 = max.
+//!invariant: `p2a(p) = ((p + inner_offset) << shift).ror(rotation) + outer_offset`,
+//!and `a2p` is the exact inverse — round-trip exact on canonical
+//!(block-handed-out) addrs. addrs may wrap; the only hard rule is position
+//!order: pos 0 = min element, pos len−1 = max.
 
 use crate::index::UnsignedNum;
+use crate::metadata::Pos;
 
 // specialized fn-ptr aliases — the `variant!`/`apply!` macros below generate
 // the 16 specialized bodies.
-// p2v(p) = ((p + inner_offset) << shift) ror rotation + outer_offset.
-// v2p(v) = ((v - outer_offset) rol rotation) >> shift - inner_offset   (exact
+// p2a(p) = ((p + inner_offset) << shift) ror rotation + outer_offset.
+// a2p(a) = ((a - outer_offset) rol rotation) >> shift - inner_offset   (exact
 // inverse on canonical slots).
-// inner_offset lives in physical space (added before the shift); outer_offset
-// in virtual space (added after).
+// inner_offset lives in position space (added before the shift); outer_offset
+// in address space (added after).
 // Each op whose param is 0 is a runtime no-op the CPU does NOT elide (see
 // bench notes), so specialize picks a pre-baked body that skips zero-param ops
 // entirely — straight-line, no per-iter branch, no mispredict risk. Dispatch
 // happens once per set_*, not per lookup; the call target is constant for the
-// life of the params, so the BTB-predicted indirect call costs ~1 cycle on the v
-// chain (see bench).
-type V2p<P> = fn(P, P, P, u32, u32) -> P; // x, inner, outer, shift, rotation
-type P2v<P> = fn(P, P, P, u32, u32) -> P;
+// life of the params, so the BTB-predicted indirect call costs ~1 cycle on the
+// addr chain (see bench).
+type A2p<A> = fn(A, A, A, u32, u32) -> A; // x, inner, outer, shift, rotation
+type P2a<A> = fn(A, A, A, u32, u32) -> A;
 
 // apply x.method(arg) only when the param is nonzero (nz); z is a passthrough.
 macro_rules! apply {
@@ -36,13 +37,13 @@ macro_rules! apply {
     };
 }
 
-// generate one v2p/p2v pair for a given (inner, outer, shift, rot) nz/z pattern.
-// v2p inverts p2v in reverse op order: ror, sub outer, shr, sub inner.
+// generate one a2p/p2a pair for a given (inner, outer, shift, rot) nz/z pattern.
+// a2p inverts p2a in reverse op order: ror, sub outer, shr, sub inner.
 macro_rules! variant {
-    ($v2p:ident / $p2v:ident, inner=$i:tt, outer=$o:tt, shift=$s:tt, rot=$r:tt) => {
+    ($a2p:ident / $p2a:ident, inner=$i:tt, outer=$o:tt, shift=$s:tt, rot=$r:tt) => {
         #[inline]
         #[allow(unused_variables)]
-        fn $v2p<P: UnsignedNum>(x: P, inner: P, outer: P, shift: u32, rotation: u32) -> P {
+        fn $a2p<A: UnsignedNum>(x: A, inner: A, outer: A, shift: u32, rotation: u32) -> A {
             let x = apply!(x, $o, wrapping_sub, outer);
             let x = apply!(x, $r, rotate_left, rotation);
             let x = apply!(x, $s, wrapping_shr, shift);
@@ -50,7 +51,7 @@ macro_rules! variant {
         }
         #[inline]
         #[allow(unused_variables)]
-        fn $p2v<P: UnsignedNum>(x: P, inner: P, outer: P, shift: u32, rotation: u32) -> P {
+        fn $p2a<A: UnsignedNum>(x: A, inner: A, outer: A, shift: u32, rotation: u32) -> A {
             let x = apply!(x, $i, wrapping_add, inner);
             let x = apply!(x, $s, wrapping_shl, shift);
             let x = apply!(x, $r, rotate_right, rotation);
@@ -59,49 +60,50 @@ macro_rules! variant {
     };
 }
 
-///address translator using fn-ptr specialization (see bench notes / v2p_fnptr).
-///`set_*` re-points v2p/p2v when the block's params change (grow/spread/graduate).
-///for a statically-known strategy, a const-generic block inlines the math and
-///beats even this — Translator is for the adaptive tier.
+///address↔position translator using fn-ptr specialization (see bench notes /
+///a2p_fnptr). `set_*` re-points a2p/p2a when the block's params change
+///(grow/spread/graduate). for a statically-known strategy, a const-generic
+///block inlines the math and beats even this — Translator is for the adaptive
+///tier.
 #[derive(Clone)]
-pub struct Translator<P> {
-    inner_offset: P,
-    outer_offset: P,
+pub struct Translator<A> {
+    inner_offset: A,
+    outer_offset: A,
     shift:        u32,
     rotation:     u32,
-    v2p:          V2p<P>,
-    p2v:          P2v<P>,
+    a2p:          A2p<A>,
+    p2a:          P2a<A>,
 }
 
-///virtual <-> physical address translation. P is the in-block pointer type;
-///physical slots are usize. v2p is the hot lookup path, p2v runs on remap.
-pub trait AddressTranslator<P>: Sized {
-    ///virtual address to physical slot
-    fn v2p(&self, virt: P) -> usize;
+///address ↔ position translation. `A` is the in-block address type; positions
+///are `Pos`. a2p is the hot lookup path, p2a runs on remap.
+pub trait AddressTranslator<A>: Sized {
+    ///address to position
+    fn a2p(&self, addr: A) -> Pos;
 
-    ///physical slot to virtual address
-    fn p2v(&self, phys: usize) -> P;
+    ///position to address
+    fn p2a(&self, pos: Pos) -> A;
 
-    ///physical abs distance between two vptrs;
-    fn vdist(&self, v1: P, v2: P) -> usize;
+    ///position-space abs distance between two addrs;
+    fn adist(&self, a1: A, a2: A) -> usize;
 }
 
-impl<P: UnsignedNum> Translator<P> {
-    pub(crate) fn new(inner_offset: P, outer_offset: P, shift: u32, rotation: u32) -> Self {
+impl<A: UnsignedNum> Translator<A> {
+    pub(crate) fn new(inner_offset: A, outer_offset: A, shift: u32, rotation: u32) -> Self {
         Self {
             inner_offset,
             outer_offset,
             shift,
             rotation,
-            v2p: v2p_0000::<P>,
-            p2v: p2v_0000::<P>,
+            a2p: a2p_0000::<A>,
+            p2a: p2a_0000::<A>,
         }
         .specialize(inner_offset, outer_offset, shift, rotation)
     }
-    pub(crate) fn inner_offset(&self) -> P {
+    pub(crate) fn inner_offset(&self) -> A {
         self.inner_offset
     }
-    pub(crate) fn outer_offset(&self) -> P {
+    pub(crate) fn outer_offset(&self) -> A {
         self.outer_offset
     }
     pub(crate) fn shift(&self) -> u32 {
@@ -114,16 +116,16 @@ impl<P: UnsignedNum> Translator<P> {
     ///per-field setters: re-specialize only when that field's zero/nonzero
     ///status flips. a steady param (e.g. rotation bumping past 1) is a plain
     ///field write — no fn-ptr re-dispatch.
-    pub(crate) fn set_inner_offset(&mut self, inner_offset: P) {
-        if (self.inner_offset == P::from_usize(0)) != (inner_offset == P::from_usize(0)) {
+    pub(crate) fn set_inner_offset(&mut self, inner_offset: A) {
+        if (self.inner_offset == A::from_usize(0)) != (inner_offset == A::from_usize(0)) {
             self.inner_offset = inner_offset;
             self.specialize_into(inner_offset, self.outer_offset, self.shift, self.rotation);
         } else {
             self.inner_offset = inner_offset;
         }
     }
-    pub(crate) fn set_outer_offset(&mut self, outer_offset: P) {
-        if (self.outer_offset == P::from_usize(0)) != (outer_offset == P::from_usize(0)) {
+    pub(crate) fn set_outer_offset(&mut self, outer_offset: A) {
+        if (self.outer_offset == A::from_usize(0)) != (outer_offset == A::from_usize(0)) {
             self.outer_offset = outer_offset;
             self.specialize_into(self.inner_offset, outer_offset, self.shift, self.rotation);
         } else {
@@ -147,67 +149,67 @@ impl<P: UnsignedNum> Translator<P> {
         }
     }
 
-    fn specialize(self, inner_offset: P, outer_offset: P, shift: u32, rotation: u32) -> Self {
+    fn specialize(self, inner_offset: A, outer_offset: A, shift: u32, rotation: u32) -> Self {
         let mut s = self;
         s.specialize_into(inner_offset, outer_offset, shift, rotation);
         s
     }
 
-    fn specialize_into(&mut self, inner_offset: P, outer_offset: P, shift: u32, rotation: u32) {
+    fn specialize_into(&mut self, inner_offset: A, outer_offset: A, shift: u32, rotation: u32) {
         let nz = (
-            inner_offset != P::from_usize(0),
-            outer_offset != P::from_usize(0),
+            inner_offset != A::from_usize(0),
+            outer_offset != A::from_usize(0),
             shift != 0,
             rotation != 0,
         );
-        self.v2p = match nz {
-            (false, false, false, false) => v2p_0000::<P>,
-            (true, false, false, false) => v2p_1000::<P>,
-            (false, true, false, false) => v2p_0100::<P>,
-            (false, false, true, false) => v2p_0010::<P>,
-            (false, false, false, true) => v2p_0001::<P>,
-            (true, true, false, false) => v2p_1100::<P>,
-            (true, false, true, false) => v2p_1010::<P>,
-            (true, false, false, true) => v2p_1001::<P>,
-            (false, true, true, false) => v2p_0110::<P>,
-            (false, true, false, true) => v2p_0101::<P>,
-            (false, false, true, true) => v2p_0011::<P>,
-            (true, true, true, false) => v2p_1110::<P>,
-            (true, true, false, true) => v2p_1101::<P>,
-            (true, false, true, true) => v2p_1011::<P>,
-            (false, true, true, true) => v2p_0111::<P>,
-            (true, true, true, true) => v2p_1111::<P>,
+        self.a2p = match nz {
+            (false, false, false, false) => a2p_0000::<A>,
+            (true, false, false, false) => a2p_1000::<A>,
+            (false, true, false, false) => a2p_0100::<A>,
+            (false, false, true, false) => a2p_0010::<A>,
+            (false, false, false, true) => a2p_0001::<A>,
+            (true, true, false, false) => a2p_1100::<A>,
+            (true, false, true, false) => a2p_1010::<A>,
+            (true, false, false, true) => a2p_1001::<A>,
+            (false, true, true, false) => a2p_0110::<A>,
+            (false, true, false, true) => a2p_0101::<A>,
+            (false, false, true, true) => a2p_0011::<A>,
+            (true, true, true, false) => a2p_1110::<A>,
+            (true, true, false, true) => a2p_1101::<A>,
+            (true, false, true, true) => a2p_1011::<A>,
+            (false, true, true, true) => a2p_0111::<A>,
+            (true, true, true, true) => a2p_1111::<A>,
         };
-        self.p2v = match nz {
-            (false, false, false, false) => p2v_0000::<P>,
-            (true, false, false, false) => p2v_1000::<P>,
-            (false, true, false, false) => p2v_0100::<P>,
-            (false, false, true, false) => p2v_0010::<P>,
-            (false, false, false, true) => p2v_0001::<P>,
-            (true, true, false, false) => p2v_1100::<P>,
-            (true, false, true, false) => p2v_1010::<P>,
-            (true, false, false, true) => p2v_1001::<P>,
-            (false, true, true, false) => p2v_0110::<P>,
-            (false, true, false, true) => p2v_0101::<P>,
-            (false, false, true, true) => p2v_0011::<P>,
-            (true, true, true, false) => p2v_1110::<P>,
-            (true, true, false, true) => p2v_1101::<P>,
-            (true, false, true, true) => p2v_1011::<P>,
-            (false, true, true, true) => p2v_0111::<P>,
-            (true, true, true, true) => p2v_1111::<P>,
+        self.p2a = match nz {
+            (false, false, false, false) => p2a_0000::<A>,
+            (true, false, false, false) => p2a_1000::<A>,
+            (false, true, false, false) => p2a_0100::<A>,
+            (false, false, true, false) => p2a_0010::<A>,
+            (false, false, false, true) => p2a_0001::<A>,
+            (true, true, false, false) => p2a_1100::<A>,
+            (true, false, true, false) => p2a_1010::<A>,
+            (true, false, false, true) => p2a_1001::<A>,
+            (false, true, true, false) => p2a_0110::<A>,
+            (false, true, false, true) => p2a_0101::<A>,
+            (false, false, true, true) => p2a_0011::<A>,
+            (true, true, true, false) => p2a_1110::<A>,
+            (true, true, false, true) => p2a_1101::<A>,
+            (true, false, true, true) => p2a_1011::<A>,
+            (false, true, true, true) => p2a_0111::<A>,
+            (true, true, true, true) => p2a_1111::<A>,
         };
     }
 }
 
-impl<P: UnsignedNum> AddressTranslator<P> for Translator<P> {
-    fn v2p(&self, virt: P) -> usize {
-        (self.v2p)(virt, self.inner_offset, self.outer_offset, self.shift, self.rotation)
-            .as_usize()
+impl<A: UnsignedNum> AddressTranslator<A> for Translator<A> {
+    fn a2p(&self, addr: A) -> Pos {
+        Pos((self.a2p)(addr, self.inner_offset, self.outer_offset, self.shift, self.rotation)
+            .as_usize())
     }
 
-    fn p2v(&self, phys: usize) -> P {
-        (self.p2v)(
-            P::from_usize(phys),
+    fn p2a(&self, pos: Pos) -> A {
+        (self.p2a)(
+            A::from_usize(pos.0),
             self.inner_offset,
             self.outer_offset,
             self.shift,
@@ -215,24 +217,24 @@ impl<P: UnsignedNum> AddressTranslator<P> for Translator<P> {
         )
     }
 
-    fn vdist(&self, v1: P, v2: P) -> usize {
-        self.v2p(v2).abs_diff(self.v2p(v1))
+    fn adist(&self, a1: A, a2: A) -> usize {
+        self.a2p(a2).0.abs_diff(self.a2p(a1).0)
     }
 }
 
-variant!(v2p_0000 / p2v_0000, inner = z, outer = z, shift = z, rot = z);
-variant!(v2p_1000 / p2v_1000, inner = nz, outer = z, shift = z, rot = z);
-variant!(v2p_0100 / p2v_0100, inner = z, outer = nz, shift = z, rot = z);
-variant!(v2p_0010 / p2v_0010, inner = z, outer = z, shift = nz, rot = z);
-variant!(v2p_0001 / p2v_0001, inner = z, outer = z, shift = z, rot = nz);
-variant!(v2p_1100 / p2v_1100, inner = nz, outer = nz, shift = z, rot = z);
-variant!(v2p_1010 / p2v_1010, inner = nz, outer = z, shift = nz, rot = z);
-variant!(v2p_1001 / p2v_1001, inner = nz, outer = z, shift = z, rot = nz);
-variant!(v2p_0110 / p2v_0110, inner = z, outer = nz, shift = nz, rot = z);
-variant!(v2p_0101 / p2v_0101, inner = z, outer = nz, shift = z, rot = nz);
-variant!(v2p_0011 / p2v_0011, inner = z, outer = z, shift = nz, rot = nz);
-variant!(v2p_1110 / p2v_1110, inner = nz, outer = nz, shift = nz, rot = z);
-variant!(v2p_1101 / p2v_1101, inner = nz, outer = nz, shift = z, rot = nz);
-variant!(v2p_1011 / p2v_1011, inner = nz, outer = z, shift = nz, rot = nz);
-variant!(v2p_0111 / p2v_0111, inner = z, outer = nz, shift = nz, rot = nz);
-variant!(v2p_1111 / p2v_1111, inner = nz, outer = nz, shift = nz, rot = nz);
+variant!(a2p_0000 / p2a_0000, inner = z, outer = z, shift = z, rot = z);
+variant!(a2p_1000 / p2a_1000, inner = nz, outer = z, shift = z, rot = z);
+variant!(a2p_0100 / p2a_0100, inner = z, outer = nz, shift = z, rot = z);
+variant!(a2p_0010 / p2a_0010, inner = z, outer = z, shift = nz, rot = z);
+variant!(a2p_0001 / p2a_0001, inner = z, outer = z, shift = z, rot = nz);
+variant!(a2p_1100 / p2a_1100, inner = nz, outer = nz, shift = z, rot = z);
+variant!(a2p_1010 / p2a_1010, inner = nz, outer = z, shift = nz, rot = z);
+variant!(a2p_1001 / p2a_1001, inner = nz, outer = z, shift = z, rot = nz);
+variant!(a2p_0110 / p2a_0110, inner = z, outer = nz, shift = nz, rot = z);
+variant!(a2p_0101 / p2a_0101, inner = z, outer = nz, shift = z, rot = nz);
+variant!(a2p_0011 / p2a_0011, inner = z, outer = z, shift = nz, rot = nz);
+variant!(a2p_1110 / p2a_1110, inner = nz, outer = nz, shift = nz, rot = z);
+variant!(a2p_1101 / p2a_1101, inner = nz, outer = nz, shift = z, rot = nz);
+variant!(a2p_1011 / p2a_1011, inner = nz, outer = z, shift = nz, rot = nz);
+variant!(a2p_0111 / p2a_0111, inner = z, outer = nz, shift = nz, rot = nz);
+variant!(a2p_1111 / p2a_1111, inner = nz, outer = nz, shift = nz, rot = nz);

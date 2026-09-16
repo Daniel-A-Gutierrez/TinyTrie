@@ -1,15 +1,13 @@
 //!numeric trait ladder + type-level const facts (`MIDPOINT` neutral anchor,
 //!`ZERO`/`ONE`/`MIN`/`MAX`/`BIT_WIDTH`) + wrapping/rotate ops, macro-impl'd
-//!(`impl_num`/`impl_signed`/`impl_unsigned`/`impl_block_index`/`impl_signed_index`)
-//!for the integer primitives. foundation for all address math; upholds only the
-//!numeric contract.
+//!(`impl_num`/`impl_unsigned`/`impl_addr`) for the integer primitives.
+//!foundation for all address math; upholds only the numeric contract.
 
 use std::fmt;
 use std::hash::Hash;
-use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Rem, Shl, Shr, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Not, Rem, Shl, Shr, Sub};
 
 ///common numeric ops + const facts + `rotate_left`/`rotate_right`/`wrapping_*`.
-///no `Neg` (that lives on `SignedNum`).
 pub trait Num:
     Copy
     + Clone
@@ -32,7 +30,7 @@ pub trait Num:
     + Shl<u32, Output = Self>
     + Shr<u32, Output = Self>
 {
-    /// Neutral address — where pointers anchor so growth has room both ways.
+    /// Neutral address — where addresses anchor so growth has room both ways.
     /// Signed: `0`. Unsigned: range midpoint `(MAX >> 1) + 1` = `1 << (bit_width - 1)`.
     const MIDPOINT: Self;
     const ZERO: Self;
@@ -54,14 +52,6 @@ pub trait Num:
     fn wrapping_shr(self, n: u32) -> Self;
 }
 
-///signed `Num` + `Neg` — adds negation + `isize` conversion (signed addresses
-///convert through `isize`, never `usize`).
-pub trait SignedNum: Num + Neg<Output = Self> {
-    fn as_isize(self) -> isize;
-
-    fn from_isize(n: isize) -> Self;
-}
-
 ///unsigned `Num` — adds `usize` conversion (direct Vec/slot indexing).
 pub trait UnsignedNum: Num {
     fn as_usize(self) -> usize;
@@ -69,23 +59,14 @@ pub trait UnsignedNum: Num {
     fn from_usize(n: usize) -> Self;
 }
 
-///unsigned in-block ptr with an associated `Half` (overprovisioning sibling).
-///impl'd for u16 and u32 (64-bit).
-pub trait BlockIndex: UnsignedNum {
+///unsigned in-block address with an associated `Half` (overprovisioning
+///sibling). impl'd for u16 and u32 (64-bit).
+pub trait Addr: UnsignedNum {
     type Half: UnsignedNum;
 
-    fn as_halfptr(self) -> Self::Half;
+    fn as_half(self) -> Self::Half;
 
-    fn from_halfptr(half: Self::Half) -> Self;
-}
-
-///signed in-block ptr with an associated `Half` (overprovisioning sibling).
-pub trait SignedBlockIndex: SignedNum {
-    type Half: SignedNum;
-
-    fn as_halfptr(self) -> Self::Half;
-
-    fn from_halfptr(half: Self::Half) -> Self;
+    fn from_half(half: Self::Half) -> Self;
 }
 
 macro_rules! impl_num {
@@ -107,15 +88,6 @@ macro_rules! impl_num {
         } )*
     };
 }
-macro_rules! impl_signed {
-    ($($t:ty),* $(,)?) => {
-        $( impl SignedNum for $t {
-
-            #[inline] fn as_isize(self) -> isize { self as isize }
-            #[inline] fn from_isize(n: isize) -> Self { n as $t }
-        } )*
-    };
-}
 macro_rules! impl_unsigned {
     ($($t:ty),* $(,)?) => {
         $( impl UnsignedNum for $t {
@@ -125,35 +97,18 @@ macro_rules! impl_unsigned {
         } )*
     };
 }
-macro_rules! impl_block_index {
+macro_rules! impl_addr {
     ($t:ty,$half:ty) => {
-        impl BlockIndex for $t {
+        impl Addr for $t {
             type Half = $half;
 
             #[inline]
-            fn as_halfptr(self) -> Self::Half {
+            fn as_half(self) -> Self::Half {
                 self as Self::Half
             }
 
             #[inline]
-            fn from_halfptr(half: Self::Half) -> Self {
-                half as Self
-            }
-        }
-    };
-}
-macro_rules! impl_signed_index {
-    ($t:ty,$half:ty) => {
-        impl SignedBlockIndex for $t {
-            type Half = $half;
-
-            #[inline]
-            fn as_halfptr(self) -> Self::Half {
-                self as Self::Half
-            }
-
-            #[inline]
-            fn from_halfptr(half: Self::Half) -> Self {
+            fn from_half(half: Self::Half) -> Self {
                 half as Self
             }
         }
@@ -171,16 +126,9 @@ impl_num!(
     (u64, (<u64>::MAX >> 1) + 1),
 );
 
-impl_signed!(i8, i16, i32, i64);
-
 impl_unsigned!(u8, u16, u32, u64);
 
-impl_block_index!(u16, u8);
-
-impl_signed_index!(i16, i8);
+impl_addr!(u16, u8);
 
 #[cfg(target_pointer_width = "64")]
-impl_block_index!(u32, u16);
-
-#[cfg(target_pointer_width = "64")]
-impl_signed_index!(i32, i16);
+impl_addr!(u32, u16);
