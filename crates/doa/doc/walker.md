@@ -7,13 +7,15 @@
 //! traversal, one impl per ordering (pre, in; post unimplemented).
 //! layer 3 — `PreOrderWalk`/`InOrderWalk`: the open surface. slot-moving ops
 //! CONSUME the walker — a stale position is unrepresentable at the mutation
-//! point; rotations keep it (nothing moves physically). wiring is
+//! point; rotations keep it (nothing moves physically, and the stand-on-the-
+//! riser contract ends where it started). `open_n_*` = the N-None gather
+//! (one scattered-holes compaction per open). wiring is
 //! consumer-side: opens return slots + the applied fixups, the consumer
 //! inserts and rewires via the block directly. `B` is a trait param at every
 //! level; `O` is always `B::O` (the wrapper carries it as phantom data).
 //! NOTE: traversal assumes packed ChildPos (rank == slot); sparse-addressed
 //! nodes need children()-based sibling walks, unimplemented.
-///L0026
+///L0028
 ///ordering-aware wrapper over any consumer `NW`. `O` is phantom — it tags the wrapper
 /// so the per-ordering impls sit on distinct self types (coherence), and is bound to
 /// the block's ordering at every use (`B: BlockTrait<O = O>`).
@@ -21,26 +23,30 @@ pub struct TreeWalker<O, NW> {
     pub nw: NW,
     _o:     PhantomData<O>,
 }
-///L0031
+///L0033
 pub type PreOrderWalker<NW> = TreeWalker<PreOrder, NW>;
-///L0032
+///L0034
 pub type InOrderWalker<NW> = TreeWalker<InOrder, NW>;
-///L0037
+///L0039
 ///the block is exhausted — no slot, no spread, no edge room. split the block.
 ///the walker was consumed: rebuild from the block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockExhausted;
-///L0044
+///L0048
 ///what an open applied: the grow remap + the slide pair (`b` is a no-op slide
-/// for single opens). consumers holding addresses/positions across the open
-/// apply these via their `Fixable` impl — held addrs need only the slides
-/// (addrs are grow-stable by construction), held positions need both.
-#[derive(Clone, Copy)]
+/// for single opens), or — for an `open_n_*` — the one gather. consumers
+/// holding addresses/positions across the open apply these via their
+/// `Fixable` impl — held addrs need only the slides/gather (addrs are
+/// grow-stable by construction), held positions need both, `grew` FIRST (the
+/// slides/gather deltas are post-grew coordinates).
+#[derive(Clone)]
 pub struct OpenFixups {
     pub grew:   Option<GrewFixup>,
     pub slides: DoubleSlide,
+    ///Some ⇒ the slots came from one gather; `slides` are no-ops.
+    pub gather: Option<GatherSlide>,
 }
-///L0049
+///L0055
 pub trait Node {
     type K;
     type V;
@@ -56,7 +62,7 @@ pub trait Node {
 // layer 1 — consumer-implemented node mask. the consumer's walker struct implements
 // these; the crate never sees the node representation (union/enum/whatever).
 // ---------------------------------------------------------------------------
-///L0070
+///L0076
 ///stackless positioned reader over a block's nodes. no ascend — trees without stored
 ///parent pointers can still implement this (lookup needs descent only). no constructor
 ///here: a mut-holding walker can't be built from a shared borrow, so construction lives
@@ -96,7 +102,7 @@ where
     fn search<'b>(&'b mut self, k: &<B::N as Node>::K) -> Option<&'b B::N>
     where 'block: 'b;
 }
-///L0114
+///L0120
 ///ascend-capable cursor — the consumer's stackful walker.
 pub trait NodeWalker<'block, B>: NodeCursor<'block, B>
 where
@@ -110,7 +116,7 @@ where
     ///(parent position, child slot we descended through); `None` at the root.
     fn parent(&self) -> Option<(Pos, ChildPos)>;
 }
-///L0129
+///L0135
 ///consumer mut surface: `Fixable` so the crate's choreography corrects the walker's
 ///held state directly, plus the pointer-write primitives fixup delivery needs.
 pub trait NodeWalkerMut<'block, B>: NodeWalker<'block, B> + Fixable<B::A>
@@ -133,13 +139,15 @@ where
     fn set_child(&mut self, up: usize, child: ChildPos, addr: B::A);
     ///clear the child slot `child` (levels `up`) — no addr names it anymore.
     fn clear_child(&mut self, up: usize, child: ChildPos);
-    ///set the current node's stored parent field. no-op for parent-free shapes.
-    fn set_parent(&mut self, addr: B::A);
+    ///set the current node's stored parent field, returning the overwritten old
+    /// parent addr (`None` for parent-free shapes — the read is free in the
+    /// read-modify-write). no-op for parent-free shapes.
+    fn set_parent(&mut self, addr: B::A) -> Option<B::A>;
 }
 // ---------------------------------------------------------------------------
 // layer 2 — ordered traversal.
 // ---------------------------------------------------------------------------
-///L0160
+///L0168
 ///ordered traversal in the block's layout ordering, over the wrapper.
 ///`next`/`prev`, the subtree edge walks, `first`/`last`.
 pub trait TreeWalk<'block, NW, B>
@@ -164,7 +172,7 @@ where
 // ---------------------------------------------------------------------------
 // layer 3 — the open surface. consumes the walker; returns slots + fixups.
 // ---------------------------------------------------------------------------
-///L0185
+///L0193
 ///preorder opens — B/B+ consumers.
 pub trait PreOrderWalk<'block, NW, B>: TreeWalk<'block, NW, B> + Sized
 where
@@ -186,6 +194,21 @@ where
         cb: ChildPos,
         rb: Rel,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at the current node's position, on the `rel` side —
+    /// one gather (scattered Nones crossed by a single move).
+    fn open_n_here(
+        self,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at child `child`'s subtree edge (Before/After the
+    /// whole subtree), on the `rel` side — one gather.
+    fn open_n_child(
+        self,
+        child: ChildPos,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
     ///the slot a new parent of the current node takes (= before it).
     fn open_parent(self) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     ///root split: the new parent's slot + one child-edge slot, atomically.
@@ -195,7 +218,7 @@ where
         rel: Rel,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
 }
-///L0218
+///L0241
 ///in-order opens + rotations — binary consumers. rotates move nothing
 /// physically (rotation preserves the in-order sequence), so the walker
 /// survives them.
@@ -215,15 +238,34 @@ where
         cb: ChildPos,
         rb: Rel,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
-    ///child 0 rises, current demotes to its slot 1, child 0's right subtree
-    /// moves under the current's slot 0. ends on the riser; at the root the
-    /// block root follows.
+    ///n contiguous slots at the current node's position, on the `rel` side —
+    /// one gather (scattered Nones crossed by a single move).
+    fn open_n_here(
+        self,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at child `child`'s subtree edge (Before/After the
+    /// whole subtree), on the `rel` side — one gather.
+    fn open_n_child(
+        self,
+        child: ChildPos,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///stand-on-the-riser: the walker starts on the riser (its parent's child
+    /// 0) and ends on it — the riser rises, the parent demotes to the riser's
+    /// slot 1, the riser's right subtree moves under the parent's slot 0.
+    /// nothing moves physically; writes via the ancestry stack; the end state
+    /// pops one level (the riser rose, so its true path is shallower than its
+    /// descent history). at the root the block root follows.
     fn rotate_right(&mut self);
-    ///mirror: child 1 rises, current demotes to its slot 0, child 1's left
-    /// subtree moves under the current's slot 1. ends on the riser.
+    ///mirror: the riser (its parent's child 1) rises, the parent demotes to
+    /// its slot 0, the riser's left subtree moves under the parent's slot 1.
+    /// ends on the riser.
     fn rotate_left(&mut self);
 }
-///L0246
+///L0288
 ///(internal) where an open anchors: the current node's own position, or a
 /// child's subtree edge.
 #[derive(Clone, Copy)]
@@ -231,7 +273,7 @@ pub(crate) enum Anchor {
     Here { rel: Rel },
     Child { idx: ChildPos, rel: Rel },
 }
-///L0255
+///L0297
 ///layer 3 — crate-internal choreography: the slide engine + the open engines
 /// over the unified `BlockOps` surface. machinery the consumer never calls —
 /// only the crate's open impls do (pub in-module, not consumer surface). the
@@ -244,8 +286,18 @@ where
 {
     fn reparent_children(&mut self, new_a: B::A);
     fn reparent_run(&mut self, ns: &NoneSlide);
+    ///reparent the children of every Some-dense post-move member slot
+    /// `[lo, hi]` (closed). position-based over the shifted layout — no tree
+    /// walk (subtle_bugs §3). position-restoring. STORES_PARENTS-gated.
+    fn reparent_range(&mut self, lo: Pos, hi: Pos);
     fn fixup(&mut self, ns: &NoneSlide);
+    ///run-parent-fixup for a pending gather — pre-apply, one walk (v1: all
+    /// holes on one side ⇒ one member interval beside the anchor).
+    fn fixup_gather(&mut self, g: &GatherSlide);
     fn apply_slide(&mut self, ns: &NoneSlide) -> OpenSlot;
+    ///apply a pending gather: fixup_gather → `gather_none` → walker-state
+    /// fixup → reparent over the Some-dense post-gather range.
+    fn apply_gather(&mut self, g: &GatherSlide) -> (Pos, Pos);
     fn walk_to_anchor(&mut self, anchor: Anchor) -> (Pos, Rel, usize);
     fn back_from_anchor(&mut self, levels: usize);
     fn open_at(&mut self, anchor: Anchor) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
@@ -254,22 +306,29 @@ where
         a: Anchor,
         b: Anchor,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at `anchor` — one gather. the walker's end position is
+    /// meaningless to the caller (consumed).
+    fn open_n_at(
+        &mut self,
+        anchor: Anchor,
+        n: usize,
+    ) -> Result<((Pos, Pos), OpenFixups), BlockExhausted>;
 }
-///L0275
+///L0334
 impl<O, NW> TreeWalker<O, NW> {}
-///L0281
+///L0340
 impl<'block, NW, B> TreeWalk<'block, NW, B> for TreeWalker<PreOrder, NW>
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block, O = PreOrder> + 'block,
     B::N: Node {}
-///L0345
+///L0404
 impl<'block, NW, B> TreeWalk<'block, NW, B> for TreeWalker<InOrder, NW>
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block, O = InOrder> + 'block,
     B::N: Node {}
-///L0453
+///L0512
 ///generic over `O`: the internal choreography. the `TreeWalker<O, NW>: TreeWalk`
 ///obligation is supplied as a where-clause rather than proven — it only discharges
 ///for a concrete `B`/`O` pair, so the coverage is identical without per-ordering
@@ -281,7 +340,7 @@ where
     B: BlockTrait<'block> + 'block + BlockOps<'block>,
     B::N: Node,
     TreeWalker<O, NW>: TreeWalk<'block, NW, B> {}
-///L0661
+///L0860
 impl<'block, NW, B> PreOrderWalk<'block, NW, B> for TreeWalker<PreOrder, NW>
 where
     NW: NodeWalkerMut<'block, B>,
@@ -289,7 +348,7 @@ where
     B::N: Node,
     TreeWalker<PreOrder, NW>: TreeWalk<'block, NW, B>,
     TreeWalker<PreOrder, NW>: TreeWalkHelper<'block, NW, B> {}
-///L0701
+///L0919
 impl<'block, NW, B> InOrderWalk<'block, NW, B> for TreeWalker<InOrder, NW>
 where
     NW: NodeWalkerMut<'block, B>,
@@ -299,35 +358,35 @@ where
     TreeWalker<InOrder, NW>: TreeWalk<'block, NW, B>,
     TreeWalker<InOrder, NW>: TreeWalkHelper<'block, NW, B> {}
 // ---- shared walk helpers (free fns over the consumer walker) ----
-///L0846
+///L1088
 ///in-order position boundary: the node sits between child[b-1] and child[b],
 ///`b = min(cc, DEGREE/2)` — after all children when cc ≤ DEGREE/2 (fixed by DEGREE,
 ///not cc: a full node's boundary is exactly its kept-left-half's edge, so splits
 ///never move the split node).
 fn in_boundary<'block, B: BlockTrait<'block>>(cc: usize) -> ChildPos
 where B::N: Node;
-///L0851
+///L1093
 fn at_root<'block, NW, B>(nw: &mut NW)
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L0862
+///L1104
 fn leftmost_leaf<'block, NW, B>(nw: &mut NW) -> usize
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L0876
+///L1118
 fn rightmost_leaf<'block, NW, B>(nw: &mut NW) -> usize
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L0892
+///L1134
 #[cfg(test)]
 #[path = "tests/walker.rs"]
 mod tests;

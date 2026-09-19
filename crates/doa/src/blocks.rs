@@ -9,7 +9,7 @@
 //!(pos 0 = min) is preserved by every op.
 use crate::{Ordering, Rel, RootPos,
             index::*,
-            metadata::{DoubleSlide, Fixable, Fixup, GrewFixup, Pos},
+            metadata::{DoubleSlide, Fixable, Fixup, GatherSlide, GrewFixup, Pos},
             store::{DequeStore, NoneSlide, Store, VecStore},
             translator::{AddressTranslator, Translator}};
 use std::marker::PhantomData;
@@ -67,6 +67,12 @@ pub struct FoundSlot {
 pub struct Found2Slots {
     pub grew:   Option<GrewFixup>,
     pub slides: DoubleSlide,
+}
+
+///`find_n_slots` result: the grow this call did, if any, + the gather plan.
+pub struct FoundGather {
+    pub grew:   Option<GrewFixup>,
+    pub gather: GatherSlide,
 }
 
 ///block mode: the store backend + initial translator params, a bet on a workload.
@@ -237,6 +243,45 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
             Some(slides) => Ok(Found2Slots { grew: Some(g), slides }),
             None => Err(InsufficientMaxCapacity()),
         }
+    }
+    ///n slots near `pos` on `rel`'s side — one N-None gather. default ladder:
+    ///budgeted scan → full-len scan → spread + rescan → genuine exhaustion
+    ///(one spread max; a post-spread miss means fewer than n Nones exist).
+    fn find_n_slots(
+        &mut self,
+        pos: Pos,
+        rel: Rel,
+        n: usize,
+    ) -> Result<FoundGather, InsufficientMaxCapacity> {
+        let budget = Self::A::BIT_WIDTH as usize;
+        if let Some(holes) = self.store().find_n_slots(pos, rel, n, budget, self.pin_pos()) {
+            return Ok(FoundGather { grew: None, gather: GatherSlide { anchor: pos, rel, holes } });
+        }
+        //full-len scan before growing (as find_slot's ladder rung)
+        if let Some(holes) = self.store().find_n_slots(pos, rel, n, self.len(), self.pin_pos()) {
+            return Ok(FoundGather { grew: None, gather: GatherSlide { anchor: pos, rel, holes } });
+        }
+        let mut p = pos;
+        let g = self.grow_and_spread()?;
+        g.fix_pos(&mut p);
+        let tr = self.translator().clone();
+        self.data_mut().grew_fix(g, &tr);
+        match self.store().find_n_slots(p, rel, n, self.len(), self.pin_pos()) {
+            Some(holes) => Ok(FoundGather {
+                grew:   Some(g),
+                gather: GatherSlide { anchor: p, rel, holes },
+            }),
+            None => Err(InsufficientMaxCapacity()),
+        }
+    }
+    ///apply a gather plan; returns the opened slot range. as `slide_none`,
+    ///applies the fixup to the block's own `BlockData` before returning.
+    fn gather_none(&mut self, g: &GatherSlide) -> (Pos, Pos) {
+        let pin = self.pin_pos();
+        let slots = self.store_mut().gather_none(g, pin);
+        let tr = self.translator().clone();
+        self.data_mut().gather_fix(g, &tr);
+        slots
     }
     ///the pinned slot: scans/slides must never move it (Anchored: the root's
     ///slot; free modes: none).

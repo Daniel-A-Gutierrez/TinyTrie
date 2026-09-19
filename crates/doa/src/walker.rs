@@ -6,7 +6,9 @@
 //! traversal, one impl per ordering (pre, in; post unimplemented).
 //! layer 3 — `PreOrderWalk`/`InOrderWalk`: the open surface. slot-moving ops
 //! CONSUME the walker — a stale position is unrepresentable at the mutation
-//! point; rotations keep it (nothing moves physically). wiring is
+//! point; rotations keep it (nothing moves physically, and the stand-on-the-
+//! riser contract ends where it started). `open_n_*` = the N-None gather
+//! (one scattered-holes compaction per open). wiring is
 //! consumer-side: opens return slots + the applied fixups, the consumer
 //! inserts and rewires via the block directly. `B` is a trait param at every
 //! level; `O` is always `B::O` (the wrapper carries it as phantom data).
@@ -15,8 +17,8 @@
 
 use crate::blocks::{BlockOps, BlockTrait, OpenSlot};
 use crate::index::Addr;
-use crate::metadata::{ChildPos, DoubleSlide, Fixable, GrewFixup, HasRoot, Pos};
-use crate::store::NoneSlide;
+use crate::metadata::{ChildPos, DoubleSlide, Fixable, GatherSlide, GrewFixup, HasRoot, Pos};
+use crate::store::{NoneSlide, Store};
 use crate::{InOrder, PreOrder, Rel};
 use std::marker::PhantomData;
 
@@ -37,13 +39,17 @@ pub type InOrderWalker<NW> = TreeWalker<InOrder, NW>;
 pub struct BlockExhausted;
 
 ///what an open applied: the grow remap + the slide pair (`b` is a no-op slide
-/// for single opens). consumers holding addresses/positions across the open
-/// apply these via their `Fixable` impl — held addrs need only the slides
-/// (addrs are grow-stable by construction), held positions need both.
-#[derive(Clone, Copy)]
+/// for single opens), or — for an `open_n_*` — the one gather. consumers
+/// holding addresses/positions across the open apply these via their
+/// `Fixable` impl — held addrs need only the slides/gather (addrs are
+/// grow-stable by construction), held positions need both, `grew` FIRST (the
+/// slides/gather deltas are post-grew coordinates).
+#[derive(Clone)]
 pub struct OpenFixups {
     pub grew:   Option<GrewFixup>,
     pub slides: DoubleSlide,
+    ///Some ⇒ the slots came from one gather; `slides` are no-ops.
+    pub gather: Option<GatherSlide>,
 }
 
 pub trait Node {
@@ -147,8 +153,10 @@ where
     fn set_child(&mut self, up: usize, child: ChildPos, addr: B::A);
     ///clear the child slot `child` (levels `up`) — no addr names it anymore.
     fn clear_child(&mut self, up: usize, child: ChildPos);
-    ///set the current node's stored parent field. no-op for parent-free shapes.
-    fn set_parent(&mut self, addr: B::A);
+    ///set the current node's stored parent field, returning the overwritten old
+    /// parent addr (`None` for parent-free shapes — the read is free in the
+    /// read-modify-write). no-op for parent-free shapes.
+    fn set_parent(&mut self, addr: B::A) -> Option<B::A>;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +210,21 @@ where
         cb: ChildPos,
         rb: Rel,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at the current node's position, on the `rel` side —
+    /// one gather (scattered Nones crossed by a single move).
+    fn open_n_here(
+        self,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at child `child`'s subtree edge (Before/After the
+    /// whole subtree), on the `rel` side — one gather.
+    fn open_n_child(
+        self,
+        child: ChildPos,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
     ///the slot a new parent of the current node takes (= before it).
     fn open_parent(self) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     ///root split: the new parent's slot + one child-edge slot, atomically.
@@ -231,12 +254,31 @@ where
         cb: ChildPos,
         rb: Rel,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
-    ///child 0 rises, current demotes to its slot 1, child 0's right subtree
-    /// moves under the current's slot 0. ends on the riser; at the root the
-    /// block root follows.
+    ///n contiguous slots at the current node's position, on the `rel` side —
+    /// one gather (scattered Nones crossed by a single move).
+    fn open_n_here(
+        self,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at child `child`'s subtree edge (Before/After the
+    /// whole subtree), on the `rel` side — one gather.
+    fn open_n_child(
+        self,
+        child: ChildPos,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///stand-on-the-riser: the walker starts on the riser (its parent's child
+    /// 0) and ends on it — the riser rises, the parent demotes to the riser's
+    /// slot 1, the riser's right subtree moves under the parent's slot 0.
+    /// nothing moves physically; writes via the ancestry stack; the end state
+    /// pops one level (the riser rose, so its true path is shallower than its
+    /// descent history). at the root the block root follows.
     fn rotate_right(&mut self);
-    ///mirror: child 1 rises, current demotes to its slot 0, child 1's left
-    /// subtree moves under the current's slot 1. ends on the riser.
+    ///mirror: the riser (its parent's child 1) rises, the parent demotes to
+    /// its slot 0, the riser's left subtree moves under the parent's slot 1.
+    /// ends on the riser.
     fn rotate_left(&mut self);
 }
 
@@ -260,8 +302,18 @@ where
 {
     fn reparent_children(&mut self, new_a: B::A);
     fn reparent_run(&mut self, ns: &NoneSlide);
+    ///reparent the children of every Some-dense post-move member slot
+    /// `[lo, hi]` (closed). position-based over the shifted layout — no tree
+    /// walk (subtle_bugs §3). position-restoring. STORES_PARENTS-gated.
+    fn reparent_range(&mut self, lo: Pos, hi: Pos);
     fn fixup(&mut self, ns: &NoneSlide);
+    ///run-parent-fixup for a pending gather — pre-apply, one walk (v1: all
+    /// holes on one side ⇒ one member interval beside the anchor).
+    fn fixup_gather(&mut self, g: &GatherSlide);
     fn apply_slide(&mut self, ns: &NoneSlide) -> OpenSlot;
+    ///apply a pending gather: fixup_gather → `gather_none` → walker-state
+    /// fixup → reparent over the Some-dense post-gather range.
+    fn apply_gather(&mut self, g: &GatherSlide) -> (Pos, Pos);
     fn walk_to_anchor(&mut self, anchor: Anchor) -> (Pos, Rel, usize);
     fn back_from_anchor(&mut self, levels: usize);
     fn open_at(&mut self, anchor: Anchor) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
@@ -270,6 +322,13 @@ where
         a: Anchor,
         b: Anchor,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
+    ///n contiguous slots at `anchor` — one gather. the walker's end position is
+    /// meaningless to the caller (consumed).
+    fn open_n_at(
+        &mut self,
+        anchor: Anchor,
+        n: usize,
+    ) -> Result<((Pos, Pos), OpenFixups), BlockExhausted>;
 }
 
 impl<O, NW> TreeWalker<O, NW> {
@@ -485,14 +544,20 @@ where
             return;
         }
         let (lo, hi) = (ns.from.min(ns.to), ns.from.max(ns.to));
-        //post-slide member range: delta>0 ⇒ (lo, hi]; delta<0 ⇒ [lo, hi-1]
-        let members = if ns.delta > 0 {
-            (lo.0 + 1..=hi.0).collect::<Vec<_>>()
+        //post-slide member range: delta>0 ⇒ (lo, hi]; delta<0 ⇒ [lo, hi)
+        if ns.delta > 0 {
+            self.reparent_range(lo + 1, hi);
         } else {
-            (lo.0..hi.0).collect::<Vec<_>>()
-        };
+            self.reparent_range(lo, hi - 1);
+        }
+    }
+
+    fn reparent_range(&mut self, lo: Pos, hi: Pos) {
+        if !<B::N as Node>::STORES_PARENTS {
+            return;
+        }
         let back = self.nw.position();
-        for q in members {
+        for q in lo.0..=hi.0 {
             self.nw.set_position(Pos(q)); //walker: -> the moved member (no tree meaning)
             let a = self.nw.block().p2a(Pos(q));
             self.reparent_children(a);
@@ -583,6 +648,109 @@ where
         open
     }
 
+    ///run-parent-fixup for a pending gather, BEFORE it is applied — same
+    ///instrument as `fixup`: rewrite each moved member's parent→child entry
+    /// (and its stored parent field, via the parent's own delta — 0 when the
+    /// parent didn't move) over the still-valid layout. v1: all holes on the
+    /// open side ⇒ the members are the interval's Somes beside the anchor and
+    /// the walk is single-direction, forward-only (§5: the entries read on the
+    /// way are only ever unprocessed ones). the walker must sit at the anchor —
+    /// never a member (the anchor doesn't move).
+    fn fixup_gather(&mut self, g: &GatherSlide) {
+        let (lo, hi) = match g.rel {
+            //the member interval, open: (anchor, q_hi) / (q_lo, anchor) — Before
+            //extends TO the anchor-adjacent slot (it holds a member whenever the
+            //nearest hole isn't adjacent)
+            Rel::After => (g.anchor + 1, *g.holes.last().expect("gather: no holes")),
+            Rel::Before => (*g.holes.first().expect("gather: no holes"), g.anchor),
+        };
+        //steps + far edge: the members are exactly the interval's Somes —
+        //the chosen holes are its only other slots
+        let (mut steps, mut far) = (0usize, None);
+        {
+            let block = self.nw.block();
+            for s in lo.0..hi.0 {
+                if block.store().slot(Pos(s)).is_some() {
+                    steps += 1;
+                    //After walks up (far = topmost); Before walks down (far = bottommost)
+                    if g.rel == Rel::After || far.is_none() {
+                        far = Some(Pos(s));
+                    }
+                }
+            }
+        }
+        if steps == 0 {
+            return; //holes adjacent to the anchor — nothing to fix
+        }
+        //snapshot at the anchor, restored after — as `fixup` (§5): a walk back
+        //would descend through just-rewritten entries
+        let snapshot = self.nw.save();
+        let n = if g.rel == Rel::After { self.next() } else { self.prev() };
+        debug_assert!(n.is_some(), "fixup_gather: walk fell off the block");
+        for i in 0..steps {
+            let p = self.nw.position();
+            //per-visit canary: the interval's Some slots are exactly the
+            //members, so a visit outside it names an occupied slot no walk can
+            //reach — an unwired ghost (subtle_bugs §6)
+            let in_interval = if g.rel == Rel::After {
+                lo <= p && p < hi
+            } else {
+                lo < p && p < hi
+            };
+            assert!(
+                in_interval,
+                "fixup_gather: walk left the member interval — an occupied \
+                 slot in the interval is unwired (insert without wire?)"
+            );
+            if let Some((ppos, idx)) = self.nw.parent() {
+                //delta is 0 for non-members — the parent's own remap covers
+                //both moved and unmoved parents
+                let pa = ppos.wrapping_add(g.delta(ppos) as usize);
+                self.nw.set_parent(self.nw.block().p2a(pa));
+                let new_a = self.nw.block().p2a(p.wrapping_add(g.delta(p) as usize));
+                self.nw.set_child(1, idx, new_a);
+            }
+            if i + 1 < steps {
+                let n = if g.rel == Rel::After { self.next() } else { self.prev() };
+                debug_assert!(n.is_some(), "fixup_gather: walk fell off the block");
+            }
+        }
+        //endpoint canary: against a consistent layout the walk visits the
+        //members in slot order — a ghost lands short/long (§6)
+        assert_eq!(
+            self.nw.position(),
+            far.expect("fixup_gather: steps > 0 with no member"),
+            "fixup_gather: walk endpoint diverged — an occupied slot in the \
+             interval is unwired (insert without wire?)"
+        );
+        self.nw.load(snapshot);
+    }
+
+    fn apply_gather(&mut self, g: &GatherSlide) -> (Pos, Pos) {
+        self.fixup_gather(g);
+        let slots = self.nw.block_mut().gather_none(g);
+        let tr = self.nw.block().translator().clone();
+        self.nw.gather_fix(g, &tr);
+        //post-gather members are Some-dense: After fills [anchor+n+1, q_hi];
+        //Before fills [q_lo, anchor-n-1]
+        let n = g.holes.len();
+        match g.rel {
+            Rel::After => {
+                let hi = *g.holes.last().expect("gather: no holes");
+                self.reparent_range(g.anchor + n + 1, hi);
+            }
+            Rel::Before => {
+                let lo = *g.holes.first().expect("gather: no holes");
+                //no members ⇒ anchor == q_lo+n ⇒ the end would underflow; skip
+                let end = g.anchor.0.saturating_sub(n + 1);
+                if end >= lo.0 {
+                    self.reparent_range(lo, Pos(end));
+                }
+            }
+        }
+        slots
+    }
+
     ///walk to `anchor`: (anchor position, open side, levels back to the current
     ///node). the walker is left AT the anchor — pair with `back_from_anchor`.
     fn walk_to_anchor(&mut self, anchor: Anchor) -> (Pos, Rel, usize) {
@@ -618,7 +786,7 @@ where
         }
         let open = self.apply_slide(&ns);
         let noop = NoneSlide { from: open.0, to: open.0, delta: 0 };
-        Ok((open, OpenFixups { grew: found.grew, slides: DoubleSlide { a: ns, b: noop } }))
+        Ok((open, OpenFixups { grew: found.grew, slides: DoubleSlide { a: ns, b: noop }, gather: None }))
     }
 
     ///two independent opens at `a`/`b` (find_2_slots, composed as one `DoubleSlide`
@@ -654,7 +822,38 @@ where
         self.back_from_anchor(la);
         self.walk_to_anchor(b);
         let open_b = self.apply_slide(&sb);
-        Ok(((open_a, open_b), OpenFixups { grew: found.grew, slides: found.slides }))
+        Ok(((open_a, open_b), OpenFixups { grew: found.grew, slides: found.slides, gather: None }))
+    }
+
+    ///n slots at `anchor`: walk, find_n_slots (budgeted → full-len → spread),
+    ///grew-fix the walker, one gather. as `open_at`, the walker state's
+    /// grew_fix keeps the anchor consistent — no re-walk needed.
+    fn open_n_at(
+        &mut self,
+        anchor: Anchor,
+        n: usize,
+    ) -> Result<((Pos, Pos), OpenFixups), BlockExhausted> {
+        assert!(n > 0, "open_n_at: n == 0");
+        let (pos, rel, _) = self.walk_to_anchor(anchor);
+        let found = self
+            .nw
+            .block_mut()
+            .find_n_slots(pos, rel, n)
+            .map_err(|_| BlockExhausted)?;
+        if let Some(gr) = found.grew {
+            let tr = self.nw.block().translator().clone();
+            self.nw.grew_fix(gr, &tr);
+        }
+        let slots = self.apply_gather(&found.gather);
+        let noop = NoneSlide { from: slots.0, to: slots.0, delta: 0 };
+        Ok((
+            slots,
+            OpenFixups {
+                grew:   found.grew,
+                slides: DoubleSlide { a: noop, b: noop },
+                gather: Some(found.gather),
+            },
+        ))
     }
 }
 
@@ -682,6 +881,25 @@ where
         rb: Rel,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted> {
         self.open_2_at(Anchor::Child { idx: ca, rel: ra }, Anchor::Child { idx: cb, rel: rb })
+    }
+
+    fn open_n_here(
+        mut self,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted> {
+        let ((lo, hi), fixups) = self.open_n_at(Anchor::Here { rel }, n)?;
+        Ok(((OpenSlot(lo), OpenSlot(hi)), fixups))
+    }
+
+    fn open_n_child(
+        mut self,
+        child: ChildPos,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted> {
+        let ((lo, hi), fixups) = self.open_n_at(Anchor::Child { idx: child, rel }, n)?;
+        Ok(((OpenSlot(lo), OpenSlot(hi)), fixups))
     }
 
     ///preorder: a new parent goes before the current node.
@@ -725,115 +943,139 @@ where
         self.open_2_at(Anchor::Child { idx: ca, rel: ra }, Anchor::Child { idx: cb, rel: rb })
     }
 
-    ///binary contract: ≤ 2 children; the riser must be a leaf or binary — a
-    /// unary internal riser has no defined slot 1 (panics by the `child`
-    /// contract). child 0 (L) rises, current (P) demotes to L's slot 1, L's
-    /// right subtree moves under P's slot 0. nothing moves physically. ends
-    /// on L; at the root the block root follows (the riser's own stored parent
-    /// field is only written in the non-root case — parent-free shapes don't
-    /// carry one).
+    fn open_n_here(
+        mut self,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted> {
+        let ((lo, hi), fixups) = self.open_n_at(Anchor::Here { rel }, n)?;
+        Ok(((OpenSlot(lo), OpenSlot(hi)), fixups))
+    }
+
+    fn open_n_child(
+        mut self,
+        child: ChildPos,
+        n: usize,
+        rel: Rel,
+    ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted> {
+        let ((lo, hi), fixups) = self.open_n_at(Anchor::Child { idx: child, rel }, n)?;
+        Ok(((OpenSlot(lo), OpenSlot(hi)), fixups))
+    }
+
+    ///stand-on-the-riser contract: starts on L (child 0), ends on L. reads
+    /// first (tree valid), then one ascend-to-P visit — P's field names L, G's
+    /// entry follows or the block root does when P was the root — and back via
+    /// P's slot 0, which still names L. L's own parent field is only written in
+    /// the non-root case (parent-free shapes don't carry one).
     fn rotate_right(&mut self) {
         debug_assert!(self.nw.child_count() <= 2, "rotate_right: binary contract");
-        //reads (tree valid): L = child 0; LR = L's right subtree
-        let l_a = self.nw.child(ChildPos(0));
-        let lr_a = {
-            self.nw.descend(ChildPos(0)); //walker: -> L
-            let lr = if self.nw.is_leaf() {
-                None
-            } else {
-                debug_assert!(
-                    self.nw.child_count() == 2,
-                    "rotate_right: unary internal riser — slot 1 undefined by contract"
-                );
-                Some(self.nw.child(ChildPos(1)))
-            };
-            self.nw.ascend(); //walker: -> P
-            lr
+        debug_assert!(
+            matches!(self.nw.parent(), Some((_, ChildPos(0)))),
+            "rotate_right: stand on the riser (parent's child 0)"
+        );
+        //reads (tree valid): LR = L's right subtree
+        let l_pos = self.nw.position();
+        let l_a = self.nw.block().p2a(l_pos);
+        let (p_pos, _) = self
+            .nw
+            .parent()
+            .expect("rotate_right: the riser has no parent — not the root");
+        let p_a = self.nw.block().p2a(p_pos);
+        let lr_a = if self.nw.is_leaf() {
+            None
+        } else {
+            debug_assert!(
+                self.nw.child_count() == 2,
+                "rotate_right: unary internal riser — slot 1 undefined by contract"
+            );
+            Some(self.nw.child(ChildPos(1)))
         };
-        let p_a = self.nw.block().p2a(self.nw.position());
-        let parent = self.nw.parent();
-        //P-side writes: the grandparent's entry names L; P's slot 0 takes LR
-        //(cleared when L was a leaf); P's parent field names L
-        if let Some((_, idx)) = parent {
-            self.nw.set_child(1, idx, l_a);
-        }
-        match lr_a {
-            Some(lr) => self.nw.set_child(0, ChildPos(0), lr),
-            None => self.nw.clear_child(0, ChildPos(0)),
-        }
-        self.nw.set_parent(l_a);
-        //reach L — P's slot 0 no longer names it: via the grandparent's
-        //just-written entry, or positionally at the root
-        match parent {
-            Some((g_pos, idx)) => {
-                self.nw.ascend(); //walker: -> G
-                self.nw.descend(idx); //walker: -> L
-                self.nw.set_parent(self.nw.block().p2a(g_pos));
+        self.nw.ascend(); //walker: -> P
+        self.nw.set_parent(l_a); //P's field names L
+        let g_a = match self.nw.parent() {
+            Some((g_pos, gp_idx)) => {
+                self.nw.set_child(1, gp_idx, l_a); //G's entry takes L
+                Some(self.nw.block().p2a(g_pos))
             }
             None => {
-                self.nw.set_position(self.nw.block().a2p(l_a)); //walker: -> L (state only)
+                self.nw.block_mut().data_mut().set_root(l_pos); //P was root
+                None
             }
+        };
+        self.nw.descend(ChildPos(0)); //walker: -> L (P's slot 0 still names it)
+        if let Some(g_a) = g_a {
+            self.nw.set_parent(g_a); //L's field names G
         }
-        //L-side writes: LR first — L's slot 1 still names it — then it takes P
+        //LR first — L's slot 1 still names it — then P's slot 0, then L takes P
         if lr_a.is_some() {
             self.nw.descend(ChildPos(1)); //walker: -> LR
             self.nw.set_parent(p_a);
             self.nw.ascend(); //walker: -> L
         }
-        self.nw.set_child(0, ChildPos(1), p_a);
-        if parent.is_none() {
-            let pos = self.nw.position();
-            self.nw.block_mut().data_mut().set_root(pos);
+        match lr_a {
+            Some(lr) => self.nw.set_child(1, ChildPos(0), lr), //P's slot 0 takes LR
+            None => self.nw.clear_child(1, ChildPos(0)), //riser was a leaf
         }
+        self.nw.set_child(0, ChildPos(1), p_a); //L's slot 1 = P
+        //end-state restore: the riser ROSE a level, so its true path is one
+        //shallower than the descent history — pop the transient entry and
+        //reposition. state-only over a fully consistent tree (not a mid-op
+        //reach). root case: the stack empties, L is the root.
+        self.nw.ascend(); //walker: -> P (pops the entry P's old slot-0 named)
+        self.nw.set_position(l_pos); //walker: -> L, the riser
     }
 
-    ///mirror: child 1 (R) rises, current (P) demotes to R's slot 0, R's left
-    /// subtree moves under P's slot 1. ends on R.
+    ///mirror (0↔1): starts on R (child 1), ends on R. R rises, P demotes to
+    /// R's slot 0, R's left subtree moves under P's slot 1.
     fn rotate_left(&mut self) {
-        debug_assert!(self.nw.child_count() == 2, "rotate_left: needs the right child");
-        //reads (tree valid): R = child 1; RL = R's left subtree
-        let r_a = self.nw.child(ChildPos(1));
-        let rl_a = {
-            self.nw.descend(ChildPos(1)); //walker: -> R
-            let rl = if self.nw.is_leaf() { None } else { Some(self.nw.child(ChildPos(0))) };
-            self.nw.ascend(); //walker: -> P
-            rl
+        debug_assert!(self.nw.child_count() <= 2, "rotate_left: binary contract");
+        debug_assert!(
+            matches!(self.nw.parent(), Some((_, ChildPos(1)))),
+            "rotate_left: stand on the riser (parent's child 1)"
+        );
+        //reads (tree valid): RL = R's left subtree
+        let r_pos = self.nw.position();
+        let r_a = self.nw.block().p2a(r_pos);
+        let (p_pos, _) = self
+            .nw
+            .parent()
+            .expect("rotate_left: the riser has no parent — not the root");
+        let p_a = self.nw.block().p2a(p_pos);
+        let rl_a = if self.nw.is_leaf() {
+            None
+        } else {
+            Some(self.nw.child(ChildPos(0))) //packed ⇒ slot 0 present when internal
         };
-        let p_a = self.nw.block().p2a(self.nw.position());
-        let parent = self.nw.parent();
-        //P-side writes: the grandparent's entry names R; P's slot 1 takes RL
-        //(cleared when R was a leaf); P's parent field names R
-        if let Some((_, idx)) = parent {
-            self.nw.set_child(1, idx, r_a);
-        }
-        match rl_a {
-            Some(rl) => self.nw.set_child(0, ChildPos(1), rl),
-            None => self.nw.clear_child(0, ChildPos(1)),
-        }
-        self.nw.set_parent(r_a);
-        //reach R — via the grandparent's just-written entry, or positionally at
-        //the root
-        match parent {
-            Some((g_pos, idx)) => {
-                self.nw.ascend(); //walker: -> G
-                self.nw.descend(idx); //walker: -> R
-                self.nw.set_parent(self.nw.block().p2a(g_pos));
+        self.nw.ascend(); //walker: -> P
+        self.nw.set_parent(r_a); //P's field names R
+        let g_a = match self.nw.parent() {
+            Some((g_pos, gp_idx)) => {
+                self.nw.set_child(1, gp_idx, r_a); //G's entry takes R
+                Some(self.nw.block().p2a(g_pos))
             }
             None => {
-                self.nw.set_position(self.nw.block().a2p(r_a)); //walker: -> R (state only)
+                self.nw.block_mut().data_mut().set_root(r_pos); //P was root
+                None
             }
+        };
+        self.nw.descend(ChildPos(1)); //walker: -> R (P's slot 1 still names it)
+        if let Some(g_a) = g_a {
+            self.nw.set_parent(g_a); //R's field names G
         }
-        //R-side writes: RL first — R's slot 0 still names it — then it takes P
         if rl_a.is_some() {
             self.nw.descend(ChildPos(0)); //walker: -> RL
             self.nw.set_parent(p_a);
             self.nw.ascend(); //walker: -> R
         }
-        self.nw.set_child(0, ChildPos(0), p_a);
-        if parent.is_none() {
-            let pos = self.nw.position();
-            self.nw.block_mut().data_mut().set_root(pos);
+        match rl_a {
+            Some(rl) => self.nw.set_child(1, ChildPos(1), rl), //P's slot 1 takes RL
+            None => self.nw.clear_child(1, ChildPos(1)), //riser was a leaf
         }
+        self.nw.set_child(0, ChildPos(0), p_a); //R's slot 0 = P
+        //end-state restore (as rotate_right): pop the transient entry — the
+        //riser rose a level; its true path is one shallower
+        self.nw.ascend(); //walker: -> P (pops the entry P's old slot-1 named)
+        self.nw.set_position(r_pos); //walker: -> R, the riser
     }
 }
 

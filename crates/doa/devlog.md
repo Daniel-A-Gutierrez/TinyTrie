@@ -158,9 +158,9 @@ use them to insert nodes into the block.
 after some more discussion with glm : 
     set_root
     split_block(left_root : N, right_root :N ) -> (Self,Self,N); 
-    
 
-#  kVocabulary Updates
+
+#  Vocabulary Updates
 | old (below) | now |
 |---|---|
 | vaddr, virt, virtual, vptr, `P` (the generic) | address; trait `Addr` (ex-`BlockIndex`); generic param `A` |

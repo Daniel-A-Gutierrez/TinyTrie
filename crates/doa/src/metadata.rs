@@ -1,5 +1,6 @@
 //!the fixup protocol: block ops hand back fixup structs (`GrewFixup`, `SwapFixup`,
-//!`NoneSlide`, `DoubleSlide`), each impling `Fixup` — the uniform contract
+//!`NoneSlide`, `DoubleSlide`, `GatherSlide`), each impling `Fixup` — the uniform
+//!contract
 //!(`affects_pos`/`fix_pos` direct; `affects_addr`/`fix_addr` through the block's
 //!translator). tracked state (block data, walker state) impls `Fixable` — one
 //!method per fixup kind, called unconditionally by the walker with the block's
@@ -8,9 +9,11 @@
 
 use crate::{index::Addr,
             store::NoneSlide,
-            translator::{AddressTranslator, Translator}};
+            translator::{AddressTranslator, Translator},
+            Rel};
 use std::cmp::Ordering;
-use std::ops::{Add, Sub};
+use std::mem;
+use std::ops::{Add, Index, IndexMut, Sub};
 
 ///spread remap `pos → pos<<shl + shift_offset` (grow doubles the store; addrs
 ///stay stable). `{shl: 0, shift_offset: 1}` doubles as the plain `pos → pos+1`
@@ -40,6 +43,73 @@ pub struct SwapFixup {
 pub struct DoubleSlide {
     pub a: NoneSlide,
     pub b: NoneSlide,
+}
+
+///one N-None gather: the `holes.len()` Nones at `holes` (sorted, all on
+///`rel`'s side of `anchor`) compact contiguously beside the anchor; every
+///intervening Some crosses the None-run exactly once (swap-minimal — a
+///stable compaction, one move per member). the per-element remap is a
+///crossing count, NOT sequential `NoneSlide`s — the runs overlap, so
+///coordinates go stale mid-application.
+#[derive(Clone, Debug)]
+pub struct GatherSlide {
+    pub anchor: Pos,
+    pub rel:    Rel,
+    pub holes:  Vec<Pos>,
+}
+
+impl GatherSlide {
+    ///the opened slot range, post-gather. After: `[anchor+1, anchor+n]`;
+    ///Before: `[anchor-n, anchor-1]`. the anchor itself never moves (all
+    ///holes are on the open side).
+    pub fn slots(&self) -> (Pos, Pos) {
+        let n = self.holes.len();
+        match self.rel {
+            Rel::After => (self.anchor + 1, self.anchor + n),
+            Rel::Before => (self.anchor - n, self.anchor - 1),
+        }
+    }
+
+    ///net shift of the Some at `pos` (0 ⇒ not a member). After: members are
+    ///the Somes in `(anchor, max hole)`, each shifting by the holes above it;
+    ///Before mirrors with the holes below. degenerates to `NoneSlide` at n=1.
+    pub fn delta(&self, pos: Pos) -> isize {
+        match self.rel {
+            Rel::After => {
+                let hi = self.holes.last().expect("gather: no holes");
+                if pos > self.anchor && pos < *hi {
+                    self.holes.iter().filter(|h| **h > pos).count() as isize
+                } else {
+                    0
+                }
+            }
+            Rel::Before => {
+                let lo = self.holes.first().expect("gather: no holes");
+                if pos > *lo && pos < self.anchor {
+                    -(self.holes.iter().filter(|h| **h < pos).count() as isize)
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+impl Fixup for GatherSlide {
+    fn affects_pos(&self, pos: Pos) -> bool {
+        self.delta(pos) != 0
+    }
+    fn fix_pos(&self, pos: &mut Pos) {
+        *pos = pos.wrapping_add(self.delta(*pos) as usize) //negative ⇒ wrap-subtract
+    }
+    //gather turns no knobs: the new name is the new slot's, same translator.
+    fn affects_addr<A: Addr>(&self, addr: A, tr: &Translator<A>) -> bool {
+        self.affects_pos(tr.a2p(addr))
+    }
+    fn fix_addr<A: Addr>(&self, addr: &mut A, tr: &Translator<A>) {
+        let pos = tr.a2p(*addr).wrapping_add(self.delta(tr.a2p(*addr)) as usize);
+        *addr = tr.p2a(pos);
+    }
 }
 
 ///a slot in the store's array — the truth: pos 0 holds the min element, pos
@@ -74,18 +144,25 @@ pub struct Root {
 }
 
 ///one ancestor entry: parent node's position + the child slot we descended through.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Ancestor {
     pub parent: Pos,
     pub child:  ChildPos,
 }
 
+///inline backing depth — deeper paths spill to the heap.
+pub const ANCESTRY_INLINE: usize = 8;
+
 ///stackful walker's ancestor stack, one entry per level. stores pos (not addr): fixup
-///applies `fix_pos` directly, no translator; O(height) per op.
+///applies `fix_pos` directly, no translator; O(height) per op. inline-backed
+///(`ANCESTRY_INLINE` entries, heap spill beyond): fixup's per-slide snapshot/
+///restore clones a fixed-size block — no heap below that depth.
 ///todo : optimization : ancestry is sorted for preorder and postorder, those shouldnt have to check every item every time.
 #[derive(Clone, Debug, Default)]
 pub struct Ancestry {
-    pub stack: Vec<Ancestor>,
+    inline: [Ancestor; ANCESTRY_INLINE],
+    len:    usize,
+    spill:  Vec<Ancestor>,
 }
 
 ///pos + ancestry — the standard stackful walker state: satisfies the
@@ -122,6 +199,8 @@ pub trait Fixable<A: Addr> {
     fn swap_fix(&mut self, fix: SwapFixup, tr: &Translator<A>);
     fn slide_fix(&mut self, fix: NoneSlide, tr: &Translator<A>);
     fn two_slide(&mut self, fix: DoubleSlide, tr: &Translator<A>);
+    ///by-ref: the gather plan is not `Copy` (its hole list scales with n).
+    fn gather_fix(&mut self, fix: &GatherSlide, tr: &Translator<A>);
 }
 
 ///walker state seam: the crate's defaults (position/current/descend) run on it —
@@ -293,19 +372,52 @@ impl Fixup for DoubleSlide {
 
 impl Ancestry {
     pub fn push(&mut self, parent: Pos, child: ChildPos) {
-        self.stack.push(Ancestor { parent, child });
+        let e = Ancestor { parent, child };
+        if self.len < ANCESTRY_INLINE {
+            self.inline[self.len] = e;
+        } else {
+            self.spill.push(e);
+        }
+        self.len += 1;
     }
     pub fn pop(&mut self) -> Option<Ancestor> {
-        self.stack.pop()
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(if self.len < ANCESTRY_INLINE {
+            mem::replace(&mut self.inline[self.len], Ancestor::default())
+        } else {
+            self.spill.pop().expect("ancestry: spill len drift")
+        })
     }
     pub fn last(&self) -> Option<&Ancestor> {
-        self.stack.last()
+        (self.len > 0).then(|| &self[self.len - 1])
     }
     pub fn len(&self) -> usize {
-        self.stack.len()
+        self.len
     }
     pub fn is_empty(&self) -> bool {
-        self.stack.is_empty()
+        self.len == 0
+    }
+}
+
+impl Index<usize> for Ancestry {
+    type Output = Ancestor;
+    fn index(&self, i: usize) -> &Ancestor {
+        debug_assert!(i < self.len, "ancestry: index {i} of len {}", self.len);
+        if i < ANCESTRY_INLINE { &self.inline[i] } else { &self.spill[i - ANCESTRY_INLINE] }
+    }
+}
+
+impl IndexMut<usize> for Ancestry {
+    fn index_mut(&mut self, i: usize) -> &mut Ancestor {
+        debug_assert!(i < self.len, "ancestry: index {i} of len {}", self.len);
+        if i < ANCESTRY_INLINE {
+            &mut self.inline[i]
+        } else {
+            &mut self.spill[i - ANCESTRY_INLINE]
+        }
     }
 }
 
@@ -328,6 +440,11 @@ impl<A: Addr> Fixable<A> for Pos {
             fix.fix_pos(self);
         }
     }
+    fn gather_fix(&mut self, fix: &GatherSlide, _: &Translator<A>) {
+        if fix.affects_pos(*self) {
+            fix.fix_pos(self);
+        }
+    }
 }
 
 ///pointer-free: nothing to fix.
@@ -336,6 +453,7 @@ impl<A: Addr> Fixable<A> for Height {
     fn swap_fix(&mut self, _: SwapFixup, _: &Translator<A>) {}
     fn slide_fix(&mut self, _: NoneSlide, _: &Translator<A>) {}
     fn two_slide(&mut self, _: DoubleSlide, _: &Translator<A>) {}
+    fn gather_fix(&mut self, _: &GatherSlide, _: &Translator<A>) {}
 }
 
 ///pointer-free: nothing to fix.
@@ -344,6 +462,7 @@ impl<A: Addr> Fixable<A> for Depth {
     fn swap_fix(&mut self, _: SwapFixup, _: &Translator<A>) {}
     fn slide_fix(&mut self, _: NoneSlide, _: &Translator<A>) {}
     fn two_slide(&mut self, _: DoubleSlide, _: &Translator<A>) {}
+    fn gather_fix(&mut self, _: &GatherSlide, _: &Translator<A>) {}
 }
 
 impl<A: Addr> Fixable<A> for Root {
@@ -365,32 +484,44 @@ impl<A: Addr> Fixable<A> for Root {
             fix.fix_pos(&mut self.root);
         }
     }
+    fn gather_fix(&mut self, fix: &GatherSlide, _: &Translator<A>) {
+        if fix.affects_pos(self.root) {
+            fix.fix_pos(&mut self.root);
+        }
+    }
 }
 
 impl<A: Addr> Fixable<A> for Ancestry {
     fn grew_fix(&mut self, fix: GrewFixup, _: &Translator<A>) {
-        for a in &mut self.stack {
-            fix.fix_pos(&mut a.parent);
+        for i in 0..self.len {
+            fix.fix_pos(&mut self[i].parent);
         }
     }
     fn swap_fix(&mut self, fix: SwapFixup, _: &Translator<A>) {
-        for a in &mut self.stack {
-            if fix.affects_pos(a.parent) {
-                fix.fix_pos(&mut a.parent);
+        for i in 0..self.len {
+            if fix.affects_pos(self[i].parent) {
+                fix.fix_pos(&mut self[i].parent);
             }
         }
     }
     fn slide_fix(&mut self, fix: NoneSlide, _: &Translator<A>) {
-        for a in &mut self.stack {
-            if fix.affects_pos(a.parent) {
-                fix.fix_pos(&mut a.parent);
+        for i in 0..self.len {
+            if fix.affects_pos(self[i].parent) {
+                fix.fix_pos(&mut self[i].parent);
             }
         }
     }
     fn two_slide(&mut self, fix: DoubleSlide, _: &Translator<A>) {
-        for a in &mut self.stack {
-            if fix.affects_pos(a.parent) {
-                fix.fix_pos(&mut a.parent);
+        for i in 0..self.len {
+            if fix.affects_pos(self[i].parent) {
+                fix.fix_pos(&mut self[i].parent);
+            }
+        }
+    }
+    fn gather_fix(&mut self, fix: &GatherSlide, _: &Translator<A>) {
+        for i in 0..self.len {
+            if fix.affects_pos(self[i].parent) {
+                fix.fix_pos(&mut self[i].parent);
             }
         }
     }
@@ -419,6 +550,12 @@ impl<A: Addr> Fixable<A> for PosAncestry {
         }
         self.ancestry.two_slide(fix, tr);
     }
+    fn gather_fix(&mut self, fix: &GatherSlide, tr: &Translator<A>) {
+        if fix.affects_pos(self.pos) {
+            fix.fix_pos(&mut self.pos);
+        }
+        self.ancestry.gather_fix(fix, tr);
+    }
 }
 
 ///blanket: pointer-free block data.
@@ -427,6 +564,7 @@ impl<A: Addr> Fixable<A> for () {
     fn swap_fix(&mut self, _: SwapFixup, _: &Translator<A>) {}
     fn slide_fix(&mut self, _: NoneSlide, _: &Translator<A>) {}
     fn two_slide(&mut self, _: DoubleSlide, _: &Translator<A>) {}
+    fn gather_fix(&mut self, _: &GatherSlide, _: &Translator<A>) {}
 }
 
 impl<A: Addr> CursorState<A> for Pos {

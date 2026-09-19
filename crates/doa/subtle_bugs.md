@@ -347,6 +347,64 @@ descent) in both its descend and ascend-loop arms.
 
 ---
 
+## 13. The gather's fixup shape: crossing counts, not slide sequences
+
+**The trap.** An N-None gather looks like N `NoneSlide`s — n holes each
+moving to its slot beside the anchor. Composing the per-hole `NoneSlide`
+fixups sequentially is wrong: each slide's run is expressed in the
+coordinates of the moment, and a holder applying slide k sees positions
+already shifted by slides 1..k−1 — a Some inside two overlapping runs
+double-shifts or skips. This is §9's non-composability with the
+disjointness requirement removed: gather runs necessarily overlap (they
+share the anchor-adjacent segment), which is why `DoubleSlide`'s trick
+cannot scale up.
+
+**The fix.** One closed-form remap: every member Some crosses the gathered
+None-run exactly once, so its delta is a **crossing count** — After:
+`delta(s) = #{holes > s}` for the Somes in `(anchor, q_max)`, Before the
+mirror with the holes below. One `GatherSlide` carrying the hole list
+computes any element's shift in O(n); the store's `gather_none` applies it
+as ONE directional compaction pass. The pass's safety rule: members all
+move one way, so iterate the member interval against the movement (After:
+descending, Before: ascending) — every slot's own iteration precedes any
+write into it, and member finals are distinct, so nothing double-moves and
+nothing clobbers. The single-hole degenerate (n=1) is exactly `NoneSlide`,
+which is how the formulas were validated.
+
+---
+
+## 14. "Ends where it started" is position-only; the state must be TREE-truth
+
+**The trap.** The stand-on-the-riser rotation contract says the walker ends
+where it started — and the natural reading is the full walker state. But the
+walker's descent history describes the PRE-rotation tree: it reached the
+riser by descending through the parent's slot 0/1, and that entry is exactly
+what the rotation rewires. Ending with the descent entry intact makes the
+rotation's own walker lie: at the root, `is_root()` is false for the new
+root; mid-tree, `parent()` names the demoted node through a slot that no
+longer points at the riser. A consumer loop (`while !is_root() { rotate }`,
+AVL-style continuation at the subtree root) walks into the wrong node or
+panics — far from the rotation, on state the rotation itself corrupted.
+
+```
+mid-tree, walker on L, stack [.., (G, gp_idx), (P, 0)]:
+rotate: G's slot gp_idx := L; P's slot 0 := LR; L's slot 1 := P
+   L's TRUE path is now [.., (G, gp_idx)] — one level SHALLOWER (L rose)
+   the kept entry (P, 0) claims P's slot 0 still names L — false.
+```
+
+**The rule.** "Ends on the node it started on" ≠ "ends in the state it
+started in": when the mutation changes the current node's DEPTH or PARENT,
+the end state must be re-derived from the post-mutation tree, not inherited
+from the walker's history. The rotation ends with `ascend` +
+`set_position(riser)` — a state-only pop over the fully consistent
+post-rotation tree (the one benign `set_position` use; the mid-choreography
+reach through a half-rotated tree is what stays forbidden). Root case: the
+stack empties (`is_root()` true). Tests assert the end state's truth
+explicitly, not just its position.
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

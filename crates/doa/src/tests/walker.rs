@@ -6,10 +6,10 @@
 //! (the walk-==-slot-order canary) + per-node structure (separators re-derive
 //! from child mins, leaves sorted). run targeted — full-crate runs OOM the IDE.
 
-use crate::blocks::{BlockTrait, UniformBlock};
-use crate::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GrewFixup, HasRoot, Pos,
-                      PosAncestry, SwapFixup};
-use crate::store::{NoneSlide, Store};
+use crate::blocks::{BlockTrait, OpenSlot, UniformBlock};
+use crate::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide, GrewFixup, HasRoot,
+                      Pos, PosAncestry, SwapFixup};
+use crate::store::{NoneSlide, Store, VecStore};
 use crate::translator::Translator;
 use crate::treeblock::{search, walker};
 use crate::walker::{BlockExhausted, Node, NodeCursor, NodeWalker, NodeWalkerMut, OpenFixups,
@@ -46,6 +46,11 @@ impl Fixable<u16> for Meta {
             fix.fix_pos(&mut self.root);
         }
     }
+    fn gather_fix(&mut self, fix: &GatherSlide, _tr: &Translator<u16>) {
+        if fix.affects_pos(self.root) {
+            fix.fix_pos(&mut self.root);
+        }
+    }
 }
 
 impl HasRoot<u16> for Meta {
@@ -63,13 +68,18 @@ impl HasRoot<u16> for Meta {
     }
 }
 
-///apply an open's fixups to a held addr — the open's slides/grow rename whatever
-/// moved; a held addr is only valid post-fixup.
+///apply an open's fixups to a held addr — the open's slides/grow/gather rename
+/// whatever moved; a held addr is only valid post-fixup.
 fn fix_addr<'block, B: BlockTrait<'block, A = u16>>(block: &B, fixups: &OpenFixups, a: &mut u16) {
-    //addrs are grow-stable by construction — only the slides remap them
+    //addrs are grow-stable by construction — only the slides/gather remap them
     let tr = block.translator();
     if fixups.slides.affects_addr(*a, tr) {
         fixups.slides.fix_addr(a, tr);
+    }
+    if let Some(g) = &fixups.gather {
+        if g.affects_addr(*a, tr) {
+            g.fix_addr(a, tr);
+        }
     }
 }
 
@@ -348,6 +358,9 @@ impl<'block, 'walker> Fixable<u16> for PCursorMut<'block, 'walker> {
     fn two_slide(&mut self, fix: DoubleSlide, tr: &Translator<u16>) {
         self.state.two_slide(fix, tr);
     }
+    fn gather_fix(&mut self, fix: &GatherSlide, tr: &Translator<u16>) {
+        self.state.gather_fix(fix, tr);
+    }
 }
 
 impl<'block, 'walker> NodeWalkerMut<'block, PBlock<'block>> for PCursorMut<'block, 'walker> {
@@ -369,7 +382,7 @@ impl<'block, 'walker> NodeWalkerMut<'block, PBlock<'block>> for PCursorMut<'bloc
     fn set_child(&mut self, up: usize, child: ChildPos, addr: u16) {
         let target = match up {
             0 => self.state.pos,
-            n => self.state.ancestry.stack[self.state.ancestry.len() - n].parent,
+            n => self.state.ancestry[self.state.ancestry.len() - n].parent,
         };
         match self.block_mut().get_mut(target) {
             BNode::Internal(n) => n.children[child.0] = addr,
@@ -379,7 +392,9 @@ impl<'block, 'walker> NodeWalkerMut<'block, PBlock<'block>> for PCursorMut<'bloc
     fn clear_child(&mut self, _up: usize, _child: ChildPos) {
         panic!("clear_child: binary rotations only");
     }
-    fn set_parent(&mut self, _addr: u16) {}
+    fn set_parent(&mut self, _addr: u16) -> Option<u16> {
+        None //no parent fields
+    }
 }
 
 ///the map — consumer-driven splits (preemptive descent; inlined split flows:
@@ -670,6 +685,9 @@ impl<'block, 'walker> Fixable<u16> for BCursorMut<'block, 'walker> {
     fn two_slide(&mut self, fix: DoubleSlide, tr: &Translator<u16>) {
         self.state.two_slide(fix, tr);
     }
+    fn gather_fix(&mut self, fix: &GatherSlide, tr: &Translator<u16>) {
+        self.state.gather_fix(fix, tr);
+    }
 }
 
 impl<'block, 'walker> NodeWalkerMut<'block, BBlock<'block>> for BCursorMut<'block, 'walker> {
@@ -691,18 +709,20 @@ impl<'block, 'walker> NodeWalkerMut<'block, BBlock<'block>> for BCursorMut<'bloc
     fn set_child(&mut self, up: usize, child: ChildPos, addr: u16) {
         let target = match up {
             0 => self.state.pos,
-            n => self.state.ancestry.stack[self.state.ancestry.len() - n].parent,
+            n => self.state.ancestry[self.state.ancestry.len() - n].parent,
         };
         self.block_mut().get_mut(target).kids[child.0] = Some(addr);
     }
     fn clear_child(&mut self, up: usize, child: ChildPos) {
         let target = match up {
             0 => self.state.pos,
-            n => self.state.ancestry.stack[self.state.ancestry.len() - n].parent,
+            n => self.state.ancestry[self.state.ancestry.len() - n].parent,
         };
         self.block_mut().get_mut(target).kids[child.0] = None;
     }
-    fn set_parent(&mut self, _addr: u16) {}
+    fn set_parent(&mut self, _addr: u16) -> Option<u16> {
+        None //no parent fields
+    }
 }
 
 ///shared (read) cursor over the binary block — for walk-order checks.
@@ -967,8 +987,9 @@ fn pre_hand_assembled() {
     assert_eq!(m.get(&22), None);
 }
 
-///rotate_right at the root: child 0 rises; the block root follows; the walker
-///ends on the riser; the in-order sequence is unchanged.
+///rotate_right at the root: the riser (child 0) rises; the block root follows;
+///the walker ends where it started (on the riser); the in-order sequence is
+///unchanged.
 #[test]
 fn in_rotate_root() {
     let mut block = bst_block(&[50, 30, 70, 10, 40]);
@@ -980,9 +1001,13 @@ fn in_rotate_root() {
     assert_eq!(bst_walk(&block), want);
 
     let mut w: TreeWalker<InOrder, BCursorMut<'_, '_>> = walker(&mut block); //at 50
+    w.nw.descend(ChildPos(0)); //walker: -> 30 (the riser)
+    let start = w.nw.position();
     w.rotate_right();
 
-    assert_eq!(w.nw.current().key, 30, "walker ends on the riser");
+    assert_eq!(w.nw.position(), start, "ends on the riser it started on");
+    assert_eq!(w.nw.current().key, 30, "still on the riser");
+    assert!(w.nw.is_root(), "the riser is the new root — the stack emptied");
     assert_eq!(block.get(block.data().root()).key, 30, "block root follows");
     assert_eq!(bst_walk(&block), want, "in-order sequence preserved");
     //30: kids [10, 50]; 50: kids [40, 70]
@@ -1006,9 +1031,13 @@ fn in_rotate_leaf_riser() {
     assert_eq!(bst_walk(&block), want);
 
     let mut w: TreeWalker<InOrder, BCursorMut<'_, '_>> = walker(&mut block); //at 50
+    w.nw.descend(ChildPos(0)); //walker: -> 10 (the leaf riser)
+    let start = w.nw.position();
     w.rotate_right();
 
+    assert_eq!(w.nw.position(), start, "ends on the riser it started on");
     assert_eq!(w.nw.current().key, 10, "leaf riser");
+    assert!(w.nw.is_root(), "the riser is the new root");
     assert_eq!(block.get(block.data().root()).key, 10);
     //both post-rotate nodes are one-kid (slot 0 empty) — packed-nav-walkable
     //never; use the reference sequence
@@ -1023,7 +1052,7 @@ fn in_rotate_leaf_riser() {
 }
 
 ///rotate_left mid-tree: not the root (no root move); the grandparent's entry
-///repoints; the walker ends on the riser.
+///repoints; the walker ends where it started (on the riser).
 #[test]
 fn in_rotate_left_mid() {
     let mut block = bst_block(&[30, 10, 50, 40, 70]);
@@ -1034,11 +1063,18 @@ fn in_rotate_left_mid() {
     };
     assert_eq!(bst_walk(&block), want);
 
+    let r_pos = block.data().root();
     let mut w: TreeWalker<InOrder, BCursorMut<'_, '_>> = walker(&mut block); //at 30
-    w.nw.descend(ChildPos(1)); //walker: -> 50 (the right child)
+    w.nw.descend(ChildPos(1)); //walker: -> 50 (the demoted)
+    w.nw.descend(ChildPos(1)); //walker: -> 70 (the riser)
+    let start = w.nw.position();
     w.rotate_left();
 
-    assert_eq!(w.nw.current().key, 70, "walker ends on the riser");
+    assert_eq!(w.nw.position(), start, "ends on the riser it started on");
+    assert_eq!(w.nw.current().key, 70, "still on the riser");
+    //the riser rose a level: its true parent is 30 via slot 1 — the transient
+    //descent entry is gone
+    assert_eq!(w.nw.parent(), Some((r_pos, ChildPos(1))), "end ancestry is tree-truth");
     assert_eq!(block.get(block.data().root()).key, 30, "root unchanged");
     assert_eq!(bst_walk(&block), want);
     //30: [10, 70]; 70: [50, _]; 50: [40, _]
@@ -1051,6 +1087,231 @@ fn in_rotate_left_mid() {
     let p50_pos = block.a2p(block.get(r70_pos).kids[0].unwrap());
     assert_eq!(kid(&block, p50_pos, 0), Some(40));
     assert_eq!(kid(&block, p50_pos, 1), None);
+}
+
+///insert a leaf at its key-ordered gap (open + block insert + wire) — the
+///setup primitive for the open_n tests.
+fn add_leaf(block: &mut PBlock<'_>, k: u64, pairs: &[(u64, u64)]) {
+    let w: TreeWalker<PreOrder, PCursorMut<'_, '_>> = walker(&mut *block);
+    let cc = w.nw.child_count();
+    let addrs: Vec<u16> = (0..cc).map(|i| w.nw.child(ChildPos(i))).collect();
+    let idx = addrs.iter().position(|&a| k < child_min(w.nw.block(), a)).unwrap_or(cc);
+    let (open, _) = if idx == 0 || cc == 0 {
+        w.open_here(Rel::After).unwrap()
+    } else if idx < cc {
+        w.open_child(ChildPos(idx), Rel::Before).unwrap()
+    } else {
+        w.open_child(ChildPos(cc - 1), Rel::After).unwrap()
+    };
+    block.insert(open, BNode::leaf(pairs));
+    let a = block.p2a(open.0);
+    let r = block.data().root();
+    wire_child(block, r, ChildPos(idx), a);
+}
+
+///open_n at gap 0: a 3-slot gather — the store is dense, so find_n_slots
+///spreads, then scattered Nones cross to the anchor in one move; a held addr
+///applies the gather fixup and still names its node.
+#[test]
+fn pre_open_n_after() {
+    let mut block = PBlock::new();
+    let root = block.insert_root(BNode::internal());
+    block.set_data(Meta { root, height: 1 });
+
+    add_leaf(&mut block, 40, &[(40, 400)]);
+    add_leaf(&mut block, 30, &[(30, 303)]);
+
+    //hold the 30-leaf across the gather — it sits in the member interval
+    let mut held = {
+        let w: TreeWalker<PreOrder, PCursor<'_, '_>> = walker(&block);
+        w.nw.child(ChildPos(0))
+    };
+    let held_pos = block.a2p(held);
+
+    let w: TreeWalker<PreOrder, PCursorMut<'_, '_>> = walker(&mut block);
+    let ((lo, hi), fixups) = w.open_n_here(3, Rel::After).unwrap();
+    let (lo, hi) = (lo.0, hi.0);
+    assert_eq!(hi.0 - lo.0, 2, "three contiguous slots");
+
+    fix_addr(&block, &fixups, &mut held);
+    assert_ne!(block.a2p(held), held_pos, "the gather never moved the held leaf?");
+
+    for (i, k) in [15, 16, 17].into_iter().enumerate() {
+        block.insert(OpenSlot(Pos(lo.0 + i)), BNode::leaf(&[(k, k * 10)]));
+        let a = block.p2a(Pos(lo.0 + i));
+        let r = block.data().root();
+        wire_child(&mut block, r, ChildPos(i), a);
+    }
+
+    validate(&block);
+    let BNode::Leaf(n) = block.aget(held) else { panic!("held addr is not a leaf") };
+    assert_eq!(n.keys[0], 30, "held addr still names its node");
+
+    //preorder node order: root, then leaves in key order
+    let mut w: TreeWalker<PreOrder, PCursor<'_, '_>> = walker(&block);
+    w.first().unwrap();
+    let mut order = vec![];
+    loop {
+        match w.nw.current() {
+            BNode::Internal(n) => order.push(1000 + n.children.len() as u64),
+            BNode::Leaf(n) => order.push(n.keys[0]),
+        }
+        if w.next().is_none() {
+            break;
+        }
+    }
+    assert_eq!(order, vec![1005, 15, 16, 17, 30, 40]);
+}
+
+///open_n on a child edge, Before side: a 2-slot gather below the anchor — the
+///fixup walk runs prev() over the member interval and the members shift down;
+///keys smaller than the subtree's min wire between the earlier children.
+#[test]
+fn pre_open_n_before() {
+    let mut block = PBlock::new();
+    let root = block.insert_root(BNode::internal());
+    block.set_data(Meta { root, height: 1 });
+
+    for (k, v) in [(40u64, 400u64), (30, 303), (35, 351), (25, 251), (20, 201)] {
+        add_leaf(&mut block, k, &[(k, v)]);
+    }
+    validate(&block);
+
+    //children [20, 25, 30, 35, 40]: two slots before child 2's (the 30-leaf)
+    //subtree; keys 27, 28 wire at 2, 3
+    let w: TreeWalker<PreOrder, PCursorMut<'_, '_>> = walker(&mut block);
+    let ((lo, hi), _) = w.open_n_child(ChildPos(2), 2, Rel::Before).unwrap();
+    let (lo, hi) = (lo.0, hi.0);
+    assert_eq!(hi.0 - lo.0, 1, "two contiguous slots");
+
+    for (i, k) in [27, 28].into_iter().enumerate() {
+        block.insert(OpenSlot(Pos(lo.0 + i)), BNode::leaf(&[(k, k * 10)]));
+        let a = block.p2a(Pos(lo.0 + i));
+        let r = block.data().root();
+        wire_child(&mut block, r, ChildPos(2 + i), a);
+    }
+
+    validate(&block);
+
+    let mut w: TreeWalker<PreOrder, PCursor<'_, '_>> = walker(&block);
+    w.first().unwrap();
+    let mut order = vec![];
+    loop {
+        match w.nw.current() {
+            BNode::Internal(n) => order.push(1000 + n.children.len() as u64),
+            BNode::Leaf(n) => order.push(n.keys[0]),
+        }
+        if w.next().is_none() {
+            break;
+        }
+    }
+    assert_eq!(order, vec![1007, 20, 25, 27, 28, 30, 35, 40]);
+}
+
+///open_n over a multi-level region — the burst shape: two fresh two-node
+/// subtrees at one anchor, four slots from a single gather. member internals
+/// move too, so the fixup walk rewrites entries whose parent ALSO moved (the
+/// parent's own crossing delta) — validated by structure + the map still
+/// getting.
+#[test]
+fn pre_open_n_deep() {
+    let mut m = PMap::new();
+    for k in (10..=200u64).step_by(10) {
+        m.insert(k, k * 10).unwrap();
+    }
+    assert!(m.block.data().height >= 2, "expected a multi-level tree");
+
+    let h = m.block.data().height as usize;
+    let w: TreeWalker<PreOrder, PCursorMut<'_, '_>> = walker(&mut m.block);
+    let ((lo, hi), fixups) = w.open_n_here(2 * h, Rel::After).unwrap();
+    let (lo, hi) = (lo.0, hi.0);
+    assert_eq!(hi.0 - lo.0, 2 * h - 1, "one contiguous burst range");
+    assert!(fixups.gather.is_some());
+
+    //burst: two fresh root children, each an (h-1)-deep internal chain with
+    //one leaf — preorder packs each chain at [lo+i*h, lo+(i+1)*h), leaf last
+    for i in 0..2 {
+        let base = lo.0 + i * h;
+        let (k_lo, k_hi) = (4 * i as u64 + 1, 4 * i as u64 + 2);
+        let leaf_pos = Pos(base + h - 1);
+        m.block.insert(OpenSlot(leaf_pos), BNode::leaf(&[(k_lo, k_lo * 10), (k_hi, k_hi * 10)]));
+        for d in (0..h - 1).rev() {
+            let pos = Pos(base + d);
+            let child_a = m.block.p2a(Pos(base + d + 1));
+            m.block.insert(OpenSlot(pos), BNode::new_parent(child_a));
+        }
+        let int_a = m.block.p2a(Pos(base));
+        let r = m.block.data().root();
+        wire_child(&mut m.block, r, ChildPos(i), int_a);
+    }
+    m.len += 4;
+
+    validate(&m.block);
+    for k in (10..=200u64).step_by(10) {
+        assert_eq!(m.get(&k), Some(k * 10), "get({k})");
+    }
+    for k in [1u64, 2, 5, 6] {
+        assert_eq!(m.get(&k), Some(k * 10), "get({k})");
+    }
+    assert_eq!(m.len(), 24);
+}
+
+///Before-gather with the anchor-adjacent slot OCCUPIED — the member interval
+/// extends to anchor−1 (the nearest holes sit farther down). hand-built store:
+/// holes at 2 and 4, anchor at 6, members at 3 and 5 — with the interval
+/// stopping at anchor−1 the walk's first `prev()` trips the per-visit canary
+/// and the anchor-adjacent member's entry never gets rewritten.
+#[test]
+fn pre_open_n_before_adjacent() {
+    let store = VecStore::from_vec(vec![
+        Some(BNode::internal()), //0: root (wired below)
+        Some(BNode::leaf(&[(10, 100)])), //1: A
+        None,                     //2: hole
+        Some(BNode::leaf(&[(20, 200)])), //3: B
+        None,                     //4: hole
+        Some(BNode::leaf(&[(30, 300)])), //5: S — the anchor-adjacent member
+        Some(BNode::leaf(&[(40, 400)])), //6: C — child 3, the anchor
+    ]);
+    let mut block = PBlock::from_parts(
+        store,
+        Translator::new(0, 0, 16, 0), //Uniform's initial translator (shift = BIT_WIDTH)
+        Meta { root: Pos(0), height: 1 },
+    );
+    //wire: children [A, B, S, C], separators = the tail children's mins
+    let kids: Vec<u16> = [1, 3, 5, 6].iter().map(|&p| block.p2a(Pos(p))).collect();
+    let BNode::Internal(n) = block.get_mut(Pos(0)) else { panic!("hand-built root") };
+    n.children = kids;
+    n.keys = vec![20, 30, 40];
+    validate(&block);
+
+    let w: TreeWalker<PreOrder, PCursorMut<'_, '_>> = walker(&mut block);
+    let ((lo, hi), _) = w.open_n_child(ChildPos(3), 2, Rel::Before).unwrap();
+    let (lo, hi) = (lo.0, hi.0);
+    assert_eq!((lo.0, hi.0), (4, 5), "the run is [anchor-2, anchor-1]");
+
+    //B: 3→2 (−1 crossing), S: 5→3 (−2 crossings) — the run lands between them
+    for (i, k) in [35, 36].into_iter().enumerate() {
+        block.insert(OpenSlot(Pos(lo.0 + i)), BNode::leaf(&[(k, k * 10)]));
+        let a = block.p2a(Pos(lo.0 + i));
+        let r = block.data().root();
+        wire_child(&mut block, r, ChildPos(3 + i), a);
+    }
+
+    validate(&block);
+
+    let mut w: TreeWalker<PreOrder, PCursor<'_, '_>> = walker(&block);
+    w.first().unwrap();
+    let mut order = vec![];
+    loop {
+        match w.nw.current() {
+            BNode::Internal(n) => order.push(1000 + n.children.len() as u64),
+            BNode::Leaf(n) => order.push(n.keys[0]),
+        }
+        if w.next().is_none() {
+            break;
+        }
+    }
+    assert_eq!(order, vec![1006, 10, 20, 30, 35, 36, 40]);
 }
 
 ///held addresses across opens: apply the returned fixups and the addr still

@@ -4,12 +4,14 @@
 //!slots; `find_slot`/`slide_none` honor a `pin` (kept out of the moved run).
 //!slots are `Option<T>`: `Some` = occupied, `None` = hole — values are always
 //!initialized; `insert` places one into a hole, the store hands out no
-//!write-places. a two-slot open computes both slides before either is applied.
+//!write-places. a two-slot open computes both slides before either is applied;
+//!`find_n_slots`/`gather_none` are the N-None gather (v1: rel-side holes only,
+//!one compaction pass — every member Some crosses the run exactly once).
 use std::cmp::Ordering::*;
 use std::collections::VecDeque;
 
 use crate::{Rel,
-            metadata::{DoubleSlide, Fixup, Pos}};
+            metadata::{DoubleSlide, Fixup, GatherSlide, Pos}};
 
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
 ///delta: shift each moved item's position by. from>to ⇒ None moves left ⇒ items move
@@ -151,6 +153,71 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     }
 
     fn swap(&mut self, a: Pos, b: Pos);
+
+    ///nearest `n` Nones on `rel`'s side of `pos` (occupied by contract) within
+    /// `budget`, sorted; `None` if fewer than n. `pin` as `find_slot` — the
+    /// clamp caps the window at the pin, so no chosen hole's gather crosses it
+    /// (a gathered span moves every intervening Some).
+    fn find_n_slots(
+        &self,
+        pos: Pos,
+        rel: Rel,
+        n: usize,
+        budget: usize,
+        pin: Option<Pos>,
+    ) -> Option<Vec<Pos>> {
+        debug_assert!(self.slot(pos).is_some());
+        let max = (u32::MAX as usize).min(self.len()).min(pos.0 + budget);
+        let min = pos.0.saturating_sub(budget);
+        let (min, max) = match pin.map(|p| p.0) {
+            Some(p) if p == pos.0 => {
+                if rel == Rel::After { (pos.0, max) } else { (min, pos.0) }
+            }
+            Some(p) if p < pos.0 => (min.max(p + 1), max),
+            Some(p) => (min, max.min(p)),
+            None => (min, max),
+        };
+        let mut holes = Vec::with_capacity(n);
+        match rel {
+            Rel::After => {
+                //ascending scan = nearest-first AND sorted
+                for s in pos.0 + 1..max {
+                    if self.slot(Pos(s)).is_none() {
+                        holes.push(Pos(s));
+                        if holes.len() == n {
+                            return Some(holes);
+                        }
+                    }
+                }
+            }
+            Rel::Before => {
+                //nearest-first = descending; sorted output = reversed
+                for s in (min..pos.0).rev() {
+                    if self.slot(Pos(s)).is_none() {
+                        holes.push(Pos(s));
+                        if holes.len() == n {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if holes.len() == n {
+            if rel == Rel::Before {
+                holes.reverse();
+            }
+            Some(holes)
+        } else {
+            None
+        }
+    }
+
+    ///apply a gather plan: the chosen Nones compact beside the anchor, every
+    /// member Some crossing the run exactly once — one directional pass (all
+    /// members move one way; each slot's own iteration precedes any write into
+    /// it, and member finals are distinct). returns the opened slot range.
+    /// precondition: `pin` not in the member interval (`find_n_slots`'s clamp).
+    fn gather_none(&mut self, g: &GatherSlide, pin: Option<Pos>) -> (Pos, Pos);
 
     ///increases occupancy.
     fn push_front(&mut self, v: T);
@@ -504,6 +571,42 @@ impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {
             let v = self.buf[i].take();
             self.buf[2 * i + offset] = v;
         }
+    }
+
+    fn gather_none(&mut self, g: &GatherSlide, pin: Option<Pos>) -> (Pos, Pos) {
+        let slots = g.slots();
+        debug_assert!(
+            !g.holes.is_empty() && g.holes.windows(2).all(|w| w[0] < w[1]),
+            "gather_none: holes empty/unsorted"
+        );
+        debug_assert!(
+            pin.is_none_or(|p| !g.affects_pos(p)),
+            "gather_none: pin inside the member interval — find_n_slots must keep it out"
+        );
+        match g.rel {
+            //members move up only ⇒ one descending pass: targets sit above
+            //sources, so every slot's own iteration precedes any write into it
+            Rel::After => {
+                let hi = g.holes.last().unwrap().0;
+                for s in (g.anchor.0 + 1..hi).rev() {
+                    if let Some(v) = self.buf[s].take() {
+                        let t = s.wrapping_add(g.delta(Pos(s)) as usize);
+                        self.buf[t] = Some(v);
+                    }
+                }
+            }
+            //members move down only ⇒ one ascending pass (mirror)
+            Rel::Before => {
+                let lo = g.holes.first().unwrap().0;
+                for s in lo + 1..g.anchor.0 {
+                    if let Some(v) = self.buf[s].take() {
+                        let t = s.wrapping_add(g.delta(Pos(s)) as usize);
+                        self.buf[t] = Some(v);
+                    }
+                }
+            }
+        }
+        slots
     }
 
     fn free(&mut self, pos: Pos) -> T {
@@ -1031,6 +1134,41 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
                 self.buf[2 * j + offset] = v;
             }
         }
+    }
+
+    ///same pass as `VecStore::gather_none` — logical indexing; wrap-safe by
+    ///construction (no slice operations).
+    fn gather_none(&mut self, g: &GatherSlide, pin: Option<Pos>) -> (Pos, Pos) {
+        let slots = g.slots();
+        debug_assert!(
+            !g.holes.is_empty() && g.holes.windows(2).all(|w| w[0] < w[1]),
+            "gather_none: holes empty/unsorted"
+        );
+        debug_assert!(
+            pin.is_none_or(|p| !g.affects_pos(p)),
+            "gather_none: pin inside the member interval — find_n_slots must keep it out"
+        );
+        match g.rel {
+            Rel::After => {
+                let hi = g.holes.last().unwrap().0;
+                for s in (g.anchor.0 + 1..hi).rev() {
+                    if let Some(v) = self.buf[s].take() {
+                        let t = s.wrapping_add(g.delta(Pos(s)) as usize);
+                        self.buf[t] = Some(v);
+                    }
+                }
+            }
+            Rel::Before => {
+                let lo = g.holes.first().unwrap().0;
+                for s in lo + 1..g.anchor.0 {
+                    if let Some(v) = self.buf[s].take() {
+                        let t = s.wrapping_add(g.delta(Pos(s)) as usize);
+                        self.buf[t] = Some(v);
+                    }
+                }
+            }
+        }
+        slots
     }
 
     fn free(&mut self, pos: Pos) -> T {

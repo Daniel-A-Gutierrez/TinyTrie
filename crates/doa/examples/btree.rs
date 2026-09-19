@@ -11,8 +11,8 @@ use doa::Fixup;
 use doa::PreOrder;
 use doa::Rel;
 use doa::blocks::{BlockTrait, UniformBlock};
-use doa::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GrewFixup, HasRoot, Pos, PosAncestry,
-                    SwapFixup};
+use doa::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide, GrewFixup, HasRoot, Pos,
+                    PosAncestry, SwapFixup};
 use doa::store::NoneSlide;
 use doa::translator::Translator;
 use doa::treeblock::{search, walker};
@@ -127,6 +127,11 @@ impl Fixable<u16> for BTreeMeta {
         }
     }
     fn two_slide(&mut self, fix: DoubleSlide, _tr: &Translator<u16>) {
+        if fix.affects_pos(self.root) {
+            fix.fix_pos(&mut self.root);
+        }
+    }
+    fn gather_fix(&mut self, fix: &GatherSlide, _tr: &Translator<u16>) {
         if fix.affects_pos(self.root) {
             fix.fix_pos(&mut self.root);
         }
@@ -396,6 +401,9 @@ impl<'block, 'walker> Fixable<u16> for CursorMut<'block, 'walker> {
     fn two_slide(&mut self, fix: DoubleSlide, tr: &Translator<u16>) {
         self.state.two_slide(fix, tr);
     }
+    fn gather_fix(&mut self, fix: &GatherSlide, tr: &Translator<u16>) {
+        self.state.gather_fix(fix, tr);
+    }
 }
 
 impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
@@ -417,7 +425,7 @@ impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block
     fn set_child(&mut self, up: usize, child: ChildPos, addr: u16) {
         let target = match up {
             0 => self.state.pos,
-            n => self.state.ancestry.stack[self.state.ancestry.len() - n].parent,
+            n => self.state.ancestry[self.state.ancestry.len() - n].parent,
         };
         match self.block_mut().get_mut(target) {
             BNode::Internal(n) => *n.children.get_mut(child.0) = addr,
@@ -427,7 +435,9 @@ impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block
     fn clear_child(&mut self, _up: usize, _child: ChildPos) {
         panic!("clear_child: binary rotations only");
     }
-    fn set_parent(&mut self, _addr: u16) {} //nodes store no parent fields
+    fn set_parent(&mut self, _addr: u16) -> Option<u16> {
+        None //nodes store no parent fields
+    }
 }
 
 // ---------------------------------------------------------------------------

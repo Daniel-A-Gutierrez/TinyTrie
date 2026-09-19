@@ -67,7 +67,13 @@ pub struct Found2Slots {
     pub grew:   Option<GrewFixup>,
     pub slides: DoubleSlide,
 }
-///L0074
+///L0073
+///`find_n_slots` result: the grow this call did, if any, + the gather plan.
+pub struct FoundGather {
+    pub grew:   Option<GrewFixup>,
+    pub gather: GatherSlide,
+}
+///L0080
 ///block mode: the store backend + initial translator params, a bet on a workload.
 ///consts are the *initial* params — addrs may wrap; offsets come into play at splits.
 pub trait Mode<'block, A: Addr, N: 'block> {
@@ -81,7 +87,7 @@ pub trait Mode<'block, A: Addr, N: 'block> {
     const MAX_CAP: usize = 1 << A::BIT_WIDTH;
     fn make_translator() -> Translator<A>;
 }
-///L0090
+///L0096
 ///shared read + basic mut surface over store+translator+block data; the per-mode
 ///slot surface (sparse mid-insert, splits) is `BlockOps`.
 pub trait BlockTrait<'block>: Sized {
@@ -144,7 +150,7 @@ pub trait BlockTrait<'block>: Sized {
     ///`src`'s position and the position the record moved to.
     fn swap_open(&mut self, src: Pos, open: OpenSlot) -> (OpenSlot, Pos);
 }
-///L0201
+///L0207
 ///unified per-mode op surface: sparse mid-insert + split. inherent per-mode methods
 ///can't be called from generic code (the tree-ops layer) — this trait is that surface.
 ///every tree-capable mode impls it; `find_slot`/`find_2_slots`/`slide_none`/
@@ -174,6 +180,18 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
         pos_b: Pos,
         rel_b: Rel,
     ) -> Result<Found2Slots, InsufficientMaxCapacity>;
+    ///n slots near `pos` on `rel`'s side — one N-None gather. default ladder:
+    ///budgeted scan → full-len scan → spread + rescan → genuine exhaustion
+    ///(one spread max; a post-spread miss means fewer than n Nones exist).
+    fn find_n_slots(
+        &mut self,
+        pos: Pos,
+        rel: Rel,
+        n: usize,
+    ) -> Result<FoundGather, InsufficientMaxCapacity>;
+    ///apply a gather plan; returns the opened slot range. as `slide_none`,
+    ///applies the fixup to the block's own `BlockData` before returning.
+    fn gather_none(&mut self, g: &GatherSlide) -> (Pos, Pos);
     ///the pinned slot: scans/slides must never move it (Anchored: the root's
     ///slot; free modes: none).
     fn pin_pos(&self) -> Option<Pos>;
@@ -204,13 +222,13 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
     ///`cleave_and_rotate` (which is the shift-exhausted one). left half unchanged.
     fn cleave_and_spread(&mut self, at: Pos) -> Self;
 }
-///L0294
+///L0339
 impl<'block, A: Addr, N: 'block> Mode<'block, A, N> for Uniform {}
-///L0299
+///L0344
 impl<'block, O: Ordering, A: Addr, N: 'block> Mode<'block, A, N> for Anchored<O> {}
-///L0306
+///L0351
 impl<'block, A: Addr, N: 'block> Mode<'block, A, N> for Pluripotent {}
-///L0312
+///L0357
 impl<'block, N, A, M, D, O> Block<'block, N, A, M, D, O>
 where
     N: Sized + 'block,
@@ -218,7 +236,7 @@ where
     M: Mode<'block, A, N>,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0357
+///L0402
 impl<'block, N, A, M, D, O> BlockTrait<'block> for Block<'block, N, A, M, D, O>
 where
     N: Sized + 'block,
@@ -229,31 +247,31 @@ where
 // ---------------------------------------------------------------------------
 // BlockOps impls — one per mode, disjoint by `M`.
 // ---------------------------------------------------------------------------
-///L0400
+///L0445
 impl<'block, N, A, D, O> BlockOps<'block> for Block<'block, N, A, Uniform, D, O>
 where
     N: Sized + 'block,
     A: Addr,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0513
+///L0558
 impl<'block, N, A, D, O> BlockOps<'block> for Block<'block, N, A, Anchored<O>, D, O>
 where
     N: Sized + 'block,
     A: Addr,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0662
+///L0707
 impl<'block, N, A, D, O> BlockOps<'block> for Block<'block, N, A, Pluripotent, D, O>
 where
     N: Sized + 'block,
     A: Addr,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0781
+///L0826
 ///(shift, inner_offset, outer_offset, init_cap) pinning the root at `O`'s fixed addr.
 const fn fr_params<A: Addr, O: Ordering>() -> (u32, A, A, usize);
-///L0790
+///L0835
 ///apply a grow remap to `pos`/`pin` + the block's own data, recording it in `grew`.
 fn grew_step<A: Addr, D: Fixable<A>>(
     grew: &mut Option<GrewFixup>,
@@ -263,7 +281,7 @@ fn grew_step<A: Addr, D: Fixable<A>>(
     data: &mut D,
     tr: &Translator<A>,
 );
-///L0807
+///L0852
 ///fixed root addr for an ordering (the `Anchored` pin target).
 fn root_addr<O: Ordering, A: Addr>() -> A;
 ```

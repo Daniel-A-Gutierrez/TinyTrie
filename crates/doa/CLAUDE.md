@@ -96,26 +96,35 @@ files' `//!` headers restate purpose + invariants next to the code.
 - `translator.rs` — `a2p`/`p2a`/`adist` translation, fn-ptr-specialized over
   zero/nonzero params; the one hard rule is position order (pos 0 = min, pos
   len−1 = max).
-- `metadata.rs` — the fixup protocol (`Fixup`/`Fixable`/`CursorState`) + the
-  position/child types (`Pos`, `ChildPos`, `PosAncestry`, `Root`…); `HasRoot`
-  exposes a movable root **pos**.
+- `metadata.rs` — the fixup protocol (`Fixup`/`Fixable`/`CursorState` — kinds:
+  `GrewFixup`/`SwapFixup`/`NoneSlide`/`DoubleSlide`/`GatherSlide`) + the
+  position/child types (`Pos`, `ChildPos`, `PosAncestry` (inline-backed
+  `Ancestry`), `Root`…); `HasRoot` exposes a movable root **pos**.
 - `store.rs` — unbounded `Option<T>` slot backends (slots hold initialized values;
-  no reservation model) + slide/find/grow/spread/split primitives.
+  no reservation model) + slide/find/gather/grow/spread/split primitives
+  (`find_n_slots`/`gather_none` = the N-None gather).
 - `blocks.rs` — `Block` (store + translator + block data + mode) + the shared
-  `BlockTrait`/per-mode `BlockOps` surfaces + the three modes.
+  `BlockTrait`/per-mode `BlockOps` surfaces (find ladders incl. `find_n_slots`)
+  + the three modes.
 - `walker.rs` — `Node` contract + the walker layers: `NodeCursor`/
   `NodeWalker`/`NodeWalkerMut` (consumer mask; the walker IS its own state —
   `Fixable` + internal `Snapshot`/save/load/set_position), `TreeWalk` (nav,
   per-ordering: pre + in; post unimplemented), `PreOrderWalk`/`InOrderWalk`
-  (the open surface — slot-moving ops consume the walker; rotations keep it),
-  and the sealed `TreeWalkHelper` (slide engine + open engines; `Anchor` is
-  internal). `B` is a trait param at every level, `O` is always `B::O`;
-  traversal assumes packed ChildPos (rank == slot) — sparse-addressed nodes
-  need children()-based sibling walks, unimplemented.
+  (the open surface — slot-moving ops consume the walker; `open_n_*` = the
+  gather; rotations keep the walker — stand-on-the-riser, ends ON the riser
+  with the true one-shallower ancestry), and the sealed `TreeWalkHelper` (slide engine, gather engine,
+  open engines; `Anchor` is internal). `B` is a trait param at every level,
+  `O` is always `B::O`; traversal assumes packed ChildPos (rank == slot) —
+  sparse-addressed nodes need children()-based sibling walks, unimplemented.
 - `treeblock.rs` — `TreeBlock` (param-less tree-block marker) + the `walker`/
   `search` free-fn constructors over consumer `From` impls.
 - `subtle_bugs.md` — nuanced correctness issues solved, with diagrams; the rules
   they left behind.
+- `HANDOFF.md` — zero-context state/flaws/directions ledger for a cold agent:
+  what landed, where the surface debate landed, the known-flaws list, and the
+  agreed-but-unimplemented directions (rotation rework, walk-back
+  optimization). Status above is the short-term record; this carries the
+  reasoning.
 - unwired — `block_cursor.rs` + `leafblock.rs` / `inline_leafblock.rs` (mod decls
   commented out in lib.rs — uncompiled, unported to addr/pos) + `src/archive/` +
   `examples/old_btree/` (the live consumer is `examples/btree.rs`).
@@ -149,7 +158,11 @@ the block directly. The pieces:
 
 - consumer mask flattened: the walker IS its own state (`NodeCursor` reads +
   consumer-impl'd `descend`; `NodeWalkerMut: Fixable` + `Snapshot`/save/load/
-  set_position (internal machinery) + set_child/clear_child/set_parent);
+  set_position (internal machinery — proposed for deletion 2026-09-19 and
+  KEPT after review: save/load is fixup's correctness instrument, the run
+  walk rewrites entries to post-slide addrs so walking back is unsound,
+  subtle_bugs §5; the per-slide clone is an optimization target, not a
+  subtraction) + set_child/clear_child/set_parent (both kept by decision));
   `lookup -> Option<ChildPos>` (None = descent terminates — the consumer's
   equal policy); `children() -> (ChildPos, A)` pairs, DoubleEnded+ExactSize.
   Died: the `State` assoc type + accessors + `parts`/`parts_mut`, `has_space`,
@@ -182,9 +195,72 @@ the block directly. The pieces:
 - `src/tests/walker.rs` live on the new surface (see Testing) — miri-clean.
   The old split-driver/hop/postorder torture died with its machinery.
 
-Deferred: `find_n_slots`/`open_n` (the swap-minimal N-gather — a worktree
-agent attempt died on output limits; nothing landed, `NoneSlide` untouched);
-`split_block` body; store tests port (still unwired).
+Second session (2026-09-19, same day) — the three agreed directions landed:
+- **rotations → the stand-on-the-riser contract** (was HANDOFF §4a): the
+  walker starts ON the riser, all writes via up-navigation over the ancestry
+  stack, ends ON the riser — with the ancestry popped ONE level, because the
+  riser ROSE: "ends where it started" is position-only, and the end state
+  must be TREE-TRUTH (the descent-history entry naming P via slot 0 is stale
+  post-rotation). The final pop is `ascend` + `set_position` — a state-only
+  restore over the fully-consistent post-rotation tree; what died is the old
+  MID-CHOREOGRAPHY reach (walking to the riser through a half-rotated tree).
+  Root/mid-tree uniform; root case ends with an empty stack. The HANDOFF
+  pseudocode omitted the riser's own stored-parent-field write — kept (the
+  old code's third `set_parent`; parent-free shapes no-op it).
+- **§4b partial**: `set_parent -> Option<B::A>` — the overwritten old parent
+  addr, `None` for parent-free shapes; crate call sites discard it (what a
+  walker does with it is consumer territory — journaling `save`/`load` or
+  ascend-by-old; `Some` returns are unexercised, no parent-field consumer
+  exists). `Ancestry` is inline-backed (8 entries + spill, Index/IndexMut):
+  fixup's per-slide snapshot/restore is a fixed-size copy below depth 8. The
+  clone itself stays — irreducible for stack walkers (§5: popped anchor-path
+  entries can't be re-derived mid-fixup); the heap alloc was the cost.
+- **gather machinery (v1)**: `GatherSlide` (metadata.rs) — the N-None gather
+  as a closed-form CROSSING-COUNT fixup (`delta(pos) = ±#{holes beyond
+  pos}` — NOT sequential `NoneSlide`s: overlapping runs go stale
+  mid-application). `Store::find_n_slots` (rel-side nearest-n, pin-clamped) +
+  per-store `gather_none` — one directional compaction pass (After descends
+  moving members up, Before ascends moving them down; each slot's own
+  iteration precedes any write into it), every member Some crosses the run
+  exactly once. `BlockOps::find_n_slots` ladder (budgeted → full-len →
+  spread+rescan → exhaustion) + `gather_none` (fixes BlockData). Walker:
+  `fixup_gather` (one single-direction run walk, per-visit + endpoint
+  canaries, snapshot/restore), `apply_gather` (`reparent_range` =
+  reparent_run's body generalized to explicit Some-dense bounds),
+  `open_n_at` + surface `open_n_here`/`open_n_child` on both orderings.
+  `OpenFixups.gather` (no longer Copy); `Fixable::gather_fix` (by-ref).
+  v1 scope: holes all on the open's rel side (one walk segment per gather);
+  Pluripotent gets the default ladder (no edge-grow for n>1); Uniform lacks
+  the proactive 3/4-spread rung.
+- tests: the rotation tests reworked (descend to the riser first; end
+  position == start + end-STATE truth asserted — is_root at the root, the
+  true parent mid-tree); `pre_open_n_after` (3-slot gather, held-addr
+  delivery), `pre_open_n_before` (Before child edge, prev() walk),
+  `pre_open_n_before_adjacent` (hand-built store — the anchor-adjacent slot
+  OCCUPIED, the member interval extends to anchor−1),
+  `pre_open_n_deep` (2*h-slot burst — two fresh (h-1)-deep internal chains +
+  leaves into a multi-level map; member internals with moved parents).
+  12 tests, miri-clean. The in-order `open_n_*` surface is untestable against
+  the binary consumer: any 2-node burst needs a slot on each side of the
+  parent gap, or produces leftless-right chains (unwalkable) — it waits for a
+  DEGREE>2 in-order consumer.
+  Fresh-review findings (all fixed pre-commit): the Before member interval
+  stopped at anchor−1 instead of the anchor (adjacent-occupied case tripped
+  the canary / skipped a member's entry rewrite), the rotation end state kept
+  the stale descent entry (is_root/parent lied), and the Before reparent
+  range underflowed on the empty-member edge.
+
+Deferred: `split_block` body; store tests port (still unwired — now also the
+gather matrices). Agreed, not yet implemented: the §4b walk-back USAGE
+(ascend-by-old for parent-field walkers — the return is in place, no
+consumer exercises it).
+
+Known latent flaws, full ledger in `HANDOFF.md` §3: reparent_run's
+`set_position` jumps (unexercised), the unary-internal-riser panic,
+packed-ChildPos nav breaking on sparse-addressed nodes, the STORES_PARENTS
+walker hazard class (unvalidated — no such consumer exists; also the
+unexercised `set_parent` Some-return),
+children()-sortedness unchecked.
 
 Not designed/wired: sparse-ChildPos nav (children()-based sibling walks —
 one-kid in-order nodes are reference-walked in tests, not TreeWalk'd);
@@ -194,10 +270,14 @@ deletion rebalancing/merges; serialization; `leafblock`/`inline_leafblock`;
 
 ## Future Work
 
-- gather machinery — `gather_none`/`apply_gather_none` (store tier): swap-minimal
-  N-None gather (adjacent Nones crossed by one move), plural plan/fixup type
-  beside `DoubleSlide`, then `find_n_slots`/`open_n_*` on top + the 240-key
-  reference-model store tests port.
+- fixup walk-back usage (§4b remainder) — ascend-by-old-value for
+  parent-field walkers, over `set_parent`'s `Some(old)` return (in place,
+  unexercised); needs a STORES_PARENTS consumer to validate at all.
+- mixed-side gathers — holes from both sides of the anchor (the member
+  interval splits in two, one walk per side, anchor shifts by the
+  opposite-side crossings); v1 is rel-side-only.
+- store tests port (still unwired) + gather matrices for `find_n_slots`/
+  `gather_none` — the 240-key reference-model torture.
 - `split_block` body — the cleave/rotate choreography (blocks.rs's per-mode
   `cleave*` are the starting points), arena handoff.
 - canary negative test — occupy-in-run-without-wire → expect the panic.
