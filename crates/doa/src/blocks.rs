@@ -238,6 +238,28 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
             None => Err(InsufficientMaxCapacity()),
         }
     }
+    ///the pinned slot: scans/slides must never move it (Anchored: the root's
+    ///slot; free modes: none).
+    fn pin_pos(&self) -> Option<Pos> {
+        None
+    }
+    ///scan-only probe: a free slot near `pos` on the `rel` side, `None` ⇒ would
+    ///need growth. mutates nothing (no spread/grow/edge-grow) — the space test
+    ///for split-vs-grow decisions.
+    fn try_find_slot(&self, pos: Pos, rel: Rel) -> Option<NoneSlide> {
+        self.store().find_slot(pos, rel, self.len(), self.pin_pos())
+    }
+    ///`try_find_slot` for two anchors; the slides apply independently.
+    fn try_find_2_slots(
+        &self,
+        pos_a: Pos,
+        rel_a: Rel,
+        pos_b: Pos,
+        rel_b: Rel,
+    ) -> Option<DoubleSlide> {
+        self.store()
+            .find_2_slots(pos_a, rel_a, pos_b, rel_b, self.len(), self.pin_pos())
+    }
     ///split [at, len) into a new block (right), self keeps [0, at). right's translator:
     ///inner += at (preserves right-half addrs). right's `BlockData` is cloned as-is —
     ///its positions are left-relative; the caller re-points it. caller guarantees no
@@ -412,6 +434,14 @@ where
             found.slide = Some(ns);
             return found;
         }
+        //full-len scan before growing: append-heavy growth densifies the store
+        //edge past the budget while mid-span holes remain — a fixed budget
+        //scales with nothing, and spreading over a hole-rich store runs the
+        //translator out of shift.
+        if let Some(ns) = self.store().find_slot(pos, rel, self.len(), None) {
+            found.slide = Some(ns);
+            return found;
+        }
         if self.len() == <Uniform as Mode<'block, A, N>>::MAX_CAP {
             return found; //genuine exhaustion
         }
@@ -492,7 +522,7 @@ where
     ///never on the pin and the same cannot-miss argument holds.
     fn find_slot(&mut self, pos: Pos, rel: Rel) -> FoundSlot {
         let mut pos = pos;
-        let mut pin = Some(self.a2p(root_addr::<O, A>()));
+        let mut pin = self.pin_pos();
         let mut found = FoundSlot { grew: None, slide: None };
         if self.occupied() * 4 > self.len() * 3 && self.translator().shift() > 0 {
             if let Ok(g) = self.grow_and_spread() {
@@ -513,6 +543,11 @@ where
             }
         }
         if let Some(ns) = self.store().find_slot(pos, rel, A::BIT_WIDTH as usize, pin) {
+            found.slide = Some(ns);
+            return found;
+        }
+        //full-len scan before growing (as Uniform's — the pin still applies)
+        if let Some(ns) = self.store().find_slot(pos, rel, self.len(), pin) {
             found.slide = Some(ns);
             return found;
         }
@@ -540,7 +575,7 @@ where
 
     ///root is always pinned — override the `pin=None` of the free modes.
     fn slide_none(&mut self, ms: NoneSlide) -> OpenSlot {
-        let pin = Some(self.a2p(root_addr::<O, A>()));
+        let pin = self.pin_pos();
         let open = OpenSlot(self.store_mut().slide_none(ms, pin));
         self.block_data.slide_fix(ms, &self.translator);
         open
@@ -554,7 +589,7 @@ where
         pos_b: Pos,
         rel_b: Rel,
     ) -> Result<Found2Slots, InsufficientMaxCapacity> {
-        let pin = Some(self.a2p(root_addr::<O, A>()));
+        let pin = self.pin_pos();
         let budget = A::BIT_WIDTH as usize;
         if let Some(slides) = self.store().find_2_slots(pos_a, rel_a, pos_b, rel_b, budget, pin)
         {
@@ -564,13 +599,17 @@ where
         let g = self.grow_and_spread()?;
         g.fix_pos(&mut ga);
         g.fix_pos(&mut gb);
-        let pin = Some(self.a2p(root_addr::<O, A>())); //grew remaps it
+        let pin = self.pin_pos(); //grew remaps it
         let tr = self.translator().clone();
         self.data_mut().grew_fix(g, &tr);
         match self.store().find_2_slots(ga, rel_a, gb, rel_b, self.len(), pin) {
             Some(slides) => Ok(Found2Slots { grew: Some(g), slides }),
             None => Err(InsufficientMaxCapacity()),
         }
+    }
+
+    fn pin_pos(&self) -> Option<Pos> {
+        Some(self.a2p(root_addr::<O, A>()))
     }
 
     fn grow_and_spread(&mut self) -> Result<GrewFixup, InsufficientMaxCapacity> {

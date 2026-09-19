@@ -1,21 +1,23 @@
-//! B+ tree consumer over doa's three-layer walker ladder.
+//! B+ tree consumer over doa's open surface.
 //! u16 pointers, `Uniform` block, `PreOrder` layout.
 //!
-//! Splits are wired (`SplitTreeWalker::split_child`/`split_root`): the map's insert
-//! drives them bottom-up, and `two_level_demo` hand-assembles with `insert_child`.
+//! All wiring is consumer-side: splits are preemptive (a full node on the
+//! descent path splits before anything descends into it), driven with
+//! `open_child`/`open_parent`/`open_parent_child` + raw block inserts and the
+//! crate-returned fixups. Held addresses never survive an open uncorrected.
 
 use arrays::tiny_array::TinyArray;
 use doa::Fixup;
 use doa::PreOrder;
+use doa::Rel;
 use doa::blocks::{BlockTrait, UniformBlock};
-use doa::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GrewFixup, HasRoot, Pos,
-                    PosAncestry, SwapFixup};
+use doa::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GrewFixup, HasRoot, Pos, PosAncestry,
+                    SwapFixup};
 use doa::store::NoneSlide;
 use doa::translator::Translator;
 use doa::treeblock::{search, walker};
-use doa::walker::{InsertErr, Node, NodeCursor, NodeWalker, NodeWalkerMut, SplitTreeWalker,
-                  SplittableNode, TreeWalk, TreeWalkMut, TreeWalker};
-use std::cmp::Ordering;
+use doa::walker::{BlockExhausted, Node, NodeCursor, NodeWalker, NodeWalkerMut, OpenFixups,
+                  PreOrderWalk, TreeWalk, TreeWalker};
 
 const DEGREE: usize = 6; //max children per inode; leaves hold up to DEGREE pairs
 
@@ -45,28 +47,19 @@ impl BNode {
         }
         BNode::Leaf(n)
     }
-}
 
-impl Node for BNode {
-    type K = u64;
-    type V = u64;
-    type A = u16;
-    const DEGREE: usize = DEGREE;
-    const STORES_PARENTS: bool = false; //nodes carry no parent fields
-    type Payload = (); //B+ separators are child mins — nothing promotes besides them
-}
-
-impl SplittableNode for BNode {
-    ///promoted root, pre-wired with its first child = the old root.
-    fn new_root(r_a: u16) -> Self {
+    ///fresh internal node pre-wired with its first child = `child0` (the root
+    /// promotion / burst shape — the one wire with no separator).
+    fn new_parent(child0: u16) -> Self {
         let mut children = TinyArray::new();
-        children.push(r_a);
+        children.push(child0);
         BNode::Internal(INode { keys: TinyArray::new(), children })
     }
 
-    ///drain the right half out (returned). leaf: promote the right half's min
-    ///(copied up — leaves keep all keys); internal: move the boundary separator up.
-    fn split(&mut self) -> (Self::K, Self::Payload, Self) {
+    ///drain the right half out (returned); self keeps the left half. leaf: the
+    /// right half's min copies up later (leaves keep all keys); internal: the
+    /// boundary separator moves with the drain.
+    fn split(&mut self) -> Self {
         match self {
             BNode::Leaf(n) => {
                 let len = n.keys.len();
@@ -80,14 +73,12 @@ impl SplittableNode for BNode {
                     n.keys.remove(mid);
                     n.values.remove(mid);
                 }
-                let sep = *r.keys.get(0);
-                (sep, (), BNode::Leaf(r))
+                BNode::Leaf(r)
             }
             BNode::Internal(n) => {
                 let cc = n.children.len();
                 let mid = cc >> 1;
                 let mut r = INode { keys: TinyArray::new(), children: TinyArray::new() };
-                let sep = *n.keys.get(mid - 1); //min of child[mid] — the boundary
                 for i in mid..cc {
                     r.children.push(*n.children.get(i));
                 }
@@ -100,10 +91,18 @@ impl SplittableNode for BNode {
                 for _ in mid - 1..cc - 1 {
                     n.keys.remove(mid - 1);
                 }
-                (sep, (), BNode::Internal(r))
+                BNode::Internal(r)
             }
         }
     }
+}
+
+impl Node for BNode {
+    type K = u64;
+    type V = u64;
+    type A = u16;
+    const DEGREE: usize = DEGREE;
+    const STORES_PARENTS: bool = false; //nodes carry no parent fields
 }
 
 ///root position + tree height (B+ leaves sit at depth == height).
@@ -175,6 +174,44 @@ fn block_get(b: &BlockT<'_>, k: &u64) -> Option<u64> {
     }
 }
 
+fn node_full(b: &BlockT<'_>, pos: Pos) -> bool {
+    match b.get(pos) {
+        BNode::Internal(n) => n.children.is_full(),
+        BNode::Leaf(n) => n.keys.is_full(),
+    }
+}
+
+///apply an open's fixups to a held addr — an open's slides/grow rename whatever
+/// moved, so a held addr is only valid post-fixup.
+fn fix_addr(block: &BlockT<'_>, fixups: &OpenFixups, a: &mut u16) {
+    //addrs are grow-stable by construction — only the slides remap them
+    let tr = block.translator();
+    if fixups.slides.affects_addr(*a, tr) {
+        fixups.slides.fix_addr(a, tr);
+    }
+}
+
+///B+ wire: insert `addr` as child `child_idx` of the node at `par`. separators
+///re-derive from child mins — `keys[i] = min(children[i+1])` holds afterward
+///(a new leftmost takes the OLD leftmost's min as its separator).
+fn wire_child(block: &mut BlockT<'_>, par: Pos, child_idx: ChildPos, addr: u16) {
+    let m = child_min(block, addr);
+    let old_left = {
+        let BNode::Internal(n) = block.get(par) else { panic!("wire_child: not internal") };
+        (child_idx == 0 && n.children.len() > 0)
+            .then(|| child_min(block, *n.children.get(0)))
+    };
+    let BNode::Internal(n) = block.get_mut(par) else { panic!("wire_child: not internal") };
+    n.children.insert_at(child_idx.0, addr);
+    if child_idx == 0 {
+        if let Some(sep) = old_left {
+            n.keys.insert_at(0, sep);
+        }
+    } else {
+        n.keys.insert_at(child_idx.0 - 1, m);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // layer 1 — consumer cursors. tracked state = the crate's `PosAncestry`.
 // ---------------------------------------------------------------------------
@@ -197,16 +234,11 @@ where 'block: 'a
 }
 
 impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for Cursor<'block, 'walker> {
-    type State = PosAncestry;
-
-    fn state(&self) -> &PosAncestry {
-        &self.state
-    }
-    fn state_mut(&mut self) -> &mut PosAncestry {
-        &mut self.state
-    }
     fn block(&self) -> &BlockT<'block> {
         self.b
+    }
+    fn position(&self) -> Pos {
+        self.state.pos
     }
     fn is_root(&self) -> bool {
         self.state.ancestry.is_empty()
@@ -226,59 +258,37 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for Cursor<'block, 'wal
             BNode::Leaf(_) => panic!("child: leaf"),
         }
     }
-    ///`(child, cmp)`: child = descent slot, cmp = k vs that child. B+ separators bound
-    ///children 1.. — child 0 is unbounded below (min fetch); k within a child's key
-    ///span is `Equal` (equal-right); beyond the last separator is the append
-    ///`(cc-1, Greater)`. leaves: item-relative (unused by tree ops).
-    fn lookup(&self, k: &u64) -> (ChildPos, Ordering) {
+    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
+                             + ExactSizeIterator
+                             + '_ {
+        let cc = self.child_count();
+        (0..cc).map(|i| (ChildPos(i), self.child(ChildPos(i))))
+    }
+    ///descent slot for `k`; `None` at a leaf (descent terminates). B+ separators
+    /// bound children 1.. and are equal-right, so the slot is the first
+    /// separator greater than k, clamped to the last child.
+    fn lookup(&self, k: &u64) -> Option<ChildPos> {
         match self.current() {
-            BNode::Leaf(n) => {
-                let ks = n.keys.as_slice();
-                match ks.iter().position(|&key| key >= *k) {
-                    Some(i) if ks[i] == *k => (ChildPos(i), Ordering::Equal),
-                    Some(i) => (ChildPos(i), Ordering::Less),
-                    None if ks.is_empty() => (ChildPos(0), Ordering::Less),
-                    None => (ChildPos(ks.len() - 1), Ordering::Greater),
-                }
-            }
+            BNode::Leaf(_) => None,
             BNode::Internal(n) => {
-                let cc = n.children.len();
-                if cc == 0 {
-                    return (ChildPos(0), Ordering::Less);
-                }
                 let keys = n.keys.as_slice();
+                let cc = n.children.len();
                 let p = keys.iter().position(|&key| key > *k).unwrap_or(keys.len());
-                if p == 0 {
-                    if *k < child_min(self.b, *n.children.get(0)) {
-                        (ChildPos(0), Ordering::Less)
-                    } else {
-                        (ChildPos(0), Ordering::Equal)
-                    }
-                } else if p == keys.len() && *k > keys[keys.len() - 1] {
-                    (ChildPos(cc - 1), Ordering::Greater)
-                } else {
-                    (ChildPos(p), Ordering::Equal) //k ∈ child p's span, equal-right on the left edge
-                }
+                Some(ChildPos(p.min(cc.saturating_sub(1))))
             }
         }
     }
-
-    ///B+ routing: descend `child` in every case (spans are contiguous and equal-right;
-    ///the append `Greater` is still the last child).
-    fn search(&mut self, k: &u64) -> Option<&BNode> {
-        if self.b.occupied() == 0 {
-            return None;
-        }
-        while !self.is_leaf() {
-            let (i, _) = self.lookup(k);
-            self.descend(i);
-        }
-        Some(self.current())
+    fn descend<'b>(&'b mut self, child: ChildPos) -> &'b BNode
+    where 'block: 'b {
+        let addr = self.child(child);
+        let pos = self.b.a2p(addr);
+        let parent = self.state.pos;
+        self.state.ancestry.push(parent, child);
+        self.state.pos = pos;
+        self.b.get(pos)
     }
 }
 
-//position/current/descend: crate defaults over the state traits.
-//ascend/parent: per-shape — parent knowledge is the `PosAncestry` stack.
 impl<'block, 'walker> NodeWalker<'block, BlockT<'block>> for Cursor<'block, 'walker> {
     fn ascend<'b>(&'b mut self) -> (&'b BNode, ChildPos)
     where 'block: 'b {
@@ -308,16 +318,11 @@ where 'block: 'a
 //the mut cursor reborrows its `&'walker mut B` down to shared through `&self` — all the
 //read methods are safe since their returns tie to the `&self` borrow, not `'walker`.
 impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
-    type State = PosAncestry;
-
-    fn state(&self) -> &PosAncestry {
-        &self.state
-    }
-    fn state_mut(&mut self) -> &mut PosAncestry {
-        &mut self.state
-    }
     fn block(&self) -> &BlockT<'block> {
         self.b
+    }
+    fn position(&self) -> Pos {
+        self.state.pos
     }
     fn is_root(&self) -> bool {
         self.state.ancestry.is_empty()
@@ -337,89 +342,77 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for CursorMut<'block, '
             BNode::Leaf(_) => panic!("child: leaf"),
         }
     }
-    ///`(child, cmp)`: child = descent slot, cmp = k vs that child. B+ separators bound
-    ///children 1.. — child 0 is unbounded below (min fetch); k within a child's key
-    ///span is `Equal` (equal-right); beyond the last separator is the append
-    ///`(cc-1, Greater)`. leaves: item-relative (unused by tree ops).
-    fn lookup(&self, k: &u64) -> (ChildPos, Ordering) {
+    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
+                             + ExactSizeIterator
+                             + '_ {
+        let cc = self.child_count();
+        (0..cc).map(|i| (ChildPos(i), self.child(ChildPos(i))))
+    }
+    ///descent slot for `k`; `None` at a leaf (descent terminates).
+    fn lookup(&self, k: &u64) -> Option<ChildPos> {
         match self.current() {
-            BNode::Leaf(n) => {
-                let ks = n.keys.as_slice();
-                match ks.iter().position(|&key| key >= *k) {
-                    Some(i) if ks[i] == *k => (ChildPos(i), Ordering::Equal),
-                    Some(i) => (ChildPos(i), Ordering::Less),
-                    None if ks.is_empty() => (ChildPos(0), Ordering::Less),
-                    None => (ChildPos(ks.len() - 1), Ordering::Greater),
-                }
-            }
+            BNode::Leaf(_) => None,
             BNode::Internal(n) => {
-                let cc = n.children.len();
-                if cc == 0 {
-                    return (ChildPos(0), Ordering::Less);
-                }
                 let keys = n.keys.as_slice();
+                let cc = n.children.len();
                 let p = keys.iter().position(|&key| key > *k).unwrap_or(keys.len());
-                if p == 0 {
-                    if *k < child_min(self.block(), *n.children.get(0)) {
-                        (ChildPos(0), Ordering::Less)
-                    } else {
-                        (ChildPos(0), Ordering::Equal)
-                    }
-                } else if p == keys.len() && *k > keys[keys.len() - 1] {
-                    (ChildPos(cc - 1), Ordering::Greater)
-                } else {
-                    (ChildPos(p), Ordering::Equal) //k ∈ child p's span, equal-right on the left edge
-                }
+                Some(ChildPos(p.min(cc.saturating_sub(1))))
             }
         }
     }
-
-    ///B+ routing: descend `child` in every case (spans are contiguous and equal-right;
-    ///the append `Greater` is still the last child).
-    fn search(&mut self, k: &u64) -> Option<&BNode> {
-        if self.block().occupied() == 0 {
-            return None;
-        }
-        while !self.is_leaf() {
-            let (i, _) = self.lookup(k);
-            self.descend(i);
-        }
-        Some(self.current())
+    fn descend<'b>(&'b mut self, child: ChildPos) -> &'b BNode
+    where 'block: 'b {
+        let addr = self.child(child);
+        let pos = self.b.a2p(addr);
+        let parent = self.state.pos;
+        self.state.ancestry.push(parent, child);
+        self.state.pos = pos;
+        self.b.get(pos)
     }
 }
 
-//position/current/descend: crate defaults over the state traits.
-//ascend/parent: per-shape — this walker's parent knowledge is its `PosAncestry`
-//stack (a parent-pointer tree would read the node's stored field instead).
 impl<'block, 'walker> NodeWalker<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
     fn ascend<'b>(&'b mut self) -> (&'b BNode, ChildPos)
     where 'block: 'b {
         let a = self.state.ancestry.pop().expect("ascend: at root");
         self.state.pos = a.parent;
-        (self.block().get(a.parent), a.child)
+        (self.b.get(a.parent), a.child)
     }
     fn parent(&self) -> Option<(Pos, ChildPos)> {
         self.state.ancestry.last().map(|a| (a.parent, a.child))
     }
 }
 
-impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
-    fn parts(&mut self) -> (&mut PosAncestry, &BlockT<'block>) {
-        (&mut self.state, &*self.b)
+impl<'block, 'walker> Fixable<u16> for CursorMut<'block, 'walker> {
+    fn grew_fix(&mut self, fix: GrewFixup, tr: &Translator<u16>) {
+        self.state.grew_fix(fix, tr);
     }
-    fn parts_mut(&mut self) -> (&mut PosAncestry, &mut BlockT<'block>) {
-        (&mut self.state, &mut *self.b)
+    fn swap_fix(&mut self, fix: SwapFixup, tr: &Translator<u16>) {
+        self.state.swap_fix(fix, tr);
+    }
+    fn slide_fix(&mut self, fix: NoneSlide, tr: &Translator<u16>) {
+        self.state.slide_fix(fix, tr);
+    }
+    fn two_slide(&mut self, fix: DoubleSlide, tr: &Translator<u16>) {
+        self.state.two_slide(fix, tr);
+    }
+}
+
+impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block, 'walker> {
+    type Snapshot = PosAncestry;
+
+    fn save(&self) -> Self::Snapshot {
+        self.state.clone()
+    }
+    fn load(&mut self, snap: Self::Snapshot) {
+        self.state = snap;
+    }
+    fn set_position(&mut self, pos: Pos) {
+        self.state.pos = pos;
     }
 
     fn block_mut(&mut self) -> &mut BlockT<'block> {
         self.b
-    }
-    //current_mut/set_position: crate defaults over `CursorState`.
-    fn has_space(&self) -> bool {
-        match self.current() {
-            BNode::Internal(n) => !n.children.is_full(),
-            BNode::Leaf(n) => !n.keys.is_full(),
-        }
     }
     fn set_child(&mut self, up: usize, child: ChildPos, addr: u16) {
         let target = match up {
@@ -431,49 +424,14 @@ impl<'block, 'walker> NodeWalkerMut<'block, BlockT<'block>> for CursorMut<'block
             BNode::Leaf(_) => panic!("set_child: leaf"),
         }
     }
+    fn clear_child(&mut self, _up: usize, _child: ChildPos) {
+        panic!("clear_child: binary rotations only");
+    }
     fn set_parent(&mut self, _addr: u16) {} //nodes store no parent fields
-    ///node-level wire. the separator is re-derived from the placed child's own min
-    ///(B+ separators are child mins, not the caller's routing key): children stay
-    ///sorted, keys[i] = min(children[i+1]) holds.
-    fn insert_child(&mut self, child_idx: ChildPos, _k: &u64, _payload: (), addr: u16) {
-        //separator from the placed child's own min; new leftmost's separator
-        //is the OLD leftmost's min
-        let (m, old_left) = {
-            let shared = self.block();
-            let m = child_min(shared, addr);
-            let BNode::Internal(n) = shared.get(self.state.pos) else {
-                panic!("insert_child: child into non-internal")
-            };
-            let old_left = if child_idx == 0 && n.children.len() > 0 {
-                Some(child_min(shared, *n.children.get(0)))
-            } else {
-                None
-            };
-            (m, old_left)
-        };
-        let BNode::Internal(n) = self.current_mut() else { panic!() };
-        n.children.insert_at(child_idx.0, addr);
-        if child_idx == 0 {
-            if let Some(sep) = old_left {
-                n.keys.insert_at(0, sep);
-            }
-        } else {
-            n.keys.insert_at(child_idx.0 - 1, m);
-        }
-    }
-    fn remove_child(&mut self, child_idx: ChildPos) -> (Option<u64>, Option<()>, u16) {
-        let BNode::Internal(n) = self.current_mut() else {
-            panic!("remove_child: not internal")
-        };
-        let p = n.children.remove(child_idx.0);
-        let sep = (child_idx.0 > 0).then(|| *n.keys.get(child_idx.0 - 1));
-        let _ = n.keys.remove(child_idx.0.saturating_sub(1));
-        (sep, None, p)
-    }
 }
 
 // ---------------------------------------------------------------------------
-// the map
+// the map — consumer-driven splits
 // ---------------------------------------------------------------------------
 
 pub struct BTreeMap {
@@ -501,57 +459,124 @@ impl BTreeMap {
         }
     }
 
-    ///insert with the split driver: on a full leaf, ascend to the nearest node with
-    ///room and split its full child on the path (`split_root` at the top), then
-    ///re-search. every split shifts indices, so retrying from the top is simpler and
-    ///sounder than tracking the path.
-    pub fn insert(&mut self, k: u64, v: u64) -> Result<(), InsertErr> {
-        enum Step {
-            Done,
-            Placed,
-            Full,
-        }
+    ///preemptive descent: a full node on k's path splits before anything
+    /// descends into it (its parent had room — checked before descending). a
+    /// split shifts indices ⇒ restart. the split flows are inlined: the opens
+    /// consume the walker, releasing the block borrow for the drain/wire phase.
+    pub fn insert(&mut self, k: u64, v: u64) -> Result<(), BlockExhausted> {
         loop {
-            let mut w: TreeWalker<PreOrder, CursorMut<'_, '_>> = search(&mut self.block, &k);
-            let step = match w.nw.current_mut() {
-                BNode::Leaf(n) if n.keys.as_slice().contains(&k) => {
-                    let pos = n.keys.as_slice().iter().position(|&key| key == k).unwrap();
-                    *n.values.get_mut(pos) = v;
-                    Step::Done //overwrite: no len change
-                }
-                BNode::Leaf(n) if !n.keys.is_full() => {
-                    let pos = n
-                        .keys
-                        .as_slice()
-                        .iter()
-                        .position(|&key| k < key)
-                        .unwrap_or(n.keys.len());
-                    n.keys.insert_at(pos, k);
-                    n.values.insert_at(pos, v);
-                    Step::Placed
-                }
-                _ => Step::Full, //full leaf: split the path below
-            };
-            match step {
-                Step::Done => return Ok(()),
-                Step::Placed => {
-                    self.len += 1;
-                    return Ok(());
-                }
-                Step::Full => {}
-            }
-            //walk up to the first node with room; split the full child we came from
-            //(the root has no parent — split it itself)
+            let mut w: TreeWalker<PreOrder, CursorMut<'_, '_>> = walker(&mut self.block);
+            let mut restart = false;
             loop {
-                let Some((_, idx)) = w.nw.parent() else {
-                    w.split_root()?;
-                    break;
-                };
-                w.nw.ascend();
-                if w.nw.has_space() {
-                    w.split_child(idx)?;
+                if node_full(w.nw.block(), w.nw.position()) {
+                    if w.nw.is_root() {
+                        //split the root: a fresh parent above it + Y (the
+                        //drained half). preorder: NR before R, Y before R's
+                        //mid-child's subtree (internal) / right after R (childless)
+                        let mut r_a = w.nw.block().p2a(w.nw.position()); //held across the opens
+                        let cc = w.nw.child_count();
+                        if cc == 0 {
+                            //childless (leaf) root: sequential — NR before R, then
+                            //Y right after R; each step leaves a walkable tree
+                            let (nr_open, fixups) = w.open_parent()?;
+                            fix_addr(&self.block, &fixups, &mut r_a);
+                            self.block.insert(nr_open, BNode::new_parent(r_a));
+                            //NR held as an ADDR: the second open below can slide or
+                            //spread, and `nr_open`'s pos would go stale (§2 addendum)
+                            let mut nr_a = self.block.p2a(nr_open.0);
+                            self.block.data_mut().set_root(nr_open.0);
+                            let h = self.block.data().height() + 1;
+                            self.block.data_mut().set_height(h);
+                            //Y after R — a fresh walker routes through NR down to R
+                            let mut w2: TreeWalker<PreOrder, CursorMut<'_, '_>> =
+                                walker(&mut self.block);
+                            w2.nw.descend(ChildPos(0)); //walker: -> R
+                            let (y_open, fixups) = w2.open_here(Rel::After)?;
+                            fix_addr(&self.block, &fixups, &mut r_a);
+                            fix_addr(&self.block, &fixups, &mut nr_a);
+                            let y = self.block.get_mut(self.block.a2p(r_a)).split();
+                            self.block.insert(y_open, y);
+                            let y_a = self.block.p2a(y_open.0);
+                            let y_min = child_min(&self.block, y_a);
+                            let BNode::Internal(n) =
+                                self.block.get_mut(self.block.a2p(nr_a)) else {
+                                panic!("insert: fresh parent is not internal")
+                            };
+                            n.children.push(y_a);
+                            n.keys.push(y_min);
+                        } else {
+                            //internal root: one atomic two-anchor pass — NR before
+                            //R + Y before R's mid-child's subtree, both slides
+                            //computed before either moves
+                            let mid = cc >> 1;
+                            let ((nr_open, y_open), fixups) =
+                                w.open_parent_child(ChildPos(mid), Rel::Before)?;
+                            fix_addr(&self.block, &fixups, &mut r_a);
+                            let y = self.block.get_mut(self.block.a2p(r_a)).split();
+                            self.block.insert(y_open, y);
+                            self.block.insert(nr_open, BNode::new_parent(r_a));
+                            let y_a = self.block.p2a(y_open.0);
+                            let y_min = child_min(&self.block, y_a);
+                            let BNode::Internal(n) = self.block.get_mut(nr_open.0) else {
+                                panic!("insert: fresh parent is not internal")
+                            };
+                            n.children.push(y_a);
+                            n.keys.push(y_min);
+                            self.block.data_mut().set_root(nr_open.0);
+                            let h = self.block.data().height() + 1;
+                            self.block.data_mut().set_height(h);
+                        }
+                    } else {
+                        //split child idx of the parent (preorder: Y lands before
+                        //X's mid-child's subtree — inside X's old span, so Y's
+                        //children visit after it)
+                        let (_, idx) = w.nw.ascend(); //walker: -> the parent (has room)
+                        let mut x_a = w.nw.child(idx); //held across the open
+                        let mut par_a = w.nw.block().p2a(w.nw.position());
+                        w.nw.descend(idx); //walker: -> X
+                        let cc = w.nw.child_count();
+                        let (open, fixups) = if cc == 0 {
+                            w.open_here(Rel::After)? //childless X: Y right after it
+                        } else {
+                            w.open_child(ChildPos(cc >> 1), Rel::Before)? //Y before X's child[mid]
+                        };
+                        fix_addr(&self.block, &fixups, &mut x_a);
+                        fix_addr(&self.block, &fixups, &mut par_a);
+                        let y = self.block.get_mut(self.block.a2p(x_a)).split();
+                        self.block.insert(open, y);
+                        let y_a = self.block.p2a(open.0);
+                        let par_pos = self.block.a2p(par_a);
+                        wire_child(&mut self.block, par_pos, idx + 1, y_a);
+                    }
+                    restart = true;
                     break;
                 }
+                if w.nw.is_leaf() {
+                    //guaranteed non-full (checked above): overwrite or place
+                    let pos = w.nw.position();
+                    let BNode::Leaf(n) = w.nw.block_mut().get_mut(pos) else {
+                        panic!("insert: not a leaf")
+                    };
+                    if let Some(p) = n.keys.as_slice().iter().position(|&key| key == k) {
+                        *n.values.get_mut(p) = v; //overwrite: no len change
+                    } else {
+                        let at = n
+                            .keys
+                            .as_slice()
+                            .iter()
+                            .position(|&key| k < key)
+                            .unwrap_or(n.keys.len());
+                        n.keys.insert_at(at, k);
+                        n.values.insert_at(at, v);
+                        self.len += 1;
+                    }
+                    break;
+                }
+                let c = w.nw.lookup(&k).expect("insert: internal node routes");
+                w.nw.descend(c); //walker: -> the routed child
+            }
+            if !restart {
+                return Ok(());
             }
         }
     }
@@ -559,10 +584,11 @@ impl BTreeMap {
     pub fn remove(&mut self, k: &u64) -> Option<u64> {
         let v = {
             let mut w: TreeWalker<PreOrder, CursorMut<'_, '_>> = search(&mut self.block, k);
-            let BNode::Leaf(n) = w.nw.current_mut() else { return None };
-            let pos = n.keys.as_slice().iter().position(|&key| key == *k)?;
-            let v = n.values.remove(pos);
-            n.keys.remove(pos);
+            let pos = w.nw.position();
+            let BNode::Leaf(n) = w.nw.block_mut().get_mut(pos) else { return None };
+            let at = n.keys.as_slice().iter().position(|&key| key == *k)?;
+            let v = n.values.remove(at);
+            n.keys.remove(at);
             v
         };
         self.len -= 1;
@@ -635,30 +661,50 @@ fn map_demo() {
     };
     assert_eq!(pairs, want);
     println!(
-        "map demo: ok (100 keys, splits + multi root promotions, get/overwrite/remove/iter)"
+        "map demo: ok (100 keys, consumer-driven splits + multi root promotions, get/overwrite/remove/iter)"
     );
 }
 
-///hand-assembled two-level tree: root inode + five leaves placed via the crate's
-///`TreeWalkMut::insert_child` (spreads + slides + wiring + preorder placement, no split
-///driver). 40/30/25 are "new leftmost" inserts (gap 0 → parent-adjacent anchor); 35 is
-///a mid-gap insert (descend + subtree-edge anchor); the final 20 insert lands on the
-///out-of-run slide case — the None sits two slots right of the anchor, so fixup walks
-///the run from below the anchor and restores its state instead of walking back through
-///the pointers it just rewrote.
-fn two_level_demo() {
+///hand-assembled two-level tree: root inode + five leaves placed via
+///`insert_leaf` (open + block insert + wire, preorder anchors — no split
+///flow). 40/30/25/20 are gap-0 inserts (parent-adjacent anchor); 35 is a
+///mid-gap insert (descend + subtree-edge anchor); the final 20 insert lands
+///on the out-of-run slide case — the None sits two slots right of the anchor,
+///so the fixup walk runs from below the anchor and restores its state instead
+///of walking back through the pointers it just rewrote.
+fn insert_leaf(block: &mut BlockT<'_>, k: u64, leaf: BNode) -> Result<(), BlockExhausted> {
+    let w: TreeWalker<PreOrder, CursorMut<'_, '_>> = walker(&mut *block);
+    //gap by key: before the first child whose min exceeds k, else append.
+    //collect addrs first; the min-scan reads the block through the walker.
+    let cc = w.nw.child_count();
+    let addrs: Vec<u16> = (0..cc).map(|i| w.nw.child(ChildPos(i))).collect();
+    let idx = addrs.iter().position(|&a| k < child_min(w.nw.block(), a)).unwrap_or(cc);
+    //preorder anchor: gap 0 (or no children) → the root itself, After; mid →
+    //the routed child's subtree edge, Before; append → the last child's, After
+    let (open, _) = if idx == 0 || cc == 0 {
+        w.open_here(Rel::After)?
+    } else if idx < cc {
+        w.open_child(ChildPos(idx), Rel::Before)?
+    } else {
+        w.open_child(ChildPos(cc - 1), Rel::After)?
+    };
+    block.insert(open, leaf);
+    let a = block.p2a(open.0);
+    let root = block.data().root();
+    wire_child(block, root, ChildPos(idx), a);
+    Ok(())
+}
+
+fn two_level_demo() -> Result<(), BlockExhausted> {
     let mut block = BlockT::new();
     let root = block.insert_root(BNode::internal());
     block.set_data(BTreeMeta { root, height: 1 });
 
-    {
-        let mut w: TreeWalker<PreOrder, CursorMut<'_, '_>> = walker(&mut block); //at the root
-        w.insert_child(&40, (), BNode::leaf(&[(40, 400), (42, 421)])).unwrap();
-        w.insert_child(&30, (), BNode::leaf(&[(30, 303), (33, 331)])).unwrap();
-        w.insert_child(&35, (), BNode::leaf(&[(35, 351), (37, 372)])).unwrap();
-        w.insert_child(&25, (), BNode::leaf(&[(25, 251)])).unwrap();
-        w.insert_child(&20, (), BNode::leaf(&[(20, 201)])).unwrap();
-    }
+    insert_leaf(&mut block, 40, BNode::leaf(&[(40, 400), (42, 421)]))?;
+    insert_leaf(&mut block, 30, BNode::leaf(&[(30, 303), (33, 331)]))?;
+    insert_leaf(&mut block, 35, BNode::leaf(&[(35, 351), (37, 372)]))?;
+    insert_leaf(&mut block, 25, BNode::leaf(&[(25, 251)]))?;
+    insert_leaf(&mut block, 20, BNode::leaf(&[(20, 201)]))?;
 
     //preorder node order: root then leaves in key order
     let mut w: TreeWalker<PreOrder, Cursor<'_, '_>> = walker(&block);
@@ -687,12 +733,13 @@ fn two_level_demo() {
     assert_eq!(block_get(&block, &50), None);
 
     println!(
-        "two-level demo: ok (insert_child x5, all anchor kinds, in-run + out-of-run slides, preorder placement, cross-leaf get)"
+        "two-level demo: ok (open x5, all preorder anchor kinds, in-run + out-of-run slides, placement, cross-leaf get)"
     );
+    Ok(())
 }
 
 fn main() {
     map_demo();
-    two_level_demo();
+    two_level_demo().unwrap();
     println!("btree example: all checks passed");
 }

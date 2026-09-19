@@ -1,8 +1,8 @@
 ```rust
 //!`TreeBlock` — a block whose stored type is a node: the param-less marker
-//!trait + the free-fn constructors `walker`/`search` (over the consumer's
-//!`From` impls — local type, orphan-safe). `SplitTreeBlock` is the declared
-//!sketch of the arena-level cleave, unwired.
+//!trait (root access + the arena-tier `split_block` sketch, `todo!`) + the
+//!free-fn constructors `walker`/`search` (over the consumer's `From` impls —
+//!local type, orphan-safe).
 ///L0011
 macro_rules! impl_tree_block;
 ///L0029
@@ -18,19 +18,22 @@ where
 {
     ///position of the root node. default: `BlockData::root`.
     fn root_position(&self) -> Pos;
+    ///hand the root to the node at `pos` (root promotion). block-data level
+    /// only — tree re-wiring is the consumer's.
+    fn set_root(&mut self, pos: Pos);
+    ///cleave a full block in two. the current root pops out — extracted, its
+    /// slot reclaimed — and `left_root`/`right_root` install at the two blocks'
+    /// root positions. returns (left, right, popped root, split boundary): the
+    /// popped root's child entries partition as `[0..m]` left, `[m..]` right
+    /// (key order = child order ⇒ prefix). the consumer drains the popped root
+    /// into the two new roots via `get_mut(root_position())`.
+    fn split_block(
+        self,
+        _left_root: Self::N,
+        _right_root: Self::N,
+    ) -> (Self, Self, Self::N, usize);
 }
-///L0043
-///block-level splits (cleave on `BlockExhausted`, arena handoff) — declared,
-///unwired. the node-level split driver lives on `SplitTreeWalker` (it needs the
-///walker's fixup machinery); this surface is the future arena tier's.
-pub trait SplitTreeBlock<'block>: BlockTrait<'block> + BlockOps<'block>
-where Self::N: SplittableNode
-{
-    ///cleave the block; returns the separator the caller wires under an arena
-    ///parent when the block itself splits.
-    fn split_root(&mut self) -> <Self::N as Node>::K;
-}
-///L0054
+///L0061
 ///walker at the block's root (shared). `R` is the borrow — `&B` or `&mut B` — so one
 ///fn covers shared and mut walkers: the `From` impl the consumer names picks it.
 ///`NW` must be ascend-capable (`TreeWalk` traverses).
@@ -41,7 +44,7 @@ where
     NW: NodeWalker<'block, B> + From<R>,
     R: std::ops::Deref<Target = B>,
 ;
-///L0066
+///L0073
 ///walker routed to `k`'s terminal node. stackless cursors work here (`search` needs
 /// descent only); `walker` for a positioned-at-root start.
 pub fn search<'block, NW, B, R>(b: R, k: &<B::N as Node>::K) -> TreeWalker<B::O, NW>
@@ -51,10 +54,10 @@ where
     NW: NodeCursor<'block, B> + From<R>,
     R: std::ops::Deref<Target = B>,
 ;
-///L0078
+///L0085
 impl_tree_block!(crate::blocks::Uniform);
-///L0079
+///L0086
 impl_tree_block!(crate::blocks::Pluripotent);
-///L0080
+///L0087
 impl_tree_block!(crate::blocks::Anchored<O>);
 ```

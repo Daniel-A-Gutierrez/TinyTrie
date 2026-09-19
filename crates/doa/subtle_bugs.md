@@ -11,6 +11,10 @@ the reasoning is here.
 
 ## 1. The postorder root split: walking a diverged tree
 
+*(postorder walker impls are unimplemented since the open-surface refactor;
+the rule survives it — it is why `open_2_at` computes both slides before
+either moves, and why consumer-driven flows open everything before draining.)*
+
 **The trap.** Postorder walk order is *children, then node*, and position order
 equals walk order. When an internal root R splits, R must relocate to the
 mid boundary (its kept half's edge) — but the old flow relocated R *before*
@@ -130,36 +134,33 @@ itself does what a collected-Vec fixup would have.
 
 ---
 
-## 4. The root hop corrupting `BlockData::root`
+## 4. Whoever moves the root owns the block-root fixup
 
-**The trap.** The in-order hop relocates a node whose boundary identity
-shifted (§8). Swaps emit no self-fixup — the mover applies `SwapFixup` by hand.
-The hop fixed the walker state and the grandparent's entry, but when the
-hoppee was *the block's root* (a root parent in in-order), nothing updated
-the block data's root position:
+*(recast after the open-surface refactor — the hop is gone; `rotate_left/right`
+and consumer-driven root promotions are the live instances.)*
+
+**The trap.** Swaps and slides emit fixups the mover must apply, and the
+block's `Root` data is one of the holders — but nothing in the swap/slide
+machinery applies it *for* the mover. Relocate the root and skip
+`data_mut().set_root`, and every fresh walker (constructed from
+`data().root()`) starts on garbage:
 
 ```
-in-order hop of a root parent (left split shifted its boundary):
+before:  data.root ──┐
+slots:      [ A ][ R ][ B ]        R = tree root AND block root
 
-   before:  data.root ──┐
-   slots:      [ A ][ R ][ B ]        R = tree root AND block root
-                          ↑ hop target: before child[b]
-
-   after:   slots: [ A ][ R' ][ B ]   data.root STILL points at R's
-            data.root ──┘ (dangling)  old position — every fresh walker
-                                      (constructed from data().root)
-                                      starts on garbage.
+after:   slots: [ A ][ R' ][ B ]   data.root STILL points at R's
+          data.root ──┘ (dangling)  old position
 ```
 
-**Why it was easy to miss:** the hop's guard was `parent().is_none()` ⇒ "skip
-the grandparent repoint" — which read as *nothing to do* at the root, when
-there was in fact a different owner to fix (the block data, not a
-grandparent). No in-order consumer existed to hit it.
+**Why it's easy to miss:** the mover's own state gets fixed (it holds the
+fixup), the parent entry gets repointed — the block data is the one holder the
+mover doesn't naturally have in hand, and the corruption is silent until the
+next walker construction.
 
-**The fix:** `hop_current` checks `parent().is_none() && data().root() ==
-from` — the hoppee being the block root — and calls `set_root`. `swap_current`
-deliberately does *not* own this (it has no `HasRoot`); the tree-level caller
-does.
+**The rule:** every root relocation ends with `set_root` — the crate's
+rotations do it at the root; consumer-driven promotions must (the btree
+example's split_root flows); `swap_open`-based hops must too.
 
 ---
 
@@ -180,7 +181,8 @@ after visiting C, C's parent entry holds C's POST addr.
 ```
 
 **The fix:** the walker state is **snapshotted at the anchor and restored**
-after the walk — zero walking. The walk itself stays forward-only, which is
+after the walk (`NodeWalkerMut::save`/`load` over the consumer's `Snapshot`) —
+zero walking. The walk itself stays forward-only, which is
 what makes it sound: a forward-only walk can't re-enter a processed node's
 subtree, so the entries it reads on the way are only ever unprocessed
 (correct) ones.
@@ -211,49 +213,21 @@ is None-free by `find_slot`'s construction, and the walk is forward-only, so
 position must be the run's far edge exactly — against a consistent layout the
 walk visits the run in slot order, so any ghost lands the endpoint short or
 long. Both fire **at the moment of the inconsistency**. Cheap (integer
-compares) and load-bearing precisely because the store is `MaybeUninit`-backed
-(§7) and the failure mode is otherwise UB rather than a panic.
+compares) and load-bearing: against a consistent layout they cannot fire, so
+either firing names a real desync between the tree and the slots.
 
-The endpoint check has ONE sanctioned skew: the in-order hop's slide (§11)
-walks its run in LOGICAL order — the misplaced hoppee is visited first — so
-when the hoppee is itself the far-edge member the walk ends one below far.
-`fixup`/`apply_slide` take a `far_short` parameter the hop passes exactly
-then; every other caller passes false and gets the strict invariant. (The
-skew is only one: a mid-run hoppee is visited first but the walk still ends
-on the far member.)
+(The endpoint check once carried ONE sanctioned skew — the in-order hop's
+slide walked its run in logical order; the hop is gone with the open-surface
+refactor and the check is strict again.)
 
 ---
 
-## 7. MaybeUninit slots: the drop leak, and why no transmute
+## 7. *(deleted)* MaybeUninit slots
 
-**Representation.** Slots are `Option<MaybeUninit<T>>`: the discriminant is
-the occupancy flag (store-internal, flipped only by `alloc`), the payload is
-exempt from validity until its reservation's write completes (**alloc-write-read**
-— enforced by the exclusive `&mut MaybeUninit<T>` handed out).
-
-**The drop leak.** `MaybeUninit<T>` never drops `T`, so dropping a store drops
-every node's *wrapper* but not its payloads — a regression from
-`Vec<Option<T>>`, silent for Copy-ish nodes, a leak for heap-carrying ones.
-Fixed with `Drop` impls on both stores: `assume_init_drop` over every `Some`.
-Sound *because* of alloc-write-read; the one dangerous case is documented on
-the impl: unwinding through a pending reservation (a `Some` not yet written)
-is UB — the contract's single sharp edge.
-
-**Why the obvious transmute doesn't work** (handing `&mut MaybeUninit<T>` out
-of a `None` `Option<T>` slot):
-
-1. **Layouts differ.** `MaybeUninit<T>` is niche-proof — every bit pattern is
-   valid — so `Option<MaybeUninit<T>>` is always `tag + size_of::<T>()`, while
-   `Option<T>` is often niche-packed to exactly `size_of::<T>()`. For
-   niche-having `T` the sizes don't even match.
-2. **Validity is not lazy.** The memory's true type is `Option<T>` (it lives in
-   a `Vec<Option<T>>`). During the handoff the bytes would have to read as
-   `Some` through the punned view while the payload is garbage-as-`T` — a live
-   `Option<T>` holding an invalid value is UB whether or not anything reads
-   it, and any drop glue on unwind would observe it. `MaybeUninit`'s exemption
-   only works when the memory's *declared* type has no validity requirement —
-   you can't get that by type-punning a view on top; the `Option<T>` view
-   never goes away.
+The reservation model (`Option<MaybeUninit<T>>` write-places) is gone — slots
+are plain `Option<T>`, values always initialized, so the drop-leak and
+transmute-soundness section no longer applies. The canary (§6) remains: it
+outlived the representation, catching ghost `Some`s that no walk can name.
 
 ---
 
@@ -284,11 +258,11 @@ move the split node, and the boundary's *identity* (who child[b-1]/[b] are)
 only shifts when a **left** child is inserted or split (`slot < DEGREE/2`, a
 pure const test). Consequences that all fall out:
 
-- splits: X never moves; the parent hops iff `child_idx < DEGREE/2` (guarded
-  by the block-root case, §4);
-- inserts: the same hop rule (the hop is *not* split-specific);
-- below `DEGREE/2` children the node sits after-all and absorbs inserts —
-  no hop.
+- in-order is binary-only since the open-surface refactor; binaries never
+  split, so the hop is gone from the crate. a consumer driving an in-order
+  layout beyond binary owns the hop itself: a left insert/split
+  (`slot < DEGREE/2`) shifts the boundary identity — open_2 + swap the parent
+  across the crossed child, ending with the block-root fixup when it moved (§4).
 
 ---
 
@@ -336,45 +310,13 @@ Fix: ascend *first*, descend into the previous sibling's subtree only when
 
 ---
 
-## 11. The hop's fixup walk: the anchor must follow the None
+## 11. *(deleted)* The hop's fixup walk anchor
 
-**The trap.** The in-order hop relocates the one node whose logical gap
-(`in_boundary` over its post-insert children) no longer matches its position
-slot — mid-hop, walk order and slot order *legitimately* diverge at that
-node. The hop's slot-opening slide therefore needs a fixup walk whose anchor
-depends on **where the None landed relative to the hoppee**:
-
-```
-gap before child[b]; hoppee H positionally past it; None found to the right of the gap:
-
-case A — None BEYOND H (H inside the run):
-   slots: [ .. child[b-1] ][ members.. ][ H ][ .. ][ ·None ]
-   anchor LEFT edge (after subtree_last(child[b-1])): next() of child[b-1] IS
-   H via the ancestry stack — no entry read, position-true — then descents run
-   through unprocessed entries only. anchoring at the right edge instead, the
-   walk starts inside the run and can never reach H (H is logically BEFORE
-   child[b]) — it walks off the block.
-
-case B — None BETWEEN gap and H (H outside the run):
-   slots: [ .. child[b-1] ][ members.. ][ ·None ][ H ]
-   anchor RIGHT edge (subtree_first(child[b]) — exactly the slide's `to`):
-   the walk starts on the run's first member and never crosses H. anchoring
-   at the left edge instead, next() of child[b-1] is H — a NON-member —
-   consuming a visit and rewriting its entries with a phantom delta.
-
-identity or None left of the anchor: the run is at/below the left anchor and
-the walker is in it — left edge both times.
-```
-
-**The rule:** `hop_current` probes with the left-edge anchor, then picks the
-walk side by comparing `ns.from` against the hoppee's position. The general
-principle is §1's — no walk may run over a node whose logical position
-disagrees with its slot — except the hoppee itself, whose visit must be
-arranged to be entry-free (via the stack) and first, or avoided entirely.
-Case A's walk ends on the far edge as usual UNLESS the hoppee IS the far-edge
-member (it was visited first, so the last logical member is one below) — the
-one `far_short` skew of §6; `hop_current` passes it exactly then
-(`ns.from == hoppee + 1 && steps > 1`).
+`hop_current` is gone (in-order is binary-only; hops are consumer-driven).
+The rule it encoded is §1's — no walk may run over a node whose logical
+position disagrees with its slot — and it applies unchanged to any
+consumer-driven hop: pick the walk side by where the None landed relative to
+the node being relocated.
 
 ---
 

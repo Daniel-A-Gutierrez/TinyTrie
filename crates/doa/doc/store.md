@@ -166,14 +166,14 @@ impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterato
     for SomeIter<'b, T, I> {}
 ///L0261
 impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {}
-///L0544
+///L0554
 impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {}
-///L1053
+///L1084
 ///the pair can't apply independently: affected spans overlap (a shared slot would
 ///double-move, or one slide's None-hole lies inside the other's run) or one slide
 ///moves the other's anchor. spans are closed — conservative.
 fn slides_interfere(s1: &NoneSlide, s2: &NoneSlide, a1: Pos, a2: Pos) -> bool;
-///L1068
+///L1099
 ///outward nearest-None scan: `left` at `l0, l0-1, …` (lcnt slots, decreasing) and
 ///`right` at `r0, r0+1, …` (rcnt slots, increasing). D tie-breaks equidistant hits
 ///(false⇒left, true⇒right). the caller checks the anchor slot separately, so l0/r0

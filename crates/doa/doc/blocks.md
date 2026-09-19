@@ -174,6 +174,21 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
         pos_b: Pos,
         rel_b: Rel,
     ) -> Result<Found2Slots, InsufficientMaxCapacity>;
+    ///the pinned slot: scans/slides must never move it (Anchored: the root's
+    ///slot; free modes: none).
+    fn pin_pos(&self) -> Option<Pos>;
+    ///scan-only probe: a free slot near `pos` on the `rel` side, `None` ⇒ would
+    ///need growth. mutates nothing (no spread/grow/edge-grow) — the space test
+    ///for split-vs-grow decisions.
+    fn try_find_slot(&self, pos: Pos, rel: Rel) -> Option<NoneSlide>;
+    ///`try_find_slot` for two anchors; the slides apply independently.
+    fn try_find_2_slots(
+        &self,
+        pos_a: Pos,
+        rel_a: Rel,
+        pos_b: Pos,
+        rel_b: Rel,
+    ) -> Option<DoubleSlide>;
     ///split [at, len) into a new block (right), self keeps [0, at). right's translator:
     ///inner += at (preserves right-half addrs). right's `BlockData` is cloned as-is —
     ///its positions are left-relative; the caller re-points it. caller guarantees no
@@ -189,13 +204,13 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
     ///`cleave_and_rotate` (which is the shift-exhausted one). left half unchanged.
     fn cleave_and_spread(&mut self, at: Pos) -> Self;
 }
-///L0272
+///L0294
 impl<'block, A: Addr, N: 'block> Mode<'block, A, N> for Uniform {}
-///L0277
+///L0299
 impl<'block, O: Ordering, A: Addr, N: 'block> Mode<'block, A, N> for Anchored<O> {}
-///L0284
+///L0306
 impl<'block, A: Addr, N: 'block> Mode<'block, A, N> for Pluripotent {}
-///L0290
+///L0312
 impl<'block, N, A, M, D, O> Block<'block, N, A, M, D, O>
 where
     N: Sized + 'block,
@@ -203,7 +218,7 @@ where
     M: Mode<'block, A, N>,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0335
+///L0357
 impl<'block, N, A, M, D, O> BlockTrait<'block> for Block<'block, N, A, M, D, O>
 where
     N: Sized + 'block,
@@ -214,31 +229,31 @@ where
 // ---------------------------------------------------------------------------
 // BlockOps impls — one per mode, disjoint by `M`.
 // ---------------------------------------------------------------------------
-///L0378
+///L0400
 impl<'block, N, A, D, O> BlockOps<'block> for Block<'block, N, A, Uniform, D, O>
 where
     N: Sized + 'block,
     A: Addr,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0482
+///L0513
 impl<'block, N, A, D, O> BlockOps<'block> for Block<'block, N, A, Anchored<O>, D, O>
 where
     N: Sized + 'block,
     A: Addr,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0623
+///L0662
 impl<'block, N, A, D, O> BlockOps<'block> for Block<'block, N, A, Pluripotent, D, O>
 where
     N: Sized + 'block,
     A: Addr,
     D: 'block + Default + Clone + Fixable<A>,
     O: Ordering {}
-///L0741
+///L0781
 ///(shift, inner_offset, outer_offset, init_cap) pinning the root at `O`'s fixed addr.
 const fn fr_params<A: Addr, O: Ordering>() -> (u32, A, A, usize);
-///L0750
+///L0790
 ///apply a grow remap to `pos`/`pin` + the block's own data, recording it in `grew`.
 fn grew_step<A: Addr, D: Fixable<A>>(
     grew: &mut Option<GrewFixup>,
@@ -248,7 +263,7 @@ fn grew_step<A: Addr, D: Fixable<A>>(
     data: &mut D,
     tr: &Translator<A>,
 );
-///L0767
+///L0807
 ///fixed root addr for an ordering (the `Anchored` pin target).
 fn root_addr<O: Ordering, A: Addr>() -> A;
 ```

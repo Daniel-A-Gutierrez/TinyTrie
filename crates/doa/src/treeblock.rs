@@ -1,12 +1,12 @@
 //!`TreeBlock` — a block whose stored type is a node: the param-less marker
-//!trait + the free-fn constructors `walker`/`search` (over the consumer's
-//!`From` impls — local type, orphan-safe). `SplitTreeBlock` is the declared
-//!sketch of the arena-level cleave, unwired.
+//!trait (root access + the arena-tier `split_block` sketch, `todo!`) + the
+//!free-fn constructors `walker`/`search` (over the consumer's `From` impls —
+//!local type, orphan-safe).
 
 use crate::blocks::{Block, BlockOps, BlockTrait};
 use crate::index::Addr;
 use crate::metadata::{Fixable, HasRoot, Pos};
-use crate::walker::{Node, NodeCursor, NodeWalker, SplittableNode, TreeWalker};
+use crate::walker::{Node, NodeCursor, NodeWalker, TreeWalker};
 
 macro_rules! impl_tree_block {
     ($m:ty) => {
@@ -35,17 +35,24 @@ where
     fn root_position(&self) -> Pos {
         self.data().root()
     }
-}
-
-///block-level splits (cleave on `BlockExhausted`, arena handoff) — declared,
-///unwired. the node-level split driver lives on `SplitTreeWalker` (it needs the
-///walker's fixup machinery); this surface is the future arena tier's.
-pub trait SplitTreeBlock<'block>: BlockTrait<'block> + BlockOps<'block>
-where Self::N: SplittableNode
-{
-    ///cleave the block; returns the separator the caller wires under an arena
-    ///parent when the block itself splits.
-    fn split_root(&mut self) -> <Self::N as Node>::K;
+    ///hand the root to the node at `pos` (root promotion). block-data level
+    /// only — tree re-wiring is the consumer's.
+    fn set_root(&mut self, pos: Pos) {
+        self.data_mut().set_root(pos);
+    }
+    ///cleave a full block in two. the current root pops out — extracted, its
+    /// slot reclaimed — and `left_root`/`right_root` install at the two blocks'
+    /// root positions. returns (left, right, popped root, split boundary): the
+    /// popped root's child entries partition as `[0..m]` left, `[m..]` right
+    /// (key order = child order ⇒ prefix). the consumer drains the popped root
+    /// into the two new roots via `get_mut(root_position())`.
+    fn split_block(
+        self,
+        _left_root: Self::N,
+        _right_root: Self::N,
+    ) -> (Self, Self, Self::N, usize) {
+        todo!("block cleave — arena tier")
+    }
 }
 
 ///walker at the block's root (shared). `R` is the borrow — `&B` or `&mut B` — so one
