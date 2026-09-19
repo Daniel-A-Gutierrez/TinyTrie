@@ -2,7 +2,165 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
-# Vocabulary Updates
+# Node Impl Flexibility changes
+I felt like the current traits assume children are stored in a vec indexed 0..len where len < DEGREE and > 0. 
+I planned changes to support greater flexibility in how nodes store/index their children with ai, this is its preliminary summary.
+
+    Node
+    - const PACKED: bool — do inserts/removes shift subsequent ChildPos? Gates the hop: hop iff CHILDREN_PACKED && pos < gap(). Slotted nodes never hop.
+    - fn gap(&self) -> ChildPos — node-reported; crate rule stays fixed: parent after children with ChildPos < gap. Packed reports a count/degree-derived value; slotted reports ChildPos(DEGREE/2) constant.
+    - Doc re-scope: DEGREE ≥ 3 gates split consumers only — DEGREE=2 rotation consumers are legitimate (they skip SplittableNode entirely).
+
+    NodeCursor
+    - children() -> impl DoubleEndedIterator + ExactSizeIterator<Item = (ChildPos, B::A)> — no default impl, yields in ChildPos order.
+    - lookup(&self, k) -> Self::Lookup — type Lookup: Lookup<Self::A>; consumer-implemented, (ChildPos, Ordering, K) demoted to its private representation (K by value, K: Copy). The crate never interprets Ordering; it asks two questions:
+
+    trait Lookup<A> {
+        fn insert(&self) -> (ChildPos, Rel);    // anchor for suggest_insertion
+        fn descend(&self) -> Option<ChildPos>;  // routing/equal-policy — search's only need
+    }
+
+    NodeWalkerMut
+    - insert_child(k, payload, addr) -> ChildPos — child_idx arg dropped; placement is node policy (required for slotted nodes — the crate can't compute their slots). remove_child(child_idx) keeps its arg: removal targets, insertion places.
+
+    SplittableNode
+    - split(&mut self, split_at: ChildPos) — takes the split point; midpoint no longer hardcoded.
+    - new_root(r_a) → new_parent(r_a) — same construction serves root promotion, insert_parent, and burst's inode.
+
+    TreeWalk (consuming the above)
+    - suggest_split(s), suggest_split_relocate(s), suggest_insert_parent(), suggest_hop(shift) -> Option — per the corrected table.
+    - Suggestion bodies become small enumerations over children() (.filter(slot ≥ s).nth(h−1)) instead of index arithmetic — arithmetic that's meaningless for gapped slots.
+    - suggest_insertion consumes Lookup::insert().
+
+    Division of labor after all of it: crate keeps the ordering rules (layout = ChildPos order, gap comparison, hop choreography, suggestions); node owns placement, routing, slot semantics, and storage. The crate's only operations on a ChildPos are compare, enumerate, and hand back.
+
+review of that : 
+children_packed - insufficient, just because its not packed doesnt mean the mid-rank child or mid-address child didnt change on insert. 
+gap - name is ambiguous, midpoint would be better. still insufficient though. 
+note - K must be copy?
+
+    the bits on gap and children packed - i dont think itll work. i think nodewalker needs a middle_child() -> ChildPos , and child(childpos) needs to return an option. when nw.child(nw.middle_child()) changes after an insert, we hop.
+
+some discussion later settled on this shape
+
+```rust
+    // NodeWalkerMut:
+    /// the child that would slide across the midpoint if we insert at `lookup`'s
+    /// target, if any. None = no hop. internal movement is irrelevant — only a
+    /// midpoint crossing concerns the layout.
+    fn insert_would_cross_midpoint(&self, lookup: &Self::Lookup) -> Option<ChildPos> {
+        if !B::N::CHILDREN_PACKED {
+            todo!("{} must impl insert_would_cross_midpoint for non-packed storage", ...);
+        }
+        let (pos, _) = lookup.insert();
+        (pos.0 < B::N::DEGREE / 2 && self.child_count() >= B::N::DEGREE / 2)
+            .then_some(ChildPos(B::N::DEGREE / 2 - 1))
+    }
+
+    /// mirror for removal: the child that would slide back across the midpoint.
+    fn remove_would_cross_midpoint(&self, at: ChildPos) -> Option<ChildPos> {
+        if !B::N::CHILDREN_PACKED { todo!("..."); }
+        (at.0 < B::N::DEGREE / 2 && self.child_count() > B::N::DEGREE / 2)
+            .then_some(ChildPos(B::N::DEGREE / 2))
+    }
+```
+
+## In Order Meaning - Child Ordering Semantics
+Ok after some deliberation:  
+in order is relative to child pos. 
+in order works under the assumption that the children are sorted by key.
+sparse is allowed, its not rank order, its child pos order. 
+
+binary trees wouldnt work under packed + sorted, 
+btrees may want to take advantage of sparse nodes but still have to reckon with their assignment influencing traversal order. 
+
+     ❯ one hiccup i notice - its not a dealbreaker for anything, but 'layout order' isnt necessarily 'value order'. right? a node with multiple 'values' per inode like a btree shows up multiple times in the value enumeration, while a tree with some nodes that dont store values like a b+ tree has some nodes that dont show up at all in the value enumeration. not super sure how to feel about that or if its relevant...
+     ---
+     The real consequence is for the planned ordered-iteration surface (the IntoIterator future work): it's clean for B+ (value order = leaf-chain order, inodes invisible to the iterator) and for 1:1 shapes, but a regular B-tree needs a value cursor that interleaves the parent's keys around its gap — "visit the parent" split into k visits between child halves — which the walker's node model can't express. That's the same territory as the deferred keys() iter hook, so it's a known-open spot rather than a new problem.
+
+     How to feel about it: fine, as long as the docs never claim value order — only node order. Maybe worth one line in the ordering docs stating the multiplicity contract explicitly so a future regular-B-tree consumer isn't surprised.
+
+i *would* like the type system to care though, if a walker's state goes stale.
+namely if any mutation happens to the block while its alive, but not through itself.
+its a bit paradoxical.
+at the same time theres operations that need to be in multiple places within the block at the same time.
+like we need a tree equivalent of 'split at mut', so that we know 2 subtrees arent overlapping.
+maybe thats the right track.
+find slot -> slide none -> apply slide -> insert  - all of these operate under an unspoken contract that the block won't be mutated in between them.
+on one hand , that makes me a little more comfortable with the idea of walkers going stale.
+on the other, i want to know how the system could be engineered to be more foolproof.
+
+find slot finds a none slide
+the set of things that 'owns' is all the referrers to the items in the none slide, the items there, and the none.
+even more specifically, its the specific ptrs within the referrers, the nodes that are moving, the parent pointers of their children, and the none.
+
+however since all those ptrs are singular, so long as no other none slide physically overlaps this one, the referrers dont overlap either. 
+then walkers with indexes that cross the split mut point would oob index. 
+the address / translator arithmetic gets gross too. 
+
+it would be nice if it at least guaranteed the walker couldnt outlast the lifetime of a borrow used to create it. 
+maybe the save/load thing was underrated.
+it gates the ability to me, so consumers cant accidentally do it. 
+
+
+another concern i had - the current nibble trie is sorta a hybrid btree/radix trie. most nodes are largely empty (degree 16, nibble=4bits so 4 possibilities ,
+usually 2-3 occupied, more towards root less towards leaves) , so i created distinct leaf/inode types, the leaf types dont actually store values, they just inline
+up to 16 nodes in an internal mini-tree. once those fill up they 'split up' where the root of the tree becomes a proper node with its direct children becoming
+its contents, and the grandchildren all become roots of their own leaves.
+
+the new children would all be sequential, the current node can become the parent. but the degree of the split is variable. id need find_n_slots. the interface
+would be what ... split_n_off ? split_n_up? or do we just give the consumer N spaces + addresses to insert children into?
+
+if the ordering is in order thered have to be a parent hop, which we dont give the consumer the tools to do. not like a radix trie should be in-order.
+to know what slot the parent should go into wed have to know the child_ids of each child that'll be produced.
+
+so something like 'split_n_off(children : &[childpos])'. that could force an allocation when we otherwise wouldnt need one.
+im leaning towards doing the orderings separately lately, its getting complex unifying them all into a single impl.
+I worry itll lead to mistakes.
+
+maybe the single treewalkermut impl should be split up by ordering and consume treewalk.
+itd be less complex to develop them one at a time then unify later.
+what would we need from the consumer to even implement that ? 
+a splitnode function that produces a vec of nodes? 
+
+im wondering about all this 'rewiring on behalf of the consumer'. 
+itd just be a matter of 'heres a slot' if it werent for the fact that the parent had to hop sometimes to maintain the ordering, 
+or that the root may change and the block needs to know that. 
+binary trees seem like theyre the only ones that benefit from in-order and they never split, so their children dont cross over the midpoint.
+
+so new direction : 
+in order intended for binary trees, impls rotation methods
+preorder intended for b/b+trees, when N : split node, impls spiltnodewalker methods
+postorder - unimpled. 
+
+walkers dont permit hopping. 
+walkers dont impl wiring, thats consumer side, we just supply open slots at the correct relative position.
+open_after , open_before, open_before_after, open_n_after, open_n_before
+or just 
+    open_here(rel), open_n_here(rel)
+and for convenience on preorder
+    open_child(childpos, rel), open_parent(), open_parent_child(childpos, rel)
+meanwhile inorder provides
+    rotate_left, rotate_right, 
+
+on the consumers side, if they want to split a node in preorder: 
+    open_child(midpoint child, before/after), 
+    then the consumer splits their node into that and repoints. 
+if they want to split their root node,
+    open_parent_child(split_at child, rel) -> 2 open slots. 
+
+now the natural flow for the consumer is 
+create walker
+goto position to insert/split from
+get open slots from walker (consuming it)
+use them to insert nodes into the block. 
+
+after some more discussion with glm : 
+    set_root
+    split_block(left_root : N, right_root :N ) -> (Self,Self,N); 
+    
+
+#  kVocabulary Updates
 | old (below) | now |
 |---|---|
 | vaddr, virt, virtual, vptr, `P` (the generic) | address; trait `Addr` (ex-`BlockIndex`); generic param `A` |
@@ -72,10 +230,9 @@ preorder  : split/merge = adjacent slot, no slides; rotate/borrow = parent hop/s
 inorder   : rotate/borrow = free (seq preserved); split/merge = parent hop
 postorder : split/merge = adjacent before parent; rotate/borrow = parent hop/subtree slide
 
-## Where does the cursor wind up? 
-If we put rotation into the cursor's responsibilities, the current node moves and is ancestry changes. 
-Ugh this is so nasty. 
-Lets just record it. 
+## Walker Interface to Support Tree Methods
+
+Where does the cursor wind up? 
 treewalkermut
 insert_child -> winds up on child
 rotate_l/r -> winds up on subtree root
@@ -88,10 +245,34 @@ splitwalker
 split_child -> winds up on new child
 split_root -> winds up on new root
 
+## Suggestions
 TreeWalk
 existing stuff prev/next suggest_insert_child, suggest split 
+in any case where we insert or move a node we need a suggestion - insert child is the easy one. 
+split node, split root, insert parent, split parent edge (burst)
 
+whenever we remove a child also the parent may have to hop.
+// TreeWalk — per-ordering impls:
+//cc = current child count, h = DEGREE/2, s = split_at (first-moved index; children 0..s−1 stay with X, s..end go to Y).
+fn suggest_insertion(&self, child_idx: ChildPos) -> Suggested;               // unchanged
+fn suggest_split(&self, split_at: ChildPos) -> Suggested;                    // + s arg
+fn suggest_split_relocate(&self, split_at: ChildPos) -> Option<Suggested>;    // new
+fn suggest_insert_parent(&self) -> Suggested;                                // new
 
+┌───────────────────┬──────────────────┬───────────────────────────────────────────────────┬──────────────────────────────────────────┐
+│        fn         │     preorder     │                      inorder                      │                postorder                 │
+├───────────────────┼──────────────────┼───────────────────────────────────────────────────┼──────────────────────────────────────────┤
+│ insert_parent     │ Parent{Before}   │ if cc > h: Child{cc−1, After} else: Parent{After} │ Parent{After}                            │
+├───────────────────┼──────────────────┼───────────────────────────────────────────────────┼──────────────────────────────────────────┤
+│ split(s)          │ Child{s, Before} │ Child{s + min(cc−s, h) − 1, After}                │ Child{s−1, After}                        │
+├───────────────────┼──────────────────┼───────────────────────────────────────────────────┼──────────────────────────────────────────┤
+│ split_relocate(s) │ None             │ if s < h: Some(Child{s, Before}) else: None       │ None — the split anchor does double duty │
+└───────────────────┴──────────────────┴───────────────────────────────────────────────────┴──────────────────────────────────────────┘
+
+- split_root = (suggest_insert_parent, suggest_split(s), suggest_split_relocate(s)) on the root; driver pairs into find_2/find_3 + RootPos handoff.
+- burst = suggest_insert_parent() then suggest_insertion(1) on the new inode (stepwise-safe; precompute for open_two if wanted).
+- yield/adopt = suggest_insertion(0 | cc) evaluated standing on the sibling.
+- remove hop (opposite of insert child) (inorder, j < h) = Child{h, After} — driver-constructed or a direction param on hop_current.
 
 # Reviewing again
 im trying to get the code to a higher level of quality and robustness.

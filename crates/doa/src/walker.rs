@@ -117,9 +117,7 @@ where
     ///PANIC when the current node can't support the operation.
     fn child(&self, child: ChildPos) -> B::A;
     ///the current node's child addrs, in order.
-    fn children(&self) -> impl Iterator<Item = B::A> + '_ {
-        (0..self.child_count()).map(|i| self.child(ChildPos(i)))
-    }
+    fn children(&self) -> impl Iterator<Item = B::A> + '_ ;
     ///node-level relative position of `k` among the current node's ordered children:
     ///`(child slot, cmp)`. search owns routing.
     fn lookup(&self, k: &<B::N as Node>::K) -> (ChildPos, Ordering);
