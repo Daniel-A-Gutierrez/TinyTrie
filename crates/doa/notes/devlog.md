@@ -2,6 +2,279 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Putting TreeBlock aside for a bit
+
+An ordered map over ord components.
+A sorted vec is dense, difficult to 'grow'. 
+If its sparse instead we grow while shifting elements left and right.
+The 'insert' caller needs to provide a `&mut Vec< (prev,new) >` for us to report changes - the number of things that were shifted. 
+insert returns an address for the inserted thing.
+
+Simplest form - a set
+``` rust
+insert (key, &mut delta) -> addr
+remove (key) -> Option<key>
+iter -> impl Iter<item=&key>
+get(addr) -> &key
+```
+
+## Adaptive translator mode
+Instead of using high bits first, we use low and offset/rotate as necessary. 
+
+5,11,14,8,6,2,9,15,1
+
+empty 
+Translator ( offset = 0, rotation = 0 )
+5 -> 0, alloc cap 2, address width = log2(2) = 1
+5,x
+11 -> 1, 
+5,11
+
+end insert
+14 -> 2, realloc cap 4, insert at end so no translator mutation necessary, address width = log2(4) = 2
+Translator( offset = 0 , rotation = 0 )
+5,11,14,x
+8 -> 1, deltas=[(2,3),(1,2)] 
+5,8,11,14
+
+mid insert
+realloc cap 8, rotate addrs L1 before insert in 3 bit space, 6 goes at pos1 which after R1 is now 4.
+Translator ( offset = 0, rot = 1 ) p2v = rot_r(1), v2p = rot_l(1)
+6 -> 1,                         5,6,8,x,11,x,14,x
+2 -> 0, deltas=[(0,4),(4,1)]    2,5,6,8,11,x,14,x
+9 -> 5p=3a, deltas=...          2,5,6,8,9,11,14,x
+15 -> 8                         2,5,6,8,9,11,14,15
+
+front insert
+1->15 in 4 bit space
+offset += 8 so new post rot addrs 8..15 -> pos 0..8. 
+this has to occur in a rotated regime though so rotation is applied first? 
+x,x,x,x,x,x,x,1,2,5,6,8,9,11,14,15
+....
+
+deltas may need to be sorted? Or ordered so the 'into none' tuple is first.
+i think the idea here is as follows : 
+
+imagine we have 4 bits of addressed space, and we're growing up to 5 bits
+if we're prepending, we've used up the space in 0b0000..0b1111, but we want all our previous things to end up at a higher address
+so we want to use that space again, and the new stuff goes to 0b10000..0b11111. so we offset by 0b10000. 
+if we're inserting within we want 0b0000x .. 0b1111x , so we just rotate the old addrs left. 
+if we're appending we want 0b10000..0b11111 free, which they already are, so we do nothing. 
+
+the question is how does that all work when we interleave rotates with offsets. 
+how do we calculate offset for a new space in the first place? 
+if our cap is 16 and we're going up to 32, thats 4 bits to 5 bits
+so our offset if we're prepending is 1<<4? 
+
+doesnt growing out bit width actually change all the addresses we've already given out in a way? 
+say we gave out 8 , then we grow to cap 32 from cap 16.
+say we'd only ever rotated via middle inserts, so r3
+8 rl 3 = 4, so the phys was 4 but now its 2 in width 5. 
+0b1000 rl 3 = 0b0100 = 4 , 0b1000 rr 3 = 1, and p2v=rot_r(rot), v2p=rot_l(rot)
+so whenever we grow, if we've rotated we need to increase rotation? 
+
+im worried that this grows into a string of translator mutations that cant be simplified...
+if we're always rotating in space then thats always interleaving the upper half (new, empty) with the lower half, making space in between. 
+if we had an offset already... is it wiped out? can it be preserved into a single op? 
+
+say weve got 
+2,3,0,1 
+offset 
+we want to grow via rotation
+2,3,0,1,x,x,x,x -> 2,x,3,x,0,x,1,x ? is that right
+if our formula was p + 2 % 4
+its now (p + 2) rl 1 % 8 but that doesnt work
+2 should be at 0 and now its at 4. 
+whatd be correct is (p+2) rl 1 % 4 rl 1 % 8 
+0+2 rl 1 = 4 % 4 = 0 rl 1 = 0 % 8 = 0 .
+can it be simplified? 
+0 + 4 rl 1 % 8 = 0. 
+so if we rotate the offset it works? 
+lets try the other numbers
+
+before : 
+3 rl<3> 1 = 6, % 4 = 2
+3 + 4 % 8 = 7, rotation irrelevant. 
+
+what if instead we start at bit_width=full, use shift instead of rotate, at each grow shift decreases and 
+if its a prepend offset increases? 
+
+init for u8 : translator = shift=7 offset=0
+a2p = a>>shift + off , p2a = `a+off<<shift` 
+so 
+0,1,2,3 , shift=6 off=0 => 0, 64, 128, 196 
+if we want to free it up to 
+x,x,x,x,0,64,128,196
+wed need offset=4, shift=5 right ? 
+no thats no dice it gets us 128,160,192,224,0,32,64,96
+it has to be a rotation, to get us 
+32,96,160,224,0,64,128,196
+
+so its what, offset 1 rotation 5 ? 
+not quite...
+the rotation has to happen last i think since 224..0 is only 32 while the rest is 64
+p2a = ((p + 4) % 8 ) rl 5
+a2p = p rr 5 % 8 - 4 
+32 rr 5 => 1 % 8 => 1 - 4 => 252
+
+addresses
+0,64,128,192
+scale down (>> 5)
+0,1,2,3
+offset  128 % 256
+128,196,0,64
+rotate left 1 (in 8 bit)
+0, 128, 1, 129
+rotate right 5
+0, 1, 2, 3
+rotate left 7? 
+0,32,64,96
+
+0,64,128,192,256,320,384,428
+0,1,2,3,4,5,6,7                 >> 6
+4,5,6,7,0,1,2,3                 +4 % 8
+256,320,384,428,0,64,128,192    << 6
+
+that reaches outside our addressable space though so instead maybe we can use rot
+instead of shift 
+
+0,64,128,192,x,x,x,x
+0,1,2,3,4,5,6,7             rr 6
+4 rl 6 = 1, 5 => 65, 6 => 129...
+technically, that works. 
+actually i think im worrying about this too much, logical space will open up bewtween 
+the new addresses when we rotate anyway. 
+
+p+4 rl 6 
+1,65,129,193,0,64,128,192
+
+a rr 6 - 4
+0,1,2,3,252!
+we need a mod, cant leave it up to the bw
+
+p2a 
+p = a rr 6 - 4 % 8 
+0,1,2,3,4,5,6,7
+
+a2p : 
+a = (p + 4) % 8 rl 6 
+1, 65, 129, 193, 0, 64, 128, 192
+
+so our params are cap, offset, rotation
+we cant just do wrapping add for the wrap.
+
+so lets try some stuff out - 
+initial conditions : 
+rot = 7, offset = 0, cap = 2
+[0,1] => [0,128]
+
+appending 
+[0,128,x,x] => [0,128,1,129] - this is equivalent to [0,1,2,3] rr 1 or rl 7 
+so we mutate neither offset nor rotation, cap does increase to 4 tho, not that it matters. 
+
+prepending 
+[0,128] => [1,129,0,128] p2a = (p+2)%4 rr 1 or rl 7
+
+inserting 
+[0,128] => [0,x,128,x] p2a = p rr 6 or rl 2. 
+
+OK so that works. 
+
+can we prepend again? 
+[1,129,0,128] off = 2 rot = 7 cap =4  => off,rot=?? [x,x,x,x,1,129,0,128]
+
+off = 6, cap = 8 , rot stays 7 left or 1 right
+like taking [2,3,0,1] and making [4,5,6,7,2,3,0,1] 
+maybe instead we can do [6,7,4,5,2,3,0,1]? 
+nah no way.
+2 ideas
+1. ring buffer
+    - [2,3,0,1] => [0,1,x,x,x,x,2,3] - how even 
+2. just rev the existing elements when we move them to the end of the new space. 
+    - ie [2,3,0,1] => [7,6,5,4,3,2,1,0] - this is a repoint, otherwise we're out of order
+compromise : repoint or move, cant do neither. 
+
+well, i guess we can always do 
+[0,128] == grow => [127,255,0,128] => [254,255,0,1]
+thats the classic form anyway.
+skip the % cap , wrap in full width address space. 
+
+So prepending is possible , we dont need the % cap, we wrap in address space. 
+however, it still makes prepending slower than appending. If we want it to be really balanced we should reverse the semantic ordering and treat it as 'on strategy' vs 'off strategy' push. 
+
+the translator or the block can store a 'reversed' flag.
+then prepending is functionally the same as appending, its just the semantic meaning of the ordering that changes.
+
+the translator doesnt even need to know about rev i guess, thats a block concern.
+
+we keep the blocks very small , u8 addresses, then aggressively bias towards an insertion pattern early on. That means when we're not reversed and we hit a prepend-grow, we reverse the order of the items and push the new one on the end after the realloc. 
+
+## Block Bias
+goal : prevent spurious array reversal
+maybe a block can have 3 bias states - rev, middle, fwd 
+they start by default rev=false , bias=none.
+when we prepend at a grow point , bias moves towards rev. 
+if rev=false and bias != fwd, we reverse the contents of the block and repoint via the returned delta array. 
+etc. 
+
+## Other notes
+- a block that stores heapful keys/values can have a side buffer that stores the keys and values inline. 
+- im thinking with the new translator scheme a tree of blocks becomes less... up for interpretation. 
+- a single u256 mask can store occupancy, save us 224 bytes of space per block. 
+- deltas have to be returned in an order such that a referrer can just loop over them and do 'swap(from,to)'. 
+
+## Block Decapitation
+say we start inserting a series of decreasing values in the middle of another block. it wont trigger a strategy change like that. 
+in that case, maybe we should count where the none had to come from instead. 
+within budget of an end = make it at the end, move items, bump after
+otherwise, spread or split, depending on occupancy. 
+
+maybe in the case where we fetch a none from the end, instead, we do so by bumping an item off the block to a neighboring one... if possible. 
+i guess thats an arena level strategy? 
+
+then we split out a section from a block if there isnt any space within bit_width of the desired location. cut out bit_width-1 items centered around the current and make 3 blocks from it. 
+
+the caller can maybe infer when a bump is a good idea from deltas + the translator
+if deltas includes an end element moving into a new space for example. instead of fixing it up we can pop it out and move it. leaves it up to the caller without changing the signature...
+
+also implies insert into a block can fail, maybe if we have try_insert(...,budget) and insert() where insert forces it no matter how many items we have to move, unless we're at capacity. 
+
+## Insert bulk
+possibly faster? If we can sort the next n things we're putting into the block and find cases where theyll end up adjacent, we can do less shuffling around of items. 
+
+
+
+## Database use
+with a reverse map, as a column index, wed basically have
+``` rust
+IdxCol {
+    revmap : Vec<Addr> // row/insert ord -> rank
+    map : SortedBlock<Key, Row>,
+    delta : Vec<(Addr,Addr,&Row)>
+}
+
+SortedBlock<K,V> {
+    reversed : bool,
+    bias : Enum{ rev, mid, fwd }
+    block : Vec<MaybeUninit<(K,V)>>,
+    occupancy : usize,
+    mask : BitVec
+    translator: Translator<u8>
+}
+
+IdxCol.insert(Key) {
+    let new_row = self.revmap.len();
+    let new_addr = self.map.insert(key,new_row,&mut self.delta)
+    for old,new,row in delta {
+        self.revmap[row] = new
+    }
+    self.delta.clear()
+}
+```
+
+cool.
+
+
 # Node Impl Flexibility changes
 I felt like the current traits assume children are stored in a vec indexed 0..len where len < DEGREE and > 0. 
 I planned changes to support greater flexibility in how nodes store/index their children with ai, this is its preliminary summary.
