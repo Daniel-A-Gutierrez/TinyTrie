@@ -10,14 +10,15 @@ use arrays::tiny_array::TinyArray;
 use doa::Fixup;
 use doa::PreOrder;
 use doa::Rel;
-use doa::blocks::{BlockTrait, UniformBlock};
-use doa::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide, GrewFixup, HasRoot, Pos,
-                    PosAncestry, SwapFixup};
-use doa::store::NoneSlide;
+use doa::index::Pos;
 use doa::translator::Translator;
+use doa::treeblock::blocks::{BlockTrait, UniformBlock};
+use doa::treeblock::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide,
+                               GrewFixup, HasRoot, PosAncestry, SwapFixup};
+use doa::treeblock::store::NoneSlide;
+use doa::treeblock::walker::{BlockExhausted, Node, NodeCursor, NodeWalker, NodeWalkerMut,
+                             OpenFixups, PreOrderWalk, TreeWalk, TreeWalker};
 use doa::treeblock::{search, walker};
-use doa::walker::{BlockExhausted, Node, NodeCursor, NodeWalker, NodeWalkerMut, OpenFixups,
-                  PreOrderWalk, TreeWalk, TreeWalker};
 
 const DEGREE: usize = 6; //max children per inode; leaves hold up to DEGREE pairs
 
@@ -203,8 +204,7 @@ fn wire_child(block: &mut BlockT<'_>, par: Pos, child_idx: ChildPos, addr: u16) 
     let m = child_min(block, addr);
     let old_left = {
         let BNode::Internal(n) = block.get(par) else { panic!("wire_child: not internal") };
-        (child_idx == 0 && n.children.len() > 0)
-            .then(|| child_min(block, *n.children.get(0)))
+        (child_idx == 0 && n.children.len() > 0).then(|| child_min(block, *n.children.get(0)))
     };
     let BNode::Internal(n) = block.get_mut(par) else { panic!("wire_child: not internal") };
     n.children.insert_at(child_idx.0, addr);
@@ -263,9 +263,9 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for Cursor<'block, 'wal
             BNode::Leaf(_) => panic!("child: leaf"),
         }
     }
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
-                             + ExactSizeIterator
-                             + '_ {
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, u16)> + ExactSizeIterator + '_ {
         let cc = self.child_count();
         (0..cc).map(|i| (ChildPos(i), self.child(ChildPos(i))))
     }
@@ -347,9 +347,9 @@ impl<'block, 'walker> NodeCursor<'block, BlockT<'block>> for CursorMut<'block, '
             BNode::Leaf(_) => panic!("child: leaf"),
         }
     }
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
-                             + ExactSizeIterator
-                             + '_ {
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, u16)> + ExactSizeIterator + '_ {
         let cc = self.child_count();
         (0..cc).map(|i| (ChildPos(i), self.child(ChildPos(i))))
     }
@@ -508,8 +508,8 @@ impl BTreeMap {
                             self.block.insert(y_open, y);
                             let y_a = self.block.p2a(y_open.0);
                             let y_min = child_min(&self.block, y_a);
-                            let BNode::Internal(n) =
-                                self.block.get_mut(self.block.a2p(nr_a)) else {
+                            let BNode::Internal(n) = self.block.get_mut(self.block.a2p(nr_a))
+                            else {
                                 panic!("insert: fresh parent is not internal")
                             };
                             n.children.push(y_a);

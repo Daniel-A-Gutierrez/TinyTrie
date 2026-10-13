@@ -2,6 +2,209 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Picking back up
+
+from last time : 
+```
+so the tools i need for all this are
+bias - high and low threshold 
+back - ptr to last to calc density from
+asymmetric find_slot
+rotate - make space between elements by moving them such that they wind up at their rotated address
+balance - move items to pos = a2p(p2a(rank))
+pack - move items to pos=rank 
+derotate = reduce rotation - should pack elements if theyre balanced prior. 
+```
+
+so lets think about what SBlock struct needs.
+
+```rust
+    struct SortBlock <K,A> { 
+        translator: Translator<A>,
+        data : Vec<MaybeUninit<K>>, //len useless
+        mask : BitVec,
+        bias : InsertBias,
+        len : A,
+        back : A
+    }
+
+    enum InsertBias { Append, Prepend, Insert }
+    struct Translator <A> { rotation : u8, offset : A }
+
+    
+```
+
+
+
+# SortedBlock Interfaces
+
+### SortedBlockSet<K,A>
+--pub interface--
+insert(&mut self, K, &mut deltas : Vec<(usize,usize)>) -> Result<A,K> //deltas maybe custom type? 
+remove(&mut self, K) -> Option<K>
+find(&self, &K) -> Option<A>
+occ(&self) -> usize
+cap(&self) -> usize
+iter(&self) -> doubleended exact size iter
+range(&self, &K1, &K2) -> RangeIter
+new() -> Self
+from_vec(v : Vec<K>)
+
+--convenience-- 
+contains(&self, &K) -> bool 
+max_capacity() -> usize
+is_full(&self) -> bool
+high_occupancy(&self) -> bool
+min(&self) -> &K
+max(&self) -> &K
+nth(&self, n: usize) -> &K
+
+--sealed interface (for arena) --
+split(Pos)
+split_range
+set_bias
+try_insert(&mut self, K, budget : usize, &mut deltas) -> Result<A,K> 
+bias(&self) -> BlockBias
+reverse(&mut self)
+reversed(&self) -> bool
+
+-- pub getters --
+get(&self, &A) -> &K //panics if mask says uninit
+try_get(&self, &A) -> Option<&K>
+get_unsafe(&self, &A) -> &K //no check
+index(&self, Pos) -> &K //panic if mask is 0
+try_index(&self, Pos) -> Option<&K>
+index_unsafe(&self, Pos) -> &K
+get_mut(&self, &A) -> &K //panics if mask says uninit
+try_get_mut(&self, &A) -> Option<&K>
+get_unsafe_mut(&self, &A) -> &K //no check
+index_mut(&self, Pos) -> &K //panic if mask is 0
+try_index_mut(&self, Pos) -> Option<&K>
+index_unsafe_mut(&self, Pos) -> &K
+
+-- internal -- 
+closest_slot(&self, pos, budget) -> Result<Pos>
+alloc(Pos, Rel, &mut Delta) -> OpenPos (holds mutable borrow of self)
+try_alloc(Pos, Rel, budget, &mut Delta) -> Result<OpenPos>
+place(&mut self, K , OpenPos) -> place an item into an open slot
+remove(&mut self, Pos) -> OpenPos
+move_open(&mut self, Pos, OpenPos, &mut delta)
+grow_back(&mut self) -> increase cap to next power of 2
+grow_rotate(&mut self) -> increase cap to next power of 2, move items from addr to addr rl 1
+grow_reverse(&mut self) -> increase cap, reverse contents of block, reverse translator
+prepend(&mut self, K, &mut Delta) - push front and slide items to nearest none
+binary_search(&self, &K) -> Pos - 
+balance(&mut self, deltas)
+
+-- stretch -- 
+
+insert_many( keys : &[K], deltas : &mut Vec<(usize,usize)> )
+unsafe insert_sorted( keys : &[K], deltas : &mut Vec<(usize,usize)> )
+closest_slots(pos, n, budget, &mut Vec<Pos>) //stretch
+move_openings( openings : Vec<(src,dst)> , delta: &mut Vec<(Pos,Pos)>) //stretch 
+
+## refining
+i think the compromise im trying to brook between the try/force insertion variants boils down to use in an arena vs as a standalone datastructure.
+
+arena allows
+- bumping
+- splitting
+- everything standalone does
+
+standalone 
+- auto grow
+- automatically bias towards insertion pattern via near edge insert detection
+
+so insert must use try_insert , and if that fails at budget, adapt or grow depending on occupancy.
+flow map 
+
+insert flowchart : 
+occupancy high : grow with current method via bias
+    different biases can have different thresholds, middle ~75%, fwd and rev ~ 95%
+try insert -> Ok(P) -> Return A
+fail -> occupancy > 50% -> 
+    insert near front -> grow_reverse
+    insert near back -> grow_back
+    insert in middle -> grow_rotate
+fail -> occupancy < 50% ->
+    near front -> balance & reverse
+    near back -> balance
+    in middle -> balance & rotate without growing
+
+so how do i help with the bump / split detection
+the arena doesnt use the insert flowchart
+oh , try insert needs to return the position of the item it would go at even when it fails.
+when try insert fails at low occupancy instead of balancing it will split range. 
+if the block is at max_cap with high occupancy and we fail itll split at a position determined by the bias.
+if its at max cap with low occupancy itll balance it. 
+
+## arena insert flowchart
+occupancy high (~75%) -> grow with current method via bias
+    different biases can have different thresholds, middle ~3/4, fwd and rev ~ 15/16
+try_insert-> 
+    Ok(P) -> return A
+    Err(P,K) -> 
+        occupancy > 50% 
+            insert at front
+                split off front dense region
+            insert near front 
+                grow_reverse
+        occupancy < 50%
+
+
+i think i need a low and a high threshold for each bias 
+middle: 50%,75%
+back & front : 15/16, 31/32
+
+append and prepend can manually leave 1 spot open every budget*2. when those get taken up its a sign of off-strategy insertions.
+for middle, an abnormally low occupancy is the flag for off-strategy. we're making space that isnt getting used. 
+
+lets make a matrix of red flags, cases when try_insert has failed. 
+
+bias        pattern
+append      append              occupancy/len == 15/16, insert near back not possible,          try bumping 
+append      prepend             occupancy/len > 15/16 , insert is within budget of front,       split off
+append      random              occupancy/len > 15/16 , insert is not near an edge              split range
+append      middle sequential   occupancy/len > 15/16 , insert not near an edge                 split range
+prepend     same as append but reversed 
+middle      random              occupancy/len > .5      dense region in moderately dense block  split range
+middle      sequential          occupancy/len < .5      dense region in sparse block,           split range, bias 
+
+yk what, i can alter find slot so it looks further in the direction relative to an element that we're looking...
+but thatd depend on binary_search's behavior , since that finds the anchor.
+no actually wait
+if i always favor the 'higher' side, repeated prepends to a sequence will run out of budget in a smaller dense region,
+repeated appends will run out of budget in a larger dense region. 
+
+that gets me a hint as to what the split off block's bias should be, and whether we're on strategy or not. 
+dense region diameter
+lesser if sequential / off strategy
+greater if sequential / on strategy
+much greater if random either on or off strategy. 
+
+have to think about blocks that went from random->sequential also, theyll have terrible utilization, maybe should balance then reverse rotate to compact. 
+
+## Improving Standalone flowchart with ideas
+insert branches on bias
+sequential biases check hot end first, then bsearch from there backwards
+random bias bsearches starting from middle. 
+
+so the tools i need for all this are
+bias - high and low threshold 
+back - ptr to last to calc density from
+asymmetric find_slot
+rotate - make space between elements by moving them such that they wind up at their rotated address
+balance - move items to pos = a2p(p2a(rank))
+pack - move items to pos=rank 
+derotate = reduce rotation - should pack elements if theyre balanced prior. 
+
+
+
+
+### OccMask
+
+
+
 # Putting TreeBlock aside for a bit
 
 An ordered map over ord components.
@@ -243,7 +446,6 @@ also implies insert into a block can fail, maybe if we have try_insert(...,budge
 possibly faster? If we can sort the next n things we're putting into the block and find cases where theyll end up adjacent, we can do less shuffling around of items. 
 
 
-
 ## Database use
 with a reverse map, as a column index, wed basically have
 ``` rust
@@ -273,6 +475,11 @@ IdxCol.insert(Key) {
 ```
 
 cool.
+
+## Trait / Abstraction Ladder
+
+I dont think store is necessary. 
+If i do a bitvec/bitmap instead of the options i think i can make find_slot faster. 
 
 
 # Node Impl Flexibility changes

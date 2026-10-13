@@ -11,7 +11,8 @@ use std::cmp::Ordering::*;
 use std::collections::VecDeque;
 
 use crate::{Rel,
-            metadata::{DoubleSlide, Fixup, GatherSlide, Pos}};
+            index::Pos,
+            treeblock::metadata::{DoubleSlide, Fixup, GatherSlide}};
 
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
 ///delta: shift each moved item's position by. from>to ⇒ None moves left ⇒ items move
@@ -171,7 +172,11 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         let min = pos.0.saturating_sub(budget);
         let (min, max) = match pin.map(|p| p.0) {
             Some(p) if p == pos.0 => {
-                if rel == Rel::After { (pos.0, max) } else { (min, pos.0) }
+                if rel == Rel::After {
+                    (pos.0, max)
+                } else {
+                    (min, pos.0)
+                }
             }
             Some(p) if p < pos.0 => (min.max(p + 1), max),
             Some(p) => (min, max.min(p)),

@@ -8,9 +8,8 @@
 //!(block-handed-out) addrs. addrs may wrap; the only hard rule is position
 //!order: pos 0 = min element, pos len−1 = max.
 
+use crate::index::Pos;
 use crate::index::UnsignedNum;
-use crate::metadata::Pos;
-
 // specialized fn-ptr aliases — the `variant!`/`apply!` macros below generate
 // the 16 specialized bodies.
 // p2a(p) = ((p + inner_offset) << shift) ror rotation + outer_offset.

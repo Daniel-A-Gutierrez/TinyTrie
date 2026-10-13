@@ -1,19 +1,18 @@
 //!module wiring + the ordering + relative-side vocabulary. `Ordering` impls are
 //!how a block names its traversal order so tree ops can `match O::ORDER` and
-//!monomorphize per-ordering flows. re-exports `metadata::Fixup`.
+//!monomorphize per-ordering flows. re-exports `treeblock::metadata::Fixup`.
+//!
+//!two consumers over the shared substrate (`index`/`translator`):
+//!`treeblock` (the walker/tree machinery + its store/fixup protocol) and
+//!`sortedblock` (the set — new, pairs-based feedback).
 
-pub use metadata::Fixup;
+pub use treeblock::metadata::Fixup;
 
-pub mod blocks;
 pub mod index;
-pub mod metadata;
-pub mod store;
+pub mod mask;
+pub mod sortedblock;
 pub mod translator;
 pub mod treeblock;
-pub mod walker;
-//unwired for the addr/pos terminology refactor — port when they earn a consumer:
-//mod inline_leafblock;
-//mod leafblock;
 
 pub struct InOrder;
 pub struct PreOrder;

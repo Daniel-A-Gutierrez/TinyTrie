@@ -5,12 +5,14 @@
 //!translator). tracked state (block data, walker state) impls `Fixable` — one
 //!method per fixup kind, called unconditionally by the walker with the block's
 //!translator; the impl decides relevance. also the cursor/walker/block data
-//!types (`Pos`, `ChildPos`, `PosAncestry`, `Root`, `Ancestry`, `CursorState`, ...).
+//!types (`ChildPos`, `PosAncestry`, `Root`, `Ancestry`, `CursorState`, ...).
+//!`Pos` itself lives in `index` (the translator needs it).
 
-use crate::{index::Addr,
-            store::NoneSlide,
+use crate::{Rel,
+            index::Addr,
+            index::Pos,
             translator::{AddressTranslator, Translator},
-            Rel};
+            treeblock::store::NoneSlide};
 use std::cmp::Ordering;
 use std::mem;
 use std::ops::{Add, Index, IndexMut, Sub};
@@ -111,14 +113,6 @@ impl Fixup for GatherSlide {
         *addr = tr.p2a(pos);
     }
 }
-
-///a slot in the store's array — the truth: pos 0 holds the min element, pos
-///len−1 the max; addr→pos is the translator's job. also the stackless cursor
-///state: descends freely (no per-level record), `ascend`/`parent` report
-///nothing. derived `Ord` + usize-rhs `+`/`-` keep inline arithmetic bare;
-///`.0` for the rest.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Pos(pub usize);
 
 ///a child's slot within its parent's child sequence; as an insertion gap it
 ///may equal `child_count`. compares against usize (`idx + 1 < child_count()`).
@@ -222,34 +216,6 @@ pub trait HasRoot<A: Addr>: Fixable<A> {
     fn set_root(&mut self, root: Pos);
     fn height(&self) -> u32;
     fn set_height(&mut self, height: u32);
-}
-
-impl Pos {
-    #[inline]
-    pub fn wrapping_add(self, rhs: usize) -> Self {
-        Self(self.0.wrapping_add(rhs))
-    }
-
-    #[inline]
-    pub fn abs_diff(self, other: Self) -> usize {
-        self.0.abs_diff(other.0)
-    }
-}
-
-impl Add<usize> for Pos {
-    type Output = Self;
-    #[inline]
-    fn add(self, rhs: usize) -> Self {
-        Self(self.0 + rhs)
-    }
-}
-
-impl Sub<usize> for Pos {
-    type Output = Self;
-    #[inline]
-    fn sub(self, rhs: usize) -> Self {
-        Self(self.0 - rhs)
-    }
 }
 
 impl Add<usize> for ChildPos {

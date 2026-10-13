@@ -15,7 +15,7 @@
 //! level; `O` is always `B::O` (the wrapper carries it as phantom data).
 //! NOTE: traversal assumes packed ChildPos (rank == slot); sparse-addressed
 //! nodes need children()-based sibling walks, unimplemented.
-///L0028
+///L0030
 ///ordering-aware wrapper over any consumer `NW`. `O` is phantom — it tags the wrapper
 /// so the per-ordering impls sit on distinct self types (coherence), and is bound to
 /// the block's ordering at every use (`B: BlockTrait<O = O>`).
@@ -23,16 +23,16 @@ pub struct TreeWalker<O, NW> {
     pub nw: NW,
     _o:     PhantomData<O>,
 }
-///L0033
+///L0035
 pub type PreOrderWalker<NW> = TreeWalker<PreOrder, NW>;
-///L0034
+///L0036
 pub type InOrderWalker<NW> = TreeWalker<InOrder, NW>;
-///L0039
+///L0041
 ///the block is exhausted — no slot, no spread, no edge room. split the block.
 ///the walker was consumed: rebuild from the block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockExhausted;
-///L0048
+///L0050
 ///what an open applied: the grow remap + the slide pair (`b` is a no-op slide
 /// for single opens), or — for an `open_n_*` — the one gather. consumers
 /// holding addresses/positions across the open apply these via their
@@ -46,7 +46,7 @@ pub struct OpenFixups {
     ///Some ⇒ the slots came from one gather; `slides` are no-ops.
     pub gather: Option<GatherSlide>,
 }
-///L0055
+///L0057
 pub trait Node {
     type K;
     type V;
@@ -62,7 +62,7 @@ pub trait Node {
 // layer 1 — consumer-implemented node mask. the consumer's walker struct implements
 // these; the crate never sees the node representation (union/enum/whatever).
 // ---------------------------------------------------------------------------
-///L0076
+///L0078
 ///stackless positioned reader over a block's nodes. no ascend — trees without stored
 ///parent pointers can still implement this (lookup needs descent only). no constructor
 ///here: a mut-holding walker can't be built from a shared borrow, so construction lives
@@ -86,9 +86,9 @@ where
     ///the current node's child slots, in key order (slot ids may be sparse; they
     ///must sort like the keys). exact-size + double-ended: subtree edges and
     ///anchor scans run off it.
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, B::A)>
-                             + ExactSizeIterator
-                             + '_;
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, B::A)> + ExactSizeIterator + '_;
     ///node routing: the child to descend into for `k`, `None` = descent terminates
     ///at the current node. the consumer's equal/partial-match policy lives here.
     fn lookup(&self, k: &<B::N as Node>::K) -> Option<ChildPos>;
@@ -102,7 +102,7 @@ where
     fn search<'b>(&'b mut self, k: &<B::N as Node>::K) -> Option<&'b B::N>
     where 'block: 'b;
 }
-///L0120
+///L0122
 ///ascend-capable cursor — the consumer's stackful walker.
 pub trait NodeWalker<'block, B>: NodeCursor<'block, B>
 where
@@ -116,7 +116,7 @@ where
     ///(parent position, child slot we descended through); `None` at the root.
     fn parent(&self) -> Option<(Pos, ChildPos)>;
 }
-///L0135
+///L0137
 ///consumer mut surface: `Fixable` so the crate's choreography corrects the walker's
 ///held state directly, plus the pointer-write primitives fixup delivery needs.
 pub trait NodeWalkerMut<'block, B>: NodeWalker<'block, B> + Fixable<B::A>
@@ -147,7 +147,7 @@ where
 // ---------------------------------------------------------------------------
 // layer 2 — ordered traversal.
 // ---------------------------------------------------------------------------
-///L0168
+///L0170
 ///ordered traversal in the block's layout ordering, over the wrapper.
 ///`next`/`prev`, the subtree edge walks, `first`/`last`.
 pub trait TreeWalk<'block, NW, B>
@@ -172,7 +172,7 @@ where
 // ---------------------------------------------------------------------------
 // layer 3 — the open surface. consumes the walker; returns slots + fixups.
 // ---------------------------------------------------------------------------
-///L0193
+///L0195
 ///preorder opens — B/B+ consumers.
 pub trait PreOrderWalk<'block, NW, B>: TreeWalk<'block, NW, B> + Sized
 where
@@ -184,7 +184,11 @@ where
     fn open_here(self, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     ///open a slot at child `child`'s subtree edge (Before/After the whole
     ///subtree), on the `rel` side.
-    fn open_child(self, child: ChildPos, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
+    fn open_child(
+        self,
+        child: ChildPos,
+        rel: Rel,
+    ) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     ///two independently-anchored opens, one atomic find pass — both slides
     /// computed before either moves.
     fn open_2_child(
@@ -218,7 +222,7 @@ where
         rel: Rel,
     ) -> Result<((OpenSlot, OpenSlot), OpenFixups), BlockExhausted>;
 }
-///L0241
+///L0247
 ///in-order opens + rotations — binary consumers. rotates move nothing
 /// physically (rotation preserves the in-order sequence), so the walker
 /// survives them.
@@ -227,10 +231,14 @@ where
     NW: NodeWalkerMut<'block, B>,
     B: BlockTrait<'block> + 'block + BlockOps<'block>,
     B::N: Node,
-    B::BlockData: crate::metadata::HasRoot<B::A>,
+    B::BlockData: crate::treeblock::metadata::HasRoot<B::A>,
 {
     fn open_here(self, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
-    fn open_child(self, child: ChildPos, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
+    fn open_child(
+        self,
+        child: ChildPos,
+        rel: Rel,
+    ) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     fn open_2_child(
         self,
         ca: ChildPos,
@@ -265,7 +273,7 @@ where
     /// ends on the riser.
     fn rotate_left(&mut self);
 }
-///L0288
+///L0298
 ///(internal) where an open anchors: the current node's own position, or a
 /// child's subtree edge.
 #[derive(Clone, Copy)]
@@ -273,7 +281,7 @@ pub(crate) enum Anchor {
     Here { rel: Rel },
     Child { idx: ChildPos, rel: Rel },
 }
-///L0297
+///L0307
 ///layer 3 — crate-internal choreography: the slide engine + the open engines
 /// over the unified `BlockOps` surface. machinery the consumer never calls —
 /// only the crate's open impls do (pub in-module, not consumer surface). the
@@ -314,21 +322,21 @@ where
         n: usize,
     ) -> Result<((Pos, Pos), OpenFixups), BlockExhausted>;
 }
-///L0334
+///L0344
 impl<O, NW> TreeWalker<O, NW> {}
-///L0340
+///L0350
 impl<'block, NW, B> TreeWalk<'block, NW, B> for TreeWalker<PreOrder, NW>
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block, O = PreOrder> + 'block,
     B::N: Node {}
-///L0404
+///L0414
 impl<'block, NW, B> TreeWalk<'block, NW, B> for TreeWalker<InOrder, NW>
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block, O = InOrder> + 'block,
     B::N: Node {}
-///L0512
+///L0522
 ///generic over `O`: the internal choreography. the `TreeWalker<O, NW>: TreeWalk`
 ///obligation is supplied as a where-clause rather than proven — it only discharges
 ///for a concrete `B`/`O` pair, so the coverage is identical without per-ordering
@@ -340,7 +348,7 @@ where
     B: BlockTrait<'block> + 'block + BlockOps<'block>,
     B::N: Node,
     TreeWalker<O, NW>: TreeWalk<'block, NW, B> {}
-///L0860
+///L0871
 impl<'block, NW, B> PreOrderWalk<'block, NW, B> for TreeWalker<PreOrder, NW>
 where
     NW: NodeWalkerMut<'block, B>,
@@ -348,7 +356,7 @@ where
     B::N: Node,
     TreeWalker<PreOrder, NW>: TreeWalk<'block, NW, B>,
     TreeWalker<PreOrder, NW>: TreeWalkHelper<'block, NW, B> {}
-///L0919
+///L0934
 impl<'block, NW, B> InOrderWalk<'block, NW, B> for TreeWalker<InOrder, NW>
 where
     NW: NodeWalkerMut<'block, B>,
@@ -358,35 +366,35 @@ where
     TreeWalker<InOrder, NW>: TreeWalk<'block, NW, B>,
     TreeWalker<InOrder, NW>: TreeWalkHelper<'block, NW, B> {}
 // ---- shared walk helpers (free fns over the consumer walker) ----
-///L1088
+///L1103
 ///in-order position boundary: the node sits between child[b-1] and child[b],
 ///`b = min(cc, DEGREE/2)` — after all children when cc ≤ DEGREE/2 (fixed by DEGREE,
 ///not cc: a full node's boundary is exactly its kept-left-half's edge, so splits
 ///never move the split node).
 fn in_boundary<'block, B: BlockTrait<'block>>(cc: usize) -> ChildPos
 where B::N: Node;
-///L1093
+///L1108
 fn at_root<'block, NW, B>(nw: &mut NW)
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L1104
+///L1119
 fn leftmost_leaf<'block, NW, B>(nw: &mut NW) -> usize
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L1118
+///L1133
 fn rightmost_leaf<'block, NW, B>(nw: &mut NW) -> usize
 where
     NW: NodeWalker<'block, B>,
     B: BlockTrait<'block> + 'block,
     B::N: Node,
 ;
-///L1134
+///L1149
 #[cfg(test)]
 #[path = "tests/walker.rs"]
 mod tests;

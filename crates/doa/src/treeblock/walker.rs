@@ -15,10 +15,12 @@
 //! NOTE: traversal assumes packed ChildPos (rank == slot); sparse-addressed
 //! nodes need children()-based sibling walks, unimplemented.
 
-use crate::blocks::{BlockOps, BlockTrait, OpenSlot};
 use crate::index::Addr;
-use crate::metadata::{ChildPos, DoubleSlide, Fixable, GatherSlide, GrewFixup, HasRoot, Pos};
-use crate::store::{NoneSlide, Store};
+use crate::index::Pos;
+use crate::treeblock::blocks::{BlockOps, BlockTrait, OpenSlot};
+use crate::treeblock::metadata::{ChildPos, DoubleSlide, Fixable, GatherSlide, GrewFixup,
+                                 HasRoot};
+use crate::treeblock::store::{NoneSlide, Store};
 use crate::{InOrder, PreOrder, Rel};
 use std::marker::PhantomData;
 
@@ -92,9 +94,9 @@ where
     ///the current node's child slots, in key order (slot ids may be sparse; they
     ///must sort like the keys). exact-size + double-ended: subtree edges and
     ///anchor scans run off it.
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, B::A)>
-                             + ExactSizeIterator
-                             + '_;
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, B::A)> + ExactSizeIterator + '_;
     ///node routing: the child to descend into for `k`, `None` = descent terminates
     ///at the current node. the consumer's equal/partial-match policy lives here.
     fn lookup(&self, k: &<B::N as Node>::K) -> Option<ChildPos>;
@@ -200,7 +202,11 @@ where
     fn open_here(self, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     ///open a slot at child `child`'s subtree edge (Before/After the whole
     ///subtree), on the `rel` side.
-    fn open_child(self, child: ChildPos, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
+    fn open_child(
+        self,
+        child: ChildPos,
+        rel: Rel,
+    ) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     ///two independently-anchored opens, one atomic find pass — both slides
     /// computed before either moves.
     fn open_2_child(
@@ -243,10 +249,14 @@ where
     NW: NodeWalkerMut<'block, B>,
     B: BlockTrait<'block> + 'block + BlockOps<'block>,
     B::N: Node,
-    B::BlockData: crate::metadata::HasRoot<B::A>,
+    B::BlockData: crate::treeblock::metadata::HasRoot<B::A>,
 {
     fn open_here(self, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
-    fn open_child(self, child: ChildPos, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
+    fn open_child(
+        self,
+        child: ChildPos,
+        rel: Rel,
+    ) -> Result<(OpenSlot, OpenFixups), BlockExhausted>;
     fn open_2_child(
         self,
         ca: ChildPos,
@@ -692,11 +702,8 @@ where
             //per-visit canary: the interval's Some slots are exactly the
             //members, so a visit outside it names an occupied slot no walk can
             //reach — an unwired ghost (subtle_bugs §6)
-            let in_interval = if g.rel == Rel::After {
-                lo <= p && p < hi
-            } else {
-                lo < p && p < hi
-            };
+            let in_interval =
+                if g.rel == Rel::After { lo <= p && p < hi } else { lo < p && p < hi };
             assert!(
                 in_interval,
                 "fixup_gather: walk left the member interval — an occupied \
@@ -786,7 +793,14 @@ where
         }
         let open = self.apply_slide(&ns);
         let noop = NoneSlide { from: open.0, to: open.0, delta: 0 };
-        Ok((open, OpenFixups { grew: found.grew, slides: DoubleSlide { a: ns, b: noop }, gather: None }))
+        Ok((
+            open,
+            OpenFixups {
+                grew:   found.grew,
+                slides: DoubleSlide { a: ns, b: noop },
+                gather: None,
+            },
+        ))
     }
 
     ///two independent opens at `a`/`b` (find_2_slots, composed as one `DoubleSlide`
@@ -805,11 +819,8 @@ where
         self.back_from_anchor(la);
         let (pb, rb, lb) = self.walk_to_anchor(b);
         self.back_from_anchor(lb);
-        let found = self
-            .nw
-            .block_mut()
-            .find_2_slots(pa, ra, pb, rb)
-            .map_err(|_| BlockExhausted)?;
+        let found =
+            self.nw.block_mut().find_2_slots(pa, ra, pb, rb).map_err(|_| BlockExhausted)?;
         if let Some(g) = found.grew {
             let tr = self.nw.block().translator().clone();
             self.nw.grew_fix(g, &tr);
@@ -822,7 +833,10 @@ where
         self.back_from_anchor(la);
         self.walk_to_anchor(b);
         let open_b = self.apply_slide(&sb);
-        Ok(((open_a, open_b), OpenFixups { grew: found.grew, slides: found.slides, gather: None }))
+        Ok((
+            (open_a, open_b),
+            OpenFixups { grew: found.grew, slides: found.slides, gather: None },
+        ))
     }
 
     ///n slots at `anchor`: walk, find_n_slots (budgeted → full-len → spread),
@@ -835,11 +849,8 @@ where
     ) -> Result<((Pos, Pos), OpenFixups), BlockExhausted> {
         assert!(n > 0, "open_n_at: n == 0");
         let (pos, rel, _) = self.walk_to_anchor(anchor);
-        let found = self
-            .nw
-            .block_mut()
-            .find_n_slots(pos, rel, n)
-            .map_err(|_| BlockExhausted)?;
+        let found =
+            self.nw.block_mut().find_n_slots(pos, rel, n).map_err(|_| BlockExhausted)?;
         if let Some(gr) = found.grew {
             let tr = self.nw.block().translator().clone();
             self.nw.grew_fix(gr, &tr);
@@ -869,7 +880,11 @@ where
         self.open_at(Anchor::Here { rel })
     }
 
-    fn open_child(mut self, child: ChildPos, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted> {
+    fn open_child(
+        mut self,
+        child: ChildPos,
+        rel: Rel,
+    ) -> Result<(OpenSlot, OpenFixups), BlockExhausted> {
         self.open_at(Anchor::Child { idx: child, rel })
     }
 
@@ -929,7 +944,11 @@ where
         self.open_at(Anchor::Here { rel })
     }
 
-    fn open_child(mut self, child: ChildPos, rel: Rel) -> Result<(OpenSlot, OpenFixups), BlockExhausted> {
+    fn open_child(
+        mut self,
+        child: ChildPos,
+        rel: Rel,
+    ) -> Result<(OpenSlot, OpenFixups), BlockExhausted> {
         self.open_at(Anchor::Child { idx: child, rel })
     }
 
@@ -976,10 +995,8 @@ where
         //reads (tree valid): LR = L's right subtree
         let l_pos = self.nw.position();
         let l_a = self.nw.block().p2a(l_pos);
-        let (p_pos, _) = self
-            .nw
-            .parent()
-            .expect("rotate_right: the riser has no parent — not the root");
+        let (p_pos, _) =
+            self.nw.parent().expect("rotate_right: the riser has no parent — not the root");
         let p_a = self.nw.block().p2a(p_pos);
         let lr_a = if self.nw.is_leaf() {
             None
@@ -1014,7 +1031,7 @@ where
         }
         match lr_a {
             Some(lr) => self.nw.set_child(1, ChildPos(0), lr), //P's slot 0 takes LR
-            None => self.nw.clear_child(1, ChildPos(0)), //riser was a leaf
+            None => self.nw.clear_child(1, ChildPos(0)),       //riser was a leaf
         }
         self.nw.set_child(0, ChildPos(1), p_a); //L's slot 1 = P
         //end-state restore: the riser ROSE a level, so its true path is one
@@ -1036,10 +1053,8 @@ where
         //reads (tree valid): RL = R's left subtree
         let r_pos = self.nw.position();
         let r_a = self.nw.block().p2a(r_pos);
-        let (p_pos, _) = self
-            .nw
-            .parent()
-            .expect("rotate_left: the riser has no parent — not the root");
+        let (p_pos, _) =
+            self.nw.parent().expect("rotate_left: the riser has no parent — not the root");
         let p_a = self.nw.block().p2a(p_pos);
         let rl_a = if self.nw.is_leaf() {
             None
@@ -1069,7 +1084,7 @@ where
         }
         match rl_a {
             Some(rl) => self.nw.set_child(1, ChildPos(1), rl), //P's slot 1 takes RL
-            None => self.nw.clear_child(1, ChildPos(1)), //riser was a leaf
+            None => self.nw.clear_child(1, ChildPos(1)),       //riser was a leaf
         }
         self.nw.set_child(0, ChildPos(0), p_a); //R's slot 0 = P
         //end-state restore (as rotate_right): pop the transient entry — the

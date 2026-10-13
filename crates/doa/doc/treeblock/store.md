@@ -8,7 +8,7 @@
 //!write-places. a two-slot open computes both slides before either is applied;
 //!`find_n_slots`/`gather_none` are the N-None gather (v1: rel-side holes only,
 //!one compaction pass — every member Some crosses the run exactly once).
-///L0021
+///L0022
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
 ///delta: shift each moved item's position by. from>to ⇒ None moves left ⇒ items move
 ///right ⇒ +1. from<to ⇒ items move left ⇒ -1. equal ⇒ 0.
@@ -19,34 +19,34 @@ pub struct NoneSlide {
     pub to:    Pos,
     pub delta: isize,
 }
-///L0028
+///L0029
 ///which side the nearest None was found on (slice-relative index).
 pub enum NearestNone {
     Left(usize),
     Right(usize),
     NotFound,
 }
-///L0036
+///L0037
 ///forward-only `ExactSizeIterator` over a store's `Some` refs. `len()` is the `Some` count
 ///(set at construction from `occupied`), so it stays exact despite filtering.
 pub(crate) struct SomeIter<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> {
     inner:     I,
     remaining: usize,
 }
-///L0042
+///L0043
 ///Vec-backed store. slots are `Option<T>`: `Some` = occupied, `None` = hole.
 pub struct VecStore<T> {
     buf:      Vec<Option<T>>,
     occupied: usize,
 }
-///L0049
+///L0050
 ///VecDeque-backed store. wrap-aware: cross-slice logic for find/slide/spread/split
 ///at the wrap boundary. slots are `Option<T>` (see `VecStore`).
 pub struct DequeStore<T> {
     buf:      VecDeque<Option<T>>,
     occupied: usize,
 }
-///L0056
+///L0057
 ///slot-backend surface: slot access, slide/find/grow/spread/split primitives, and
 ///insertion.
 pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
@@ -175,25 +175,25 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///deconstruct into a vec of slots.
     fn into_vec(self) -> Vec<Option<T>>;
 }
-///L0283
+///L0288
 impl NoneSlide {}
-///L0289
+///L0294
 impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> Iterator for SomeIter<'b, T, I> {}
-///L0307
+///L0312
 impl<'b, T: 'b, I: Iterator<Item = &'b Option<T>>> ExactSizeIterator for SomeIter<'b, T, I> {}
-///L0314
+///L0319
 impl<'b, T: 'b, I: DoubleEndedIterator<Item = &'b Option<T>>> DoubleEndedIterator
     for SomeIter<'b, T, I> {}
-///L0328
+///L0333
 impl<'a, T: Sized + 'a> Store<'a, T> for VecStore<T> {}
-///L0657
+///L0662
 impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {}
-///L1222
+///L1227
 ///the pair can't apply independently: affected spans overlap (a shared slot would
 ///double-move, or one slide's None-hole lies inside the other's run) or one slide
 ///moves the other's anchor. spans are closed — conservative.
 fn slides_interfere(s1: &NoneSlide, s2: &NoneSlide, a1: Pos, a2: Pos) -> bool;
-///L1237
+///L1242
 ///outward nearest-None scan: `left` at `l0, l0-1, …` (lcnt slots, decreasing) and
 ///`right` at `r0, r0+1, …` (rcnt slots, increasing). D tie-breaks equidistant hits
 ///(false⇒left, true⇒right). the caller checks the anchor slot separately, so l0/r0

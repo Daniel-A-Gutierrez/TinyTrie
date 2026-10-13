@@ -9,9 +9,9 @@
 //!(pos 0 = min) is preserved by every op.
 use crate::{Ordering, Rel, RootPos,
             index::*,
-            metadata::{DoubleSlide, Fixable, Fixup, GatherSlide, GrewFixup, Pos},
-            store::{DequeStore, NoneSlide, Store, VecStore},
-            translator::{AddressTranslator, Translator}};
+            translator::{AddressTranslator, Translator},
+            treeblock::metadata::{DoubleSlide, Fixable, Fixup, GatherSlide, GrewFixup},
+            treeblock::store::{DequeStore, NoneSlide, Store, VecStore}};
 use std::marker::PhantomData;
 
 pub type UniformBlock<'block, N, A, D, O> = Block<'block, N, A, Uniform, D, O>;
@@ -255,11 +255,18 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
     ) -> Result<FoundGather, InsufficientMaxCapacity> {
         let budget = Self::A::BIT_WIDTH as usize;
         if let Some(holes) = self.store().find_n_slots(pos, rel, n, budget, self.pin_pos()) {
-            return Ok(FoundGather { grew: None, gather: GatherSlide { anchor: pos, rel, holes } });
+            return Ok(FoundGather {
+                grew:   None,
+                gather: GatherSlide { anchor: pos, rel, holes },
+            });
         }
         //full-len scan before growing (as find_slot's ladder rung)
-        if let Some(holes) = self.store().find_n_slots(pos, rel, n, self.len(), self.pin_pos()) {
-            return Ok(FoundGather { grew: None, gather: GatherSlide { anchor: pos, rel, holes } });
+        if let Some(holes) = self.store().find_n_slots(pos, rel, n, self.len(), self.pin_pos())
+        {
+            return Ok(FoundGather {
+                grew:   None,
+                gather: GatherSlide { anchor: pos, rel, holes },
+            });
         }
         let mut p = pos;
         let g = self.grow_and_spread()?;
@@ -302,8 +309,7 @@ pub trait BlockOps<'block>: BlockTrait<'block> {
         pos_b: Pos,
         rel_b: Rel,
     ) -> Option<DoubleSlide> {
-        self.store()
-            .find_2_slots(pos_a, rel_a, pos_b, rel_b, self.len(), self.pin_pos())
+        self.store().find_2_slots(pos_a, rel_a, pos_b, rel_b, self.len(), self.pin_pos())
     }
     ///split [at, len) into a new block (right), self keeps [0, at). right's translator:
     ///inner += at (preserves right-half addrs). right's `BlockData` is cloned as-is —

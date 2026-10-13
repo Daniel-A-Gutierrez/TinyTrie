@@ -110,7 +110,14 @@ if __name__ == "__main__":
     root = Path(__file__).resolve().parent
     doc = root / "doc"
     doc.mkdir(exist_ok=True)
-    for f in sorted((root / "src").glob("*.rs")):
-        out = doc / (f.stem + ".md")
+    # stale outputs from the pre-split flat layout
+    for f in doc.glob("*.md"):
+        f.unlink()
+    for f in sorted((root / "src").rglob("*.rs")):
+        rel = f.relative_to(root / "src")
+        if "archive" in rel.parts or "tests" in rel.parts:
+            continue
+        out = doc / rel.with_suffix(".md")
+        out.parent.mkdir(exist_ok=True)
         out.write_text("```rust\n" + skeleton(f.read_text()) + "\n```\n")
-        print(f"{f.name} -> doc/{out.name}")
+        print(f"src/{rel} -> doc/{out.relative_to(doc)}")

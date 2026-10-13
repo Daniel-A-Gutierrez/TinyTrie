@@ -405,6 +405,77 @@ explicitly, not just its position.
 
 ---
 
+## 15. *(open)* u8 addresses: `Half = u8` is a lie
+
+**The known flaw.** `Addr::Half` exists for Pluripotent's cap math
+(`MAX_CAP = 1 << Half::BIT_WIDTH`, `SHIFT = BIT_WIDTH/2`), and there is no u4,
+so `impl_addr!(u8, u8)` names u8 its own half:
+
+```
+u8: MAX_CAP = 1 << 8 = 256 > the whole address space; SHIFT = 4
+Pluripotent<u8>: MAX_CAP (256) overstates capacity 16× — only the
+`addressable = 2^8 >> shift`-min guard in its find ladder keeps it honest.
+```
+
+**Why it stands:** u8 addressing is for the sortedblock tier (devlog: small
+blocks, u8 addrs), whose translator logic (full-width shift-down + rotation
+turns) doesn't use `Half` at all. Reshaping the knob (`Half` type → a
+`HALF_BIT_WIDTH: u8` const, so u8 can name 4) is deferred until that
+translator settles — then revisit both `Mode::MAX_CAP` and Pluripotent's
+initial `SHIFT` under a real u8 consumer. Until then: u8 Pluripotent blocks
+compile and run, but trust `addressable`, not `MAX_CAP`.
+
+---
+
+## 16. shift-then-mask: the shift eats the mask width
+
+**The bug (2026-10-12, `Mask::next_clear`).** word-wise scans shift the
+inverted word right by the start offset, then mask to the word's valid
+tail. the first version masked `(1 << end) − 1` bits — but `end` (valid
+bits in this word) counts from the WORD start, while the shift had already
+dropped `off` of them:
+
+```
+bits = 200, from = 193: word 3, end = 8, off = 1
+mask (1<<8)−1 keeps bits 0..8 of the shifted word = positions 193..=200
+bit 200 is past `bits` (padded clear in storage, so inverted = clear)
+→ next_clear(193) returned Some(200) for a fully-set tail
+```
+
+caught by the exhaustive naive-comparison test (every from ∈ 0..=bits) on
+its first run — the per-position oracle pays for itself.
+
+**The rule.** after `word >> off`, the tail mask is `(1 << (end − off)) − 1`
+— mask width is measured from where the SHIFTED value starts, not from the
+word start. `prev_clear` avoids the trap by masking the unshifted word
+first (leading_zeros needs no shift); any scan that shifts then masks owns
+this arithmetic.
+
+---
+
+## 17. *(open)* stale names alias the new owner — the name-transfer sharp edge
+
+sortedblock's addr = the slot's canonical name, and a slide TRANSFERS names
+(the mover adopts the vacated slot's name, giving up its own). The released
+name isn't retired — the next insert takes it. So a holder that skipped a
+`Deltas` application holds a STALE name, and that name still aliases a live
+slot: `get` returns the wrong element and `remove` deletes the wrong one,
+silently. No panic, no aliasing detection possible — `a2p` is injective and
+the slot's name is by definition minted.
+
+```
+{10@0, 20@128}; insert 5 → 10 renamed 0→64, 5 named 0
+a holder still holding 0 (skipped the delta) now names 5, not 10
+```
+
+**The rule.** unlike treeblock (birth-stable addrs, miss-applied fixups
+leave you pointing at a hole), here the delta is not optional metadata —
+every `Deltas` handed out by an insert must be applied before its addrs are
+used. The contract is name swaps, and an unswapped name is a wrong name.
+(An arena applying deltas at split/hand-off time is the intended holder.)
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

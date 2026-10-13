@@ -3,9 +3,9 @@
 //!trait (root access + the arena-tier `split_block` sketch, `todo!`) + the
 //!free-fn constructors `walker`/`search` (over the consumer's `From` impls —
 //!local type, orphan-safe).
-///L0011
+///L0012
 macro_rules! impl_tree_block;
-///L0029
+///L0030
 ///tree block: a block whose stored type is a node. param-less marker — construction
 ///lives on the free fns `walker`/`search` via the consumer's `From` impls
 ///(`impl From<&'a MyBlock> for MyCursor` — local type, orphan-safe), so no walker
@@ -33,7 +33,7 @@ where
         _right_root: Self::N,
     ) -> (Self, Self, Self::N, usize);
 }
-///L0061
+///L0062
 ///walker at the block's root (shared). `R` is the borrow — `&B` or `&mut B` — so one
 ///fn covers shared and mut walkers: the `From` impl the consumer names picks it.
 ///`NW` must be ascend-capable (`TreeWalk` traverses).
@@ -44,7 +44,7 @@ where
     NW: NodeWalker<'block, B> + From<R>,
     R: std::ops::Deref<Target = B>,
 ;
-///L0073
+///L0074
 ///walker routed to `k`'s terminal node. stackless cursors work here (`search` needs
 /// descent only); `walker` for a positioned-at-root start.
 pub fn search<'block, NW, B, R>(b: R, k: &<B::N as Node>::K) -> TreeWalker<B::O, NW>
@@ -54,10 +54,10 @@ where
     NW: NodeCursor<'block, B> + From<R>,
     R: std::ops::Deref<Target = B>,
 ;
-///L0085
-impl_tree_block!(crate::blocks::Uniform);
 ///L0086
-impl_tree_block!(crate::blocks::Pluripotent);
+impl_tree_block!(crate::treeblock::blocks::Uniform);
 ///L0087
-impl_tree_block!(crate::blocks::Anchored<O>);
+impl_tree_block!(crate::treeblock::blocks::Pluripotent);
+///L0088
+impl_tree_block!(crate::treeblock::blocks::Anchored<O>);
 ```

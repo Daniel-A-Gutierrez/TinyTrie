@@ -6,8 +6,9 @@
 //!translator). tracked state (block data, walker state) impls `Fixable` — one
 //!method per fixup kind, called unconditionally by the walker with the block's
 //!translator; the impl decides relevance. also the cursor/walker/block data
-//!types (`Pos`, `ChildPos`, `PosAncestry`, `Root`, `Ancestry`, `CursorState`, ...).
-///L0022
+//!types (`ChildPos`, `PosAncestry`, `Root`, `Ancestry`, `CursorState`, ...).
+//!`Pos` itself lives in `index` (the translator needs it).
+///L0024
 ///spread remap `pos → pos<<shl + shift_offset` (grow doubles the store; addrs
 ///stay stable). `{shl: 0, shift_offset: 1}` doubles as the plain `pos → pos+1`
 ///(Pluripotent front-edge grow).
@@ -16,7 +17,7 @@ pub struct GrewFixup {
     pub shl:          u32,
     pub shift_offset: u8,
 }
-///L0032
+///L0034
 ///a swap exchanged the record at `from` with the None at `to`. only the moved
 ///record's position remaps (from → to). swaps emit no self-fixup — the mover applies
 ///this by hand to block data + walker state, and `split_root` returns it as the
@@ -26,7 +27,7 @@ pub struct SwapFixup {
     pub from: Pos,
     pub to:   Pos,
 }
-///L0043
+///L0045
 ///two non-overlapping slides from one `find_2_slots` — the address fixup for a
 ///two-slot reservation, so holders get ONE `fixup` call covering both (order-
 ///independent: disjoint runs). the applying side still slides them separately
@@ -37,7 +38,7 @@ pub struct DoubleSlide {
     pub a: NoneSlide,
     pub b: NoneSlide,
 }
-///L0055
+///L0057
 ///one N-None gather: the `holes.len()` Nones at `holes` (sorted, all on
 ///`rel`'s side of `anchor`) compact contiguously beside the anchor; every
 ///intervening Some crosses the None-run exactly once (swap-minimal — a
@@ -50,34 +51,26 @@ pub struct GatherSlide {
     pub rel:    Rel,
     pub holes:  Vec<Pos>,
 }
-///L0061
+///L0063
 impl GatherSlide {}
-///L0098
+///L0100
 impl Fixup for GatherSlide {}
-///L0121
-///a slot in the store's array — the truth: pos 0 holds the min element, pos
-///len−1 the max; addr→pos is the translator's job. also the stackless cursor
-///state: descends freely (no per-level record), `ascend`/`parent` report
-///nothing. derived `Ord` + usize-rhs `+`/`-` keep inline arithmetic bare;
-///`.0` for the rest.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Pos(pub usize);
-///L0126
+///L0120
 ///a child's slot within its parent's child sequence; as an insertion gap it
 ///may equal `child_count`. compares against usize (`idx + 1 < child_count()`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChildPos(pub usize);
-///L0131
+///L0125
 ///tree height for fixed-height trees (b+ / S trees). pointer-free no-op-fixable
 ///level counter — a component, not a walker state.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Height(pub u64);
-///L0136
+///L0130
 ///walker's current depth. pointer-free no-op-fixable level counter — a
 ///component, not a walker state.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Depth(pub u64);
-///L0141
+///L0135
 ///minimal tree block data: root position + tree height (Fixable + HasRoot). not a
 ///walker state — a `reposition` on block data would rewrite the block root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,17 +78,17 @@ pub struct Root {
     root:   Pos,
     height: u32,
 }
-///L0148
+///L0142
 ///one ancestor entry: parent node's position + the child slot we descended through.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ancestor {
     pub parent: Pos,
     pub child:  ChildPos,
 }
-///L0154
+///L0148
 ///inline backing depth — deeper paths spill to the heap.
 pub const ANCESTRY_INLINE: usize = 8;
-///L0162
+///L0156
 ///stackful walker's ancestor stack, one entry per level. stores pos (not addr): fixup
 ///applies `fix_pos` directly, no translator; O(height) per op. inline-backed
 ///(`ANCESTRY_INLINE` entries, heap spill beyond): fixup's per-slide snapshot/
@@ -107,7 +100,7 @@ pub struct Ancestry {
     len:    usize,
     spill:  Vec<Ancestor>,
 }
-///L0172
+///L0166
 ///pos + ancestry — the standard stackful walker state: satisfies the
 ///`NodeCursor::State` (`CursorState`) contract for any stackful walker, so
 ///consumers embed it instead of reimplementing the fixup loop.
@@ -116,7 +109,7 @@ pub struct PosAncestry {
     pub pos:      Pos,
     pub ancestry: Ancestry,
 }
-///L0183
+///L0177
 ///one block op's address remap — the contract every fixup struct satisfies.
 ///`affects_*` guards its `fix_*`. pos-space is direct; addr-space goes through
 ///the block's translator — addrs are slot-derived names, so knob-free ops
@@ -131,7 +124,7 @@ pub trait Fixup {
     ///raw remap — precondition `affects_addr`.
     fn fix_addr<A: Addr>(&self, addr: &mut A, tr: &Translator<A>);
 }
-///L0197
+///L0191
 ///tracked tree state (block data, walker data) holding addresses. the walker calls
 ///the matching method unconditionally after every op that produces that fixup kind,
 ///passing the block's post-op translator — the IMPL decides relevance: pos-holders
@@ -145,7 +138,7 @@ pub trait Fixable<A: Addr> {
     ///by-ref: the gather plan is not `Copy` (its hole list scales with n).
     fn gather_fix(&mut self, fix: &GatherSlide, tr: &Translator<A>);
 }
-///L0211
+///L0205
 ///walker state seam: the crate's defaults (position/current/descend) run on it —
 ///`Fixable` via supertrait, so every grow/slide/swap fixup corrects the state;
 ///`Clone` because the run-walk fixup snapshots + restores it.
@@ -157,7 +150,7 @@ pub trait CursorState<A: Addr>: Fixable<A> + Clone {
     ///record one descent (no-op for a stackless state).
     fn descend(&mut self, parent: Pos, child: ChildPos);
 }
-///L0220
+///L0214
 ///block data that exposes a movable root position + the tree height (splits' root
 ///promotion bumps it; the consumer's `is_leaf` reads it). extends `Fixable`.
 pub trait HasRoot<A: Addr>: Fixable<A> {
@@ -166,62 +159,56 @@ pub trait HasRoot<A: Addr>: Fixable<A> {
     fn height(&self) -> u32;
     fn set_height(&mut self, height: u32);
 }
-///L0227
-impl Pos {}
-///L0239
-impl Add<usize> for Pos {}
-///L0247
-impl Sub<usize> for Pos {}
-///L0255
+///L0221
 impl Add<usize> for ChildPos {}
-///L0263
+///L0229
 impl Sub<usize> for ChildPos {}
-///L0271
+///L0237
 impl PartialEq<usize> for ChildPos {}
-///L0278
+///L0244
 impl PartialOrd<usize> for ChildPos {}
-///L0286
+///L0252
 ///whole-store remap — every position moves.
 impl Fixup for GrewFixup {}
-///L0303
+///L0269
 ///only the run between `from` and `to` shifts; the gap slot at `from` is
 ///vacated, not moved. `from == to` ⇒ nothing moves.
 impl Fixup for NoneSlide {}
-///L0324
+///L0290
 impl SwapFixup {}
-///L0333
+///L0299
 ///only the moved record remaps.
 impl Fixup for SwapFixup {}
-///L0349
+///L0315
 ///affected by either run.
 impl Fixup for DoubleSlide {}
-///L0373
+///L0339
 impl Ancestry {}
-///L0405
+///L0371
 impl Index<usize> for Ancestry {}
-///L0413
+///L0379
 impl IndexMut<usize> for Ancestry {}
-///L0424
+///L0390
 impl<A: Addr> Fixable<A> for Pos {}
-///L0451
+///L0417
 ///pointer-free: nothing to fix.
 impl<A: Addr> Fixable<A> for Height {}
-///L0460
+///L0426
 ///pointer-free: nothing to fix.
 impl<A: Addr> Fixable<A> for Depth {}
-///L0468
+///L0434
 impl<A: Addr> Fixable<A> for Root {}
-///L0494
+///L0460
 impl<A: Addr> Fixable<A> for Ancestry {}
-///L0530
+///L0496
 impl<A: Addr> Fixable<A> for PosAncestry {}
-///L0562
+///L0528
 ///blanket: pointer-free block data.
 impl<A: Addr> Fixable<A> for () {}
-///L0570
+///L0536
 impl<A: Addr> CursorState<A> for Pos {}
-///L0580
+///L0546
 impl<A: Addr> CursorState<A> for PosAncestry {}
-///L0592
+///L0558
 impl<A: Addr> HasRoot<A> for Root {}
 ```

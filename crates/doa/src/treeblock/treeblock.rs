@@ -3,10 +3,11 @@
 //!free-fn constructors `walker`/`search` (over the consumer's `From` impls —
 //!local type, orphan-safe).
 
-use crate::blocks::{Block, BlockOps, BlockTrait};
 use crate::index::Addr;
-use crate::metadata::{Fixable, HasRoot, Pos};
-use crate::walker::{Node, NodeCursor, NodeWalker, TreeWalker};
+use crate::index::Pos;
+use crate::treeblock::blocks::{Block, BlockOps, BlockTrait};
+use crate::treeblock::metadata::{Fixable, HasRoot};
+use crate::treeblock::walker::{Node, NodeCursor, NodeWalker, TreeWalker};
 
 macro_rules! impl_tree_block {
     ($m:ty) => {
@@ -82,6 +83,6 @@ where
     w
 }
 
-impl_tree_block!(crate::blocks::Uniform);
-impl_tree_block!(crate::blocks::Pluripotent);
-impl_tree_block!(crate::blocks::Anchored<O>);
+impl_tree_block!(crate::treeblock::blocks::Uniform);
+impl_tree_block!(crate::treeblock::blocks::Pluripotent);
+impl_tree_block!(crate::treeblock::blocks::Anchored<O>);

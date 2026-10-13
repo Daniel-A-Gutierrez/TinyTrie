@@ -6,14 +6,15 @@
 //! (the walk-==-slot-order canary) + per-node structure (separators re-derive
 //! from child mins, leaves sorted). run targeted — full-crate runs OOM the IDE.
 
-use crate::blocks::{BlockTrait, OpenSlot, UniformBlock};
-use crate::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide, GrewFixup, HasRoot,
-                      Pos, PosAncestry, SwapFixup};
-use crate::store::{NoneSlide, Store, VecStore};
+use crate::index::Pos;
 use crate::translator::Translator;
+use crate::treeblock::blocks::{BlockTrait, OpenSlot, UniformBlock};
+use crate::treeblock::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide,
+                                 GrewFixup, HasRoot, PosAncestry, SwapFixup};
+use crate::treeblock::store::{NoneSlide, Store, VecStore};
+use crate::treeblock::walker::{BlockExhausted, InOrderWalk, Node, NodeCursor, NodeWalker,
+                               NodeWalkerMut, OpenFixups, PreOrderWalk, TreeWalk, TreeWalker};
 use crate::treeblock::{search, walker};
-use crate::walker::{BlockExhausted, Node, NodeCursor, NodeWalker, NodeWalkerMut, OpenFixups,
-                    PreOrderWalk, InOrderWalk, TreeWalk, TreeWalker};
 use crate::{Fixup, InOrder, PreOrder, Rel};
 
 // ---------------------------------------------------------------------------
@@ -70,7 +71,11 @@ impl HasRoot<u16> for Meta {
 
 ///apply an open's fixups to a held addr — the open's slides/grow/gather rename
 /// whatever moved; a held addr is only valid post-fixup.
-fn fix_addr<'block, B: BlockTrait<'block, A = u16>>(block: &B, fixups: &OpenFixups, a: &mut u16) {
+fn fix_addr<'block, B: BlockTrait<'block, A = u16>>(
+    block: &B,
+    fixups: &OpenFixups,
+    a: &mut u16,
+) {
     //addrs are grow-stable by construction — only the slides/gather remap them
     let tr = block.translator();
     if fixups.slides.affects_addr(*a, tr) {
@@ -123,18 +128,18 @@ impl BNode {
         match self {
             BNode::Leaf(n) => {
                 let mid = n.keys.len() >> 1;
-                let r = LNode {
-                    keys:   n.keys.split_off(mid),
-                    values: n.values.split_off(mid),
-                };
+                let r =
+                    LNode { keys: n.keys.split_off(mid), values: n.values.split_off(mid) };
                 BNode::Leaf(r)
             }
             BNode::Internal(n) => {
                 let cc = n.children.len();
                 let mid = cc >> 1;
                 n.keys.remove(mid - 1); //the boundary separator moves out (re-derived at wire)
-                let r =
-                    INode { keys: n.keys.split_off(mid - 1), children: n.children.split_off(mid) };
+                let r = INode {
+                    keys:     n.keys.split_off(mid - 1),
+                    children: n.children.split_off(mid),
+                };
                 BNode::Internal(r)
             }
         }
@@ -173,8 +178,7 @@ fn wire_child(block: &mut PBlock<'_>, par: Pos, child_idx: ChildPos, addr: u16) 
     let m = child_min(block, addr);
     let old_left = {
         let BNode::Internal(n) = block.get(par) else { panic!("wire_child: not internal") };
-        (child_idx == 0 && !n.children.is_empty())
-            .then(|| child_min(block, n.children[0]))
+        (child_idx == 0 && !n.children.is_empty()).then(|| child_min(block, n.children[0]))
     };
     let BNode::Internal(n) = block.get_mut(par) else { panic!("wire_child: not internal") };
     n.children.insert(child_idx.0, addr);
@@ -229,9 +233,9 @@ impl<'block, 'walker> NodeCursor<'block, PBlock<'block>> for PCursor<'block, 'wa
             BNode::Leaf(_) => panic!("child: leaf"),
         }
     }
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
-                             + ExactSizeIterator
-                             + '_ {
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, u16)> + ExactSizeIterator + '_ {
         let cc = self.child_count();
         (0..cc).map(|i| (ChildPos(i), self.child(ChildPos(i))))
     }
@@ -307,9 +311,9 @@ impl<'block, 'walker> NodeCursor<'block, PBlock<'block>> for PCursorMut<'block, 
             BNode::Leaf(_) => panic!("child: leaf"),
         }
     }
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
-                             + ExactSizeIterator
-                             + '_ {
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, u16)> + ExactSizeIterator + '_ {
         let cc = self.child_count();
         (0..cc).map(|i| (ChildPos(i), self.child(ChildPos(i))))
     }
@@ -454,8 +458,8 @@ impl PMap {
                             self.block.insert(y_open, y);
                             let y_a = self.block.p2a(y_open.0);
                             let y_min = child_min(&self.block, y_a);
-                            let BNode::Internal(n) =
-                                self.block.get_mut(self.block.a2p(nr_a)) else {
+                            let BNode::Internal(n) = self.block.get_mut(self.block.a2p(nr_a))
+                            else {
                                 panic!("insert: fresh parent is not internal")
                             };
                             n.children.push(y_a);
@@ -631,9 +635,9 @@ impl<'block, 'walker> NodeCursor<'block, BBlock<'block>> for BCursorMut<'block, 
     fn child(&self, idx: ChildPos) -> u16 {
         self.current().kids[idx.0].expect("child: empty slot")
     }
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
-                             + ExactSizeIterator
-                             + '_ {
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, u16)> + ExactSizeIterator + '_ {
         let present: Vec<(usize, u16)> = self
             .current()
             .kids
@@ -759,9 +763,9 @@ impl<'block, 'walker> NodeCursor<'block, BBlock<'block>> for BCursor<'block, 'wa
     fn child(&self, idx: ChildPos) -> u16 {
         self.current().kids[idx.0].expect("child: empty slot")
     }
-    fn children(&self) -> impl DoubleEndedIterator<Item = (ChildPos, u16)>
-                             + ExactSizeIterator
-                             + '_ {
+    fn children(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (ChildPos, u16)> + ExactSizeIterator + '_ {
         let present: Vec<(usize, u16)> = self
             .current()
             .kids
@@ -1234,7 +1238,8 @@ fn pre_open_n_deep() {
         let base = lo.0 + i * h;
         let (k_lo, k_hi) = (4 * i as u64 + 1, 4 * i as u64 + 2);
         let leaf_pos = Pos(base + h - 1);
-        m.block.insert(OpenSlot(leaf_pos), BNode::leaf(&[(k_lo, k_lo * 10), (k_hi, k_hi * 10)]));
+        m.block
+            .insert(OpenSlot(leaf_pos), BNode::leaf(&[(k_lo, k_lo * 10), (k_hi, k_hi * 10)]));
         for d in (0..h - 1).rev() {
             let pos = Pos(base + d);
             let child_a = m.block.p2a(Pos(base + d + 1));
@@ -1264,11 +1269,11 @@ fn pre_open_n_deep() {
 #[test]
 fn pre_open_n_before_adjacent() {
     let store = VecStore::from_vec(vec![
-        Some(BNode::internal()), //0: root (wired below)
+        Some(BNode::internal()),         //0: root (wired below)
         Some(BNode::leaf(&[(10, 100)])), //1: A
-        None,                     //2: hole
+        None,                            //2: hole
         Some(BNode::leaf(&[(20, 200)])), //3: B
-        None,                     //4: hole
+        None,                            //4: hole
         Some(BNode::leaf(&[(30, 300)])), //5: S — the anchor-adjacent member
         Some(BNode::leaf(&[(40, 400)])), //6: C — child 3, the anchor
     ]);

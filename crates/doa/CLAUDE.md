@@ -50,6 +50,56 @@ I'd split them into three kinds — worldview shifts, choreography, and sharp ed
 
 6. The modes as workload bets (breadth, not depth). Uniform, Anchored, Pluripotent aren't three algorithms so much as three answers to "where will space be needed next?" — answered with different initial translator knobs, different store backends, and different find-space ladders. None is individually hard, but their interaction surface (which one pins the root implicitly, which one grows at the edges and compensates the translator instead of moving anything) is a lot of context to hold at once.
 
+## The set consumer — sortedblock
+
+`BlockSet<K, A>` (sortedblock/) is the height-1 consumer: a flat sorted SET
+over the same substrate. No tree lives inside, so the machinery that exists
+to find and correct a tree's referers disappears. The simplifications vs
+treeblock, each load-bearing:
+
+- **addr = the slot's canonical name (`p2a`), not a birth-stable row id.**
+  Names are semi-stable: a rotation turn (growth) preserves every live name
+  by construction — the element physically relocates to its own name's new
+  slot — so turns are invisible to holders; a slide TRANSFERS names (the
+  mover adopts the vacated slot's name). The feedback is therefore
+  (from_addr, to_addr) name swaps; holders retarget refs. treeblock cannot
+  do this: its consumers hold addrs across arbitrary mutations inside a
+  tree it can't see, so names are assigned at birth and slides report
+  pos-space fixups for the consumer's own structures to apply.
+- **2-knob translator (rotation, offset).** treeblock's shift knob exists to
+  keep spreads fixup-free while address width grows; (offset, rotation)
+  alone provably can't survive width growth + post-rotation adjustment
+  (carries break the rotation) — but sortedblock's
+  address width is FIXED and growth IS the rotation turn (`pos → 2·pos −
+  offset` mod A; offset 0 ⇒ always wrap-free; the new slots mint the idle
+  names rotation leaves between the spaced-out old ones). The 4-knob
+  closure degenerates and 2 knobs close. Offset turns (window moves) are
+  the unimplemented third move; grow reports no-turn while offset ≠ 0.
+- **no walker, no `Fixable`, no anchor discipline.** `try_alloc` = nearest
+  hole either side, one contiguous run slide — a single `ptr::copy` (the
+  source range's bitwise duplicate is uninit-by-mask; the mask is the only
+  init oracle), an O(1) mask update (nearest hole ⇒ the run is fully live,
+  so the mask delta is one set + one clear), one compact event. No
+  run-walk fixup choreography, no ancestry.
+- **Deltas = one compact event.** `enum Delta { NoneSlide{from,to}, Pairs }`
+  — the common contiguous slide records the hole's `from → to` (elements
+  between shift one step toward `from`; `from == to` = no-op direct place);
+  `Deltas::iter` lazily expands to the same swap-cascade pairs (hole-adjacent
+  first) the consumer always saw. `Pairs(Vec)` waits for non-run shapes
+  (reversal, bulk). Recording a slide costs one write; the old per-pair Vec
+  pushes cost 2× the memmove they described (bench_notes).
+- **occupancy = `Mask` (`src/mask.rs`)** — Vec<u64> words, word-at-a-time
+  scans (`next_set`/`next_clear`/`prev_clear`/`nearest_clear`; the find
+  ladder's primitives) + `spread_double` (the rotation turn's mask half:
+  bit p → bit 2p via 5-op interleave). bitvec was dropped — miri-unclean
+  (integer-to-ptr provenance in its own internals), and the word form is
+  what makes the scans fast anyway.
+
+Deferred: budget/heuristic tier (`insert` passes budget = cap; the
+`try_alloc`/`try_insert` split + grow-vs-rebase-vs-offset decisions belong
+to the arena), offset turns, `from_vec`, convenience getters. Benchmarks
+and phase breakdown in `notes/bench_notes.md`.
+
 
 ## Style
 - comment at every call that alters the walker's position or the node it points
@@ -89,49 +139,44 @@ Item inventories live in `doc/<name>.md` — generated skeletons (fenced rust,
 `///L####` tags jump to source). This section is the conceptual map only; the
 files' `//!` headers restate purpose + invariants next to the code.
 
-- `lib.rs` — module wiring + the ordering/side vocabulary (`RootPos`/`Order`/`Ordering`/`Rel`).
-- `index.rs` — numeric trait ladder (`Num`/`UnsignedNum`/`Addr`, the ex-`BlockIndex`)
-  + type-level const facts underpinning all address math; upholds only the numeric
-  contract.
-- `translator.rs` — `a2p`/`p2a`/`adist` translation, fn-ptr-specialized over
+src/ is a shared substrate + two consumers:
+
+substrate:
+- `lib.rs` — module wiring + the ordering/side vocabulary
+  (`RootPos`/`Order`/`Ordering`/`Rel`); re-exports keep old paths stable
+  (`doa::Fixup`, `doa::treeblock::{search, walker, TreeBlock}`).
+- `index.rs` — numeric trait ladder (`Num`/`UnsignedNum`/`Addr`) + `Pos` +
+  type-level const facts underpinning all address math.
+- `mask.rs` — dense occupancy bitmap (see the sortedblock section).
+- `translator.rs` — the 4-knob treeblock translator, fn-ptr-specialized over
   zero/nonzero params; the one hard rule is position order (pos 0 = min, pos
-  len−1 = max).
-- `metadata.rs` — the fixup protocol (`Fixup`/`Fixable`/`CursorState` — kinds:
-  `GrewFixup`/`SwapFixup`/`NoneSlide`/`DoubleSlide`/`GatherSlide`) + the
-  position/child types (`Pos`, `ChildPos`, `PosAncestry` (inline-backed
-  `Ancestry`), `Root`…); `HasRoot` exposes a movable root **pos**.
-- `store.rs` — unbounded `Option<T>` slot backends (slots hold initialized values;
-  no reservation model) + slide/find/gather/grow/spread/split primitives
-  (`find_n_slots`/`gather_none` = the N-None gather).
-- `blocks.rs` — `Block` (store + translator + block data + mode) + the shared
-  `BlockTrait`/per-mode `BlockOps` surfaces (find ladders incl. `find_n_slots`)
-  + the three modes.
-- `walker.rs` — `Node` contract + the walker layers: `NodeCursor`/
-  `NodeWalker`/`NodeWalkerMut` (consumer mask; the walker IS its own state —
-  `Fixable` + internal `Snapshot`/save/load/set_position), `TreeWalk` (nav,
-  per-ordering: pre + in; post unimplemented), `PreOrderWalk`/`InOrderWalk`
-  (the open surface — slot-moving ops consume the walker; `open_n_*` = the
-  gather; rotations keep the walker — stand-on-the-riser, ends ON the riser
-  with the true one-shallower ancestry), and the sealed `TreeWalkHelper` (slide engine, gather engine,
-  open engines; `Anchor` is internal). `B` is a trait param at every level,
-  `O` is always `B::O`; traversal assumes packed ChildPos (rank == slot) —
-  sparse-addressed nodes need children()-based sibling walks, unimplemented.
-- `treeblock.rs` — `TreeBlock` (param-less tree-block marker) + the `walker`/
-  `search` free-fn constructors over consumer `From` impls.
-- `subtle_bugs.md` — nuanced correctness issues solved, with diagrams; the rules
-  they left behind.
-- `HANDOFF.md` — zero-context state/flaws/directions ledger for a cold agent:
-  what landed, where the surface debate landed, the known-flaws list, and the
-  agreed-but-unimplemented directions (rotation rework, walk-back
-  optimization). Status above is the short-term record; this carries the
-  reasoning.
-- unwired — `block_cursor.rs` + `leafblock.rs` / `inline_leafblock.rs` (mod decls
-  commented out in lib.rs — uncompiled, unported to addr/pos) + `src/archive/` +
-  `examples/old_btree/` (the live consumer is `examples/btree.rs`).
+  len−1 = max). sortedblock carries its own 2-knob translator internally.
+
+consumers:
+- `treeblock/` — ALL the tree machinery: `blocks` (Block + BlockTrait/
+  BlockOps + the three modes), `walker` (Node contract + walker layers +
+  open surface), `treeblock` (TreeBlock marker + constructors), `metadata`
+  (the fixup protocol + tree-state types; Pos lives in index now), `store`
+  (slot backends + slide/gather/grow primitives), unwired `block_cursor`/
+  `leafblock`/`inline_leafblock`, and the tests (live `tests/walker.rs`,
+  unwired `tests/store.rs`/`tests/block.rs`).
+- `sortedblock/` — the set tier: `mod.rs` (contract), `store.rs` (COPY of
+  treeblock's store evolving the pairs feedback protocol — `open_slot`
+  emits swap-cascade `(from, to)` pairs; gather/bulk still plan-returning),
+  `sortedblock.rs` (`BlockSet` + `Deltas` + the 2-knob translator — live).
+- `benches/` — `sorted_find_slot.rs` (mask find vs store scan),
+  `sorted_insert.rs` (10k shuffled inserts; findings + phase breakdown in
+  `notes/bench_notes.md`).
+
+notes: `devlog.md` (design log), `subtle_bugs.md` (solved nuances + their
+rules), `bench_notes.md`.
+
+archive: `src/archive/` + `examples/old_btree/` (the live tree consumer is
+`examples/btree.rs`).
 
 ## Testing
 
-`src/tests/walker.rs` is LIVE on the open surface: a preorder B+ consumer (Vec
+`treeblock/tests/walker.rs` is LIVE on the open surface: a preorder B+ consumer (Vec
 nodes, DEGREE 4 — consumer-driven splits) with 240-key torture (ascending/
 descending/stride) + hand-assembled anchors + held-addr fixup delivery, and an
 in-order DEGREE=2 binary consumer for rotate_left/rotate_right (root / leaf
@@ -139,13 +184,23 @@ riser / mid) — validated by structural checks (separator re-derivation from
 child mins, leaf order, reachable == occupied) and walk order vs strictly
 increasing positions; miri-clean.
 
-`src/tests/store.rs` stays UNWIRED (written against the addr/pos surface;
+`treeblock/tests/store.rs` stays UNWIRED (written against the addr/pos surface;
 re-enable after porting) — reference-model torture + exhaustive slide/find/
 find-2 matrices for both backends, spread/split/pop coverage, drop accounting,
 contract panics. `block.rs` stays unwired (pre-refactor API — needs adaptation).
-Run targeted: `cargo test -p doa --lib walker::tests` / `store::tests`;
-uninit/leaks: `cargo +nightly miri test -p doa --lib <filter>` (slow —
-recompiles + interprets).
+
+sortedblock is inline `#[cfg(test)]`: mask (exhaustive next_set/next_clear/
+prev_clear/nearest_clear vs naive comparison at every start position,
+spread_double across word boundaries, word edges) + BlockSet
+(ascending/descending/stride torture with a holder mirror applying translated
+deltas — every name still resolves to its key; the front-insert rename
+examples in both the no-turn and rotated phases; dup rejection;
+remove/reinsert; NoneSlide expansion).
+
+Run targeted: `cargo test -p doa --lib sortedblock` / `mask` /
+`treeblock::tests::walker::tests`; uninit/leaks: `cargo +nightly miri test -p
+doa --lib <filter>` (slow — recompiles + interprets; sortedblock is
+miri-eligible now that bitvec is gone, not yet run).
 ⚠ Running the full `cargo test` in this crate has crashed the IDE out of memory in
 the past — run targeted tests.
 
@@ -196,7 +251,8 @@ the block directly. The pieces:
   The old split-driver/hop/postorder torture died with its machinery.
 
 Second session (2026-09-19, same day) — the three agreed directions landed:
-- **rotations → the stand-on-the-riser contract** (was HANDOFF §4a): the
+- **rotations → the stand-on-the-riser contract** (agreed direction,
+  2026-09-19): the
   walker starts ON the riser, all writes via up-navigation over the ancestry
   stack, ends ON the riser — with the ancestry popped ONE level, because the
   riser ROSE: "ends where it started" is position-only, and the end state
@@ -204,7 +260,7 @@ Second session (2026-09-19, same day) — the three agreed directions landed:
   post-rotation). The final pop is `ascend` + `set_position` — a state-only
   restore over the fully-consistent post-rotation tree; what died is the old
   MID-CHOREOGRAPHY reach (walking to the riser through a half-rotated tree).
-  Root/mid-tree uniform; root case ends with an empty stack. The HANDOFF
+  Root/mid-tree uniform; root case ends with an empty stack. The original
   pseudocode omitted the riser's own stored-parent-field write — kept (the
   old code's third `set_parent`; parent-free shapes no-op it).
 - **§4b partial**: `set_parent -> Option<B::A>` — the overwritten old parent
@@ -255,7 +311,7 @@ gather matrices). Agreed, not yet implemented: the §4b walk-back USAGE
 (ascend-by-old for parent-field walkers — the return is in place, no
 consumer exercises it).
 
-Known latent flaws, full ledger in `HANDOFF.md` §3: reparent_run's
+Known latent flaws: reparent_run's
 `set_position` jumps (unexercised), the unary-internal-riser panic,
 packed-ChildPos nav breaking on sparse-addressed nodes, the STORES_PARENTS
 walker hazard class (unvalidated — no such consumer exists; also the
@@ -267,9 +323,44 @@ one-kid in-order nodes are reference-walked in tests, not TreeWalk'd);
 deletion rebalancing/merges; serialization; `leafblock`/`inline_leafblock`;
 `block.rs` test adaptation.
 
+Third stretch (2026-10-06 → 10-12) — module split + BlockSet insert live
+(one commit at this session's end):
+- **module split**: src/ = substrate (`index` + `Pos`, `translator`, `lib`
+  wiring) + `treeblock/` (all tree machinery, byte-identical) +
+  `sortedblock/`. re-exports keep old paths stable. notes/ moved under
+  doa.
+- sortedblock/store.rs pairs protocol (10-06): `open_slot` fused
+  find+slide+record emitting swap-cascade `(from, to)` pairs — the
+  treeblock fixup contract doesn't apply (set holders want plain pairs);
+  gather/bulk still plan-returning. `benches/sorted_find_slot.rs`: mask
+  find 1.28×/1.45× at 80% occupancy (see notes/bench_notes.md).
+- (10-12) `BlockSet` insert basics: bsearch over live slots (Ok = dup,
+  Err = insertion spot — conventional semantics; holes skipped forward,
+  sortedness proves everything before the probe known), `try_alloc`
+  (nearest hole either side via `Mask::nearest_clear`, fails clean),
+  in-place rotation-turn grow (`pos → 2·pos` descending pass +
+  `Mask::spread_double`; false while offset ≠ 0), slide = one
+  `ptr::copy` + O(1) mask, `Delta::NoneSlide` compact event with lazy
+  cascade expansion, `Drop` via `assume_init_drop`, cap 0→4 vec-like
+  first allocation. 10k shuffled inserts: 386 → 87.5 ns (ladder + phase
+  breakdown in bench_notes; the per-pair delta Vec cost 2× its memmove —
+  the compact event killed it). bitvec dropped (miri-unclean in its own
+  internals) for `src/mask.rs`.
+- sortedblock translator settled as the 2-knob degeneration (the devlog's
+  adaptive-translator analysis, lines 21–119, is the reasoning; the
+  sortedblock section above is the map).
+
 
 ## Future Work
 
+- sortedblock: budget/heuristic tier — `try_insert`/`try_alloc` split,
+  insert's response to try-failure by occupancy (grow vs rebase vs offset
+  turn), `InsertBias` + `back` density heuristics; arena's own ladder.
+- sortedblock: offset turns (window moves; grow currently reports
+  no-turn while offset ≠ 0), mixed-side/multi-event deltas
+  (`Delta::Pairs` awaits reversal/bulk), `from_vec`, convenience getters.
+- sortedblock: miri run (eligible now), find-bench density sweep (90–97%),
+  pairs-based bulk open in store.rs (gather → pairs).
 - fixup walk-back usage (§4b remainder) — ascend-by-old-value for
   parent-field walkers, over `set_parent`'s `Some(old)` return (in place,
   unexercised); needs a STORES_PARENTS consumer to validate at all.
