@@ -476,6 +476,69 @@ used. The contract is name swaps, and an unswapped name is a wrong name.
 
 ---
 
+## 18. "Full" is a per-resource question: mask-full ≠ names-exhausted
+
+**The bug (2026-10-12, sortedblock insert ladder).** once push_back growth
+landed (sequential biases extend the allocation one slot at a time), the
+block's cap stopped being a power of two tracking len. the old grow rung
+still equated "no hole in the mask" with "turn now" — and the turn was
+refused whenever `2·cap` would exceed the name space:
+
+```
+u8 names (space 256), stride torture: cap grows past 128 via push_backs
+mask fills at cap 132 → old rung: grow → 2·132 = 264 > 256 → refused → Err
+len is 132; 124 names unused — insert of key 152 failed on a half-empty block
+```
+
+**Why it was easy to miss:** with pow2 cap growth the two fullnesses
+coincided (cap hits the ceiling exactly when names do); one-slot-at-a-time
+extension broke the coincidence, and the failure surfaced as a plain
+`Err(k)` — the same signal a genuine out-of-names returns.
+
+**The rule.** every growth decision must name WHICH resource is exhausted:
+the ladder now distinguishes mask-full (room to push a slot always exists —
+mask full + len < ceiling ⟹ cap < ceiling) from name-ceiling (the early
+`len ≥ max_capacity` check). `push_slot` is the single growth primitive;
+`grow_rotate` is a layout change, not a capacity change.
+
+---
+
+## 19. The turn's +1 is the recycled rol bit: the wrap band
+
+**The nuance (2026-10-13, rotation turns with a translator offset).** the
+name-preserving turn maps pos via the translator composition
+`q(p) = a2p_new(p2a_old(p))` — names preserved by construction, the old
+rotation cancels (`ror r ∘ rol (r+1) = rol 1`). what's left is a ramp
+`x = (p − offset) mod 2^w` rolled left one — and `rol 1` is NOT `2x mod 2^w`:
+when x sits in the upper half of the name space, plain doubling discards the
+top bit and `rol` recycles it to bit 0. that recycled bit is the `+1`:
+
+```
+q(p) = 2·p + [x ≥ 2^(w−1)]        x = (p − offset) mod 2^w — a rising ramp
+ramp wraps at p = offset          → +1 switches OFF: junction gap 1, no hole
+ramp crosses half at p = o−mid    → +1 switches ON:  junction gap 3, two holes
+```
+
+the flip-OFF junction is the pair holding addr MAX and addr MIN — adjacent
+in the circular name space, so "no hole between them" is forced by name
+preservation, not chosen. with the MIDPOINT refusal (cap ≤ 2^(w−1)) at most
+one junction falls inside the array, so the band is one prefix
+(`offset ≤ midpoint`: bits < offset land odd — `rotate_mask`'s ripple range
+`[0, 2·min(offset,cap))`), one suffix (`offset > midpoint`: bits ≥
+offset−midpoint land odd — ripple `[2·(o−mid), 2·cap)`), whole-range, or
+empty.
+
+**The implementation rule.** `rotate_mask` = plain interleave (every bit →
+2p, a hole after every element) + ONE masked ripple of the band's target
+range up a slot. the ripple needs no carry chain: an even bit and its odd
+target are adjacent, and word boundaries sit at odd global bits, so the
+shift never crosses a word — every word moves independently. the two-step
+segment machinery this replaced (saved boundary word, merge masks, last-word
+preservation) is all carry-chain bookkeeping for a carry that provably never
+happens.
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

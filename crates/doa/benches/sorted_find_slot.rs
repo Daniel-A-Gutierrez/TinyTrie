@@ -7,9 +7,9 @@
 //!(pin None) and is asserted equivalent over every probe × rel × budget
 //!before any timing runs.
 
+use doa::Rel;
 use doa::index::Pos;
 use doa::sortedblock::store::{Store, VecStore};
-use doa::Rel;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -62,7 +62,13 @@ fn last_zero(mask: &[u64], a: usize, b: usize) -> Option<usize> {
 ///on exhaustion. returns (None's pos, to) — same (from, to) the store hands
 ///back: `to` adjacent-inserting on the rel side, else `pos` (probe shifts
 ///toward the hole).
-fn mask_find_slot(mask: &[u64], len: usize, pos: usize, rel: Rel, budget: usize) -> Option<(usize, usize)> {
+fn mask_find_slot(
+    mask: &[u64],
+    len: usize,
+    pos: usize,
+    rel: Rel,
+    budget: usize,
+) -> Option<(usize, usize)> {
     let (min, max) = (pos.saturating_sub(budget), len.min(pos + budget));
     match rel {
         Rel::After => first_zero(mask, pos + 1, max)
@@ -137,13 +143,13 @@ fn time_mask(mask: &[u64], probes: &[usize], budget: usize) -> f64 {
 fn main() {
     let (store, mask, probes) = build();
     assert_equivalent(&store, &mask, &probes);
-    println!(
-        "slots {SLOTS}, elements {}, holes {HOLES}, slot = (usize, usize)",
-        SLOTS - HOLES
-    );
+    println!("slots {SLOTS}, elements {}, holes {HOLES}, slot = (usize, usize)", SLOTS - HOLES);
     for budget in [16, SLOTS] {
         let s = time_store(&store, &probes, budget);
         let m = time_mask(&mask, &probes, budget);
-        println!("budget {budget:>3}: store {s:6.2} ns/find, mask {m:6.2} ns/find, ratio {:.2}x", s / m);
+        println!(
+            "budget {budget:>3}: store {s:6.2} ns/find, mask {m:6.2} ns/find, ratio {:.2}x",
+            s / m
+        );
     }
 }

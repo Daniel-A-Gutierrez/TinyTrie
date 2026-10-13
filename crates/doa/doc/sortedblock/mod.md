@@ -10,16 +10,14 @@
 //! get(addr) -> &key
 //! ```
 //!
-//!invariants: pos order == key order (pos 0 = min); addrs are stable names
-//!across grows (translator absorbs) — slides/gathers rename them, reported as
-//!pairs ordered so a holder can apply `swap(from, to)` in sequence (the
+//!invariants: pos order == key order — normal (pos 0 = min) or reversed
+//!(pos 0 = max, Prepend bias); addrs are stable names across grows
+//!(translator absorbs) — slides/gathers rename them, reported as pairs
+//!ordered so a holder can apply `swap(from, to)` in sequence (the
 //!hole-adjacent pair first, then the cascade). `store` records `(Pos, Pos)`
 //!pairs at the slot level; the block translates them to addr pairs.
-//!translator logic (devlog lines 99–245: full-width shift-down, edge-offset,
-//!rotation-turn minting, reversed-flag bias) is the open design — the block
-//!itself is unwritten.
-///L0021
-pub mod store;
-///L0022
+///L0019
 pub mod sortedblock;
+///L0020
+pub mod store;
 ```

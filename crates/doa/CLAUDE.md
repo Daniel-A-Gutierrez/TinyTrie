@@ -95,9 +95,10 @@ treeblock, each load-bearing:
   (integer-to-ptr provenance in its own internals), and the word form is
   what makes the scans fast anyway.
 
-Deferred: budget/heuristic tier (`insert` passes budget = cap; the
-`try_alloc`/`try_insert` split + grow-vs-rebase-vs-offset decisions belong
-to the arena), offset turns, `from_vec`, convenience getters. Benchmarks
+Deferred: the `try_alloc`/`try_insert` split + arena-level occupancy
+decisions (`insert`'s ladder owns the in-block heuristics now), offset
+turns (mask + data halves both ready — `rotate_mask` + the
+translator-composed turn), `from_vec`, convenience getters. Benchmarks
 and phase breakdown in `notes/bench_notes.md`.
 
 
@@ -114,7 +115,8 @@ and phase breakdown in `notes/bench_notes.md`.
   outlines), spawn a **fresh** review agent (not a fork) on the session's diff —
   it reads this file and subtle_bugs.md first so it doesn't re-flag intentional
   choices — apply findings, update this file + subtle_bugs.md (merge in place,
-  prune stale entries), commit.
+  prune stale entries), re-run `skeletonize.py` if src changed, and leave the
+  tree ready for commit — the user commits.
 - review priority: correctness (bugs, invariant breaks, do-not-revive violations) >
   cheap cleanups > doc-record > perf. unbenchmarked perf suggestions are reported,
   never auto-applied.
@@ -163,10 +165,11 @@ consumers:
 - `sortedblock/` — the set tier: `mod.rs` (contract), `store.rs` (COPY of
   treeblock's store evolving the pairs feedback protocol — `open_slot`
   emits swap-cascade `(from, to)` pairs; gather/bulk still plan-returning),
-  `sortedblock.rs` (`BlockSet` + `Deltas` + the 2-knob translator — live).
+  `sortedblock.rs` (`BlockSet` + `Deltas` + the 2-knob translator + the
+  unified space ladder — live; Prepend blocks are Direction-reversed).
 - `benches/` — `sorted_find_slot.rs` (mask find vs store scan),
-  `sorted_insert.rs` (10k shuffled inserts; findings + phase breakdown in
-  `notes/bench_notes.md`).
+  `sorted_insert.rs` (append/prepend/random × unbiased/biased, 32-byte
+  items; findings + phase breakdown in `notes/bench_notes.md`).
 
 notes: `devlog.md` (design log), `subtle_bugs.md` (solved nuances + their
 rules), `bench_notes.md`.
@@ -190,12 +193,15 @@ find-2 matrices for both backends, spread/split/pop coverage, drop accounting,
 contract panics. `block.rs` stays unwired (pre-refactor API — needs adaptation).
 
 sortedblock is inline `#[cfg(test)]`: mask (exhaustive next_set/next_clear/
-prev_clear/nearest_clear vs naive comparison at every start position,
-spread_double across word boundaries, word edges) + BlockSet
-(ascending/descending/stride torture with a holder mirror applying translated
-deltas — every name still resolves to its key; the front-insert rename
-examples in both the no-turn and rotated phases; dup rejection;
-remove/reinsert; NoneSlide expansion).
+prev_clear/prev_set/nearest_clear vs naive comparison at every start
+position; `rotate_mask` vs the naive `2p + [ramp ≥ midpoint]` model at
+every offset — prefix/suffix/whole/empty bands; word edges) + BlockSet
+(ascending/descending/stride torture under all three biases with a holder
+mirror applying translated deltas — every name still resolves to its key;
+`rotate_map` property test — name-stable, monotone, in-bounds for every
+reachable translator incl. offsets grow_rotate refuses; front-insert
+back-open cascade; pending-deltas panic; dup rejection; remove/reinsert;
+NoneSlide expansion).
 
 Run targeted: `cargo test -p doa --lib sortedblock` / `mask` /
 `treeblock::tests::walker::tests`; uninit/leaks: `cargo +nightly miri test -p
@@ -350,15 +356,50 @@ Third stretch (2026-10-06 → 10-12) — module split + BlockSet insert live
   adaptive-translator analysis, lines 21–119, is the reasoning; the
   sortedblock section above is the map).
 
+Fourth session (2026-10-12 → 10-13) — deltas safety, biases → the unified
+ladder (one commit at this session's end):
+- **deltas safety**: `Delta::Empty` is the explicit sentinel (pending ⇔
+  event ≠ Empty); `insert` panics on pending deltas instead of clearing;
+  `Deltas::clear` public. caller protocol: apply, then clear.
+- **biases → unified ladder**: started as `InsertBias` → (Direction, Growth)
+  split (Desc = reversed blocks: bsearch operand flip via `locate`, reverse
+  `iter`), then Growth DELETED when the ladder unified — the same rungs for
+  every block: strategy-free tail fast path (`spot`), edge rule (`spot ==
+  cap` → `push_back` — Vec's own doubling carries cap; hole every BIT_WIDTH
+  slots by tail-run cadence), then `open`'s rungs: BIT_WIDTH probe →
+  back-open (push_slot + slide when the tail run is within budget) → dense
+  turn (len ≥ cap − cap/5) → local turn (len ≥ cap − cap/3 AND nearest
+  hole > 4·budget — spreads never leave the block below ⅓) → fluke wide
+  slide → mask-full grow. `push_slot` is the single growth primitive
+  (grow_rotate is a layout change, not a capacity change — subtle_bugs
+  §18). `insert` split: `spot`/`insert_first`/`push_back`/`open`/`place`.
+- **rotate_mask(offset, midpoint)** replaces `spread_double`: plain
+  interleave + one masked ripple over the wrap band (prefix/suffix/
+  whole/empty); `grow_rotate` moves via the translator composition
+  `new.a2p(old.p2a(p))` (names by construction), refuses at cap >
+  MIDPOINT. the +1 band is the recycled rol bit (subtle_bugs §19).
+- bench (32B items): sequential 8 both columns after the review's cadence
+  fix (the hole goes BELOW k — appends can't consume it; the pre-fix
+  trailing hole was eaten every append, leaving the block dense so every
+  push_back paid a full-mask prev_clear + doubled push: 64), random 99.3
+  lazy → 88.7 preemptive → 87.0 unified, wrong-direction column (descending
+  into Asc) 692 — irreducible, the fix is Direction. ladder + findings in
+  bench_notes.
+
 
 ## Future Work
 
-- sortedblock: budget/heuristic tier — `try_insert`/`try_alloc` split,
-  insert's response to try-failure by occupancy (grow vs rebase vs offset
-  turn), `InsertBias` + `back` density heuristics; arena's own ladder.
-- sortedblock: offset turns (window moves; grow currently reports
-  no-turn while offset ≠ 0), mixed-side/multi-event deltas
-  (`Delta::Pairs` awaits reversal/bulk), `from_vec`, convenience getters.
+- sortedblock: `try_insert`/`try_alloc` split + arena-level occupancy
+  decisions; ladder threshold tuning (the 80% / ⅔ / 4·budget constants are
+  unbenchmarked knobs); holder-applying bench variant — the cascade savings
+  (turns are zero-churn) aren't measured by a deltas-clearing bench.
+- sortedblock: clustered streams below the ⅔ floor still slide wide
+  (accepted: space over slides); a miss-streak counter is the state-ful
+  alternative if it ever bites.
+- sortedblock: offset turns (window moves — mask + data halves ready;
+  remaining: the move op itself + `grow_rotate`'s offset ≠ 0 refusal),
+  mixed-side/multi-event deltas (`Delta::Pairs` awaits reversal/bulk),
+  `from_vec`, convenience getters.
 - sortedblock: miri run (eligible now), find-bench density sweep (90–97%),
   pairs-based bulk open in store.rs (gather → pairs).
 - fixup walk-back usage (§4b remainder) — ascend-by-old-value for

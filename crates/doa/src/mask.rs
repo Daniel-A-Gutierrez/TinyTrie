@@ -6,7 +6,7 @@
 #[derive(Clone, Debug, Default)]
 pub struct Mask {
     words: Vec<u64>,
-    bits: usize,
+    bits:  usize,
 }
 
 impl Mask {
@@ -65,6 +65,40 @@ impl Mask {
             }
             w += 1;
             off = 0;
+        }
+        None
+    }
+
+    ///highest set bit < from, or None
+    pub fn prev_set(&self, from: usize) -> Option<usize> {
+        let from = from.min(self.bits);
+        if from == 0 {
+            return None;
+        }
+        let mut w = (from - 1) >> 6;
+        let mut keep = ((from - 1) & 63) + 1;
+        loop {
+            let word = self.words[w] & if keep == 64 { u64::MAX } else { (1 << keep) - 1 };
+            if word != 0 {
+                return Some((w << 6) + 63 - word.leading_zeros() as usize);
+            }
+            if w == 0 {
+                return None;
+            }
+            w -= 1;
+            keep = 64;
+        }
+    }
+
+    ///highest set bit, or None
+    pub fn last_set(&self) -> Option<usize> {
+        let mut w = self.words.len();
+        while w > 0 {
+            w -= 1;
+            let word = self.words[w];
+            if word != 0 {
+                return Some((w << 6) + 63 - word.leading_zeros() as usize);
+            }
         }
         None
     }
@@ -138,12 +172,22 @@ impl Mask {
         })
     }
 
-    ///double the tracked range, spacing every set bit out with one clear bit
-    ///between (bit p → bit 2p) — the mask half of a rotation turn. set bits
-    ///are preserved; the word count stays exact for the doubled range.
-    pub fn spread_double(&mut self) {
+    ///the rotation turn's mask half: bit p → 2·p, +1 over the wrap band —
+    ///the pos whose name-space ramp (p − offset) mod 2·midpoint sits in
+    ///the upper half. the plain interleave opens a hole after every
+    ///element; the band's ripple shifts its target range up one, so the
+    ///band's low junction consumes that hole (the addr MAX|MIN pair —
+    ///prefix, offset ≤ midpoint) or doubles it (suffix). at most one wrap
+    ///event falls inside a range capped at midpoint, so the band is one
+    ///prefix or suffix. the ripple never crosses a word boundary (even
+    ///bit → adjacent odd bit), so each word shifts independently.
+    ///panics if bits > midpoint. set bits are preserved; the word count
+    ///stays exact for the doubled range.
+    pub fn rotate_mask(&mut self, offset: usize, midpoint: usize) {
+        assert!(self.bits <= midpoint, "bits {} > midpoint {midpoint}", self.bits);
         let old_words = self.words.len();
-        self.bits = self.bits * 2;
+        let cap = self.bits;
+        self.bits = cap * 2;
         self.words.resize(old_words * 2, 0);
         for i in (0..old_words).rev() {
             let w = self.words[i];
@@ -151,6 +195,32 @@ impl Mask {
             self.words[i * 2 + 1] = spread((w >> 32) as u32);
         }
         self.words.truncate((self.bits + 63) / 64);
+        //band target range: prefix [0, min(offset, cap)) lands odd, or
+        //suffix [offset − midpoint, cap) when the window sits past midpoint
+        let (lo, hi) = if offset <= midpoint {
+            (0, offset.min(cap) * 2)
+        } else {
+            match offset - midpoint {
+                s if s < cap => (s * 2, cap * 2),
+                _ => (1, 0), //band beyond the range — plain interleave
+            }
+        };
+        if lo >= hi {
+            return;
+        }
+        let wlo = lo >> 6;
+        let whi = (hi - 1) >> 6;
+        for wi in wlo..=whi {
+            let low = if wi == wlo { lo & 63 } else { 0 };
+            let high = if wi == whi { ((hi - 1) & 63) + 1 } else { 64 };
+            let rmask = if high == 64 {
+                if low == 0 { u64::MAX } else { u64::MAX << low }
+            } else {
+                ((1u64 << (high - low)) - 1) << low
+            };
+            let w = self.words[wi];
+            self.words[wi] = (w & rmask) << 1 & rmask | w & !rmask;
+        }
     }
 
     ///number of set bits
@@ -207,6 +277,11 @@ mod tests {
             };
             assert_eq!(m.nearest_clear(from), naive_near, "nearest_clear from {from}");
         }
+        assert_eq!(m.last_set(), set.last().copied(), "last_set");
+        for from in 0..=bits {
+            let naive_prev_set = (0..from).rev().find(|p| set.contains(p));
+            assert_eq!(m.prev_set(from), naive_prev_set, "prev_set from {from}");
+        }
     }
 
     #[test]
@@ -214,6 +289,7 @@ mod tests {
         let mut m = Mask::new();
         assert_eq!(m.next_set(0), None);
         assert_eq!(m.next_clear(0), None);
+        assert_eq!(m.last_set(), None);
         m.resize(64);
         assert_eq!(m.next_clear(0), Some(0));
         for p in 0..64 {
@@ -256,20 +332,45 @@ mod tests {
     }
 
     #[test]
-    fn spread_double_spaces_bits() {
-        let mut m = mask_ones(200, &[0, 1, 63, 64, 199]);
-        m.spread_double();
-        assert_eq!(m.bits(), 400);
-        assert_eq!(m.iter_set().collect::<Vec<_>>(), vec![0, 2, 126, 128, 398]);
+    fn rotate_mask_plain_doubles() {
+        let mut m = mask_ones(100, &[0, 1, 63, 64, 99]);
+        m.rotate_mask(0, 128);
+        assert_eq!(m.bits(), 200);
+        assert_eq!(m.iter_set().collect::<Vec<_>>(), vec![0, 2, 126, 128, 198]);
         assert_eq!(m.count(), 5);
         //doubled range still exact-scannable
         assert_eq!(m.next_clear(3), Some(3));
         //non-word-multiple range keeps words_for exact
-        assert_eq!(m.words.len(), (400 + 63) / 64);
+        assert_eq!(m.words.len(), (200 + 63) / 64);
         let mut m = mask_ones(65, &[64]);
-        m.spread_double();
+        m.rotate_mask(0, 128);
         assert_eq!(m.bits(), 130);
         assert_eq!(m.iter_set().collect::<Vec<_>>(), vec![128]);
         assert_eq!(m.words.len(), (130 + 63) / 64);
+    }
+
+    ///bit p → 2p + [(p − offset) mod name space ≥ midpoint] at every
+    ///offset — prefix, suffix, whole-range and empty bands, word-edge and
+    ///mid-word junctions
+    #[test]
+    fn rotate_mask_matches_naive() {
+        let bits = 100;
+        let mut set: Vec<usize> = (0..bits).filter(|p| (p * 31 + 7) % 10 < 7).collect();
+        set.extend([0, 1, 63, 64, 65, 99]);
+        set.sort_unstable();
+        set.dedup();
+        let (mid, space) = (128usize, 256usize);
+        for offset in 0..=255 {
+            let mut m = mask_ones(bits, &set);
+            m.rotate_mask(offset, mid);
+            let mut naive: Vec<usize> = set
+                .iter()
+                .map(|&p| 2 * p + usize::from((p + space - offset) % space >= mid))
+                .collect();
+            naive.sort_unstable();
+            assert_eq!(m.iter_set().collect::<Vec<_>>(), naive, "offset {offset}");
+            assert_eq!(m.count(), set.len(), "offset {offset}");
+            assert_eq!(m.bits(), 2 * bits, "offset {offset}");
+        }
     }
 }

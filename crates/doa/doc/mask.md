@@ -7,14 +7,14 @@
 #[derive(Clone, Debug, Default)]
 pub struct Mask {
     words: Vec<u64>,
-    bits: usize,
+    bits:  usize,
 }
 ///L0012
 impl Mask {}
-///L0167
+///L0237
 ///bits of x moved to the even positions of a u64 (p → 2p)
 fn spread(x: u32) -> u64;
-///L0178
+///L0248
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,6 +28,11 @@ mod tests {
     #[test]
     fn iter_set_ascending();
     #[test]
-    fn spread_double_spaces_bits();
+    fn rotate_mask_plain_doubles();
+    ///bit p → 2p + [(p − offset) mod name space ≥ midpoint] at every
+    ///offset — prefix, suffix, whole-range and empty bands, word-edge and
+    ///mid-word junctions
+    #[test]
+    fn rotate_mask_matches_naive();
 }
 ```
