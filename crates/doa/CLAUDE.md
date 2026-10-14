@@ -103,11 +103,21 @@ treeblock, each load-bearing:
   described (bench_notes).
 - **occupancy = `Mask` (`src/mask.rs`)** — Vec<u64> words, word-at-a-time
   scans (`next_set`/`next_clear`/`prev_clear`/`nearest_clear`; the find
-  ladder's primitives), `rotate_mask` (the turn's mask half: interleave +
-  one band ripple — upper-half names land odd; the reversed band ripples
-  DOWN over the suffix `(offset, cap)` and can cross word boundaries, so
-  the fall carries word by word) + `reverse` (the reversal's mirror).
-  bitvec was dropped — miri-unclean (integer-to-ptr provenance in its own
+  ladder's primitives; all four carry a dense fast path — the query
+  position IS the answer when its bit matches — and `#[inline]`), the
+  `SetBits`/`SetBitsRev` iteration engines (in-place bit test against the
+  cached word, `pos` as the state so yields are free; holes advance one
+  bit, whole-empty word tails skip; exhaustion must zero the cached word
+  at EVERY site or a re-poll yields out-of-range positions — subtle_bugs
+  §21), `rotate_mask` (the turn's mask half: interleave + one band
+  ripple — upper-half names land odd; the reversed band ripples DOWN
+  over the suffix `(offset, cap)` and can cross word boundaries, so the
+  fall carries word by word) + `reverse` (the reversal's mirror).
+  `nearest_clear` excludes its center by contract (searches ±1;
+  callers pass a position they occupy) — `gather_slots` checks
+  spot-is-hole itself first, because the insert SPOT is usually a hole
+  (the bsearch converges lo to k's gap), not a live slot. bitvec was
+  dropped — miri-unclean (integer-to-ptr provenance in its own
   internals), and the word form is what makes the scans fast anyway.
 - **reversal = two mirrors + a negated translator, zero deltas.** the
   array mirrors (`data.reverse` + `mask.reverse`), the translator
@@ -196,10 +206,14 @@ consumers:
   emits swap-cascade `(from, to)` pairs; gather/bulk still plan-returning),
   `translator.rs` (the 2-knob translator, fn-ptr per direction + the
   reversal/turn maps), `sortedblock.rs` (`BlockSet` + `Deltas` + the
-  fetch-gather ladder + the reversal trigger).
+  fetch-gather ladder + the reversal trigger + the differential `Iter`
+  over SetBits/SetBitsRev).
 - `benches/` — `sorted_find_slot.rs` (mask find vs store scan),
-  `sorted_insert.rs` (append/prepend/random, 32-byte items; findings +
-  phase breakdown in `notes/bench_notes.md`).
+  `sorted_insert.rs` (append/prepend/random/runs × insert/lookup/seqread
+  vs sorted-vec + BTreeSet, 32-byte items, size via CLI arg — default
+  10k, u32 addrs — with a 3s wall budget per structure×workload cell and
+  partial-rep reporting; findings + phase breakdown in
+  `notes/bench_notes.md`).
 
 notes: `devlog.md` (design log), `subtle_bugs.md` (solved nuances + their
 rules), `bench_notes.md`.
@@ -460,6 +474,58 @@ at this session's end):
   torture inline, fixed doc drift (Gather coordinates frame, descending
   comment, mod.rs invariant line), wrapping-mul hygiene in the trigger,
   deleted the dead `back` field.
+
+Sixth session (2026-10-14) — bench scale-out, seqread engine, lookup
+fast paths (one commit at this session's end):
+- **bench rework**: `sorted_insert.rs` takes a size CLI arg (default 10k;
+  u32 addrs — u16's name space caps at 64k), a 3s wall budget per
+  structure×workload cell (slow cells finish one partial rep, reported
+  over the completed prefix, `[partial done]`-marked — SortedSet's O(n²)
+  columns stay benchable at 1M), a runs workload (chunks of 100
+  sequential keys, half reversed to descending runs, chunk order
+  shuffled), seqread + lookup columns, and the `sorted-vec` crate as a
+  third column (dev-dep). 1M findings: the cache cliff is measured now
+  (random insert 96→487, lookup 68→330), runs is the scale-proof
+  workload (132 at 1M), seqread scale-invariant, BTreeSet's lookup edge
+  — since inverted by the fast paths below.
+- **seqread engine, 3 rounds + inline** (5× end to end, 1.98→0.4
+  ns/elem): the `from_fn`+`next_set`/`prev_set` iter died for the
+  differential `Iter` enum (Asc/Desc picked once) over word-stepping
+  engines; Desc 2.81→1.41 (killing `prev_set`'s keep-mask loop was the
+  biggest algorithmic fix); then the in-place bit test (cached word, `pos`
+  as the state — yields free, the position rebuild was the hidden
+  cost); rotation-mask and tz-jump variants measured worse; then
+  `#[inline]` on the per-element `next`s — 1.4→0.4, the round that
+  mattered most (cross-crate call overhead was the dominant term; check
+  it FIRST, tune loop bodies second). masked scan now 0.4-0.8 ns/elem
+  cache-resident (~1.4 cycles), within 2× of bare memory at both
+  scales.
+- **bsearch fast paths** (lookup 68→57 at 10k, 328→256 at 1M; insert
+  rides it): `next_set` returns the probe position directly when its bit
+  is set — the ~90% case — skipping the shift/tzcnt/rebuild. the other
+  three scans got the same fast path + `#[inline]` (flat on insert:
+  hole-finders' queries are dense by construction — the payoff case
+  there is the 10% case; kept for API uniformity at zero measured cost).
+- **`nearest_clear` excludes its center** (contract; callers pass a
+  position they occupy): initially broke insert — the insert SPOT is
+  usually a HOLE (the bsearch converges lo to k's gap), and
+  `gather_slots` relied on nearest_clear returning the spot for that
+  case; fixed by an explicit spot-is-hole mask test at the top of
+  `gather_slots` (the check the old scan did implicitly).
+- **batched lookup: built, measured, DROPPED.** `lookup_batch<const B>`
+  went through five designs (median-partition descent → level-sync
+  frontier → serial+running-lo → plain sorted → evens/odds two-phase
+  with an adaptive span rule). spread keys are parity-with-singles at
+  every B and both scales (singles' OOO overlap + shared probe pyramid
+  are near the floor; the descent saves only ~log2(B)−2 probes);
+  clustered batches win 3-13× — but the probe-path sharing does most of
+  that WITHOUT any API (a globally sorted probe stream through plain
+  `contains` is the 2.4×/1.7× win). not worth the complexity — do not
+  revive; full analysis in bench_notes (2026-10-14 sections).
+- fresh-review: one real bug found and fixed (iterator re-poll
+  instability — stale cached word after exhaustion yields OOB
+  positions; subtle_bugs §21, `iterators_none_stable` regression test);
+  sorted-vec moved to dev-deps; doc drift updated.
 
 
 ## Future Work

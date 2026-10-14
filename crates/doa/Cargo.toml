@@ -12,6 +12,9 @@ readme = "README.md"
 itertools = "0.15.0"
 arrays = {path="../arrays"}
 
+[dev-dependencies]
+sorted-vec = "0.8.11"
+
 [features]
 default = []
 
@@ -26,3 +29,4 @@ harness = false
 [[bench]]
 name = "sorted_insert"
 harness = false
+

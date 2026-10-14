@@ -82,7 +82,16 @@ pub struct BlockSet<K, A> {
 impl<K, A> Drop for BlockSet<K, A> {}
 ///L0169
 impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {}
-///L0585
+///L0589
+///`BlockSet::iter`'s differential — one enum dispatch per element, the
+///per-direction bodies specialized (word-stepping mask iteration)
+pub enum Iter<'a, K, A> {
+    Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
+    Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
+}
+///L0594
+impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {}
+///L0608
 #[cfg(test)]
 mod tests {
     use super::*;

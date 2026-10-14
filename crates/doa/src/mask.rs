@@ -1,6 +1,8 @@
 //!dense occupancy bitmap — bit p ⇔ slot p live. word-at-a-time scans
-//!(`next_set`/`next_clear` skip full/empty words, no per-bit loop); bits past
-//! `bits` read as clear, so `next_clear` never returns ≥ `bits`.
+//!(`next_set`/`next_clear` skip full/empty words, no per-bit loop);
+//!`iter_set`/`iter_set_rev` test positions in place against the cached
+//!current word. bits past `bits` read as clear, so `next_clear` never
+//!returns ≥ `bits`.
 
 ///invariant: `words.len() == (bits + 63) / 64`; no bit ≥ `bits` is ever set.
 #[derive(Clone, Debug, Default)]
@@ -55,7 +57,13 @@ impl Mask {
     }
 
     ///first set bit ≥ from, or None
+    #[inline]
     pub fn next_set(&self, from: usize) -> Option<usize> {
+        //dense fast path: the bit at `from` is usually set — `from` is the
+        //answer, no scan and no position rebuild
+        if from >> 6 < self.words.len() && self.words[from >> 6] & 1 << (from & 63) != 0 {
+            return Some(from);
+        }
         let mut w = from >> 6;
         let mut off = from & 63;
         while w < self.words.len() {
@@ -70,13 +78,19 @@ impl Mask {
     }
 
     ///highest set bit < from, or None
+    #[inline]
     pub fn prev_set(&self, from: usize) -> Option<usize> {
         let from = from.min(self.bits);
         if from == 0 {
             return None;
         }
-        let mut w = (from - 1) >> 6;
-        let mut keep = ((from - 1) & 63) + 1;
+        //dense fast path: the bit just below is usually set
+        let p = from - 1;
+        if self.words[p >> 6] & 1 << (p & 63) != 0 {
+            return Some(p);
+        }
+        let mut w = p >> 6;
+        let mut keep = (p & 63) + 1;
         loop {
             let word = self.words[w] & if keep == 64 { u64::MAX } else { (1 << keep) - 1 };
             if word != 0 {
@@ -104,9 +118,14 @@ impl Mask {
     }
 
     ///first clear bit ≥ from and < bits, or None
+    #[inline]
     pub fn next_clear(&self, from: usize) -> Option<usize> {
         if from >= self.bits {
             return None;
+        }
+        //fast path: `from` itself clear — it's the answer
+        if self.words[from >> 6] & 1 << (from & 63) == 0 {
+            return Some(from);
         }
         let mut w = from >> 6;
         let mut off = from & 63;
@@ -127,11 +146,16 @@ impl Mask {
     }
 
     ///last clear bit ≤ from (clamped to bits−1), or None
+    #[inline]
     pub fn prev_clear(&self, from: usize) -> Option<usize> {
         if self.bits == 0 {
             return None;
         }
         let from = from.min(self.bits - 1);
+        //fast path: `from` itself clear — it's the answer
+        if self.words[from >> 6] & 1 << (from & 63) == 0 {
+            return Some(from);
+        }
         let mut w = from >> 6;
         let mut keep = from & 63;
         loop {
@@ -152,9 +176,18 @@ impl Mask {
         }
     }
 
-    ///nearest clear bit to `center`, ties resolved to the after side
+    ///nearest clear bit to `center`, ties resolved to the after side.
+    ///`center` itself is excluded (callers pass a live position — the
+    ///search starts at center±1)
+    #[inline]
     pub fn nearest_clear(&self, center: usize) -> Option<usize> {
-        let after = self.next_clear(center);
+        //center < bits guard: next_clear treats ≥ bits as None anyway,
+        //this also keeps center+1 from overflowing
+        let after = if center < self.bits {
+            self.next_clear(center + 1)
+        } else {
+            None
+        };
         let before = center.checked_sub(1).and_then(|b| self.prev_clear(b));
         match (after, before) {
             (Some(a), Some(b)) => Some(if a - center <= center - b { a } else { b }),
@@ -163,13 +196,15 @@ impl Mask {
     }
 
     ///set bits in ascending order
-    pub fn iter_set(&self) -> impl Iterator<Item = usize> + '_ {
-        let mut from = 0;
-        std::iter::from_fn(move || {
-            let n = self.next_set(from)?;
-            from = n + 1;
-            Some(n)
-        })
+    pub fn iter_set(&self) -> SetBits<'_> {
+        let mut words = self.words.iter();
+        SetBits { word: words.next().copied().unwrap_or(0), words, pos: 0 }
+    }
+
+    ///set bits in descending order
+    pub fn iter_set_rev(&self) -> SetBitsRev<'_> {
+        let mut words = self.words.iter().rev();
+        SetBitsRev { word: words.next().copied().unwrap_or(0), words, pos: self.bits.wrapping_sub(1) }
     }
 
     ///the rotation turn's mask half: bit p → 2·p ± the band ripple. the
@@ -274,6 +309,102 @@ impl Mask {
     }
 }
 
+///`iter_set`'s engine: the current word cached, positions tested in
+///place — the dense common case is a bit test + increment (no tz, no
+///position rebuild); holes advance one bit, whole-empty word tails skip
+///at once. a rotating-bit-mask engine measured slightly WORSE: the shift
+///saved on the test returns on the yield as `pos + tzcnt` (the position
+///no longer is the state) — see bench_notes
+pub struct SetBits<'a> {
+    words: std::slice::Iter<'a, u64>,
+    ///cached current word; 0 past the end
+    word: u64,
+    ///next position to test
+    pos:  usize,
+}
+
+impl Iterator for SetBits<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            if self.word & 1 << (self.pos & 63) != 0 {
+                let p = self.pos;
+                self.pos += 1;
+                if self.pos & 63 == 0 {
+                    self.word = self.words.next().copied().unwrap_or(0);
+                }
+                return Some(p);
+            }
+            //hole: advance one bit (tz-jumping measured slower — the jump
+            //costs more than the retest for scattered holes)
+            if self.word >> (self.pos & 63) == 0 {
+                //nothing set at pos or beyond — the word is done. zero the
+                //cache on exhaustion: `?` alone leaves the stale word and
+                //a re-poll yields out-of-range positions
+                self.pos = (self.pos | 63) + 1;
+                match self.words.next() {
+                    Some(&w) => self.word = w,
+                    None => {
+                        self.word = 0;
+                        return None;
+                    }
+                }
+            } else {
+                self.pos += 1;
+            }
+        }
+    }
+}
+
+///`iter_set_rev`'s engine — the descending mirror: positions tested down
+///through the cached word, holes advancing one bit, whole-empty word heads
+///skipping at once. `pos` wraps below 0 into a sentinel once the mask is
+///exhausted
+pub struct SetBitsRev<'a> {
+    words: std::iter::Rev<std::slice::Iter<'a, u64>>,
+    word:  u64,
+    ///next position to test
+    pos:   usize,
+}
+
+impl Iterator for SetBitsRev<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            let bit = 1u64 << (self.pos & 63);
+            if self.word & bit != 0 {
+                let p = self.pos;
+                self.pos = self.pos.wrapping_sub(1);
+                if self.pos & 63 == 63 {
+                    self.word = self.words.next().copied().unwrap_or(0);
+                }
+                return Some(p);
+            }
+            //hole: advance one bit (see SetBits — tz-jumping measured slower)
+            let below = self.word & (bit | bit.wrapping_sub(1));
+            if below == 0 {
+                //nothing set at pos or below — the word is done. zero the
+                //cache on exhaustion (see SetBits): `?` alone leaves the
+                //stale word and a re-poll yields out-of-range positions
+                self.pos = (self.pos & !63).wrapping_sub(1);
+                match self.words.next() {
+                    Some(&w) => self.word = w,
+                    None => {
+                        self.word = 0;
+                        return None;
+                    }
+                }
+            } else {
+                self.pos = self.pos.wrapping_sub(1);
+            }
+        }
+    }
+}
+
 ///bits of x moved to the even positions of a u64 (p → 2p)
 fn spread(x: u32) -> u64 {
     let mut x = x as u64;
@@ -312,7 +443,9 @@ mod tests {
             let naive_prev = (0..=from.min(bits - 1)).rev().find(|p| !set.contains(p));
             assert_eq!(m.prev_clear(from), naive_prev, "prev_clear from {from}");
             let naive_before = (0..from).rev().find(|p| !set.contains(p));
-            let naive_near = match (naive_clear, naive_before) {
+            //nearest_clear excludes `from` (callers pass a live position)
+            let naive_after = (from + 1..bits).find(|p| !set.contains(p));
+            let naive_near = match (naive_after, naive_before) {
                 (Some(a), Some(b)) => Some(if a - from <= from - b { a } else { b }),
                 (a, b) => a.or(b),
             };
@@ -370,6 +503,33 @@ mod tests {
         let m = mask_ones(300, &[0, 63, 64, 65, 127, 128, 299]);
         assert_eq!(m.iter_set().collect::<Vec<_>>(), vec![0, 63, 64, 65, 127, 128, 299]);
         assert_eq!(mask_ones(300, &[]).iter_set().next(), None);
+    }
+
+    #[test]
+    fn iter_set_rev_descending() {
+        let bits = 200;
+        let set: Vec<usize> = (0..bits).filter(|p| (p * 31 + 7) % 10 < 7).collect();
+        let m = mask_ones(bits, &set);
+        let naive: Vec<usize> = set.iter().rev().copied().collect();
+        assert_eq!(m.iter_set_rev().collect::<Vec<_>>(), naive);
+        assert_eq!(mask_ones(300, &[]).iter_set_rev().next(), None);
+    }
+
+    ///poll twice past the end — exhaustion must clear the cached word, or
+    ///a re-poll tests the stale word at boundary positions and yields
+    ///out-of-range positions (→ panic through BlockSet::iter's key read)
+    #[test]
+    fn iterators_none_stable() {
+        let asc = mask_ones(64, &[0]);
+        let mut it = asc.iter_set();
+        assert_eq!(it.next(), Some(0));
+        assert_eq!(it.next(), None);
+        assert_eq!(it.next(), None);
+        let desc = mask_ones(64, &[63]);
+        let mut it = desc.iter_set_rev();
+        assert_eq!(it.next(), Some(63));
+        assert_eq!(it.next(), None);
+        assert_eq!(it.next(), None);
     }
 
     #[test]

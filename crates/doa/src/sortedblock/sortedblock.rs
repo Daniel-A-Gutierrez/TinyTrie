@@ -14,7 +14,7 @@ use std::mem::MaybeUninit;
 use super::store::NoneSlide;
 use super::translator::Translator;
 use crate::index::*;
-use crate::mask::Mask;
+use crate::mask::{Mask, SetBits, SetBitsRev};
 
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
@@ -198,6 +198,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
             .then(|| unsafe { self.data[p.0].assume_init_ref() })
     }
 
+    #[inline]
     pub fn find(&self, k: &K) -> Option<A> {
         match self.position(k) {
             Ok(p) => Some(self.translator.p2a(p)),
@@ -205,20 +206,20 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         }
     }
 
+    #[inline]
     pub fn contains(&self, k: &K) -> bool {
         self.find(k).is_some()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &K> {
-        //Desc blocks: key order ascends against pos order
-        let rev = self.translator.reversed();
-        let mut cursor = if rev { self.mask.bits() } else { 0 };
-        std::iter::from_fn(move || {
-            let p =
-                if rev { self.mask.prev_set(cursor)? } else { self.mask.next_set(cursor)? };
-            cursor = if rev { p } else { p + 1 };
-            Some(self.key(p))
-        })
+    ///first→last over live keys. the direction is picked once here, never
+    ///per element — Asc walks positions up, Desc down (key order ascends
+    ///against pos order)
+    pub fn iter(&self) -> Iter<'_, K, A> {
+        if self.translator.reversed() {
+            Iter::Desc { bits: self.mask.iter_set_rev(), set: self }
+        } else {
+            Iter::Asc { bits: self.mask.iter_set(), set: self }
+        }
     }
 
     ///deltas must be empty (applied + cleared) — panics if pending. Err
@@ -372,8 +373,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     }
 
     fn bsearch(&self, k: &K, locate: impl Fn(&K, &K) -> Ordering) -> Result<Pos, Pos> {
-        let mut lo = 0;
-        let mut hi = self.data.len();
+        let (mut lo, mut hi) = (0, self.data.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
             match self.next_live(mid, hi) {
@@ -409,13 +409,16 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     ///right ⇒ `spot` (run shifts up), left ⇒ `spot − 1` (run shifts
     ///down). fails clean on a hole-free mask.
     fn gather_slots(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Option<Pos> {
-        let hole = self.mask.nearest_clear(spot.0)?;
-        deltas.translator = self.translator;
-        if hole == spot.0 {
-            //k's slot is already open
+        //k's slot already open (the bsearch converges on holes for
+        //mid-gap inserts) — no fetch, no slide. nearest_clear excludes
+        //`spot` by contract, so this is checked first
+        if spot.0 < self.cap() && !self.mask.get(spot.0) {
+            deltas.translator = self.translator;
             deltas.event = Delta::NoneSlide { from: spot, to: spot };
             return Some(spot);
         }
+        let hole = self.mask.nearest_clear(spot.0)?;
+        deltas.translator = self.translator;
         let right = hole > spot.0;
         let open = if right { spot.0 } else { spot.0 - 1 };
         //the common case: hole within a stride — one plain slide, no fetch
@@ -578,6 +581,26 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     pub fn from_vec(v: Vec<K>) -> Self {
         let _ = v;
         todo!()
+    }
+}
+
+///`BlockSet::iter`'s differential — one enum dispatch per element, the
+///per-direction bodies specialized (word-stepping mask iteration)
+pub enum Iter<'a, K, A> {
+    Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
+    Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
+}
+
+impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {
+    type Item = &'a K;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a K> {
+        match self {
+            //mask ⇔ init invariant upholds the read
+            Iter::Asc { bits, set } => bits.next().map(|p| set.key(p)),
+            Iter::Desc { bits, set } => bits.next().map(|p| set.key(p)),
+        }
     }
 }
 

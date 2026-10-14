@@ -585,6 +585,32 @@ is §19's implementation-rule addition.
 
 ---
 
+## 21. Cached-word iterators: exhaustion must zero the cache
+
+**The nuance (2026-10-14, the SetBits engines — caught by session review,
+verified by probe).** `SetBits`/`SetBitsRev` cache the current mask word
+across `next()` calls. both exhaustion sites matter and behave
+differently: the YIELD-path refresh (`unwrap_or(0)`) clears correctly,
+but the HOLE-skip path's `?` operator returns `None` BEFORE the stale
+word is cleared — a re-poll (Iterator's contract allows arbitrarily
+many `next()` calls after None) then tests the STALE word at the
+boundary position and yields a position ≥ bits: through
+`BlockSet::iter` that is an index-OOB panic in `key()`. the first fix
+attempt failed the same way — `None => return None` inside a match that
+assigns the word only on `Some` still leaves the stale cache; the
+exhaustion arm must explicitly zero `self.word` before returning.
+
+**The rules.**
+- any iterator whose state caches a slice element must zero/drop the
+  cache at EVERY exhaustion site, not just the convenient ones. `?` on
+  the fetch is the trap: it early-returns with state intact.
+- poll-twice-past-the-end is a mandatory test for hand-rolled iterators
+  (`iterators_none_stable`): the old `from_fn` iter was None-stable by
+  construction; an engine rewrite regresses it silently, and nothing
+  in-crate ever polls past None (for loops, collect, Drop all stop).
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on
