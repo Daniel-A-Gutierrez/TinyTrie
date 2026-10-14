@@ -530,12 +530,58 @@ empty.
 
 **The implementation rule.** `rotate_mask` = plain interleave (every bit →
 2p, a hole after every element) + ONE masked ripple of the band's target
-range up a slot. the ripple needs no carry chain: an even bit and its odd
-target are adjacent, and word boundaries sit at odd global bits, so the
-shift never crosses a word — every word moves independently. the two-step
-segment machinery this replaced (saved boundary word, merge masks, last-word
-preservation) is all carry-chain bookkeeping for a carry that provably never
-happens.
+range. the UP-ripple (forward ramp) shifts up a slot and needs no carry
+chain: an even bit and its odd target are adjacent, and word boundaries
+sit at odd global bits, so the shift never crosses a word — every word
+moves independently. the DOWN-ripple (the reversed ramp, §20) shifts down
+and DOES cross — a word's bit-0 element lands on the word below's bit 63 —
+so the fall carries word by word (descending word loop; whenever a fall
+arrives, bit 63 is provably inside the ripple range). the two-step
+segment machinery the up-ripple replaced (saved boundary word, merge
+masks, last-word preservation) was all carry-chain bookkeeping for a
+carry that provably never happens — in the up-ripple only.
+
+---
+
+## 20. The reversal: names survive the death of their orientation
+
+**The nuance (2026-10-13, the reversal tier).** flipping a block (pos 0 =
+min ⇄ pos 0 = max) is two mirrors and a negated translator — no deltas, no
+name churn, nothing for holders to apply. the array mirrors
+(`data.reverse` + `mask.reverse`); the translator re-parameterizes so
+`p2a_new(p) = p2a_old(cap−1−p)` — in the 2-knob form that is exactly
+`offset → cap−1−offset` with the direction flag flipped: the formula
+negates its position term (`(p − offset) ror r` → `(offset − p) ror r`).
+names follow the mirrored slots BY CONSTRUCTION, so a pending `Deltas`
+event (the gather/slide from the same insert) stays valid across the flip
+— it speaks names, and names did not change.
+
+the reversal turn (the negated ramp): `q(p) = 2·p − [(offset−p) mod 2^w ≥
+2^(w−1)]` — the upper-half names still land odd, but one slot DOWN. under
+reversal the name of p is `offset − p`, so the upper half of the name
+space is the pos-SUFFIX `(offset, cap)` (offset < cap ≤ midpoint in every
+reachable state — offset is name 0's slot). the map is monotone, and
+q ≥ p holds (band members have p ≥ 1), so grow_rotate's descending pass
+stays safe under either direction. the down-ripple's word-crossing fall
+is §19's implementation-rule addition.
+
+**The rules.**
+- the flip is free; the trigger is not: `pos_sum·8 < len²`, len >
+  4·FREE_STRIDE (pos_sum doubles at turns, reflects around len at flips).
+  at len/4 a uniform stream's small early window flips spuriously (benched:
+  4 flips on pure random, each echo at a larger scale), and a real front
+  stream's mean sits ≈ 0, so the tighter line costs nothing real.
+- the all-time doubled pos_sum is an intentional estimator: each doubling
+  era votes (roughly) once, so the block judges by early behavior and
+  gets stickier as it grows — the devlog's "biases develop aggressively
+  early, harder to change later," by construction.
+- `offset ≥ cap` states (only offset turns can make them) break the
+  reversal turn's monotonicity/bounds — unreachable today; the
+  offset-turn tier must respect `offset < cap` or generalize the band.
+- turns work under ANY offset and either direction now (the `offset ≠ 0`
+  refusal is gone); `rotate_mask`'s reversed branch asserts
+  `offset < midpoint`, which reachable states guarantee via
+  `offset < cap ≤ midpoint`.
 
 ---
 

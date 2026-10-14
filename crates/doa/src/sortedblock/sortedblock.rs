@@ -4,124 +4,76 @@
 //!are reported as pos pairs in swap-cascade order (hole-adjacent mover
 //!first) + a translator snapshot; the holder applies `Deltas::iter`'s
 //!(from_addr, to_addr) name swaps in order.
-//!order: pos order == key order — normal (pos 0 = min) or reversed (pos 0
-//!= max, Prepend bias), so a sequential insert at the key extreme is always
-//!a physical tail push_back.
+//!order: pos order == key order — pos 0 = min (Asc) or max (Desc); a
+//!sequential insert at the key extreme is always a physical tail
+//!push_back. the translator carries the direction (see translator.rs).
 
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 
+use super::store::NoneSlide;
+use super::translator::Translator;
 use crate::index::*;
 use crate::mask::Mask;
-
-///workload vocabulary, fixed for the block's life. the space ladder is
-///unified (edge pushes, budgeted probes, dense turns), so only key
-///direction differs: Prepend stores the block reversed (pos 0 = max), so
-///a sequential prepend is a tail push_back, never a slide. Append and
-///Insert are equivalent today; the heuristic tier may re-diverge them
-///(e.g. per-workload turn thresholds).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum InsertBias {
-    Append,
-    Prepend,
-    Insert,
-}
-
-///key order along pos — Desc stores keys descending (pos 0 = max), so a
-///sequential prepend is a tail push_back, never a slide
-enum Direction {
-    Asc,
-    Desc,
-}
-
-impl Direction {
-    ///k beyond the tail extreme (the end a sequential insert extends —
-    ///max Asc, min Desc)?
-    fn beyond_tail<K: Ord>(&self, k: &K, tail: &K) -> bool {
-        match self {
-            Direction::Asc => tail < k,
-            Direction::Desc => k < tail,
-        }
-    }
-
-    ///k vs the probe in scan order — Desc flips the operands, the whole of
-    ///the reversal. Less: the spot lies past p; Greater: before p.
-    fn locate<K: Ord>(&self, k: &K, probe: &K) -> Ordering {
-        match self {
-            Direction::Asc => probe.cmp(k),
-            Direction::Desc => k.cmp(probe),
-        }
-    }
-}
-
-///`a2p(a) = (a rol rotation) + offset`, `p2a` the exact inverse (both wrap in
-///A). rotation turn = growth: every live pos maps to `2·pos − offset` mod A.
-///offset turn = window move (heuristic tier, unimplemented).
-#[derive(Clone, Copy)]
-struct Translator<A> {
-    rotation: u32,
-    offset:   A,
-}
-
-impl<A: UnsignedNum> Translator<A> {
-    fn new() -> Self {
-        Translator { rotation: 0, offset: A::ZERO }
-    }
-
-    ///the rotation turn: rotation + 1, offset doubled. `a2p_new ∘ p2a_old`
-    ///is the turn's relocation map — names preserved by construction; the
-    ///old rotation cancels (`ror r ∘ rol (r+1) = rol 1`), leaving
-    ///`pos → 2·pos`, +1 across the name-space wrap (pos < offset).
-    fn rotate(&self) -> Self {
-        Translator {
-            rotation: self.rotation + 1,
-            offset:   self.offset.wrapping_add(self.offset),
-        }
-    }
-
-    #[inline]
-    fn a2p(&self, a: A) -> Pos {
-        Pos(a.rotate_left(self.rotation).wrapping_add(self.offset).as_usize())
-    }
-
-    #[inline]
-    fn p2a(&self, p: Pos) -> A {
-        A::from_usize(p.0).wrapping_sub(self.offset).rotate_right(self.rotation)
-    }
-}
 
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
 ///nothing). the common contiguous run slide (the hole moves `from → to`;
-///every element strictly between shifts one step toward `from`). `Pairs`
-///covers rare non-run shapes (reversal, bulk).
+///every element strictly between shifts one step toward `from`). `Gather`:
+///a fetch-distance gather's slide chain, nearest hole first, each slide
+///in post-prior-slides coordinates — identical to its pre-read position,
+///since a hole's slot is never touched before its own slide; a two-sided
+///gather is two chains' worth, side told by `from > to`. `Pairs` covers
+///rare non-run shapes (reversal, bulk).
 enum Delta {
     Empty,
     NoneSlide {
         from: Pos,
         to:   Pos,
     },
+    Gather(Vec<NoneSlide>),
     #[allow(dead_code)]
     Pairs(Vec<(Pos, Pos)>),
 }
 
 ///expanded `(from, to)` pos pairs of one event, swap-cascade order
 ///(hole-adjacent mover first). `Run`: `p` cursor, `step` (−1 = run shifts
-///up), `remaining` emissions; each pair is `(p, p − step)`.
+///up), `remaining` emissions; each pair is `(p, p − step)`. `Gather` chains
+///the slides' runs in order (each slide's coordinates are post-prior-slides).
 enum DeltaPairs<'a> {
     Empty,
     Run { p: usize, step: i64, remaining: usize },
+    Gather {
+        slides:    std::slice::Iter<'a, NoneSlide>,
+        p:         usize,
+        step:      i64,
+        remaining: usize,
+    },
     Pairs(std::slice::Iter<'a, (Pos, Pos)>),
+}
+
+///swap-cascade run state of one hole slide `from → to`
+fn run_of(from: usize, to: usize) -> (usize, i64, usize) {
+    if from > to {
+        (from - 1, -1, from - to)
+    } else {
+        (from + 1, 1, to - from)
+    }
 }
 
 impl Delta {
     fn pairs(&self) -> DeltaPairs<'_> {
         match self {
             Delta::Empty => DeltaPairs::Empty,
-            Delta::NoneSlide { from, to } => DeltaPairs::Run {
-                p:         if from.0 > to.0 { from.0 - 1 } else { from.0 + 1 },
-                step:      if from.0 > to.0 { -1 } else { 1 },
-                remaining: from.0.abs_diff(to.0),
+            Delta::NoneSlide { from, to } => {
+                let (p, step, remaining) = run_of(from.0, to.0);
+                DeltaPairs::Run { p, step, remaining }
+            }
+            Delta::Gather(v) => DeltaPairs::Gather {
+                slides:    v.iter(),
+                p:         0,
+                step:      0,
+                remaining: 0,
             },
             Delta::Pairs(v) => DeltaPairs::Pairs(v.iter()),
         }
@@ -143,6 +95,16 @@ impl Iterator for DeltaPairs<'_> {
                 *p = (q as i64 + *step) as usize;
                 Some((Pos(q), Pos((q as i64 - *step) as usize)))
             }
+            DeltaPairs::Gather { slides, p, step, remaining } => loop {
+                if *remaining == 0 {
+                    let ns = slides.next()?;
+                    (*p, *step, *remaining) = run_of(ns.from.0, ns.to.0);
+                }
+                *remaining -= 1;
+                let q = *p;
+                *p = (q as i64 + *step) as usize;
+                return Some((Pos(q), Pos((q as i64 - *step) as usize)));
+            },
             DeltaPairs::Pairs(it) => it.next().copied(),
         }
     }
@@ -179,16 +141,20 @@ impl<A: UnsignedNum> Deltas<A> {
     }
 }
 
+///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
+///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
+const FREE_STRIDE: usize = 8;
+
 ///mask covers data.len() slots; bit ⇔ slot initialized.
 pub struct BlockSet<K, A> {
     translator: Translator<A>,
     data:       Vec<MaybeUninit<K>>,
     mask:       Mask,
-    order:      Direction,
     len:        usize,
-    ///last minted addr — density heuristic tier
+    ///running sum of placed slot positions — the mean-insert-position
+    ///signal for the reversal tier
     #[allow(dead_code)]
-    back:       A,
+    pos_sum:    u64,
 }
 
 impl<K, A> Drop for BlockSet<K, A> {
@@ -202,21 +168,12 @@ impl<K, A> Drop for BlockSet<K, A> {
 
 impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     pub fn new() -> Self {
-        Self::with_bias(InsertBias::Insert)
-    }
-
-    pub fn with_bias(bias: InsertBias) -> Self {
-        let order = match bias {
-            InsertBias::Append | InsertBias::Insert => Direction::Asc,
-            InsertBias::Prepend => Direction::Desc,
-        };
         BlockSet {
             translator: Translator::new(),
-            data: Vec::new(),
-            mask: Mask::new(),
-            order,
-            len: 0,
-            back: A::ZERO,
+            data:      Vec::new(),
+            mask:      Mask::new(),
+            len:       0,
+            pos_sum:   0,
         }
     }
 
@@ -254,7 +211,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
 
     pub fn iter(&self) -> impl Iterator<Item = &K> {
         //Desc blocks: key order ascends against pos order
-        let rev = matches!(self.order, Direction::Desc);
+        let rev = self.translator.reversed();
         let mut cursor = if rev { self.mask.bits() } else { 0 };
         std::iter::from_fn(move || {
             let p =
@@ -281,17 +238,53 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //k belongs at the back (spot past the whole array): extend the
         //allocation — the cheapest space is the edge
         if spot.0 == self.data.len() && self.data.len() < Self::max_capacity() {
-            return Ok(self.push_back(k, spot));
+            let a = self.push_back(k, spot);
+            self.maybe_reverse();
+            return Ok(a);
         }
         let p = self.open(&k, spot, deltas);
-        Ok(self.place(k, p))
+        let a = self.place(k, p);
+        self.maybe_reverse();
+        Ok(a)
+    }
+
+    ///in-place reversal: the array mirrors (pos 0 = max), names follow the
+    ///slots — the translator absorbs it, no deltas (a pending event stays
+    ///valid: it speaks names, and names never change). pos_sum reflects
+    ///around len: the historical insert positions read in the new
+    ///orientation
+    fn reverse(&mut self) {
+        self.data.reverse();
+        self.mask.reverse();
+        self.translator = self.translator.reverse(self.data.len());
+        let len = self.len as u64;
+        self.pos_sum = len.wrapping_mul(len).wrapping_sub(self.pos_sum);
+    }
+
+    ///front-biased insert stream ⇒ flip, so the stream's next inserts
+    ///land at the tail. the signal must be committed — mean insert position
+    ///below len/8 past a 4·stride warmup: at len/4 a uniform stream's small
+    ///early window flips the block spuriously (4 flips on pure random,
+    ///bench_notes), and a real front stream's mean sits ≈ 0 either way
+    fn maybe_reverse(&mut self) {
+        if self.len > 4 * FREE_STRIDE {
+            let len = self.len as u64;
+            if self.pos_sum.wrapping_mul(8) < len.wrapping_mul(len) {
+                self.reverse();
+            }
+        }
     }
 
     ///insertion spot, or None on dup. beyond the tail extreme the spot is
-    ///known without bsearch
+    ///known without bsearch (max Asc, min Desc — the end a sequential
+    ///insert extends)
     fn spot(&self, k: &K) -> Option<Pos> {
-        if self.len > 0 && self.order.beyond_tail(k, self.key_tail()) {
-            return Some(Pos(self.mask.last_set().unwrap() + 1));
+        if self.len > 0 {
+            let tail = self.key_tail();
+            let beyond = if self.translator.reversed() { k < tail } else { tail < k };
+            if beyond {
+                return Some(Pos(self.mask.last_set().unwrap() + 1));
+            }
         }
         self.position(k).err()
     }
@@ -303,83 +296,50 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         self.place(k, Pos(0))
     }
 
-    ///extend the allocation and place k at the edge, leaving a hole below
-    ///k whenever the tail run would span BIT_WIDTH live slots — below the
-    ///tail, so sequential inserts can't consume it; middle inserts find
-    ///space within budget. caller guarantees spot == cap < max_capacity.
+    ///extend the allocation and place k at the edge — dense; banked holes
+    ///come from `gather_slots`' fetch, not minted here. caller guarantees
+    ///spot == cap < max_capacity.
     fn push_back(&mut self, k: K, spot: Pos) -> A {
-        let run = self.mask.prev_clear(spot.0 - 1).map_or(spot.0, |h| spot.0 - h - 1);
-        let hole = run >= A::BIT_WIDTH as usize - 1;
-        if hole {
-            self.push_slot();
-        }
         self.push_slot();
-        self.place(k, spot + usize::from(hole))
+        self.place(k, spot)
     }
 
-    ///open a slot at/near `spot`, cheapest space first: a probe within
-    ///BIT_WIDTH; on a miss, the back — if the tail run is within budget the
-    ///allocation edge is the nearest space, so open a slot there and slide
-    ///the run into it; else a rotation turn in a ≥80%-full block (one O(n)
-    ///move with zero name churn beats the long slides and pair cascades
-    ///dense probing produces); else a wide slide (a fluke gap in a sparse
-    ///block). mask full ⇒ turn, or one plain tail slot when the turn is
-    ///refused (room always exists: mask full + len < name ceiling).
-    ///heuristic tier later.
+    ///open a slot at/near `spot`: a preemptive turn past 7/8 occupancy when
+    ///the insert sits mid-block (at one hole per FREE_STRIDE expected, past
+    ///7/8 fetches blow past the stride — one O(n) turn beats the long
+    ///gathers); then the fetch gather (nearest hole sets the distance,
+    ///distance sets the count — banked holes ride the slide). mask full ⇒
+    ///one tail push when the edge is within FREE_STRIDE, else a turn;
+    ///refused ⇒ plain tail slot (room always exists: mask full + len <
+    ///name ceiling).
     fn open(&mut self, k: &K, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
-        let budget = A::BIT_WIDTH as usize;
-        if let Some(p) = self.try_alloc(spot, budget, deltas) {
-            return p;
-        }
-        //budget miss, tail run within budget: the back is the nearest
-        //space — open a slot there, the wide probe finds it
-        if spot.0 < self.data.len()
-            && self.data.len() - spot.0 <= budget
-            && self.data.len() < Self::max_capacity()
-        {
-            self.push_slot();
-            return self.try_alloc(spot, self.data.len(), deltas).expect("back slot is nearest");
-        }
-        //systemic scarcity: dense block, no hole within budget — spread
-        if self.len >= self.data.len() - self.data.len() / 5 && self.grow_rotate() {
-            let spot = self.position(k).err().expect("no dup post-grow");
-            return self.try_alloc(spot, self.data.len(), deltas).expect("grow leaves holes");
-        }
-        //fluke: a wide slide in a sparse block — unless the block is
-        //filling (≥ two thirds, so a spread still leaves it ≥ one third)
-        //and the nearest hole is more than four budgets away: a locally
-        //dense hot region (global density alone is blind to it)
-        if self.len >= self.data.len() - self.data.len() / 3
-            && self
-                .mask
-                .nearest_clear(spot.0)
-                .is_some_and(|h| h.abs_diff(spot.0) > 4 * budget)
+        let mut spot = spot;
+        if self.len.wrapping_mul(8) > self.data.len().wrapping_mul(7)
+            && self.data.len() - spot.0 > FREE_STRIDE
             && self.grow_rotate()
         {
-            let spot = self.position(k).err().expect("no dup post-grow");
-            return self.try_alloc(spot, self.data.len(), deltas).expect("grow leaves holes");
+            spot = self.position(k).err().expect("no dup post-grow");
         }
-        if let Some(p) = self.try_alloc(spot, self.data.len(), deltas) {
+        if let Some(p) = self.gather_slots(spot, deltas) {
             return p;
         }
-        //mask full: turn if possible, else one plain tail slot
-        let turned = self.grow_rotate();
-        if !turned {
+        if self.data.len() - spot.0 <= FREE_STRIDE && self.data.len() < Self::max_capacity() {
+            self.push_slot();
+        } else if self.grow_rotate() {
+            spot = self.position(k).err().expect("no dup post-grow");
+        } else {
             self.push_slot();
         }
-        let spot = if turned {
-            self.position(k).err().expect("no dup post-grow")
-        } else {
-            spot
-        };
-        self.try_alloc(spot, self.data.len(), deltas).expect("grow leaves holes")
+        self.gather_slots(spot, deltas).expect("mask had a hole minted")
     }
 
-    ///write k at an open slot, mark live, mint its name
+    ///write k at an open slot, mark live, mint its name; the slot position
+    ///joins the running insert-position sum
     fn place(&mut self, k: K, p: Pos) -> A {
         self.data[p.0] = MaybeUninit::new(k);
         self.mask.set(p.0, true);
         self.len += 1;
+        self.pos_sum = self.pos_sum.wrapping_add(p.0 as u64);
         self.translator.p2a(p)
     }
 
@@ -401,15 +361,24 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     ///bsearch over live slots. Ok(p) = duplicate found at p; Err(spot) = the
     ///insertion spot: first live pos past the run that will precede k.
     ///holes are skipped forward — sortedness makes everything live before
-    ///the probe compare known. Desc is just flipped operands (`locate`).
+    ///the probe compare known. the probe/k operand order is the block's
+    ///direction, fixed per arm so the hot loop carries no branch
     fn position(&self, k: &K) -> Result<Pos, Pos> {
+        if self.translator.reversed() {
+            self.bsearch(k, |probe, k| k.cmp(probe))
+        } else {
+            self.bsearch(k, |probe, k| probe.cmp(k))
+        }
+    }
+
+    fn bsearch(&self, k: &K, locate: impl Fn(&K, &K) -> Ordering) -> Result<Pos, Pos> {
         let mut lo = 0;
         let mut hi = self.data.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
             match self.next_live(mid, hi) {
                 None => hi = mid,
-                Some(p) => match self.order.locate(k, self.key(p)) {
+                Some(p) => match locate(self.key(p), k) {
                     Ordering::Less => lo = p + 1,
                     Ordering::Greater => hi = p,
                     Ordering::Equal => return Ok(Pos(p)),
@@ -433,37 +402,131 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         self.key(self.mask.last_set().expect("live"))
     }
 
-    ///find the nearest hole within `budget` of `spot` (either side; ties go
-    ///right), slide it adjacent, record pairs. fails clean: no mutation on
-    ///None. hole left of spot: the run `hole+1..spot` shifts down, k lands on
-    ///`spot − 1`; hole right: run `spot..hole` shifts up, k lands on `spot`.
-    fn try_alloc(&mut self, spot: Pos, budget: usize, deltas: &mut Deltas<A>) -> Option<Pos> {
-        let hole = self.mask.nearest_clear(spot.0).filter(|h| h.abs_diff(spot.0) <= budget)?;
+    ///fetch-distance gather: the nearest hole's distance from `spot` sets
+    ///the fetch — one hole per FREE_STRIDE traveled (the further the look,
+    ///the more Nones come back, banked beside k for the cluster's next
+    ///inserts). holes all from the nearest hole's side. k's slot: hole
+    ///right ⇒ `spot` (run shifts up), left ⇒ `spot − 1` (run shifts
+    ///down). fails clean on a hole-free mask.
+    fn gather_slots(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Option<Pos> {
+        let hole = self.mask.nearest_clear(spot.0)?;
         deltas.translator = self.translator;
-        //the run between spot and hole is fully live (nearest hole), so the
-        //mask update collapses to: hole fills, the vacated edge clears
-        let open = if hole >= spot.0 {
-            //ptr::copy leaves a bitwise duplicate in the source range —
-            //uninit by mask, never assume_init'd (mask ⇔ init invariant)
-            unsafe {
-                let ptr = self.data.as_mut_ptr();
-                std::ptr::copy(ptr.add(spot.0), ptr.add(spot.0 + 1), hole - spot.0);
+        if hole == spot.0 {
+            //k's slot is already open
+            deltas.event = Delta::NoneSlide { from: spot, to: spot };
+            return Some(spot);
+        }
+        let right = hole > spot.0;
+        let open = if right { spot.0 } else { spot.0 - 1 };
+        //the common case: hole within a stride — one plain slide, no fetch
+        if hole.abs_diff(spot.0) < FREE_STRIDE {
+            self.slide_hole(hole, open);
+            deltas.event = Delta::NoneSlide { from: Pos(hole), to: Pos(open) };
+            return Some(Pos(open));
+        }
+        let holes = self.fetch_holes(spot, right, 1 + hole.abs_diff(spot.0) / FREE_STRIDE);
+        self.compact_gather(spot, open, right, &holes);
+        deltas.event = Delta::Gather(
+            holes
+                .iter()
+                .enumerate()
+                .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
+                .collect(),
+        );
+        Some(Pos(open))
+    }
+
+    ///one plain slide: hole `from` → `to`; the run between is fully live
+    ///(nearest hole), so the mask update is two bits. the bitwise duplicate
+    ///ptr::copy leaves in the source range is uninit by mask, never
+    ///assume_init'd (mask ⇔ init invariant).
+    fn slide_hole(&mut self, from: usize, to: usize) {
+        unsafe {
+            let ptr = self.data.as_mut_ptr();
+            if from > to {
+                std::ptr::copy(ptr.add(to), ptr.add(to + 1), from - to);
+            } else {
+                std::ptr::copy(ptr.add(from + 1), ptr.add(from), to - from);
             }
-            self.mask.set(hole, true);
-            self.mask.set(spot.0, false);
-            deltas.event = Delta::NoneSlide { from: Pos(hole), to: spot };
-            spot
+        }
+        self.mask.set(from, true);
+        self.mask.set(to, false);
+    }
+
+    ///the `want` nearest holes on one side of `spot`, nearest-first
+    ///(right: ascending, left: descending) — pre-read positions, consumed
+    ///by `compact_gather` without further scans
+    fn fetch_holes(&self, spot: Pos, right: bool, want: usize) -> Vec<usize> {
+        let mut holes = Vec::with_capacity(want);
+        if right {
+            let mut cursor = spot.0;
+            while holes.len() < want
+                && let Some(h) = self.mask.next_clear(cursor)
+            {
+                holes.push(h);
+                cursor = h + 1;
+            }
         } else {
-            unsafe {
-                let ptr = self.data.as_mut_ptr();
-                std::ptr::copy(ptr.add(hole + 1), ptr.add(hole), spot.0 - hole - 1);
+            let mut cursor = spot.0 - 1;
+            while holes.len() < want {
+                let Some(h) = self.mask.prev_clear(cursor) else { break };
+                holes.push(h);
+                if h == 0 {
+                    break;
+                }
+                cursor = h - 1;
             }
-            self.mask.set(hole, true);
-            self.mask.set(spot.0 - 1, false);
-            deltas.event = Delta::NoneSlide { from: Pos(hole), to: Pos(spot.0 - 1) };
-            Pos(spot.0 - 1)
-        };
-        Some(open)
+        }
+        holes
+    }
+
+    ///gather compaction, one pass: each member crosses exactly once —
+    ///segment j (between consecutive holes) shifts by its crossing count,
+    ///far segments copy first so no live source is read after being
+    ///overwritten. mask: the holes fill, the vacated target range
+    ///(`[open, open+w)` right, `[open−w+1, open]` left) clears; sets first
+    ///— a hole compacted onto its own old position ends clear.
+    fn compact_gather(&mut self, spot: Pos, open: usize, right: bool, holes: &[usize]) {
+        let w = holes.len();
+        unsafe {
+            let ptr = self.data.as_mut_ptr();
+            if right {
+                //holes ascend; segment 0 spans [spot, h_0), the run k shifts
+                for j in (0..w).rev() {
+                    let (lo, len) = if j == 0 {
+                        (spot.0, holes[0] - spot.0)
+                    } else {
+                        (holes[j - 1] + 1, holes[j] - holes[j - 1] - 1)
+                    };
+                    let shift = w - j;
+                    std::ptr::copy(ptr.add(lo), ptr.add(lo + shift), len);
+                }
+            } else {
+                //holes descend; the top segment ends at spot − 1 (the
+                //element at spot never moves — k lands below it)
+                for k in (0..w).rev() {
+                    let (lo, len) = if k == 0 {
+                        (holes[0] + 1, spot.0 - 1 - holes[0])
+                    } else {
+                        (holes[k] + 1, holes[k - 1] - holes[k] - 1)
+                    };
+                    let shift = w - k;
+                    std::ptr::copy(ptr.add(lo), ptr.add(lo - shift), len);
+                }
+            }
+        }
+        for &h in holes {
+            self.mask.set(h, true);
+        }
+        if right {
+            for t in open..open + w {
+                self.mask.set(t, false);
+            }
+        } else {
+            for t in open + 1 - w..=open {
+                self.mask.set(t, false);
+            }
+        }
     }
 
     ///rotation turn (in-place): cap doubles; every live element relocates
@@ -471,18 +534,15 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     ///monotone (order holds), each target ≥ its source (the descending
     ///pass writes every target before its source is read). refused past
     ///the name-space midpoint (doubled positions would exceed the address
-    ///space) or at the rotation budget; refused while offset ≠ 0 until
-    ///offset turns land. mask half: `rotate_mask` — the wrap band's
-    ///junction eats the hole the interleave would open (the addr MAX|MIN
-    ///pair) or doubles it.
+    ///space) or at the rotation budget. any offset, either direction: the
+    ///band (upper-half names land odd) is rotate_mask's job.
     fn grow_rotate(&mut self) -> bool {
         let old_cap = self.data.len();
         let Some(new_cap) = old_cap.checked_mul(2) else {
             return false;
         };
         if old_cap > A::MIDPOINT.as_usize()
-            || self.translator.rotation >= A::BIT_WIDTH as u32
-            || self.translator.offset != A::ZERO
+            || self.translator.rotation() >= A::BIT_WIDTH as u32
         {
             return false;
         }
@@ -496,8 +556,14 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
                 self.data[q.0] = std::mem::replace(&mut self.data[p], MaybeUninit::uninit());
             }
         }
-        self.mask.rotate_mask(self.translator.offset.as_usize(), A::MIDPOINT.as_usize());
+        self.mask.rotate_mask(
+            self.translator.offset().as_usize(),
+            A::MIDPOINT.as_usize(),
+            self.translator.reversed(),
+        );
         self.translator = new_tr;
+        //the pos-space doubled — the insert-position sum tracks it
+        self.pos_sum = self.pos_sum.wrapping_mul(2);
         true
     }
 
@@ -520,7 +586,7 @@ mod tests {
     use super::*;
 
     ///apply translated deltas as name swaps, in the given order
-    fn apply(holder: &mut Vec<(u8, u64)>, deltas: &Deltas<u8>) {
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64)>, deltas: &Deltas<A>) {
         for (from, to) in deltas.iter() {
             for (a, _) in &mut *holder {
                 if *a == from {
@@ -531,11 +597,8 @@ mod tests {
         }
     }
 
-    fn insert_all(
-        keys: impl IntoIterator<Item = u64>,
-        bias: InsertBias,
-    ) -> (BlockSet<u64, u8>, Vec<(u8, u64)>) {
-        let mut set = BlockSet::with_bias(bias);
+    fn insert_all(keys: impl IntoIterator<Item = u64>) -> (BlockSet<u64, u8>, Vec<(u8, u64)>) {
+        let mut set = BlockSet::new();
         let mut holder = Vec::new();
         let mut deltas = Deltas::new();
         for k in keys {
@@ -566,76 +629,134 @@ mod tests {
         }
     }
 
-    const BIASES: [InsertBias; 3] =
-        [InsertBias::Insert, InsertBias::Append, InsertBias::Prepend];
-
     #[test]
     fn ascending() {
-        for b in BIASES {
-            let (s, h) = insert_all(0..200, b);
-            check(&s, &h, 200);
-        }
+        let (s, h) = insert_all(0..200);
+        check(&s, &h, 200);
     }
 
+    ///front-biased stream: the mean-insert trigger flips the block past the
+    ///warmup — the remaining inserts are tail pushes (they never reach the
+    ///turn rung), names ride the flip, the holder mirror validates them
     #[test]
     fn descending() {
-        for b in BIASES {
-            let (s, h) = insert_all((0..200).rev(), b);
-            check(&s, &h, 200);
-        }
+        let (s, h) = insert_all((0..200).rev());
+        check(&s, &h, 200);
+        assert!(s.translator.reversed(), "front bias must flip the block");
     }
 
     #[test]
     fn stride() {
-        for b in BIASES {
-            let (s, h) = insert_all((0..200).map(|i| (i * 37 + 11) % 211), b);
-            check(&s, &h, 200);
-        }
+        let (s, h) = insert_all((0..200).map(|i| (i * 37 + 11) % 211));
+        check(&s, &h, 200);
     }
 
-    ///pure appends push_back instead of turning — cap tracks n, not the next
-    ///power of two; the cadence holes sit BELOW the tail (appends can't
-    ///consume them), so a spurious middle insert lands in one within budget
-    ///— no turn
+    ///mixed-op torture: clustered streams with interleaved descending bait
+    ///(the flip) and random removals — gathers bank, turns fire under
+    ///either direction, and every holder name is verified after every op
     #[test]
-    fn append_bias_pushes_back_and_keeps_holes() {
-        let mut set = BlockSet::<u64, u8>::with_bias(InsertBias::Append);
+    fn mixed_ops_torture() {
+        let mut set = BlockSet::<u64, u16>::new();
+        let mut d = Deltas::new();
+        let mut holder = Vec::new();
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for i in 0..600u64 {
+            if holder.is_empty() || rnd() % 4 > 0 {
+                //descending stretches bait the flip; clusters bait the gather
+                let k = if i % 3 == 0 {
+                    3000 - i * 5 + rnd() % 3
+                } else {
+                    (i / 40) * 700 + rnd() % 300
+                };
+                match set.insert(k, &mut d) {
+                    Ok(a) => {
+                        apply(&mut holder, &d);
+                        d.clear();
+                        holder.push((a, k));
+                    }
+                    Err(_) => d.clear(),
+                }
+            } else {
+                let j = (rnd() % holder.len() as u64) as usize;
+                set.remove(holder[j].0);
+                holder.swap_remove(j);
+            }
+            for &(a, k) in &holder {
+                assert_eq!(set.get(a), Some(&k), "op {i}: name {a} broken");
+            }
+        }
+        let keys: Vec<u64> = set.iter().copied().collect();
+        let asc = keys.windows(2).all(|w| w[0] < w[1]);
+        let desc = keys.windows(2).all(|w| w[0] > w[1]);
+        assert!(asc || desc, "order broken after the flip(s)");
+        assert_eq!(keys.len(), holder.len());
+    }
+
+    ///appends stay dense — cap tracks n, no cadence holes; a mid insert
+    ///into the full mask turns, and the follow-up mid insert lands in a
+    ///turn-minted hole — no second turn
+    #[test]
+    fn appends_dense_mid_insert_turns() {
+        let mut set = BlockSet::<u64, u8>::new();
         let mut d = Deltas::new();
         for k in (0..100u64).map(|i| i * 2) {
             set.insert(k, &mut d).unwrap();
             d.clear();
         }
         assert!(set.cap() < 128, "cap {} — turned instead of pushing back", set.cap());
-        //interior holes at the cadence: a mid-block probe finds one within
-        //u8's BIT_WIDTH budget
-        let tail_run = set.cap() - set.mask.last_set().unwrap() - 1;
-        let holes = set.cap() - set.len();
-        assert!(holes > 1, "{holes} holes — cadence consumed");
-        assert!(tail_run < 8, "trailing run {tail_run} ate the cadence");
-        let before = set.cap();
+        assert_eq!(set.cap() - set.len(), 0, "appends left holes");
         set.insert(101, &mut d).unwrap();
-        assert_eq!(set.cap(), before, "middle insert turned");
-        assert!(d.iter().count() <= 8, "cascaded past budget");
+        d.clear();
+        assert_eq!(set.cap(), 200, "mid insert into full mask must turn");
+        set.insert(103, &mut d).unwrap();
+        d.clear();
+        assert_eq!(set.cap(), 200, "second mid insert must not turn");
         let keys: Vec<u64> = set.iter().copied().collect();
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted);
-        assert_eq!(set.len(), 101);
+        assert_eq!(set.len(), 102);
     }
 
-    ///reversed block: descending keys push_back at the tail — no front
-    ///slides, cap tracks n (ascending keys hit pos 0 via the ascending test)
+    ///fetch-distance banking: holes 24 slots from the spot fetch 4 (one per
+    ///FREE_STRIDE traveled) and land beside k — the next 3 inserts are
+    ///no-ops. the holder rides the 96-pair chain (4 slides × 24-slot runs)
     #[test]
-    fn prepend_bias_pushes_back_descending() {
-        let mut set = BlockSet::<u64, u8>::with_bias(InsertBias::Prepend);
+    fn gather_banks_holes_by_distance() {
+        let mut set = BlockSet::<u64, u8>::new();
         let mut d = Deltas::new();
-        for k in (0..100u64).rev() {
-            set.insert(k, &mut d).unwrap();
+        let mut holder = Vec::new();
+        for k in (0..=10u64).chain(60..=89) {
+            let a = set.insert(k, &mut d).unwrap();
+            apply(&mut holder, &d);
             d.clear();
+            holder.push((a, k));
         }
-        assert!(set.cap() < 128, "cap {} — grew instead of pushing back", set.cap());
-        let keys: Vec<u64> = set.iter().copied().collect();
-        assert_eq!(keys, (0..100).collect::<Vec<_>>());
+        //the only holes: pos 35..=40, 24 from the spot of key 30
+        for k in 84..=89 {
+            set.remove(set.find(&k).unwrap());
+            holder.retain(|(_, hk)| *hk != k);
+        }
+        let a = set.insert(30, &mut d).unwrap();
+        assert_eq!(d.iter().count(), 96, "4 slides × 24-slot runs");
+        apply(&mut holder, &d);
+        d.clear();
+        holder.push((a, 30));
+        assert_eq!(set.cap(), 41, "gather must not turn");
+        for k in [31, 32, 33] {
+            let a = set.insert(k, &mut d).unwrap();
+            assert_eq!(d.iter().count(), 0, "banked hole should absorb insert {k}");
+            apply(&mut holder, &d);
+            d.clear();
+            holder.push((a, k));
+        }
+        check(&set, &holder, 39);
     }
 
     ///front insert below cap: plain slide, name transfer without any turn —
@@ -729,7 +850,7 @@ mod tests {
     fn rotate_map_preserves_names_and_order() {
         for r in 0..u8::BIT_WIDTH as u32 {
             for o in [0u8, 1, 2, 63, 64, 127, 128, 200, 255] {
-                let old = Translator::<u8> { rotation: r, offset: o };
+                let old = Translator::<u8>::with_params(r, o);
                 let new = old.rotate();
                 let mut prev = None;
                 for p in 0..100usize {
@@ -762,3 +883,5 @@ mod tests {
         assert_eq!(keys, (0..50).collect::<Vec<_>>());
     }
 }
+
+

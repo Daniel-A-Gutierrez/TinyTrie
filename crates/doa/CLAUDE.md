@@ -66,39 +66,67 @@ treeblock, each load-bearing:
   do this: its consumers hold addrs across arbitrary mutations inside a
   tree it can't see, so names are assigned at birth and slides report
   pos-space fixups for the consumer's own structures to apply.
-- **2-knob translator (rotation, offset).** treeblock's shift knob exists to
-  keep spreads fixup-free while address width grows; (offset, rotation)
-  alone provably can't survive width growth + post-rotation adjustment
-  (carries break the rotation) — but sortedblock's
-  address width is FIXED and growth IS the rotation turn (`pos → 2·pos −
-  offset` mod A; offset 0 ⇒ always wrap-free; the new slots mint the idle
-  names rotation leaves between the spaced-out old ones). The 4-knob
-  closure degenerates and 2 knobs close. Offset turns (window moves) are
-  the unimplemented third move; grow reports no-turn while offset ≠ 0.
-- **no walker, no `Fixable`, no anchor discipline.** `try_alloc` = nearest
-  hole either side, one contiguous run slide — a single `ptr::copy` (the
-  source range's bitwise duplicate is uninit-by-mask; the mask is the only
-  init oracle), an O(1) mask update (nearest hole ⇒ the run is fully live,
-  so the mask delta is one set + one clear), one compact event. No
-  run-walk fixup choreography, no ancestry.
-- **Deltas = one compact event.** `enum Delta { NoneSlide{from,to}, Pairs }`
-  — the common contiguous slide records the hole's `from → to` (elements
-  between shift one step toward `from`; `from == to` = no-op direct place);
-  `Deltas::iter` lazily expands to the same swap-cascade pairs (hole-adjacent
-  first) the consumer always saw. `Pairs(Vec)` waits for non-run shapes
-  (reversal, bulk). Recording a slide costs one write; the old per-pair Vec
-  pushes cost 2× the memmove they described (bench_notes).
+- **2-knob translator, fn-ptr per direction (`sortedblock/translator.rs`).**
+  treeblock's shift knob exists to keep spreads fixup-free while address
+  width grows; (offset, rotation) alone provably can't survive width growth
+  + post-rotation adjustment (carries break the rotation) — but sortedblock's
+  address width is FIXED and growth IS the rotation turn (`pos → 2·pos` mod
+  A; the new slots mint the idle names rotation leaves between the
+  spaced-out old ones). The 4-knob closure degenerates and 2 knobs close.
+  direction is a translator knob now: reversed negates the position term
+  (`p2a(p) = (offset − p) ror rotation`), the fn-ptr specialization keeps
+  the negate off the translation path (BTB-predicted indirect call, as in
+  treeblock's translator). Offset turns (window moves) are the
+  unimplemented third move; rotation turns work under ANY offset and
+  either direction now.
+- **no walker, no `Fixable`, no anchor discipline.** `gather_slots` =
+  fetch-distance gather: the nearest hole's distance sets the fetch (one
+  hole per FREE_STRIDE=8 traveled — the further the look, the more Nones
+  banked beside k); within a stride it's one plain slide (a single
+  `ptr::copy`, source's bitwise duplicate uninit-by-mask — the mask is the
+  only init oracle; O(1) mask update: nearest hole ⇒ the run is fully
+  live). farther: `fetch_holes` pre-reads the chain, `compact_gather`
+  applies it as one segment pass — each member crosses exactly once, far
+  segments copy first so no live source is overwritten. No run-walk fixup
+  choreography, no ancestry.
+- **Deltas = one compact event.** `enum Delta { NoneSlide{from,to}, Gather,
+  Pairs }` — the common contiguous slide records the hole's `from → to`
+  (elements between shift one step toward `from`; `from == to` = no-op
+  direct place); a multi-fetch records `Gather(Vec<NoneSlide>)` — the
+  slide chain, nearest hole first, each slide in post-prior-slides
+  coordinates (identical to its pre-read position: a hole's slot is never
+  touched before its own slide; a two-sided gather is two chains' worth,
+  side told by `from > to`). `Deltas::iter` lazily expands to the same
+  swap-cascade pairs (hole-adjacent first) the consumer always saw.
+  `Pairs(Vec)` still waits for non-run shapes (bulk). Recording a slide
+  costs one write; the old per-pair Vec pushes cost 2× the memmove they
+  described (bench_notes).
 - **occupancy = `Mask` (`src/mask.rs`)** — Vec<u64> words, word-at-a-time
   scans (`next_set`/`next_clear`/`prev_clear`/`nearest_clear`; the find
-  ladder's primitives) + `spread_double` (the rotation turn's mask half:
-  bit p → bit 2p via 5-op interleave). bitvec was dropped — miri-unclean
-  (integer-to-ptr provenance in its own internals), and the word form is
-  what makes the scans fast anyway.
+  ladder's primitives), `rotate_mask` (the turn's mask half: interleave +
+  one band ripple — upper-half names land odd; the reversed band ripples
+  DOWN over the suffix `(offset, cap)` and can cross word boundaries, so
+  the fall carries word by word) + `reverse` (the reversal's mirror).
+  bitvec was dropped — miri-unclean (integer-to-ptr provenance in its own
+  internals), and the word form is what makes the scans fast anyway.
+- **reversal = two mirrors + a negated translator, zero deltas.** the
+  array mirrors (`data.reverse` + `mask.reverse`), the translator
+  re-parameterizes (`p2a_new(p) = p2a_old(cap−1−p)` — exactly `offset →
+  cap−1−offset` with the direction flipped), names follow the mirrored
+  slots BY CONSTRUCTION — a pending deltas event survives the flip
+  untouched (it speaks names; names didn't change). trigger:
+  mean insert position (`pos_sum/len`, doubling at turns, reflecting at
+  flips) below len/8 past a 4·stride warmup — the all-time doubled sum
+  is an intentional estimator (each doubling era votes once: biases
+  develop early, stickier later). at len/4 a uniform stream flips 4×
+  spuriously (bench_notes); a real front stream's mean sits ≈ 0 either
+  way. see subtle_bugs §20 for the reversal turn's band + the
+  `offset < cap` rule offset turns must respect.
 
 Deferred: the `try_alloc`/`try_insert` split + arena-level occupancy
 decisions (`insert`'s ladder owns the in-block heuristics now), offset
-turns (mask + data halves both ready — `rotate_mask` + the
-translator-composed turn), `from_vec`, convenience getters. Benchmarks
+turns (window moves — mask + data halves both handle any offset; the move
+op itself remains), `from_vec`, convenience getters. Benchmarks
 and phase breakdown in `notes/bench_notes.md`.
 
 
@@ -152,7 +180,8 @@ substrate:
 - `mask.rs` — dense occupancy bitmap (see the sortedblock section).
 - `translator.rs` — the 4-knob treeblock translator, fn-ptr-specialized over
   zero/nonzero params; the one hard rule is position order (pos 0 = min, pos
-  len−1 = max). sortedblock carries its own 2-knob translator internally.
+  len−1 = max). sortedblock's 2-knob translator lives in its own module (see
+  `sortedblock/translator.rs`).
 
 consumers:
 - `treeblock/` — ALL the tree machinery: `blocks` (Block + BlockTrait/
@@ -165,11 +194,12 @@ consumers:
 - `sortedblock/` — the set tier: `mod.rs` (contract), `store.rs` (COPY of
   treeblock's store evolving the pairs feedback protocol — `open_slot`
   emits swap-cascade `(from, to)` pairs; gather/bulk still plan-returning),
-  `sortedblock.rs` (`BlockSet` + `Deltas` + the 2-knob translator + the
-  unified space ladder — live; Prepend blocks are Direction-reversed).
+  `translator.rs` (the 2-knob translator, fn-ptr per direction + the
+  reversal/turn maps), `sortedblock.rs` (`BlockSet` + `Deltas` + the
+  fetch-gather ladder + the reversal trigger).
 - `benches/` — `sorted_find_slot.rs` (mask find vs store scan),
-  `sorted_insert.rs` (append/prepend/random × unbiased/biased, 32-byte
-  items; findings + phase breakdown in `notes/bench_notes.md`).
+  `sorted_insert.rs` (append/prepend/random, 32-byte items; findings +
+  phase breakdown in `notes/bench_notes.md`).
 
 notes: `devlog.md` (design log), `subtle_bugs.md` (solved nuances + their
 rules), `bench_notes.md`.
@@ -192,21 +222,27 @@ re-enable after porting) — reference-model torture + exhaustive slide/find/
 find-2 matrices for both backends, spread/split/pop coverage, drop accounting,
 contract panics. `block.rs` stays unwired (pre-refactor API — needs adaptation).
 
-sortedblock is inline `#[cfg(test)]`: mask (exhaustive next_set/next_clear/
-prev_clear/prev_set/nearest_clear vs naive comparison at every start
-position; `rotate_mask` vs the naive `2p + [ramp ≥ midpoint]` model at
-every offset — prefix/suffix/whole/empty bands; word edges) + BlockSet
-(ascending/descending/stride torture under all three biases with a holder
-mirror applying translated deltas — every name still resolves to its key;
-`rotate_map` property test — name-stable, monotone, in-bounds for every
-reachable translator incl. offsets grow_rotate refuses; front-insert
-back-open cascade; pending-deltas panic; dup rejection; remove/reinsert;
-NoneSlide expansion).
+sortedblock is inline `#[cfg(test)]`: mask (exhaustive scans vs naive
+comparison at every start position; `rotate_mask` vs naive models at every
+offset — forward prefix/suffix/whole/empty bands, reversed down-band with
+word-edge sweeps; `reverse` mirrors + double-reversal identity) +
+translator (`names_survive_reversal_and_turns`: round-trips, the
+name-mirror, double-reversal identity, and the reversed turn map
+`q = 2p − [name ∈ upper half]` — name-stable, monotone, descend-safe —
+over every reachable (rotation, offset<cap)) + BlockSet
+(ascending/descending/stride torture with a holder mirror applying
+translated deltas; `mixed_ops_torture` — clustered + descending-bait
+streams with random removals, every holder name verified every op, order
+valid in either direction post-flip; the reversal fires in `descending`;
+gather banking by distance; front-insert cascades; pending-deltas panic;
+dup rejection; remove/reinsert; NoneSlide expansion).
 
 Run targeted: `cargo test -p doa --lib sortedblock` / `mask` /
 `treeblock::tests::walker::tests`; uninit/leaks: `cargo +nightly miri test -p
 doa --lib <filter>` (slow — recompiles + interprets; sortedblock is
-miri-eligible now that bitvec is gone, not yet run).
+miri-CLEAN — run via the miri driver directly on this nightly: cargo-miri
+drops a path segment resolving the workspace and fails to launch its
+compiled test binary, see devlog).
 ⚠ Running the full `cargo test` in this crate has crashed the IDE out of memory in
 the past — run targeted tests.
 
@@ -386,21 +422,63 @@ ladder (one commit at this session's end):
   into Asc) 692 — irreducible, the fix is Direction. ladder + findings in
   bench_notes.
 
+Fifth session (2026-10-13) — fetch-gather + the reversal tier (one commit
+at this session's end):
+- **the unified ladder died for fetch-distance**: `FREE_STRIDE = 8` replaces
+  budget; no cadence holes (push_back dense), no 80%/⅔/4·budget turn
+  rungs. `open` = preemptive turn past 7/8 when the insert sits >
+  FREE_STRIDE from the edge (devlog line 199's rule) → `gather_slots` →
+  mask-full: one tail push within FREE_STRIDE of the edge, else turn /
+  refused tail slot. the whole prior ladder's probe/back-open/turn-rungs
+  are gone.
+- **`Delta::Gather(Vec<NoneSlide>)`**: multi-fetch chains as a Vec of
+  hole-journeys, lazily expanded to the same cascades holders always saw;
+  the single-slide fast path stays the alloc-free `NoneSlide`.
+- **reversal tier**: `sortedblock/translator.rs` extracted (fn-ptr per
+  direction — the negate never touches the translation path);
+  `BlockSet::reverse` = data+mask mirror + `offset → cap−1−offset` +
+  pos_sum reflection, ZERO deltas (names follow the mirrored slots —
+  pending events survive). trigger `pos_sum·8 < len²` past a 4·stride
+  warmup (len/4 flipped pure-random 4×; len/8 costs a real front stream
+  nothing — its mean sits ≈ 0). `Direction`/`InsertBias` died; the block
+  reads direction off the translator.
+- **turns under ANY offset + reversal** (the `offset ≠ 0` refusal deleted):
+  the reversed turn's band is the pos-suffix `(offset, cap)` landing
+  `2p−1` — a DOWN-ripple, which crosses word boundaries (bit-0 element
+  falls to the word below's bit 63; the fall carries word by word).
+  `rotate_mask(offset, midpoint, reversed)`. reversed blocks turn again —
+  a flip is no longer a degenerate tail-push trap. the reversed turn
+  requires `offset < cap` (name 0's slot — holds in every reachable
+  state; offset turns must respect it): subtle_bugs §20.
+- **position/bsearch**: direction dispatch outside the loop, monomorphized
+  comparator per arm — no order branch in the hot loop.
+- bench (32B, 10k, best): append 8.5, prepend 8.5 (692 wrong-direction →
+  74 gather-banked → 8.5 flipped), random 99 ≈ parity with the old
+  ladder on the same machine-day. phase table + the chained-gather
+  quadratic (1704) in bench_notes. miri-clean via the driver.
+- fresh-review: no correctness bugs; promoted the mixed-op randomized
+  torture inline, fixed doc drift (Gather coordinates frame, descending
+  comment, mod.rs invariant line), wrapping-mul hygiene in the trigger,
+  deleted the dead `back` field.
+
 
 ## Future Work
 
 - sortedblock: `try_insert`/`try_alloc` split + arena-level occupancy
-  decisions; ladder threshold tuning (the 80% / ⅔ / 4·budget constants are
-  unbenchmarked knobs); holder-applying bench variant — the cascade savings
-  (turns are zero-churn) aren't measured by a deltas-clearing bench.
-- sortedblock: clustered streams below the ⅔ floor still slide wide
-  (accepted: space over slides); a miss-streak counter is the state-ful
-  alternative if it ever bites.
-- sortedblock: offset turns (window moves — mask + data halves ready;
-  remaining: the move op itself + `grow_rotate`'s offset ≠ 0 refusal),
-  mixed-side/multi-event deltas (`Delta::Pairs` awaits reversal/bulk),
+  decisions; threshold tuning (FREE_STRIDE, the 7/8 turn line, the len/8
+  reversal trigger are unbenchmarked knobs); holder-applying bench variant
+  — the cascade savings (turns/flips are zero-churn) aren't measured by a
+  deltas-clearing bench.
+- sortedblock: the 7/8 preemptive turn fires before checking whether the
+  spot is already open — delete-max + reinsert-max pays a full turn for a
+  free slot (report-only finding; a nearest-hole-within-stride guard is
+  the candidate, unbenched).
+- sortedblock: offset turns (window moves — mask + data halves handle any
+  offset now; the move op remains, and it must respect `offset < cap` or
+  generalize the reversed band — subtle_bugs §20),
+  mixed-side/multi-event deltas (`Delta::Pairs` awaits bulk),
   `from_vec`, convenience getters.
-- sortedblock: miri run (eligible now), find-bench density sweep (90–97%),
+- sortedblock: find-bench density sweep (90–97%),
   pairs-based bulk open in store.rs (gather → pairs).
 - fixup walk-back usage (§4b remainder) — ascend-by-old-value for
   parent-field walkers, over `set_parent`'s `Some(old)` return (in place,

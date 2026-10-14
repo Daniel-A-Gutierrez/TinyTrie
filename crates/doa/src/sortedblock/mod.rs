@@ -9,8 +9,8 @@
 //! get(addr) -> &key
 //! ```
 //!
-//!invariants: pos order == key order — normal (pos 0 = min) or reversed
-//!(pos 0 = max, Prepend bias); addrs are stable names across grows
+//!invariants: pos order == key order — pos 0 = min (Asc) or max (Desc,
+//!the reversal tier's flip); addrs are stable names across grows
 //!(translator absorbs) — slides/gathers rename them, reported as pairs
 //!ordered so a holder can apply `swap(from, to)` in sequence (the
 //!hole-adjacent pair first, then the cascade). `store` records `(Pos, Pos)`
@@ -18,3 +18,4 @@
 
 pub mod sortedblock;
 pub mod store;
+pub mod translator;

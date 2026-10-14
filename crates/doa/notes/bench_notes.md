@@ -114,3 +114,46 @@ names, no zero-churn growth, no flat serializable array.
 `benches/sorted_find_slot.rs`: occupancy-mask find vs `VecStore` slot scan
 — mask 1.28× (budget 16) / 1.45× (budget 320) at 80% occupancy, 320 slots.
 density sweep at 90–97% still unwritten.
+## fetch-gather + reversal tier (2026-10-13, session 5; 32B items, 10k keys, best-of-10)
+
+same harness, same machine-day as the ladder rework. the ladder's cadence/
+budget rungs died for `gather_slots` (fetch = 1 hole per FREE_STRIDE=8 of
+distance to the nearest hole, one-pass segment compaction) + a preemptive
+7/8 turn (insert > stride from the edge) + `Delta::Gather(Vec<NoneSlide>)`
+chained cascade; then the reversal tier (translator fn-ptr per direction,
+`reverse()` mirror, pos_sum trigger at len/8 past a 32 warmup).
+
+| workload | old ladder | chained gather | one-pass | + 7/8 turn | + reversal |
+|---|---|---|---|---|---|
+| append | 10.5 | — | — | 7.6 | 8.5 |
+| prepend | 10.3* | — | — | — | 74 → **8.5** |
+| random | 93.5 | 1704 | 153 | 98 → 93.5 | 99 |
+
+*prepend's old 10.3 rode the Desc bias (tail pushes); the comparable
+wrong-direction number was 692–705.
+
+- chained per-slide application was quadratic in fetch distance (random
+  1704): each of the w slides re-copied the whole run. the one-pass
+  segment compaction (each member crosses once, far segments first)
+  fixed the mechanism, not the policy.
+- the 7/8 preemptive turn is the devlog line-199 rule: without it density
+  runs to mask-full and fetches blow past the stride late in each fill
+  cycle (random 153 → 98). 80% vs 7/8 measured identical — the line is
+  not sensitive there.
+- `want = 1` fast path (hole within a stride, no Vec) recovered ~4ns on
+  random (every mid insert was heap-allocating the hole list); banking
+  itself costs ~2ns there — a workload that can't use the bank.
+- the reversal trigger at len/4 flipped a pure uniform stream 4× (first
+  at len 9 — the warmup window is noise, and each flip's era-vote echoed
+  larger). each flip was expensive only because flipped blocks couldn't
+  turn (offset ≠ 0 refusal, since deleted); random degraded to wide
+  tail-hole slides (822). at len/8 + warmup 32: random flips 0, descending
+  flips exactly 1, and post-flip turning is healthy (cap 10039 on 10k
+  descending, not the degenerate push-per-insert growth).
+- fn-ptr p2a/a2p + the trigger check cost ~1ns on the append hot path
+  (7.6 → 8.5, part noise) — the BTB-predicted indirect call, as in
+  treeblock's translator.
+- unresolved (report-only): the 7/8 turn fires before checking whether
+  the spot is already open — delete-max + reinsert-max pays a full turn
+  for a free slot. a nearest-hole-within-stride guard is the candidate;
+  unbenched.

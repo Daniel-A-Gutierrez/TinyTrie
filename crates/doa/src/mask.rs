@@ -172,18 +172,24 @@ impl Mask {
         })
     }
 
-    ///the rotation turn's mask half: bit p → 2·p, +1 over the wrap band —
-    ///the pos whose name-space ramp (p − offset) mod 2·midpoint sits in
-    ///the upper half. the plain interleave opens a hole after every
-    ///element; the band's ripple shifts its target range up one, so the
-    ///band's low junction consumes that hole (the addr MAX|MIN pair —
-    ///prefix, offset ≤ midpoint) or doubles it (suffix). at most one wrap
-    ///event falls inside a range capped at midpoint, so the band is one
-    ///prefix or suffix. the ripple never crosses a word boundary (even
-    ///bit → adjacent odd bit), so each word shifts independently.
-    ///panics if bits > midpoint. set bits are preserved; the word count
-    ///stays exact for the doubled range.
-    pub fn rotate_mask(&mut self, offset: usize, midpoint: usize) {
+    ///the rotation turn's mask half: bit p → 2·p ± the band ripple. the
+    ///band = positions whose names sit in the upper half of the name space
+    ///— they land odd (2·p+1 forward, 2·p−1 reversed); everything else
+    ///lands even. forward ramp `(p − offset) mod 2·midpoint` wraps at
+    ///p = offset: at most one junction falls inside the range, so the band
+    ///is one prefix (offset ≤ midpoint: ripple `[0, 2·min(offset,cap))`
+    ///up), one suffix (offset > midpoint: `[2·(offset−midpoint), 2·cap)`
+    ///up), whole-range, or empty. reversed ramp `offset − p` wraps at
+    ///p = offset the other way: the upper half is the suffix `(offset,
+    ///cap)` (offset < cap ≤ midpoint in every reachable state) — ripple
+    ///`[2·offset+1, 2·cap)` DOWN.
+    ///the up-ripple never crosses a word boundary (even bit → adjacent
+    ///odd bit); the down-ripple does — a word's bit-0 element lands on the
+    ///word below's bit 63 — so the fall carries word by word.
+    ///panics if bits > midpoint (or, reversed, offset ≥ midpoint). set
+    ///bits are preserved; the word count stays exact for the doubled
+    ///range.
+    pub fn rotate_mask(&mut self, offset: usize, midpoint: usize, reversed: bool) {
         assert!(self.bits <= midpoint, "bits {} > midpoint {midpoint}", self.bits);
         let old_words = self.words.len();
         let cap = self.bits;
@@ -195,14 +201,17 @@ impl Mask {
             self.words[i * 2 + 1] = spread((w >> 32) as u32);
         }
         self.words.truncate((self.bits + 63) / 64);
-        //band target range: prefix [0, min(offset, cap)) lands odd, or
-        //suffix [offset − midpoint, cap) when the window sits past midpoint
-        let (lo, hi) = if offset <= midpoint {
-            (0, offset.min(cap) * 2)
+        //band target range + shift direction
+        let (lo, hi, down) = if reversed {
+            assert!(offset < midpoint, "reversed offset {offset} ≥ midpoint {midpoint}");
+            (offset * 2 + 1, cap * 2, true)
+        } else if offset <= midpoint {
+            (0, offset.min(cap) * 2, false)
         } else {
             match offset - midpoint {
-                s if s < cap => (s * 2, cap * 2),
-                _ => (1, 0), //band beyond the range — plain interleave
+                //band beyond the range — plain interleave
+                s if s < cap => (s * 2, cap * 2, false),
+                _ => (1, 0, false),
             }
         };
         if lo >= hi {
@@ -210,7 +219,9 @@ impl Mask {
         }
         let wlo = lo >> 6;
         let whi = (hi - 1) >> 6;
-        for wi in wlo..=whi {
+        //down: the word above's bit-0 element falls onto this word's bit 63
+        let mut fall = 0u64;
+        for wi in (wlo..=whi).rev() {
             let low = if wi == wlo { lo & 63 } else { 0 };
             let high = if wi == whi { ((hi - 1) & 63) + 1 } else { 64 };
             let rmask = if high == 64 {
@@ -219,7 +230,37 @@ impl Mask {
                 ((1u64 << (high - low)) - 1) << low
             };
             let w = self.words[wi];
-            self.words[wi] = (w & rmask) << 1 & rmask | w & !rmask;
+            let ripple = if down {
+                (w & rmask) >> 1 & rmask
+            } else {
+                (w & rmask) << 1 & rmask
+            };
+            let mut nw = ripple | w & !rmask;
+            if fall != 0 {
+                nw |= 1 << 63;
+            }
+            self.words[wi] = nw;
+            fall = if down { w & rmask & 1 } else { 0 };
+        }
+    }
+
+    ///bit p ⇔ old bit bits−1−p (the array-reversal half of a block
+    ///reversal; same set, mirrored order)
+    pub fn reverse(&mut self) {
+        self.words.reverse();
+        for w in &mut self.words {
+            *w = w.reverse_bits();
+        }
+        //the old tail word's zero padding flipped into the low bits — shift
+        //the array back down
+        let slack = (64 - self.bits % 64) % 64;
+        if slack != 0 {
+            let mut below = 0;
+            for w in self.words.iter_mut().rev() {
+                let cur = *w;
+                *w = (cur >> slack) | (below << (64 - slack));
+                below = cur & ((1 << slack) - 1);
+            }
         }
     }
 
@@ -332,9 +373,32 @@ mod tests {
     }
 
     #[test]
+    fn reverse_mirrors_bits() {
+        for (bits, set) in [
+            (0usize, &[][..]),
+            (1, &[0][..]),
+            (7, &[0, 6][..]),
+            (64, &[0, 63][..]),
+            (100, &[0, 1, 50, 99][..]),
+            (128, &[64, 127][..]),
+            (200, &[0, 63, 64, 65, 199][..]),
+        ] {
+            let mut m = mask_ones(bits, set);
+            m.reverse();
+            let mut naive: Vec<usize> = set.iter().map(|p| bits - 1 - p).collect();
+            naive.sort_unstable();
+            assert_eq!(m.iter_set().collect::<Vec<_>>(), naive, "bits {bits}");
+            assert_eq!(m.count(), set.len());
+            //double reversal = identity
+            m.reverse();
+            assert_eq!(m.iter_set().collect::<Vec<_>>(), set, "bits {bits} twice");
+        }
+    }
+
+    #[test]
     fn rotate_mask_plain_doubles() {
         let mut m = mask_ones(100, &[0, 1, 63, 64, 99]);
-        m.rotate_mask(0, 128);
+        m.rotate_mask(0, 128, false);
         assert_eq!(m.bits(), 200);
         assert_eq!(m.iter_set().collect::<Vec<_>>(), vec![0, 2, 126, 128, 198]);
         assert_eq!(m.count(), 5);
@@ -343,7 +407,7 @@ mod tests {
         //non-word-multiple range keeps words_for exact
         assert_eq!(m.words.len(), (200 + 63) / 64);
         let mut m = mask_ones(65, &[64]);
-        m.rotate_mask(0, 128);
+        m.rotate_mask(0, 128, false);
         assert_eq!(m.bits(), 130);
         assert_eq!(m.iter_set().collect::<Vec<_>>(), vec![128]);
         assert_eq!(m.words.len(), (130 + 63) / 64);
@@ -362,7 +426,7 @@ mod tests {
         let (mid, space) = (128usize, 256usize);
         for offset in 0..=255 {
             let mut m = mask_ones(bits, &set);
-            m.rotate_mask(offset, mid);
+            m.rotate_mask(offset, mid, false);
             let mut naive: Vec<usize> = set
                 .iter()
                 .map(|&p| 2 * p + usize::from((p + space - offset) % space >= mid))
@@ -371,6 +435,38 @@ mod tests {
             assert_eq!(m.iter_set().collect::<Vec<_>>(), naive, "offset {offset}");
             assert_eq!(m.count(), set.len(), "offset {offset}");
             assert_eq!(m.bits(), 2 * bits, "offset {offset}");
+        }
+    }
+
+    ///reversed turn: bit p → 2p − [name ∈ upper half] — the upper-half
+    ///names form the suffix past the wrap point (a2p(0) = offset), landing
+    ///one slot DOWN. the down-ripple crosses word boundaries (a word's
+    ///bit-0 element falls to the word below's bit 63), so word-edge cases
+    ///get their own sweep. offset < bits ≤ midpoint in every reachable
+    ///reversed state
+    #[test]
+    fn rotate_mask_reversed_matches_naive() {
+        let (mid, space) = (128usize, 256usize);
+        for bits in [1usize, 7, 64, 100, 128] {
+            let mut set: Vec<usize> = (0..bits).filter(|p| (p * 31 + 7) % 10 < 7).collect();
+            set.extend([0, 1, 62, 63, 64, 65, bits - 1].into_iter().filter(|p| *p < bits));
+            set.sort_unstable();
+            set.dedup();
+            for offset in 0..mid {
+                let mut m = mask_ones(bits, &set);
+                m.rotate_mask(offset, mid, true);
+                let mut naive: Vec<usize> = set
+                    .iter()
+                    .map(|&p| {
+                        let upper = (offset + space - p) % space >= mid;
+                        2 * p - usize::from(upper)
+                    })
+                    .collect();
+                naive.sort_unstable();
+                assert_eq!(m.iter_set().collect::<Vec<_>>(), naive, "bits {bits} off {offset}");
+                assert_eq!(m.count(), set.len(), "bits {bits} off {offset}");
+                assert_eq!(m.bits(), 2 * bits, "bits {bits} off {offset}");
+            }
         }
     }
 }

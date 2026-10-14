@@ -1,11 +1,12 @@
 //!1:1 vs `std::collections::BTreeSet` by workload: sequential append
 //!(ascending keys), sequential prepend (descending), random
 //!(xorshift-shuffled) — 10k 32-byte items (index-sized payload — element
-//!moves pay realistic byte costs), insert + lookup, BlockSet with its
-//!matching bias against BTreeSet. len + strict order gated before a run
+//!moves pay realistic byte costs), insert + lookup, BlockSet against
+//!BTreeSet (prepend measures the wrong-direction cost into an Asc block —
+//!the reversal tier's baseline). len + strict order gated before a run
 //!counts.
 
-use doa::sortedblock::sortedblock::{BlockSet, Deltas, InsertBias};
+use doa::sortedblock::sortedblock::{BlockSet, Deltas};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::hint::black_box;
@@ -67,10 +68,10 @@ fn check_order(keys: impl Iterator<Item = u64>) {
 }
 
 ///insert all keys, best/avg ns per insert
-fn insert_block(keys: &[u64], bias: InsertBias) -> (f64, f64) {
+fn insert_block(keys: &[u64]) -> (f64, f64) {
     let (mut best, mut sum) = (f64::MAX, 0.0);
     for _ in 0..RUNS {
-        let mut set = BlockSet::<Item, u16>::with_bias(bias);
+        let mut set = BlockSet::<Item, u16>::new();
         let mut deltas = Deltas::new();
         let t = Instant::now();
         for &k in keys {
@@ -107,8 +108,8 @@ fn insert_btree(keys: &[u64]) -> (f64, f64) {
 }
 
 ///probe every key (shuffled probe order), best/avg ns per lookup
-fn lookup_block(keys: &[u64], bias: InsertBias, probes: &[u64]) -> (f64, f64) {
-    let mut set = BlockSet::<Item, u16>::with_bias(bias);
+fn lookup_block(keys: &[u64], probes: &[u64]) -> (f64, f64) {
+    let mut set = BlockSet::<Item, u16>::new();
     let mut deltas = Deltas::new();
     for &k in keys {
         set.insert(Item::new(k), &mut deltas).unwrap();
@@ -147,15 +148,15 @@ fn lookup_btree(keys: &[u64], probes: &[u64]) -> (f64, f64) {
 
 fn main() {
     let probes = shuffled();
-    let workloads: [(&str, Vec<u64>, InsertBias); 3] = [
-        ("append", (0..N as u64).collect(), InsertBias::Append),
-        ("prepend", (0..N as u64).rev().collect(), InsertBias::Prepend),
-        ("random", shuffled(), InsertBias::Insert),
+    let workloads: [(&str, Vec<u64>); 3] = [
+        ("append", (0..N as u64).collect()),
+        ("prepend", (0..N as u64).rev().collect()),
+        ("random", shuffled()),
     ];
-    for (name, keys, bias) in &workloads {
-        let (bi, ba) = insert_block(keys, *bias);
+    for (name, keys) in &workloads {
+        let (bi, ba) = insert_block(keys);
         let (ti, ta) = insert_btree(keys);
-        let (bl, bla) = lookup_block(keys, *bias, &probes);
+        let (bl, bla) = lookup_block(keys, &probes);
         let (tl, tla) = lookup_btree(keys, &probes);
         println!(
             "{name:>8}: insert BlockSet {bi:7.1} (avg {ba:6.1}) BTreeSet {ti:7.1} (avg {ta:6.1}) \

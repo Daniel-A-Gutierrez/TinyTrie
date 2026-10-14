@@ -2,6 +2,244 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Fetch Quantity Is proportional to distance, now for reverse
+ok the 'fetch 1 extra per budget length searched' 
+
+[1,2,3,4,5] -> [5,4,3,2,1] without issuing any deltas. 
+the translator needs to know things are reversed and it has to get a new offset. 
+subsequent pushes will make it 
+[5,4,3,2,1,0,255,254,253]
+our formula went from 
+
+p2a(x) = ( x + offset ) rol 1 
+to
+p2a(x) = ( offset - x ) rol 1 
+where offset went from 1 to 5. 
+
+the treeblock's translator uses a function pointer specialization trick to optimize away the cost of unused parameters - we can do the same thing here to avoid incurring an extra instruction on each translation negating x or not.
+translator of course stores the bool 'reversed' but it doesnt use it in translation, only when choosing a specialized function.
+
+make a new rust module for the translator and implement this.
+the reversed field goes from block to translator, the block can just use translator.reversed() to query it and translator.reverse() to toggle it. 
+
+meanwhile block.place keeps a running sum of all the slot positions we insert at. 
+when we grow and rotate, it doubles. 
+when we reverse, it reflects around len. 
+if it falls below 1/4 len once len > budget, we reverse. 
+# Adaptive block there, transitions now
+
+All the data is shared but behavior branches on bias - maybe i can call it mode? 
+The AI is biased towards a single implementation, likely because of the modifications we'd have to make to the tests.
+I'll move those to another module and link them like the other files in the crate, and comment them out until theyre needed.
+
+Right now 'open' is way overloaded - its doing several jobs at once
+    - find a slot using the mask
+    - open a slot at the back if its near that
+    - make space if none can be found via rotation
+its also infallible.
+
+The flow should be 
+insert
+    - basic checks
+    - try insert 
+    - if successful return, otherwise...
+    - look at heuristics to determine which adaptation is appropriate,
+    - apply it and try again
+
+meanwhile the arena wont use pub insert, itll use try_insert.
+try insert should guarantee no mutation on failure. 
+
+also is the unsafe in try_alloc necessary? Id think slice.copy_overlapping would be fine, if theres some efficiency gain to be had tho idc.
+
+grow_rotate should return an error not a bool, clearer. also the comment should explicitly state that it errors when there isnt enough address space to create
+an equal number of free slots next to filled ones. 
+
+i think push back would be simpler if the hole check was just spot & (bit_width-1)
+
+regarding the actual single block allocation strategy : 
+
+sequential mode : 
+random insert pattern : none found within budget, new item position isnt withing budget/2 of an end
+reverse insert pattern : none found within budget, spot isnt within first budget/2 elements.
+
+or maybe budget when len > budget * 2 , otherwise budget / 2 
+maybe we want biases to develop aggressively early on and become harder to change as the block grows.
+
+so the dials we can read
+insert position
+block fill
+
+the levers we can pull
+switch mode
+balance - distribute items evenly over occupancy*2 slots
+
+mode features?
+random : 
+    grow and rotate at 80% fill
+sequential 
+    insert a blank item every BUDGET'th append
+reversed 
+    position and iter behave differently
+
+since we cant split theres no point in trying to handle middle sequential inserts, theres nothing to be done... or is there? 
+what if we move free space there? 
+
+# BlockBlock
+actually, another idea.
+i previously thought to make an arena of 256 item blocks, where each block had its own bias, and items could be bumped from one to another, or they could split etc.
+The arena could form a tree of blocks for fastish lookup. 
+
+What if i do that but over regions of a 'superblock'. 
+blockblock stores an array of 'biases', one per 256 element region.
+ok this is basically becoming the arena though so idk the benefit over just ... having them be separate allocations. 
+lets defer this
+
+## Ok then simple-ish adaptation
+
+follow the insert flow from earlier, here's our heuristics for when try_insert fails
+
+1. is the position of the item near either end?
+2. is the block's occupancy high or low for the current strategy? 
+
+since adaptation only occurs when try_alloc doesnt find a space within budget - including one AT len (grow back effectively)
+it cant occur until we have at least budget items, and we cant go sequential->random until we have at least 2*budget items. 
+
+actually maybe this is a good example of a 'sliding scale' we can use instead of a hard bias - a none-stride
+start high, on middle inserts it dips down from BUDGET(8) to 4 to 2 to 1. 
+
+we could measure the distances from the prior insertion points as data collection instead of just 'near end or near start'.
+or we could measure the actual consumption of the slots we're leaving. 
+
+## Batched insert? 
+
+keep a WAL of say, BUDGET elements - a queue that we insert them into before dumping them into the block when the queue fills up. 
+Any query checks the WAL before hitting the block. When the WAL fills up we sort it and batch insert.
+We can do heuristics on the data as its batch inserted. 
+
+check - 
+is the WAL presorted?
+is it reverse sorted?
+
+if we batch binary search where each item would go in the block, how many unique locations do we get? 
+how many items are stacked on a single location? 
+
+Reverse and None Stride basically comprise our strategy. We also know our occupancy (total slots, occupied slots).
+
+None stride should increase when we're inserting in the middle as often as we're making space there.
+failing to find space in the middle might mean we should decrease it (more open slots from appending) or grow_rotate. 
+
+I guess reverse is favorable when on average we're inserting more at the front of the array than at the back. 
+if place keeps a running total of (spot) we've inserted, we can easily amortize the cost of computing the mean insert position of an item in the block. 
+If its significantly biased towards the front, we should reverse it.
+
+We can also look at the average distance we have to look for a found slot - the average length of a slide we're performing. 
+greater than 1 i think is a red flag. 
+if appends are effectively 0 , and say we're inserting once every BUDGET=none-stride in the middle, then we get an average of 1. 
+Thats ideal then, but higher means we're mostly doing middle inserts and looking too far for an open slot. 
+
+Even if the items are say, distributed in 4 clusters within the block, the WAL hack wouldnt catch that but this method would.
+
+the WAL hack WOULD tell us exactly where to put free space though, or where to split. 
+
+## Balance
+
+basically, take each item and place it at rank*2. deltas is gonna swell up but so be it. maybe the price of using a single block is that it cant handle clusters within itself well, vs an arena. 
+
+## Data gathering
+
+mean slide and mean position do tell us how well our current strategy is performing. 
+the WAL's contents tell us if the data is reversed and or sequential, and could facilitate faster insertion.
+since we have to treat the block as a single cluster (we cant split or bump), we cant do much for middle insertions besides balance or grow and rotate. 
+so how do we decide which? 
+balance when occupancy isnt high enough to warrant a grow and we cant find space locally.
+perhaps we could balance-region? repeatedly grow and rotate'ing due to a middle dense region should leave its surroundings barren right?
+The overall block would be less dense than it should be? 
+
+## Dense regions
+
+a strict series of ascending/descending inserts in the middle of the block, causing it to grow and rotate repeatedly , will leave a occupied pattern similar to a gaussian.
+The middle BUDGET will be dense, then the next budget/2 live items on either side will be 50% occupancy, then the next budget/2 live items will take 2*budget slots on each side, and so on. 
+thats IF we grew and rotated each time we ran out of space in the middle. 
+
+instead if we say, get the nearest budget open slots and move them adjacent to the insert position preemptively, we end up with a doughnut. 
+Then, next time we'll see an even bigger dense region - at least 2*budget right? 
+so we repeat, relocate items to make space for a 2*budget hollow. 
+
+
+## IF we handle dense regions like that...
+grow and rotate could be reserved for genuinely a high occupancy state in the block when we fail to find a slot. 
+
+idk if we still need modes tbh
+knowing if the block is reversed is of course helpful
+
+but if we're willing to just make a hole proportional in size to the dense region around our desired spot, 
+the question becomes - how big before we'd rather just spread the contents of the block? 
+
+maybe once the dense region accounts for say, half the elements in the block? 
+Also maybe we shouldn't leave the dense region around the hole *completely* dense. only half is due to the local sequence if its ascending/descending, the other half would be nice to keep sortof sparse 
+if possible.
+
+i think we fix none stride at budget, use that for push_back and for hollow_region's dense parts. 
+but that makes finding the size of the dense region harder. 
+also any growing and rotating will break up all the dense regions too. 
+maybe thats desireable though. 
+
+we would be able to tell if a insert isnt at the center of a dense region. 
+maybe in that case we can spread out a part of the region. 
+
+Delta definitely needs a variant for `Vec<NoneSlide>`. 
+NoneSlide can take an additional field for how many nones are sliding - 2 adjacent at the same time is half the cost of sliding 1 none twice. 
+
+## Modes/biases mostly fall out
+
+we already insert at the end via push back, 
+find space within budget of the end via grow_back,
+make space when we cant find any at low occupancy via make_hole or balance
+make space when we are at high occupancy via grow_rotate
+reverse when the average insert position is say, < len/4 
+
+so how do we decide between making a hole, balancing a region, balancing the whole block, and grow-rotate? 
+
+maybe like this : 
+none-stride = 8, so we expect an occupancy of 7/8 for an ideal workload.
+if it exceeds say , 15/16, we're hitting random or off-bias insertions. 
+set budget to 16. 
+
+if our insertion pattern is random, 1/2 is a good minimum, 3/4 is getting a bit high, 7/8 is definitely time to grow-rotate.
+only bother though if we expect the space to be used. i guess the only case that doesnt is sequential appends to the end. 
+So if we're not within budget of the end, we consider approaches other than 'append a none and slide it.'
+
+so IF try_insert or try_alloc or find_slot or wahtever fails, we're not at an end.
+
+the lower occupancy is, the more likely it is that we're just in a dense patch. 
+if we're close to the center of it, we should make space here, otherwise, we need space all around. 
+the bigger the dense patch is, the more likely it is that we should do something that affects the whole block. 
+
+## Fetch distance as the heuristic
+
+maybe we dont budget our search, but the further we have to go the more none's we bring. 
+i think thats a simpler approach by far. 
+track average position to know when we should reverse still.
+if we're expecting to find 1 none per budget, then we should grow when occupancy is > 7/8 and our insert wasnt within budget of the end. 
+
+lets set budget at twice none stride.
+if we cant find a slot within budget, we're definitely in a dense region. 
+
+so say we find the closest slot - its 9 spaces away. we have to keep looking until we find another within the next 8, and if we dont then we're looking for 2 more. 
+as for the accumulating slides - once we get the last one, we slide it to the 2nd to last, then slide those 2 together to the 3rd to last, then those 3, etc. 
+
+if find slot becomes 1 directional - only looking to the 'right' then we can tell if the sequence is ascending or descending based on the slots position relative to the dense region. 
+is that useful now though? 
+it makes computing iter from the none slide easier. The last one is a 1 none hop, the second to last is a 2 hop, etc. 
+
+
+
+
+
+
+so whats the threshold? 
+
+
 # Picking back up
 
 from last time : 
@@ -31,7 +269,7 @@ so lets think about what SBlock struct needs.
     enum InsertBias { Append, Prepend, Insert }
     struct Translator <A> { rotation : u8, offset : A }
 
-    
+
 ```
 
 
