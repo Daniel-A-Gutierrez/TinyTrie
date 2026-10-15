@@ -8,33 +8,32 @@
 //!order: pos order == key order — pos 0 = min (Asc) or max (Desc); a
 //!sequential insert at the key extreme is always a physical tail
 //!push_back. the translator carries the direction (see translator.rs).
-///L0028
+///L0022
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
-///nothing). the common contiguous run slide (the hole moves `from → to`;
-///every element strictly between shifts one step toward `from`). `Gather`:
-///a fetch-distance gather's slide chain, nearest hole first, each slide
-///in post-prior-slides coordinates — identical to its pre-read position,
-///since a hole's slot is never touched before its own slide; a two-sided
-///gather is two chains' worth, side told by `from > to`. `Pairs` covers
-///rare non-run shapes (reversal, bulk).
+///nothing)
 enum Delta {
     Empty,
+    ///the common contiguous run slide: the hole moves `from → to`, every
+    ///element strictly between shifts one step toward `from`
     NoneSlide {
         from: Pos,
         to:   Pos,
     },
+    ///a fetch-distance gather's slide chain, nearest hole first, each
+    ///slide in post-prior-slides coordinates — identical to its pre-read
+    ///position (a hole's slot is never touched before its own slide)
     Gather(Vec<NoneSlide>),
+    ///rare non-run shapes (reversal, bulk)
     #[allow(dead_code)]
     Pairs(Vec<(Pos, Pos)>),
 }
-///L0043
+///L0041
 ///expanded `(from, to)` pos pairs of one event, swap-cascade order
-///(hole-adjacent mover first). `Run`: `p` cursor, `step` (−1 = run shifts
-///up), `remaining` emissions; each pair is `(p, p − step)`. `Gather` chains
-///the slides' runs in order (each slide's coordinates are post-prior-slides).
+///(hole-adjacent mover first)
 enum DeltaPairs<'a> {
     Empty,
+    ///one run's cursor: emits `(p, p − step)` per step
     Run { p: usize, step: i64, remaining: usize },
     Gather {
         slides:    std::slice::Iter<'a, NoneSlide>,
@@ -44,18 +43,17 @@ enum DeltaPairs<'a> {
     },
     Pairs(std::slice::Iter<'a, (Pos, Pos)>),
 }
-///L0056
+///L0055
 ///swap-cascade run state of one hole slide `from → to`
 fn run_of(from: usize, to: usize) -> (usize, i64, usize);
-///L0064
+///L0063
 impl Delta {}
-///L0083
+///L0082
 impl Iterator for DeltaPairs<'_> {}
 ///L0117
-///slot moves of one mutation, compact event + translator snapshot at
-///mutation time. `iter` expands to (from_addr, to_addr) name swaps
-///applicable in order. per-call: `insert` panics while the previous call's
-///deltas are pending — apply, then `clear`.
+///slot moves of one mutation + the translator snapshot at mutation time.
+///`iter` expands to (from_addr, to_addr) name swaps applicable in order;
+///`insert` panics while deltas are pending — apply, then `clear`
 pub struct Deltas<A> {
     event:      Delta,
     translator: Translator<A>,
@@ -66,7 +64,14 @@ impl<A: UnsignedNum> Deltas<A> {}
 ///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
 ///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
 const FREE_STRIDE: usize = 8;
-///L0149
+///L0153
+///~L2 residency: the bsearch shape split — cache-resident blocks cmov
+///(probe compares resolve from L1/L2, mispredicts dominate), DRAM-
+///resident blocks speculate (the branchy loop issues the next probe's
+///load ahead of the compare, overlapping the miss). measured both ways
+///at both scales, see bench_notes
+const L2_BYTES: usize = 512 * 1024;
+///L0157
 ///mask covers data.len() slots; bit ⇔ slot initialized.
 pub struct BlockSet<K, A> {
     translator: Translator<A>,
@@ -78,20 +83,19 @@ pub struct BlockSet<K, A> {
     #[allow(dead_code)]
     pos_sum:    u64,
 }
-///L0160
+///L0168
 impl<K, A> Drop for BlockSet<K, A> {}
-///L0169
+///L0177
 impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {}
-///L0589
-///`BlockSet::iter`'s differential — one enum dispatch per element, the
-///per-direction bodies specialized (word-stepping mask iteration)
+///L0677
+///`BlockSet::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K, A> {
     Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
     Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
 }
-///L0594
+///L0682
 impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {}
-///L0608
+///L0696
 #[cfg(test)]
 mod tests {
     use super::*;

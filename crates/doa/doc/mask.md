@@ -13,13 +13,9 @@ pub struct Mask {
 }
 ///L0014
 impl Mask {}
-///L0318
-///`iter_set`'s engine: the current word cached, positions tested in
-///place — the dense common case is a bit test + increment (no tz, no
-///position rebuild); holes advance one bit, whole-empty word tails skip
-///at once. a rotating-bit-mask engine measured slightly WORSE: the shift
-///saved on the test returns on the yield as `pos + tzcnt` (the position
-///no longer is the state) — see bench_notes
+///L0313
+///`iter_set`'s engine — ascending set bits. None-stable (exhaustion
+///zeroes the cached word, subtle_bugs §21)
 pub struct SetBits<'a> {
     words: std::slice::Iter<'a, u64>,
     ///cached current word; 0 past the end
@@ -27,25 +23,23 @@ pub struct SetBits<'a> {
     ///next position to test
     pos:  usize,
 }
-///L0326
+///L0321
 impl Iterator for SetBits<'_> {}
-///L0365
-///`iter_set_rev`'s engine — the descending mirror: positions tested down
-///through the cached word, holes advancing one bit, whole-empty word heads
-///skipping at once. `pos` wraps below 0 into a sentinel once the mask is
-///exhausted
+///L0359
+///`iter_set_rev`'s engine — the descending mirror. None-stable like
+///`SetBits`
 pub struct SetBitsRev<'a> {
     words: std::iter::Rev<std::slice::Iter<'a, u64>>,
     word:  u64,
-    ///next position to test
+    ///next position to test; wraps below 0 as the exhaustion sentinel
     pos:   usize,
 }
-///L0372
+///L0366
 impl Iterator for SetBitsRev<'_> {}
-///L0409
+///L0403
 ///bits of x moved to the even positions of a u64 (p → 2p)
 fn spread(x: u32) -> u64;
-///L0420
+///L0414
 #[cfg(test)]
 mod tests {
     use super::*;

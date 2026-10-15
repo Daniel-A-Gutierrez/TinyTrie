@@ -15,8 +15,7 @@ use std::collections::VecDeque;
 use crate::{Rel, index::*};
 
 ///slide a None `from` -> `to`; caller inserts at `to`. `from==to` => already None.
-///delta: shift each moved item's position by. from>to ⇒ None moves left ⇒ items move
-///right ⇒ +1. from<to ⇒ items move left ⇒ -1. equal ⇒ 0.
+///delta: shift of each moved item. from>to ⇒ items move right ⇒ +1; from<to ⇒ −1; equal ⇒ 0.
 #[derive(Clone, Copy, Debug)]
 pub struct NoneSlide {
     pub from:  Pos,
@@ -43,18 +42,16 @@ pub enum NearestNone {
     NotFound,
 }
 
-///two non-overlapping slides from one `find_2_slots` — both apply independently
-///in either order (disjoint runs). internal plan; no fixup impl (pairs are the
-///feedback here).
+///two non-overlapping slides from one `find_2_slots` — apply
+///independently in either order. internal plan
 #[derive(Clone, Copy, Debug)]
 pub struct DoubleSlide {
     pub a: NoneSlide,
     pub b: NoneSlide,
 }
 
-///one N-None gather: the `holes.len()` Nones at `holes` (sorted, all on `rel`'s
-///side of `anchor`) compact contiguously beside the anchor; every intervening
-///Some crosses the None-run exactly once. internal plan; no fixup impl.
+///one N-None gather: the Nones at `holes` (sorted, all on `rel`'s side
+///of `anchor`) compact contiguously beside the anchor. internal plan
 #[derive(Clone, Debug)]
 pub struct GatherSlide {
     pub anchor: Pos,
@@ -63,9 +60,8 @@ pub struct GatherSlide {
 }
 
 impl GatherSlide {
-    ///the opened slot range, post-gather. After: `[anchor+1, anchor+n]`;
-    ///Before: `[anchor-n, anchor-1]`. the anchor itself never moves (all
-    ///holes are on the open side).
+    ///the opened slot range, post-gather. the anchor never moves (all
+    ///holes are on the open side)
     pub fn slots(&self) -> (Pos, Pos) {
         let n = self.holes.len();
         match self.rel {
@@ -74,11 +70,12 @@ impl GatherSlide {
         }
     }
 
-    ///net shift of the Some at `pos` (0 ⇒ not a member). After: members are
-    ///the Somes in `(anchor, max hole)`, each shifting by the holes above it;
-    ///Before mirrors with the holes below.
+    ///net shift of the Some at `pos` (0 ⇒ not a member)
     pub fn delta(&self, pos: Pos) -> isize {
         match self.rel {
+            //After: members are the Somes in (anchor, max hole), each
+            //shifting by the holes above it; Before mirrors with the
+            //holes below
             Rel::After => {
                 let hi = self.holes.last().expect("gather: no holes");
                 if pos > self.anchor && pos < *hi {
@@ -124,11 +121,9 @@ pub struct DequeStore<T> {
     occupied: usize,
 }
 
-///per-element `(from, to)` pairs for one slide, in swap-cascade order — the
-///hole-adjacent mover first, so a holder applying `swap(from, to)` down the
-///list lands each element in a just-vacated slot. `delta > 0`: items `[lo, hi)`
-///shift right (emit `hi-1` down); `delta < 0`: items `(lo, hi]` shift left
-///(emit `lo+1` up).
+///per-element `(from, to)` pairs for one slide, swap-cascade order —
+///the hole-adjacent mover first, so a holder applying `swap(from, to)`
+///down the list lands each element in a just-vacated slot
 fn record_slide<'a, T, S>(s: &S, ms: NoneSlide, out: &mut Vec<(Pos, Pos)>)
 where
     T: 'a,
@@ -143,6 +138,8 @@ where
             out.push((Pos(p), Pos((p as isize + ms.delta) as usize)));
         }
     };
+    //delta > 0: items [lo, hi) shift right — emit hi-1 down; delta < 0:
+    //items (lo, hi] shift left — emit lo+1 up
     if ms.delta > 0 {
         for p in (lo..hi).rev() {
             push(p);
@@ -177,17 +174,13 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///insert initialized `v` into hole `pos`. panics if the slot is `Some`.
     fn insert(&mut self, pos: Pos, v: T);
 
-    ///slide the None at `from` to `to`; returns `to`. `from==to` => no slide. `pin`, if set, is a
-    ///slot whose element must not move.
-    ///Precondition: `to != pin` (a pinned `to` can't open). Fastpath rotates (memmove) the run;
-    ///the rare pin-in-range, and for the deque a wrap-crossing range, fall back to per-step swaps.
+    ///slide the None at `from` to `to`; returns `to`. `from==to` => no
+    ///slide. panics if `to == pin` (a pinned target can't open)
     fn slide_none(&mut self, ms: NoneSlide, pin: Option<Pos>) -> Pos;
 
-    ///fused find+slide: opens a hole for insert near `pos` on `rel`'s side and
-    ///records every moved element as a `(from, to)` pair into `out` —
-    ///swap-cascade order (see `record_slide`). `None` ⇒ no hole within
-    ///`budget`. the plan-returning finds + raw `slide_none` stay for
-    ///multi-slot choreography.
+    ///fused find+slide: opens a hole for insert near `pos` on `rel`'s
+    ///side, recording every moved element as a `(from, to)` pair into
+    ///`out` (swap-cascade order). None ⇒ no hole within `budget`
     fn open_slot(
         &mut self,
         pos: Pos,
@@ -201,13 +194,12 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         Some(self.slide_none(ms, pin))
     }
 
-    ///Rel-biased: scan the rel side first (forward for After, backward for Before),
-    ///1 read/step sequential, fall to the other side only on exhaustion. `to` is
-    ///adjacent on the inserting side (`pos-1`/`pos+1`) when the None is on the rel
-    ///side, else `pos` (pos elem shifts toward the None). `pin`, if set, is a slot
-    ///the search must not cross: a slide never spans it. `pos==pin` restricts the
-    ///search to the rel side only. pos occupied by contract. Not nearest-None —
-    ///may pick a farther None on the opposite side ⇒ larger slide_none.
+    ///Rel-biased None search: scan the rel side first, fall to the
+    ///other side only on exhaustion. `to` lands adjacent on the
+    ///inserting side. NOT nearest-None — may pick a farther None on
+    ///the opposite side ⇒ larger slide_none. `pin`: a slot the search
+    ///must not cross; `pos==pin` restricts to the rel side; pos
+    ///occupied by contract
     fn find_slot(
         &self,
         pos: Pos,
@@ -216,10 +208,9 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         pin: Option<Pos>,
     ) -> Option<NoneSlide>;
 
-    ///nearest None to `pos` within `budget` (bidirectional outward). `to` is
-    ///adjacent on the inserting side (`pos-1`/`pos+1`, pos unmoved) when the None
-    ///is on that side, else `pos` (pos shifts toward the None). `pin`/`pos==pin` as
-    ///find_slot. Minimizes slide distance; slower than find_slot (two-stream scan).
+    ///nearest None to `pos` within `budget` (bidirectional outward) —
+    ///minimizes slide distance; slower than `find_slot` (two-stream
+    ///scan). `pin`/`pos==pin` as `find_slot`
     fn find_nearest_slot(
         &self,
         pos: Pos,
@@ -228,20 +219,10 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         pin: Option<Pos>,
     ) -> Option<NoneSlide>;
 
-    ///two opens near `pos_a` (side `rel_a`) and `pos_b` (side `rel_b`) whose
-    ///slides apply independently in EITHER order — non-overlapping runs, neither
-    ///moves the other's anchor. returns `DoubleSlide` (one fixup call covers both).
-    ///designed for away-pointing sides (each slot opens on its anchor's own side
-    ///of the other). two passes: (1) sphere scan — `find_slot` confined to radius
-    ///`(|pos_a-pos_b|-1)/2` around each anchor (both its rel scan and its fallback
-    ///are budget-bounded, so nothing escapes the sphere): disjoint spheres ⇒
-    ///disjoint runs — independent BY CONSTRUCTION; skipped when the anchors sit
-    ///closer than 3 slots (radius 0 finds nothing — including the same-anchor
-    ///subtree-first/last case). (2) one requested-side `find_slot` per anchor (a
-    ///fallback slide shifts its anchor, preserving the walk-order side — the
-    ///wrong-side None is already covered). away-pointing scans that interfere mean
-    ///both fell onto the same lone None in budget range ⇒ no pair exists ⇒ None —
-    ///the caller spreads and retries. `pin` as `find_slot`.
+    ///two opens near `pos_a` (side `rel_a`) and `pos_b` (side `rel_b`)
+    ///whose slides apply independently in EITHER order — non-overlapping
+    ///runs, neither moves the other's anchor. None ⇒ interference (the
+    ///caller spreads and retries); `pin` as `find_slot`
     fn find_2_slots(
         &self,
         pos_a: Pos,
@@ -251,6 +232,13 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         budget: usize,
         pin: Option<Pos>,
     ) -> Option<DoubleSlide> {
+        //pass 1, sphere scan: confine each find_slot to radius
+        //(|pos_a-pos_b|-1)/2 around its anchor (both its rel scan and
+        //fallback are budget-bounded, so nothing escapes the sphere) —
+        //disjoint spheres ⇒ disjoint runs ⇒ independent BY CONSTRUCTION.
+        //skipped when the anchors sit closer than 3 slots (radius 0
+        //finds nothing — including the same-anchor subtree-first/last
+        //case)
         let dist = pos_a.abs_diff(pos_b);
         if dist >= 3 {
             let r = (dist - 1) / 2;
@@ -265,6 +253,10 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
                 return Some(DoubleSlide { a: sa, b: sb });
             }
         }
+        //pass 2: one requested-side find_slot per anchor (a fallback
+        //slide shifts its anchor, preserving the walk-order side). away-
+        //pointing scans that interfere ⇒ both fell onto the same lone
+        //None in budget range ⇒ no pair exists
         let sa = self.find_slot(pos_a, rel_a, budget, pin)?;
         let sb = self.find_slot(pos_b, rel_b, budget, pin)?;
         if slides_interfere(&sa, &sb, pos_a, pos_b) {
@@ -275,10 +267,9 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
 
     fn swap(&mut self, a: Pos, b: Pos);
 
-    ///nearest `n` Nones on `rel`'s side of `pos` (occupied by contract) within
-    /// `budget`, sorted; `None` if fewer than n. `pin` as `find_slot` — the
-    /// clamp caps the window at the pin, so no chosen hole's gather crosses it
-    /// (a gathered span moves every intervening Some).
+    ///nearest `n` Nones on `rel`'s side of `pos` (occupied by contract)
+    ///within `budget`, sorted; None if fewer than n. the pin clamp caps
+    ///the window, so no chosen hole's gather crosses it
     fn find_n_slots(
         &self,
         pos: Pos,
@@ -337,11 +328,9 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
         }
     }
 
-    ///apply a gather plan: the chosen Nones compact beside the anchor, every
-    /// member Some crossing the run exactly once — one directional pass (all
-    /// members move one way; each slot's own iteration precedes any write into
-    /// it, and member finals are distinct). returns the opened slot range.
-    /// precondition: `pin` not in the member interval (`find_n_slots`'s clamp).
+    ///apply a gather plan: the chosen Nones compact beside the anchor.
+    ///returns the opened slot range. precondition: `pin` not in the
+    ///member interval (`find_n_slots`'s clamp)
     fn gather_none(&mut self, g: &GatherSlide, pin: Option<Pos>) -> (Pos, Pos);
 
     ///increases occupancy.
@@ -368,8 +357,8 @@ pub trait Store<'a, T: Sized + 'a>: Sized + 'a {
     ///doubles cap
     fn grow(&mut self);
 
-    ///doubles len, moves element at i to 2*i + offset (offset 0 or 1: 0 = evens,
-    ///1 = odds). the gap slot is the other of the {2i, 2i+1} pair.
+    ///doubles len, moving element at i to 2*i + offset (0 = evens, 1 =
+    ///odds); the gap slot is the other of the {2i, 2i+1} pair
     fn spread(&mut self, offset: usize);
 
     ///the space at `pos` must be Some or panic. frees it and returns the value.
@@ -1341,19 +1330,17 @@ impl<'a, T: Sized + 'a> Store<'a, T> for DequeStore<T> {
     }
 }
 
-///the pair can't apply independently: affected spans overlap (a shared slot would
-///double-move, or one slide's None-hole lies inside the other's run) or one slide
-///moves the other's anchor. spans are closed — conservative.
+///the pair can't apply independently: affected spans overlap or one
+///slide moves the other's anchor. closed spans — conservative
 fn slides_interfere(s1: &NoneSlide, s2: &NoneSlide, a1: Pos, a2: Pos) -> bool {
     let (lo1, hi1) = (s1.from.min(s1.to), s1.from.max(s1.to));
     let (lo2, hi2) = (s2.from.min(s2.to), s2.from.max(s2.to));
     lo1 <= hi2 && lo2 <= hi1 || s1.affects_pos(a2) || s2.affects_pos(a1)
 }
 
-///outward nearest-None scan: `left` at `l0, l0-1, …` (lcnt slots, decreasing) and
-///`right` at `r0, r0+1, …` (rcnt slots, increasing). D tie-breaks equidistant hits
-///(false⇒left, true⇒right). the caller checks the anchor slot separately, so l0/r0
-///are the first real candidates and neither equals the anchor.
+///outward nearest-None scan; D tie-breaks equidistant hits (false⇒left,
+///true⇒right). the caller checks the anchor separately — l0/r0 are the
+///first real candidates, never the anchor.
 ///
 /// SAFETY: every accessed left index is in `[0, left.len())` and every right index
 /// in `[0, right.len())`. accessed left = `l0-k` for k in `[0,lcnt)` ⇒ in

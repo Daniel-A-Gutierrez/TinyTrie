@@ -61,11 +61,12 @@ impl Mask {
     pub fn next_set(&self, from: usize) -> Option<usize> {
         //dense fast path: the bit at `from` is usually set — `from` is the
         //answer, no scan and no position rebuild
-        if from >> 6 < self.words.len() && self.words[from >> 6] & 1 << (from & 63) != 0 {
-            return Some(from);
-        }
+        
         let mut w = from >> 6;
         let mut off = from & 63;
+        if w < self.words.len() && self.words[w] & 1 << (off) != 0 {
+            return Some(from);
+        }
         while w < self.words.len() {
             let word = self.words[w] >> off;
             if word != 0 {
@@ -177,12 +178,11 @@ impl Mask {
     }
 
     ///nearest clear bit to `center`, ties resolved to the after side.
-    ///`center` itself is excluded (callers pass a live position — the
-    ///search starts at center±1)
+    ///`center` itself is excluded — callers pass a position they occupy
     #[inline]
     pub fn nearest_clear(&self, center: usize) -> Option<usize> {
-        //center < bits guard: next_clear treats ≥ bits as None anyway,
-        //this also keeps center+1 from overflowing
+        //center < bits: next_clear already answers None for ≥ bits, this
+        //also keeps center+1 from overflowing
         let after = if center < self.bits {
             self.next_clear(center + 1)
         } else {
@@ -309,12 +309,8 @@ impl Mask {
     }
 }
 
-///`iter_set`'s engine: the current word cached, positions tested in
-///place — the dense common case is a bit test + increment (no tz, no
-///position rebuild); holes advance one bit, whole-empty word tails skip
-///at once. a rotating-bit-mask engine measured slightly WORSE: the shift
-///saved on the test returns on the yield as `pos + tzcnt` (the position
-///no longer is the state) — see bench_notes
+///`iter_set`'s engine — ascending set bits. None-stable (exhaustion
+///zeroes the cached word, subtle_bugs §21)
 pub struct SetBits<'a> {
     words: std::slice::Iter<'a, u64>,
     ///cached current word; 0 past the end
@@ -329,6 +325,7 @@ impl Iterator for SetBits<'_> {
     #[inline]
     fn next(&mut self) -> Option<usize> {
         loop {
+            //dense common case: `pos` is the state, the yield is free
             if self.word & 1 << (self.pos & 63) != 0 {
                 let p = self.pos;
                 self.pos += 1;
@@ -358,14 +355,12 @@ impl Iterator for SetBits<'_> {
     }
 }
 
-///`iter_set_rev`'s engine — the descending mirror: positions tested down
-///through the cached word, holes advancing one bit, whole-empty word heads
-///skipping at once. `pos` wraps below 0 into a sentinel once the mask is
-///exhausted
+///`iter_set_rev`'s engine — the descending mirror. None-stable like
+///`SetBits`
 pub struct SetBitsRev<'a> {
     words: std::iter::Rev<std::slice::Iter<'a, u64>>,
     word:  u64,
-    ///next position to test
+    ///next position to test; wraps below 0 as the exhaustion sentinel
     pos:   usize,
 }
 

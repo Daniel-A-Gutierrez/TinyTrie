@@ -163,7 +163,14 @@ and phase breakdown in `notes/bench_notes.md`.
 - do not update the claude.toml until the session is ending. 
 
 # Style
-- doc comments are the single source of truth for item outlines - keep them minimal, don't make them a summary, just purpose, invariants, and panics. 
+- doc comments are the single source of truth for item outlines - keep them
+  minimal: 1-2 lines, what the item is FOR plus anything non-obvious about
+  its contract (assumptions, guarantees, panics, None/return semantics).
+  they never describe HOW the function works - mechanism lives as
+  single-line annotations at the site doing it (rationale at the branch
+  that needs it, safety notes at the loop that depends on them). variant
+  and field docs carry their own semantics. SAFETY blocks and `//!` module
+  headers are exempt - they hold the full contract.
 - single line comments may be introduced in long functions to concisely explain what a block of code does
 - a comment must never be longer than the source it applies to. 
 - function names and variables should be concise but explanatory - avoid arbitrary letters and abbreviations.

@@ -538,3 +538,75 @@ already occupies.
 no cost measured: insert 90.6/71.4/402.8/107.2 across random/runs at
 10k/1M — at or under the previous run. the explicit bit test replaces
 the work the scan did implicitly.
+
+### bsearch: two shapes, split at L2 (2026-10-15)
+
+three experiments on the probe loop:
+- **linear tail (REJECTED)**: once hi−lo ≤ 64, scan branchlessly with a
+  cmov-accumulated spot — 3× REGRESSION at 10k (lookup 57→157): the
+  per-position `mask && not-Less` chain compiles to data-dependent
+  branches (mispredict ~every position on random keys), and 64
+  positions of work exceed the ~6 probes they replace even streamed;
+  worse at 1M too (451 vs 313). also broke hole-boundary semantics
+  (banked-hole test caught it live).
+- **fixed cmov loop** (core's slice::binary_search note — no early exit,
+  Equal narrows as Greater, one final compare at the boundary's live
+  element): 10k lookup 57→36 (−37% — the old 3-way match mispredicted
+  every probe), but 1M lookup 313→495 (+58%): the cmov bound serializes
+  each iteration's address on the previous compare's resolution, while
+  the branchy early-exit loop SPECULATES — the next probe's load issues
+  ahead of the compare, overlapping the miss. branch-vs-cmov is a
+  cache-residency tradeoff, not a universal win.
+- **the keeper**: dispatch on residency (`data.len() · size_of::<K>()`
+  vs ~L2, the same line odd_search's span rule drew): cmov loop
+  cache-resident, branchy loop DRAM-resident. lookup best, both scales:
+
+| | append | prepend | random | runs |
+|---|---|---|---|---|
+| 10k | 36.0 | 35.5 | 55.7 | 46.3 |
+| 1M | 240.2 | 244.1 | 293.0 | 314.9 |
+
+1M beats even the old baseline (256-352); insert rides it (random 1M
+415→316). at 10k BlockSet now beats BTreeSet on append/prepend lookup
+(36 vs 43). note: `Err(lo)` boundary semantics UNCHANGED — a hole `lo`
+is free space gather exploits (the banking test is the tripwire);
+the next_live snap belongs in the final dup resolution only. `position`'s
+fn-ptr concern was moot — `locate` is monomorphized per arm already.
+
+### search surface restructure + the Equal experiments (2026-10-15)
+
+API: the rev branch moved into `bsearch` (position is no longer a
+dispatch layer); `bsearch` = the raw boundary — Err(lo), hole ok, spot's
+search; `position` = bsearch's Err mapped through `next_live` (a LIVE
+target or cap — find's path); `spot` calls bsearch directly (hole spots
+preserved — position's mapping would forfeit them, the banking test is
+the tripwire).
+
+two Equal experiments on the speculating loop, both measured:
+- **`Equal => lo = p` + final compare: REJECTED, provable infinite
+  loop** — lo pinned on the dup, live successor at p+1: range [p, p+1)
+  probes mid = p, Equal, lo = p, forever. no early exit requires Equal
+  to narrow as Greater (hi = p).
+- **`Equal => hi = p` + shared final compare: REJECTED, measured** —
+  1M lookup 235→381 append / 291→533 random: with the early return
+  gone, the two-way match compiles to cmov and `search_spec` BECOMES
+  `search_cmov` — the speculation (next probe's load issued ahead of
+  the compare, overlapping the miss) dies with the branch codegen. the
+  Equal early exit is LOAD-BEARING in the DRAM shape, documented on the
+  fn. core's fixed-loop note holds for cache-resident slices only —
+  here it draws the L2 line instead.
+
+### within-search hybrid: branchy head + cmov tail — dominated (2026-10-15)
+
+tried per the head/tail idea: the speculating head narrows to a width
+(CMOV_SWITCH=256), then the cmov tail resolves. 1M lookup: pure spec
+242/252/299/312 → hybrid 385/373/454/495. the tail probes of a COLD
+probe stream are first-touch misses (head probes are spread far apart
+and don't warm the target region) — the cmov tail serializes them
+(~+40ns each × 8) against ~15-20ns of mispredict savings in the
+impossible-always-hot case. the crossover needs ~90% tail hotness the
+block cannot see, and even a 2-probe tail costs ~80ns cold. REVERTED to
+the pure shapes; `search_cmov`'s (lo, hi) parameterization pruned with
+it. the precomputed-trip-count unroll idea is also dead on arrival:
+`next_live`'s hole jumps make each iteration's range reduction
+data-dependent — no computable trip count.

@@ -18,30 +18,29 @@ use crate::mask::{Mask, SetBits, SetBitsRev};
 
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
-///nothing). the common contiguous run slide (the hole moves `from → to`;
-///every element strictly between shifts one step toward `from`). `Gather`:
-///a fetch-distance gather's slide chain, nearest hole first, each slide
-///in post-prior-slides coordinates — identical to its pre-read position,
-///since a hole's slot is never touched before its own slide; a two-sided
-///gather is two chains' worth, side told by `from > to`. `Pairs` covers
-///rare non-run shapes (reversal, bulk).
+///nothing)
 enum Delta {
     Empty,
+    ///the common contiguous run slide: the hole moves `from → to`, every
+    ///element strictly between shifts one step toward `from`
     NoneSlide {
         from: Pos,
         to:   Pos,
     },
+    ///a fetch-distance gather's slide chain, nearest hole first, each
+    ///slide in post-prior-slides coordinates — identical to its pre-read
+    ///position (a hole's slot is never touched before its own slide)
     Gather(Vec<NoneSlide>),
+    ///rare non-run shapes (reversal, bulk)
     #[allow(dead_code)]
     Pairs(Vec<(Pos, Pos)>),
 }
 
 ///expanded `(from, to)` pos pairs of one event, swap-cascade order
-///(hole-adjacent mover first). `Run`: `p` cursor, `step` (−1 = run shifts
-///up), `remaining` emissions; each pair is `(p, p − step)`. `Gather` chains
-///the slides' runs in order (each slide's coordinates are post-prior-slides).
+///(hole-adjacent mover first)
 enum DeltaPairs<'a> {
     Empty,
+    ///one run's cursor: emits `(p, p − step)` per step
     Run { p: usize, step: i64, remaining: usize },
     Gather {
         slides:    std::slice::Iter<'a, NoneSlide>,
@@ -97,6 +96,8 @@ impl Iterator for DeltaPairs<'_> {
             }
             DeltaPairs::Gather { slides, p, step, remaining } => loop {
                 if *remaining == 0 {
+                    //chain the next slide's run — its coordinates are
+                    //post-prior-slides
                     let ns = slides.next()?;
                     (*p, *step, *remaining) = run_of(ns.from.0, ns.to.0);
                 }
@@ -110,10 +111,9 @@ impl Iterator for DeltaPairs<'_> {
     }
 }
 
-///slot moves of one mutation, compact event + translator snapshot at
-///mutation time. `iter` expands to (from_addr, to_addr) name swaps
-///applicable in order. per-call: `insert` panics while the previous call's
-///deltas are pending — apply, then `clear`.
+///slot moves of one mutation + the translator snapshot at mutation time.
+///`iter` expands to (from_addr, to_addr) name swaps applicable in order;
+///`insert` panics while deltas are pending — apply, then `clear`
 pub struct Deltas<A> {
     event:      Delta,
     translator: Translator<A>,
@@ -144,6 +144,14 @@ impl<A: UnsignedNum> Deltas<A> {
 ///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
 ///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
 const FREE_STRIDE: usize = 8;
+
+///~L2 residency: the bsearch shape split — cache-resident blocks cmov
+///(probe compares resolve from L1/L2, mispredicts dominate), DRAM-
+///resident blocks speculate (the branchy loop issues the next probe's
+///load ahead of the compare, overlapping the miss). measured both ways
+///at both scales, see bench_notes
+const L2_BYTES: usize = 512 * 1024;
+
 
 ///mask covers data.len() slots; bit ⇔ slot initialized.
 pub struct BlockSet<K, A> {
@@ -211,10 +219,10 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         self.find(k).is_some()
     }
 
-    ///first→last over live keys. the direction is picked once here, never
-    ///per element — Asc walks positions up, Desc down (key order ascends
-    ///against pos order)
+    ///first→last over live keys
     pub fn iter(&self) -> Iter<'_, K, A> {
+        //direction picked once, never per element; Desc blocks: key order
+        //ascends against pos order, so they walk positions down
         if self.translator.reversed() {
             Iter::Desc { bits: self.mask.iter_set_rev(), set: self }
         } else {
@@ -235,59 +243,57 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         let Some(spot) = self.spot(&k) else {
             return Err(k);
         };
-        //sequential at the allocation edge: extend instead of sliding
-        //k belongs at the back (spot past the whole array): extend the
-        //allocation — the cheapest space is the edge
+        //sequential at the back: extend instead of sliding
         if spot.0 == self.data.len() && self.data.len() < Self::max_capacity() {
             let a = self.push_back(k, spot);
-            self.maybe_reverse();
             return Ok(a);
         }
-        let p = self.open(&k, spot, deltas);
-        let a = self.place(k, p);
-        self.maybe_reverse();
-        Ok(a)
+        else {
+            let p = self.open(spot, deltas);
+            let a = self.place(k, p);
+            self.maybe_reverse();
+            Ok(a)
+        }
     }
 
-    ///in-place reversal: the array mirrors (pos 0 = max), names follow the
-    ///slots — the translator absorbs it, no deltas (a pending event stays
-    ///valid: it speaks names, and names never change). pos_sum reflects
-    ///around len: the historical insert positions read in the new
-    ///orientation
+    ///in-place reversal: pos 0 = max, names follow the slots (the
+    ///translator absorbs it — no deltas; a pending event stays valid)
     fn reverse(&mut self) {
         self.data.reverse();
         self.mask.reverse();
         self.translator = self.translator.reverse(self.data.len());
         let len = self.len as u64;
+        //reflect the bias signal around len — the trigger's own scale —
+        // NOT the physical mirror (cap−1−p): cap imports density noise.
+        // fires only when pos_sum < len²/8, so the subtraction never wraps
         self.pos_sum = len.wrapping_mul(len).wrapping_sub(self.pos_sum);
     }
 
-    ///front-biased insert stream ⇒ flip, so the stream's next inserts
-    ///land at the tail. the signal must be committed — mean insert position
-    ///below len/8 past a 4·stride warmup: at len/4 a uniform stream's small
-    ///early window flips the block spuriously (4 flips on pure random,
-    ///bench_notes), and a real front stream's mean sits ≈ 0 either way
+    ///flip a front-biased insert stream so future inserts land at the
+    ///tail. fires when mean insert position sits below len/8, committed
+    ///past a 4·stride warmup
     fn maybe_reverse(&mut self) {
         if self.len > 4 * FREE_STRIDE {
             let len = self.len as u64;
+            // pos / len < len / 8
             if self.pos_sum.wrapping_mul(8) < len.wrapping_mul(len) {
                 self.reverse();
             }
         }
     }
 
-    ///insertion spot, or None on dup. beyond the tail extreme the spot is
-    ///known without bsearch (max Asc, min Desc — the end a sequential
-    ///insert extends)
+    ///insertion spot, or None on dup
     fn spot(&self, k: &K) -> Option<Pos> {
         if self.len > 0 {
+            //beyond the tail extreme (max Asc, min Desc — the end a
+            //sequential insert extends) the spot is known without bsearch
             let tail = self.key_tail();
             let beyond = if self.translator.reversed() { k < tail } else { tail < k };
             if beyond {
                 return Some(Pos(self.mask.last_set().unwrap() + 1));
             }
         }
-        self.position(k).err()
+        self.bsearch(k).err()
     }
 
     ///vec-like first allocation: 4 slots, no translator turn until it fills
@@ -297,41 +303,53 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         self.place(k, Pos(0))
     }
 
-    ///extend the allocation and place k at the edge — dense; banked holes
-    ///come from `gather_slots`' fetch, not minted here. caller guarantees
-    ///spot == cap < max_capacity.
+    ///extend the allocation and place k at the edge — dense, holes never
+    ///minted here. caller guarantees spot == cap < max_capacity
     fn push_back(&mut self, k: K, spot: Pos) -> A {
         self.push_slot();
         self.place(k, spot)
     }
 
-    ///open a slot at/near `spot`: a preemptive turn past 7/8 occupancy when
-    ///the insert sits mid-block (at one hole per FREE_STRIDE expected, past
-    ///7/8 fetches blow past the stride — one O(n) turn beats the long
-    ///gathers); then the fetch gather (nearest hole sets the distance,
-    ///distance sets the count — banked holes ride the slide). mask full ⇒
-    ///one tail push when the edge is within FREE_STRIDE, else a turn;
-    ///refused ⇒ plain tail slot (room always exists: mask full + len <
-    ///name ceiling).
-    fn open(&mut self, k: &K, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
+    ///open a slot at/near `spot`: turns and gathers, escalating until a
+    ///hole opens
+    fn open(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
         let mut spot = spot;
+        //preemptive turn past 7/8: at one hole per FREE_STRIDE expected,
+        //fetches past 7/8 blow through the stride — one O(n) turn beats
+        //the long gathers (mid-block inserts only)
         if self.len.wrapping_mul(8) > self.data.len().wrapping_mul(7)
             && self.data.len() - spot.0 > FREE_STRIDE
-            && self.grow_rotate()
         {
-            spot = self.position(k).err().expect("no dup post-grow");
+            let old = self.translator;
+            if self.grow_rotate() {
+                spot = self.turned_spot(old, spot);
+            }
         }
         if let Some(p) = self.gather_slots(spot, deltas) {
             return p;
         }
+        //mask full: one tail push when the edge is within FREE_STRIDE,
+        //else a turn; refused ⇒ plain tail slot (room always exists:
+        //mask full + len < name ceiling)
         if self.data.len() - spot.0 <= FREE_STRIDE && self.data.len() < Self::max_capacity() {
             self.push_slot();
-        } else if self.grow_rotate() {
-            spot = self.position(k).err().expect("no dup post-grow");
         } else {
-            self.push_slot();
+            let old = self.translator;
+            if self.grow_rotate() {
+                spot = self.turned_spot(old, spot);
+            } else {
+                self.push_slot();
+            }
         }
         self.gather_slots(spot, deltas).expect("mask had a hole minted")
+    }
+
+    ///k's spot under a completed turn: the old spot's name relocates via
+    ///the turn's map (the same composition the relocation loop applies to
+    ///live elements) — monotone, so the image is a valid insert boundary,
+    ///no re-search
+    fn turned_spot(&self, old: Translator<A>, spot: Pos) -> Pos {
+        self.translator.a2p(old.p2a(spot))
     }
 
     ///write k at an open slot, mark live, mint its name; the slot position
@@ -359,55 +377,116 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         None
     }
 
-    ///bsearch over live slots. Ok(p) = duplicate found at p; Err(spot) = the
-    ///insertion spot: first live pos past the run that will precede k.
-    ///holes are skipped forward — sortedness makes everything live before
-    ///the probe compare known. the probe/k operand order is the block's
-    ///direction, fixed per arm so the hot loop carries no branch
-    fn position(&self, k: &K) -> Result<Pos, Pos> {
-        if self.translator.reversed() {
-            self.bsearch(k, |probe, k| k.cmp(probe))
-        } else {
-            self.bsearch(k, |probe, k| probe.cmp(k))
+    ///bsearch over live slots — the raw boundary. Ok(p) = the
+    ///duplicate at p; Err(spot) = a boundary in k's gap: all smaller
+    ///elements before it, all greater at/after; may be a live slot or
+    ///a hole (a hole spot is free space — gather exploits it)
+    fn bsearch(&self, k: &K) -> Result<Pos, Pos> {
+        //shape split at ~L2 residency: the branch lets the next probe's
+        //load issue ahead of the compare (overlapping the miss — wins
+        //DRAM-resident); the cmov bound has no mispredict (wins
+        //cache-resident, where compares are cheap and a branch
+        //mispredicts every probe)
+        let big = self.data.len().wrapping_mul(std::mem::size_of::<K>()) > L2_BYTES;
+        match (self.translator.reversed(), big) {
+            (true, true) => self.search_spec::<true>(k),
+            (true, false) => self.search_cmov::<true>(k),
+            (false, true) => self.search_spec::<false>(k),
+            (false, false) => self.search_cmov::<false>(k),
         }
     }
 
-    fn bsearch(&self, k: &K, locate: impl Fn(&K, &K) -> Ordering) -> Result<Pos, Pos> {
+    ///speculating search — early exit, branch per probe. DRAM-resident
+    ///blocks (see bsearch's split). the Equal early exit is LOAD-BEARING:
+    ///gone, the two-way match compiles to cmov and the speculation (next
+    ///probe's load issued ahead of the compare) dies — measured 1M lookup
+    ///235→533
+    fn search_spec<const REV: bool>(&self, k: &K) -> Result<Pos, Pos> {
         let (mut lo, mut hi) = (0, self.data.len());
+        //holes skipped forward — everything live before the probe
+        //compare known
         while lo < hi {
             let mid = (lo + hi) / 2;
             match self.next_live(mid, hi) {
                 None => hi = mid,
-                Some(p) => match locate(self.key(p), k) {
-                    Ordering::Less => lo = p + 1,
-                    Ordering::Greater => hi = p,
-                    Ordering::Equal => return Ok(Pos(p)),
-                },
+                Some(p) => {
+                    let probe = unsafe { self.key(p) };
+                    //Desc: key order ascends against pos order — the
+                    //compare operands flip (folded per instantiation)
+                    let ord = if REV { k.cmp(probe) } else { probe.cmp(k) };
+                    match ord {
+                        Ordering::Less => lo = p + 1,
+                        Ordering::Greater => hi = p,
+                        Ordering::Equal => return Ok(Pos(p)),
+                    }
+                }
             }
         }
         Err(Pos(lo))
     }
 
+    ///fixed cmov search — no early exit, Equal narrows as Greater (the
+    ///dup element stays in range), one final compare resolves it
+    ///(cache-resident blocks; core's slice::binary_search)
+    fn search_cmov<const REV: bool>(&self, k: &K) -> Result<Pos, Pos> {
+        let (mut lo, mut hi) = (0, self.data.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.next_live(mid, hi) {
+                None => hi = mid,
+                Some(p) => {
+                    let probe = unsafe { self.key(p) };
+                    let ord = if REV { k.cmp(probe) } else { probe.cmp(k) };
+                    if ord == Ordering::Less {
+                        lo = p + 1;
+                    } else {
+                        hi = p;
+                    }
+                }
+            }
+        }
+        //final resolution: the boundary's first live element — the dup,
+        //if the narrowing ended on or below it. equality is
+        //direction-free
+        if let Some(p) = self.next_live(lo, self.data.len()) {
+            if unsafe { self.key(p) } == k {
+                return Ok(Pos(p));
+            }
+        }
+        Err(Pos(lo))
+    }
+
+    ///locate k: Ok(p) = the duplicate at p; Err = the first LIVE
+    ///element past k's run (bsearch's boundary mapped through
+    ///`next_live`), or cap past the end
+    fn position(&self, k: &K) -> Result<Pos, Pos> {
+        match self.bsearch(k) {
+            Ok(p) => Ok(p),
+            Err(spot) => Err(self.next_live(spot.0, self.data.len()).map(Pos).unwrap_or(spot)),
+        }
+    }
+
+    #[inline]
     fn next_live(&self, from: usize, bound: usize) -> Option<usize> {
         self.mask.next_set(from).filter(|p| *p < bound)
     }
 
-    ///mask ⇔ init invariant upholds this read
-    fn key(&self, p: usize) -> &K {
+    ///raw live-slot read
+    ///
+    /// # Safety
+    ///
+    /// p must name a live slot — mask ⇔ init
+    unsafe fn key(&self, p: usize) -> &K {
         unsafe { self.data[p].assume_init_ref() }
     }
 
     ///key at the physical tail (max Asc, min Desc); panics if len == 0
     fn key_tail(&self) -> &K {
-        self.key(self.mask.last_set().expect("live"))
+        unsafe { self.key(self.mask.last_set().expect("live")) }
     }
 
-    ///fetch-distance gather: the nearest hole's distance from `spot` sets
-    ///the fetch — one hole per FREE_STRIDE traveled (the further the look,
-    ///the more Nones come back, banked beside k for the cluster's next
-    ///inserts). holes all from the nearest hole's side. k's slot: hole
-    ///right ⇒ `spot` (run shifts up), left ⇒ `spot − 1` (run shifts
-    ///down). fails clean on a hole-free mask.
+    ///open a slot at/near `spot`; None ⇒ hole-free mask. the opened slot
+    ///arrives as one `Delta` event (NoneSlide or Gather)
     fn gather_slots(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Option<Pos> {
         //k's slot already open (the bsearch converges on holes for
         //mid-gap inserts) — no fetch, no slide. nearest_clear excludes
@@ -417,8 +496,14 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
             deltas.event = Delta::NoneSlide { from: spot, to: spot };
             return Some(spot);
         }
+        //the nearest hole's distance sets the fetch — one hole per
+        //FREE_STRIDE traveled (the further the look, the more Nones come
+        //back, banked beside k for the cluster's next inserts); holes all
+        //from its side
         let hole = self.mask.nearest_clear(spot.0)?;
         deltas.translator = self.translator;
+        //k's slot: hole right ⇒ `spot` (run shifts up), left ⇒ `spot − 1`
+        //(run shifts down)
         let right = hole > spot.0;
         let open = if right { spot.0 } else { spot.0 - 1 };
         //the common case: hole within a stride — one plain slide, no fetch
@@ -439,10 +524,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         Some(Pos(open))
     }
 
-    ///one plain slide: hole `from` → `to`; the run between is fully live
-    ///(nearest hole), so the mask update is two bits. the bitwise duplicate
-    ///ptr::copy leaves in the source range is uninit by mask, never
-    ///assume_init'd (mask ⇔ init invariant).
+    ///one plain slide: hole `from` → `to`
     fn slide_hole(&mut self, from: usize, to: usize) {
         unsafe {
             let ptr = self.data.as_mut_ptr();
@@ -452,13 +534,16 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
                 std::ptr::copy(ptr.add(from + 1), ptr.add(from), to - from);
             }
         }
+        //the run between is fully live (nearest hole) — two-bit mask
+        //update; the duplicate ptr::copy leaves in the source range is
+        //uninit by mask, never assume_init'd
         self.mask.set(from, true);
         self.mask.set(to, false);
     }
 
     ///the `want` nearest holes on one side of `spot`, nearest-first
-    ///(right: ascending, left: descending) — pre-read positions, consumed
-    ///by `compact_gather` without further scans
+    ///(right: ascending, left: descending) — pre-read for
+    ///`compact_gather`, no further scans
     fn fetch_holes(&self, spot: Pos, right: bool, want: usize) -> Vec<usize> {
         let mut holes = Vec::with_capacity(want);
         if right {
@@ -483,16 +568,16 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         holes
     }
 
-    ///gather compaction, one pass: each member crosses exactly once —
-    ///segment j (between consecutive holes) shifts by its crossing count,
-    ///far segments copy first so no live source is read after being
-    ///overwritten. mask: the holes fill, the vacated target range
-    ///(`[open, open+w)` right, `[open−w+1, open]` left) clears; sets first
-    ///— a hole compacted onto its own old position ends clear.
+    ///gather compaction, one pass: the holes compact beside `spot`, every
+    ///member Some crossing exactly once. returns the slot k lands in
+    ///(`open`)
     fn compact_gather(&mut self, spot: Pos, open: usize, right: bool, holes: &[usize]) {
         let w = holes.len();
         unsafe {
             let ptr = self.data.as_mut_ptr();
+            //segment j (between consecutive holes) shifts by its crossing
+            //count; far segments copy first so no live source is read
+            //after being overwritten
             if right {
                 //holes ascend; segment 0 spans [spot, h_0), the run k shifts
                 for j in (0..w).rev() {
@@ -521,6 +606,8 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         for &h in holes {
             self.mask.set(h, true);
         }
+        //the vacated target range clears; sets first — a hole compacted
+        //onto its own old position ends clear
         if right {
             for t in open..open + w {
                 self.mask.set(t, false);
@@ -532,18 +619,16 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         }
     }
 
-    ///rotation turn (in-place): cap doubles; every live element relocates
-    ///to `a2p_new(name)` — names preserved by construction, the map
-    ///monotone (order holds), each target ≥ its source (the descending
-    ///pass writes every target before its source is read). refused past
-    ///the name-space midpoint (doubled positions would exceed the address
-    ///space) or at the rotation budget. any offset, either direction: the
-    ///band (upper-half names land odd) is rotate_mask's job.
+    ///rotation turn (in-place): cap doubles, every live element relocates
+    ///to `a2p_new(name)` — names preserved by construction. false ⇒
+    ///refused (name-space midpoint passed, or rotation budget spent)
     fn grow_rotate(&mut self) -> bool {
         let old_cap = self.data.len();
         let Some(new_cap) = old_cap.checked_mul(2) else {
             return false;
         };
+        //refusal guards: doubled positions would exceed the address
+        //space past the midpoint; the rotation knob would wrap
         if old_cap > A::MIDPOINT.as_usize()
             || self.translator.rotation() >= A::BIT_WIDTH as u32
         {
@@ -552,6 +637,10 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         let new_tr = self.translator.rotate();
         self.data.reserve(old_cap);
         self.data.extend((old_cap..new_cap).map(|_| MaybeUninit::uninit()));
+        //the map is monotone with each target ≥ its source — the
+        //descending pass writes every target before its source is read.
+        //any offset, either direction: the band (upper-half names land
+        //odd) is rotate_mask's job
         for p in (0..old_cap).rev() {
             if self.mask.get(p) {
                 let q = new_tr.a2p(self.translator.p2a(Pos(p)));
@@ -584,8 +673,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     }
 }
 
-///`BlockSet::iter`'s differential — one enum dispatch per element, the
-///per-direction bodies specialized (word-stepping mask iteration)
+///`BlockSet::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K, A> {
     Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
     Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
@@ -598,8 +686,8 @@ impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {
     fn next(&mut self) -> Option<&'a K> {
         match self {
             //mask ⇔ init invariant upholds the read
-            Iter::Asc { bits, set } => bits.next().map(|p| set.key(p)),
-            Iter::Desc { bits, set } => bits.next().map(|p| set.key(p)),
+            Iter::Asc { bits, set } => bits.next().map(|p| unsafe { set.key(p) }),
+            Iter::Desc { bits, set } => bits.next().map(|p| unsafe { set.key(p) }),
         }
     }
 }

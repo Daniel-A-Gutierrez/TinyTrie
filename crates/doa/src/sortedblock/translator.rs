@@ -30,10 +30,9 @@ fn p2a_rev<A: UnsignedNum>(p: Pos, rotation: u32, offset: A) -> A {
     offset.wrapping_sub(A::from_usize(p.0)).rotate_right(rotation)
 }
 
-///`a2p(a) = (a rol rotation) + offset` forward, `a2p(a) = offset − (a rol
-///rotation)` reversed — the direction knob of the set tier. rotation turn =
-///growth (doubling rule unchanged either direction); reversal mirrors the
-///slot array and re-parameterizes so names follow the slots.
+///the set tier's 2-knob translator — rotation turn = growth (doubling
+///rule unchanged either direction), reversal re-parameterizes so names
+///follow the mirrored slots
 #[derive(Clone, Copy)]
 pub struct Translator<A> {
     rotation: u32,
@@ -74,10 +73,10 @@ impl<A: UnsignedNum> Translator<A> {
     }
 
     ///the rotation turn: rotation + 1, offset doubled — names preserved by
-    ///construction under both directions (forward: the old rotation cancels
-    ///leaving `pos → 2·pos`; reversed: the doubling cancels the negation,
-    ///same map)
+    ///construction under both directions
     pub(crate) fn rotate(&self) -> Self {
+        //forward: the old rotation cancels leaving `pos → 2·pos`;
+        //reversed: the doubling cancels the negation — same map
         Translator {
             rotation: self.rotation + 1,
             offset:   self.offset.wrapping_add(self.offset),
@@ -85,11 +84,11 @@ impl<A: UnsignedNum> Translator<A> {
         }
     }
 
-    ///the reversal: `p2a_new(p) = p2a_old(cap−1−p)` — offset mirrors to
-    ///`cap−1−offset`, direction flips. names follow the mirrored slots;
-    ///holders see nothing. offset ≠ 0 afterward (cap > 1), so rotation
-    ///turns refuse until offset turns land
+    ///the reversal: `p2a_new(p) = p2a_old(cap−1−p)` — names follow the
+    ///mirrored slots, holders see nothing
     pub(crate) fn reverse(&self, cap: usize) -> Self {
+        //offset ≠ 0 afterward (cap > 1), so rotation turns refuse until
+        //offset turns land
         Translator {
             offset:   A::from_usize(cap - 1).wrapping_sub(self.offset),
             reversed: !self.reversed,

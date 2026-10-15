@@ -21,11 +21,10 @@ fn a2p_rev<A: UnsignedNum>(a: A, rotation: u32, offset: A) -> A;
 fn p2a_fwd<A: UnsignedNum>(p: Pos, rotation: u32, offset: A) -> A;
 ///L0029
 fn p2a_rev<A: UnsignedNum>(p: Pos, rotation: u32, offset: A) -> A;
-///L0038
-///`a2p(a) = (a rol rotation) + offset` forward, `a2p(a) = offset − (a rol
-///rotation)` reversed — the direction knob of the set tier. rotation turn =
-///growth (doubling rule unchanged either direction); reversal mirrors the
-///slot array and re-parameterizes so names follow the slots.
+///L0037
+///the set tier's 2-knob translator — rotation turn = growth (doubling
+///rule unchanged either direction), reversal re-parameterizes so names
+///follow the mirrored slots
 #[derive(Clone, Copy)]
 pub struct Translator<A> {
     rotation: u32,
@@ -34,9 +33,9 @@ pub struct Translator<A> {
     a2p:      A2p<A>,
     p2a:      P2a<A>,
 }
-///L0046
+///L0045
 impl<A: UnsignedNum> Translator<A> {}
-///L0114
+///L0113
 #[cfg(test)]
 mod tests {
     use super::*;
