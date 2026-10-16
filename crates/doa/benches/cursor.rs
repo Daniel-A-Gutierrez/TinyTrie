@@ -7,6 +7,9 @@
 //!shuffled probes, 32-byte Item keys, u64 values, cell budget, partial
 //!reps. cursor/range walks verified equal over a probe prefix before
 //!timing. size via first CLI arg (default 10k, multiple of 100).
+//!also a full-scan row per workload: BlockSet `iter` (the SetBits
+//!differential) vs a cursor walk over the whole set, fwd (seek min +
+//!next) and back (seek_after max + prev) — ns per element.
 
 use doa::blockmap::BlockMap;
 use doa::blockset::{BlockSet, Deltas};
@@ -167,6 +170,47 @@ fn fwd_btree_map(map: &BTreeMap<Item, u64>, probes: &[u64]) -> Cell {
     })
 }
 
+///full scan via the differential Iter — ns per element
+fn scan_iter(set: &BlockSet<Item, u32>) -> Cell {
+    reps(Instant::now() + RUN_BUDGET, |_| {
+        let t = Instant::now();
+        let mut c = 0u64;
+        for i in set.iter() {
+            c = c.wrapping_add(i.key);
+        }
+        black_box(c);
+        (set.len(), false, t.elapsed().as_nanos() as f64 / set.len() as f64)
+    })
+}
+
+///full scan via cursor: seek min + next to exhaustion
+fn scan_cursor(set: &BlockSet<Item, u32>) -> Cell {
+    reps(Instant::now() + RUN_BUDGET, |_| {
+        let t = Instant::now();
+        let mut c = 0u64;
+        let mut cur = set.seek(&Item::new(0));
+        while let Some(i) = cur.next() {
+            c = c.wrapping_add(i.key);
+        }
+        black_box(c);
+        (set.len(), false, t.elapsed().as_nanos() as f64 / set.len() as f64)
+    })
+}
+
+///full scan via cursor backward: seek_after max + prev to exhaustion
+fn scan_cursor_back(set: &BlockSet<Item, u32>, max_key: u64) -> Cell {
+    reps(Instant::now() + RUN_BUDGET, |_| {
+        let t = Instant::now();
+        let mut c = 0u64;
+        let mut cur = set.seek_after(&Item::new(max_key));
+        while let Some(i) = cur.prev() {
+            c = c.wrapping_add(i.key);
+        }
+        black_box(c);
+        (set.len(), false, t.elapsed().as_nanos() as f64 / set.len() as f64)
+    })
+}
+
 ///seek + RUN_LEN nexts, key checksum
 fn fwd_set(set: &BlockSet<Item, u32>, probes: &[u64]) -> Cell {
     timed_walks(probes, |item| {
@@ -301,6 +345,22 @@ fn main() {
         assert_eq!(bmap.len(), keys.len());
         assert_eq!(bset.len(), keys.len());
         verify(name, &probes, &bmap, &bset, &tmap, &tset);
+        //scan equality gate: iter and both cursor walks see the same set
+        {
+            let a: u64 = bset.iter().fold(0u64, |c, i| c.wrapping_add(i.key));
+            let mut cur = bset.seek(&Item::new(0));
+            let b: u64 =
+                std::iter::from_fn(|| cur.next()).fold(0u64, |c, i| c.wrapping_add(i.key));
+            let mut cur = bset.seek_after(&Item::new(n as u64 - 1));
+            let d: u64 =
+                std::iter::from_fn(|| cur.prev()).fold(0u64, |c, i| c.wrapping_add(i.key));
+            assert_eq!((a, b, d), (a, a, a), "{name} scan walks disagree");
+        }
+        let scan = [
+            scan_iter(&bset),
+            scan_cursor(&bset),
+            scan_cursor_back(&bset, n as u64 - 1),
+        ];
         let fwd = [
             fwd_set(&bset, &probes),
             fwd_btree_set(&tset, &probes),
@@ -325,5 +385,11 @@ fn main() {
                 cells[3].fmt("BTreeMap", 8)
             );
         }
+        println!(
+            "{name:>8} {n:>9}    scan: {} {} {} ns/elem",
+            scan[0].fmt("iter", 8),
+            scan[1].fmt("cursor", 8),
+            scan[2].fmt("cur-back", 8),
+        );
     }
 }

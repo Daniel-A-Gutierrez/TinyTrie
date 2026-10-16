@@ -11,11 +11,11 @@
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 
-use crate::blockset::{CursorSlot, Deltas, FREE_STRIDE, L2_BYTES, TURN_DEN, TURN_NUM};
+use crate::blockset::{Deltas, FREE_STRIDE, L2_BYTES, TURN_DEN, TURN_NUM};
 use crate::blockset::NoneSlide;
 use crate::translator::Translator;
 use crate::index::*;
-use crate::mask::{Mask, SetBits, SetBitsRev};
+use crate::mask::{Mask, MaskCursor, SetBits, SetBitsRev};
 
 ///mask covers keys.len() slots; bit ⇔ slot initialized (key + value).
 pub struct BlockMap<K, V, A> {
@@ -604,26 +604,18 @@ impl<'a, K: Ord, V, A: UnsignedNum> Iterator for Iter<'a, K, V, A> {
 }
 
 ///key-ordered bidirectional walk over live pairs — blockset::Cursor's
-///machine, one (key, value) pair per yield, steps on a cached mask word
-///(see blockset::Cursor). invalidated by any mutation — re-seek
+///machine (MaskCursor under a pairs-yielding wrapper; see
+///blockset::Cursor). invalidated by any mutation — re-seek
 pub struct Cursor<'a, K, V, A> {
-    map:   &'a BlockMap<K, V, A>,
-    ///baked at construction (see blockset::Cursor)
-    rev:   bool,
-    ///the next-to-yield slot, or the forward ghost
-    state: CursorSlot,
-    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
-    word:  u64,
+    map:  &'a BlockMap<K, V, A>,
+    ///the slot-walk machine; dir = !reversed, baked at construction
+    walk: MaskCursor<'a>,
 }
 
 impl<'a, K, V, A: UnsignedNum> Cursor<'a, K, V, A> {
     fn new(map: &'a BlockMap<K, V, A>) -> Self {
-        Cursor {
-            map,
-            rev: map.translator.reversed(),
-            state: CursorSlot::FwdEnd,
-            word: 0,
-        }
+        //dir: positions ascend — unless the block is flipped
+        Cursor { map, walk: MaskCursor::start(&map.mask, !map.translator.reversed()) }
     }
 }
 
@@ -631,10 +623,10 @@ impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {
     ///reposition at the first key ≥ k
     pub fn seek(&mut self, k: &K) {
         match self.map.bsearch(k) {
-            Ok(p) => self.land(p.0),
+            Ok(p) => self.walk.at(p.0),
             Err(spot) => match self.map.key_bound(spot.0) {
-                Some(q) => self.land(q),
-                None => self.state = CursorSlot::FwdEnd,
+                Some(q) => self.walk.at(q),
+                None => self.walk.end(),
             },
         }
     }
@@ -642,37 +634,25 @@ impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {
     ///reposition at the first key > k (a dup at k skipped)
     pub fn seek_after(&mut self, k: &K) {
         let q = match self.map.bsearch(k) {
-            //past the dup in key order
+            //past the dup in key order — dir = Asc: forward skip
             Ok(p) => {
-                if self.rev { self.map.mask.prev_set(p.0) } else { self.map.mask.next_set(p.0 + 1) }
+                if self.walk.dir() { self.map.mask.next_set(p.0 + 1) }
+                else { self.map.mask.prev_set(p.0) }
             }
             Err(spot) => self.map.key_bound(spot.0),
         };
-        if let Some(q) = q { self.land(q) } else { self.state = CursorSlot::FwdEnd }
-    }
-
-    ///position at a live slot — the cache load (seeks, ghost resumes)
-    fn land(&mut self, q: usize) {
-        self.word = self.map.mask.word_at(q);
-        self.state = CursorSlot::At(Pos(q));
+        if let Some(q) = q { self.walk.at(q) } else { self.walk.end() }
     }
 
     ///yield the current pair, step forward (key-ascending). None at the
     ///walk's end
     #[inline(always)]
     pub fn next(&mut self) -> Option<(&'a K, &'a V)> {
-        let p = match self.state {
-            CursorSlot::FwdEnd => return None,
-            CursorSlot::At(p) => p.0,
-        };
-        //Asc climbs positions; Desc descends them
-        let q = if self.rev {
-            self.map.mask.step_down(p, self.word)
-        } else {
-            self.map.mask.step_up(p, self.word)
-        };
-        self.settle(q);
-        Some(unsafe { self.map.pair(p) })
+        let p = self.walk.slot()?;
+        let map = self.map;
+        let pair = unsafe { map.pair(p) };
+        self.walk.advance(p);
+        Some(pair)
     }
 
     ///step back (key-descending), yield the pair now current. None at
@@ -680,53 +660,18 @@ impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {
     ///re-yields it); from the forward ghost, resumes at the last pair
     #[inline(always)]
     pub fn prev(&mut self) -> Option<(&'a K, &'a V)> {
-        //the pair behind the current — the walk's last from FwdEnd
-        let q = match self.state {
-            CursorSlot::At(p) => {
-                if self.rev {
-                    self.map.mask.step_up(p.0, self.word)
-                } else {
-                    self.map.mask.step_down(p.0, self.word)
-                }
-            }
-            CursorSlot::FwdEnd => {
-                let q = (if self.rev { self.map.mask.next_set(0) }
-                    else { self.map.mask.last_set() })?;
-                self.land(q);
-                return Some(unsafe { self.map.pair(q) });
-            }
-        }?;
-        self.settle(Some(q));
-        Some(unsafe { self.map.pair(q.0) })
-    }
-
-    ///land a step result; None is the walk's end (the cache goes stale)
-    fn settle(&mut self, q: Option<(usize, u64)>) {
-        match q {
-            Some((q, w)) => {
-                self.word = w;
-                self.state = CursorSlot::At(Pos(q));
-            }
-            None => self.state = CursorSlot::FwdEnd,
-        }
+        let q = self.walk.retreat()?;
+        Some(unsafe { self.map.pair(q) })
     }
 
     ///the pair next() would yield, without moving
     pub fn entry(&self) -> Option<(&'a K, &'a V)> {
-        self.slot().map(|p| unsafe { self.map.pair(p) })
+        self.walk.slot().map(|p| unsafe { self.map.pair(p) })
     }
 
     ///the current entry's name
     pub fn addr(&self) -> Option<A> {
-        self.slot().map(|p| self.map.translator.p2a(Pos(p)))
-    }
-
-    ///At reads directly; FwdEnd has nothing ahead
-    fn slot(&self) -> Option<usize> {
-        match self.state {
-            CursorSlot::At(p) => Some(p.0),
-            CursorSlot::FwdEnd => None,
-        }
+        self.walk.slot().map(|p| self.map.translator.p2a(Pos(p)))
     }
 }
 

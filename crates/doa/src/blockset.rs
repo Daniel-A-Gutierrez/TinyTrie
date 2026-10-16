@@ -29,7 +29,7 @@ impl NoneSlide {
     }
 }
 use crate::index::*;
-use crate::mask::{Mask, SetBits, SetBitsRev};
+use crate::mask::{Mask, MaskCursor, SetBits, SetBitsRev};
 
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
@@ -823,40 +823,21 @@ impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {
     }
 }
 
-///the slot `next` yields next, or the forward walk's exhaustion ghost.
-///backward exhaustion needs no ghost: `prev` leaves the state at the
-///first element, where `next` correctly re-yields it. pub(crate):
-///blockmap's cursor is the same machine over pairs
-pub(crate) enum CursorSlot {
-    At(Pos),
-    ///no next
-    FwdEnd,
-}
-
 ///key-ordered bidirectional walk — `seek`/`seek_after` position, `next`
 ///walks key-ascending (yield current, then step), `prev` walks back (step,
-///then yield). steps run on a cached mask word (SetBits' optimization —
-///dense steps test it in place; crossings reload). holds raw slots: any
-///mutation (slides, turns, flips) invalidates it — re-seek
+///then yield). stepping runs on `MaskCursor` (the cached-word walk, see
+///mask.rs). holds raw slots: any mutation (slides, turns, flips)
+///invalidates it — re-seek
 pub struct Cursor<'a, K, A> {
     set:  &'a BlockSet<K, A>,
-    ///baked at construction — direction only changes by mutation, which
-    ///invalidates anyway
-    rev:  bool,
-    ///the next-to-yield slot, or the forward ghost
-    state: CursorSlot,
-    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
-    word: u64,
+    ///the slot-walk machine; dir = !reversed, baked at construction
+    walk: MaskCursor<'a>,
 }
 
 impl<'a, K, A: UnsignedNum> Cursor<'a, K, A> {
     fn new(set: &'a BlockSet<K, A>) -> Self {
-        Cursor {
-            set,
-            rev: set.translator.reversed(),
-            state: CursorSlot::FwdEnd,
-            word: 0,
-        }
+        //dir: positions ascend — unless the block is flipped
+        Cursor { set, walk: MaskCursor::start(&set.mask, !set.translator.reversed()) }
     }
 }
 
@@ -864,10 +845,10 @@ impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {
     ///reposition at the first key ≥ k
     pub fn seek(&mut self, k: &K) {
         match self.set.bsearch(k) {
-            Ok(p) => self.land(p.0),
+            Ok(p) => self.walk.at(p.0),
             Err(spot) => match self.set.key_bound(spot.0) {
-                Some(q) => self.land(q),
-                None => self.state = CursorSlot::FwdEnd,
+                Some(q) => self.walk.at(q),
+                None => self.walk.end(),
             },
         }
     }
@@ -875,19 +856,14 @@ impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {
     ///reposition at the first key > k (a dup at k skipped)
     pub fn seek_after(&mut self, k: &K) {
         let q = match self.set.bsearch(k) {
-            //past the dup in key order
+            //past the dup in key order — dir = Asc: forward skip
             Ok(p) => {
-                if self.rev { self.set.mask.prev_set(p.0) } else { self.set.mask.next_set(p.0 + 1) }
+                if self.walk.dir() { self.set.mask.next_set(p.0 + 1) }
+                else { self.set.mask.prev_set(p.0) }
             }
             Err(spot) => self.set.key_bound(spot.0),
         };
-        if let Some(q) = q { self.land(q) } else { self.state = CursorSlot::FwdEnd }
-    }
-
-    ///position at a live slot — the cache load (seeks, ghost resumes)
-    fn land(&mut self, q: usize) {
-        self.word = self.set.mask.word_at(q);
-        self.state = CursorSlot::At(Pos(q));
+        if let Some(q) = q { self.walk.at(q) } else { self.walk.end() }
     }
 
     ///yield the current element, step forward (key-ascending). None at
@@ -898,18 +874,11 @@ impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {
     ///measured 2× @10k fwd
     #[inline(always)]
     pub fn next(&mut self) -> Option<&'a K> {
-        let p = match self.state {
-            CursorSlot::FwdEnd => return None,
-            CursorSlot::At(p) => p.0,
-        };
-        //Asc climbs positions; Desc descends them
-        let q = if self.rev {
-            self.set.mask.step_down(p, self.word)
-        } else {
-            self.set.mask.step_up(p, self.word)
-        };
-        self.settle(q);
-        Some(unsafe { self.set.key(p) })
+        let p = self.walk.slot()?;
+        let set = self.set;
+        let k = unsafe { set.key(p) };
+        self.walk.advance(p);
+        Some(k)
     }
 
     ///step back (key-descending), yield the element now current. None at
@@ -917,53 +886,18 @@ impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {
     ///re-yields it); from the forward ghost, resumes at the last element
     #[inline(always)]
     pub fn prev(&mut self) -> Option<&'a K> {
-        //the element behind the current — the walk's last from FwdEnd
-        let q = match self.state {
-            CursorSlot::At(p) => {
-                if self.rev {
-                    self.set.mask.step_up(p.0, self.word)
-                } else {
-                    self.set.mask.step_down(p.0, self.word)
-                }
-            }
-            CursorSlot::FwdEnd => {
-                let q = (if self.rev { self.set.mask.next_set(0) }
-                    else { self.set.mask.last_set() })?;
-                self.land(q);
-                return Some(unsafe { self.set.key(q) });
-            }
-        }?;
-        self.settle(Some(q));
-        Some(unsafe { self.set.key(q.0) })
-    }
-
-    ///land a step result; None is the walk's end (the cache goes stale)
-    fn settle(&mut self, q: Option<(usize, u64)>) {
-        match q {
-            Some((q, w)) => {
-                self.word = w;
-                self.state = CursorSlot::At(Pos(q));
-            }
-            None => self.state = CursorSlot::FwdEnd,
-        }
+        let q = self.walk.retreat()?;
+        Some(unsafe { self.set.key(q) })
     }
 
     ///the element next() would yield, without moving
     pub fn key(&self) -> Option<&'a K> {
-        self.slot().map(|p| unsafe { self.set.key(p) })
+        self.walk.slot().map(|p| unsafe { self.set.key(p) })
     }
 
     ///the current element's name
     pub fn addr(&self) -> Option<A> {
-        self.slot().map(|p| self.set.translator.p2a(Pos(p)))
-    }
-
-    ///At reads directly; FwdEnd has nothing ahead
-    fn slot(&self) -> Option<usize> {
-        match self.state {
-            CursorSlot::At(p) => Some(p.0),
-            CursorSlot::FwdEnd => None,
-        }
+        self.walk.slot().map(|p| self.set.translator.p2a(Pos(p)))
     }
 }
 
