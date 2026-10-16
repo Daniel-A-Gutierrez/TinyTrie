@@ -9,7 +9,9 @@
 //!search; bijection guarantees a single partner per pair). the fresh
 //!entry's dummy value is never chased before its patch: only its own
 //!partner points at it, and a placed entry never moves.
-///L0017
+//!cursors (`seek`/`seek_by_value`): blockmap cursors over either native
+//!order, the partner chased one hop per yield (like the iters).
+///L0020
 ///two event streams, one per name space — apply + clear both like `Deltas`
 pub struct BiDeltas<A> {
     ///K-side name swaps
@@ -17,9 +19,9 @@ pub struct BiDeltas<A> {
     ///V-side name swaps
     pub values: Deltas<A>,
 }
-///L0024
+///L0027
 impl<A: UnsignedNum> BiDeltas<A> {}
-///L0050
+///L0053
 ///the back-pointer chase: apply `emitter`'s event to `target`'s value
 ///column, one write per moved entry. a delta pair names the emitter's
 ///moved entry, and that entry's own value addresses its partner slot in
@@ -35,7 +37,7 @@ fn chase<EK: Ord, TK: Ord, A: UnsignedNum>(
     event: &Deltas<A>,
     target: &mut BlockMap<TK, A, A>,
 );
-///L0066
+///L0069
 ///bijective map: K and V both unique, each entry reachable from either
 ///side in one hop. insert returns the pair's (K-side, V-side) names —
 ///both are ordinary `Deltas` names; removals move nothing (no deltas)
@@ -45,12 +47,36 @@ pub struct BlockBiMap<K, V, A> {
     ///V → the entry's K-side name
     values: BlockMap<V, A, A>,
 }
-///L0073
+///L0076
 impl<K: Ord, V: Ord, A: UnsignedNum> BlockBiMap<K, V, A> {}
-///L0198
+///L0224
+///key-ordered bidirectional walk — a blockmap cursor over the keys side,
+///the partner chased one hop per yield (see blockmap::Cursor; invalidated
+///by any mutation — re-seek)
+pub struct Cursor<'a, K, V, A> {
+    bimap: &'a BlockBiMap<K, V, A>,
+    walk:  MapCursor<'a, K, A, A>,
+}
+///L0231
+///value-ordered bidirectional walk — Cursor's mirror over the values
+///side, yields (&V, &K)
+pub struct ValueCursor<'a, K, V, A> {
+    bimap: &'a BlockBiMap<K, V, A>,
+    walk:  MapCursor<'a, V, A, A>,
+}
+///L0236
+impl<'a, K: Ord, V: Ord, A: UnsignedNum> Cursor<'a, K, V, A> {}
+///L0279
+impl<'a, K: Ord, V: Ord, A: UnsignedNum> ValueCursor<'a, K, V, A> {}
+///L0323
 #[cfg(test)]
 mod tests {
     use super::*;
+    ///one cursor order's battery (see blockset::assert_walks): live =
+    ///sorted live (order-key, partner) pairs — every boundary × both
+    ///seeks × both directions, addrs resolve both ways, ghost round-trip.
+    ///$swap: the walk pairs are (value, key) — addrs orients them
+    macro_rules! cursor_battery;
     ///apply both streams to the holder's two name columns, in order
     fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64, A)>, d: &BiDeltas<A>);
     fn insert_all(
@@ -85,5 +111,13 @@ mod tests {
     ///removal reopens it — no partial state anywhere
     #[test]
     fn name_space_exhaustion();
+    ///cursors over both native orders: keys descend (the keys map flips),
+    ///values ascend — the orders disagree and the internal directions
+    ///are mixed. every boundary × both seeks × both directions, addrs
+    ///resolve both ways
+    #[test]
+    fn cursor_both_orders();
+    #[test]
+    fn cursor_empty_and_single();
 }
 ```

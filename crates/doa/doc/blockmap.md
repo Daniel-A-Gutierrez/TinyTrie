@@ -6,7 +6,9 @@
 //!protocol (addr names — value slots are nameless, a name finds the pair).
 //!order: pos order == key order — pos 0 = min key (Asc) or max (Desc);
 //!the translator carries the direction (see translator.rs).
-///L0019
+//!cursor (`seek`/`seek_after`): key-ordered walk over live pairs,
+//!blockset::Cursor's machine (see blockset).
+///L0021
 ///mask covers keys.len() slots; bit ⇔ slot initialized (key + value).
 pub struct BlockMap<K, V, A> {
     translator: Translator<A>,
@@ -17,19 +19,36 @@ pub struct BlockMap<K, V, A> {
     ///running sum of placed slot positions — the reversal tier's signal
     pos_sum:   u64,
 }
-///L0029
+///L0031
 impl<K, V, A> Drop for BlockMap<K, V, A> {}
-///L0041
+///L0043
 impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {}
-///L0562
+///L0588
 ///`BlockMap::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K, V, A> {
     Asc { bits: SetBits<'a>, map: &'a BlockMap<K, V, A> },
     Desc { bits: SetBitsRev<'a>, map: &'a BlockMap<K, V, A> },
 }
-///L0567
+///L0593
 impl<'a, K: Ord, V, A: UnsignedNum> Iterator for Iter<'a, K, V, A> {}
-///L0581
+///L0609
+///key-ordered bidirectional walk over live pairs — blockset::Cursor's
+///machine, one (key, value) pair per yield, steps on a cached mask word
+///(see blockset::Cursor). invalidated by any mutation — re-seek
+pub struct Cursor<'a, K, V, A> {
+    map:   &'a BlockMap<K, V, A>,
+    ///baked at construction (see blockset::Cursor)
+    rev:   bool,
+    ///the next-to-yield slot, or the forward ghost
+    state: CursorSlot,
+    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
+    word:  u64,
+}
+///L0619
+impl<'a, K, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
+///L0630
+impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
+///L0734
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +97,18 @@ mod tests {
     ///value/value_mut by key, and the values survive a reversal + turn
     #[test]
     fn value_lookup_and_mut();
+    ///the full cursor battery (see blockset::assert_walks): both seeks ×
+    ///both walk directions at every boundary, peek + addr, ghost
+    ///round-trips. live = sorted live (key, value) pairs
+    fn assert_walks<A: UnsignedNum>(map: &BlockMap<u64, u64, A>, live: &[(u64, u64)]);
+    ///holed mask, forward block: cursor walks match the sorted model
+    #[test]
+    fn cursor_matches_sorted_model();
+    ///flipped block: identical key-order semantics, values ride (see
+    ///blockset's `cursor_flipped_block`)
+    #[test]
+    fn cursor_flipped_block();
+    #[test]
+    fn cursor_empty_and_single();
 }
 ```

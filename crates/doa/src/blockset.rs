@@ -7,6 +7,8 @@
 //!order: pos order == key order — pos 0 = min (Asc) or max (Desc); a
 //!sequential insert at the key extreme is always a physical tail
 //!push_back. the translator carries the direction (see translator.rs).
+//!cursor (`seek`/`seek_after`): bidirectional key-ordered walk over raw
+//!slots — invalidated by any mutation, re-seek.
 
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
@@ -329,6 +331,30 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
             Iter::Desc { bits: self.mask.iter_set_rev(), set: self }
         } else {
             Iter::Asc { bits: self.mask.iter_set(), set: self }
+        }
+    }
+
+    ///cursor at the first key ≥ k, or the walk's end if none
+    pub fn seek(&self, k: &K) -> Cursor<'_, K, A> {
+        let mut cursor = Cursor::new(self);
+        cursor.seek(k);
+        cursor
+    }
+
+    ///cursor at the first key > k — k itself lands in a downward walk
+    pub fn seek_after(&self, k: &K) -> Cursor<'_, K, A> {
+        let mut cursor = Cursor::new(self);
+        cursor.seek_after(k);
+        cursor
+    }
+
+    ///first live slot at/after the pos boundary `from`, in KEY order —
+    ///Desc runs key order against pos order, so its mirror is prev_set
+    fn key_bound(&self, from: usize) -> Option<usize> {
+        if self.translator.reversed() {
+            self.mask.prev_set(from)
+        } else {
+            self.mask.next_set(from)
         }
     }
 
@@ -797,6 +823,150 @@ impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {
     }
 }
 
+///the slot `next` yields next, or the forward walk's exhaustion ghost.
+///backward exhaustion needs no ghost: `prev` leaves the state at the
+///first element, where `next` correctly re-yields it. pub(crate):
+///blockmap's cursor is the same machine over pairs
+pub(crate) enum CursorSlot {
+    At(Pos),
+    ///no next
+    FwdEnd,
+}
+
+///key-ordered bidirectional walk — `seek`/`seek_after` position, `next`
+///walks key-ascending (yield current, then step), `prev` walks back (step,
+///then yield). steps run on a cached mask word (SetBits' optimization —
+///dense steps test it in place; crossings reload). holds raw slots: any
+///mutation (slides, turns, flips) invalidates it — re-seek
+pub struct Cursor<'a, K, A> {
+    set:  &'a BlockSet<K, A>,
+    ///baked at construction — direction only changes by mutation, which
+    ///invalidates anyway
+    rev:  bool,
+    ///the next-to-yield slot, or the forward ghost
+    state: CursorSlot,
+    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
+    word: u64,
+}
+
+impl<'a, K, A: UnsignedNum> Cursor<'a, K, A> {
+    fn new(set: &'a BlockSet<K, A>) -> Self {
+        Cursor {
+            set,
+            rev: set.translator.reversed(),
+            state: CursorSlot::FwdEnd,
+            word: 0,
+        }
+    }
+}
+
+impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {
+    ///reposition at the first key ≥ k
+    pub fn seek(&mut self, k: &K) {
+        match self.set.bsearch(k) {
+            Ok(p) => self.land(p.0),
+            Err(spot) => match self.set.key_bound(spot.0) {
+                Some(q) => self.land(q),
+                None => self.state = CursorSlot::FwdEnd,
+            },
+        }
+    }
+
+    ///reposition at the first key > k (a dup at k skipped)
+    pub fn seek_after(&mut self, k: &K) {
+        let q = match self.set.bsearch(k) {
+            //past the dup in key order
+            Ok(p) => {
+                if self.rev { self.set.mask.prev_set(p.0) } else { self.set.mask.next_set(p.0 + 1) }
+            }
+            Err(spot) => self.set.key_bound(spot.0),
+        };
+        if let Some(q) = q { self.land(q) } else { self.state = CursorSlot::FwdEnd }
+    }
+
+    ///position at a live slot — the cache load (seeks, ghost resumes)
+    fn land(&mut self, q: usize) {
+        self.word = self.set.mask.word_at(q);
+        self.state = CursorSlot::At(Pos(q));
+    }
+
+    ///yield the current element, step forward (key-ascending). None at
+    ///the walk's end.
+    ///#[inline(always)]: plain #[inline] left next outlined (both
+    ///directions' crossing scans inline into it, blowing LLVM's size
+    ///budget) and walk loops paid a call + cursor spill per step —
+    ///measured 2× @10k fwd
+    #[inline(always)]
+    pub fn next(&mut self) -> Option<&'a K> {
+        let p = match self.state {
+            CursorSlot::FwdEnd => return None,
+            CursorSlot::At(p) => p.0,
+        };
+        //Asc climbs positions; Desc descends them
+        let q = if self.rev {
+            self.set.mask.step_down(p, self.word)
+        } else {
+            self.set.mask.step_up(p, self.word)
+        };
+        self.settle(q);
+        Some(unsafe { self.set.key(p) })
+    }
+
+    ///step back (key-descending), yield the element now current. None at
+    ///the walk's start (the state stays at the first element — next
+    ///re-yields it); from the forward ghost, resumes at the last element
+    #[inline(always)]
+    pub fn prev(&mut self) -> Option<&'a K> {
+        //the element behind the current — the walk's last from FwdEnd
+        let q = match self.state {
+            CursorSlot::At(p) => {
+                if self.rev {
+                    self.set.mask.step_up(p.0, self.word)
+                } else {
+                    self.set.mask.step_down(p.0, self.word)
+                }
+            }
+            CursorSlot::FwdEnd => {
+                let q = (if self.rev { self.set.mask.next_set(0) }
+                    else { self.set.mask.last_set() })?;
+                self.land(q);
+                return Some(unsafe { self.set.key(q) });
+            }
+        }?;
+        self.settle(Some(q));
+        Some(unsafe { self.set.key(q.0) })
+    }
+
+    ///land a step result; None is the walk's end (the cache goes stale)
+    fn settle(&mut self, q: Option<(usize, u64)>) {
+        match q {
+            Some((q, w)) => {
+                self.word = w;
+                self.state = CursorSlot::At(Pos(q));
+            }
+            None => self.state = CursorSlot::FwdEnd,
+        }
+    }
+
+    ///the element next() would yield, without moving
+    pub fn key(&self) -> Option<&'a K> {
+        self.slot().map(|p| unsafe { self.set.key(p) })
+    }
+
+    ///the current element's name
+    pub fn addr(&self) -> Option<A> {
+        self.slot().map(|p| self.set.translator.p2a(Pos(p)))
+    }
+
+    ///At reads directly; FwdEnd has nothing ahead
+    fn slot(&self) -> Option<usize> {
+        match self.state {
+            CursorSlot::At(p) => Some(p.0),
+            CursorSlot::FwdEnd => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1146,6 +1316,113 @@ mod tests {
         let mut keys: Vec<u64> = set.iter().copied().collect();
         keys.sort();
         assert_eq!(keys, (0..50).collect::<Vec<_>>());
+    }
+
+    ///the full model battery: both seeks × both walk directions at every
+    ///boundary (below min, between, exact hits, above max), peek + addr,
+    ///ghost round-trips. live = the sorted live keys
+    fn assert_walks<A: UnsignedNum>(set: &BlockSet<u64, A>, live: &[u64]) {
+        let max = live.last().unwrap() + 1;
+        for k in 0..=max {
+            let mut c = set.seek(&k);
+            assert_eq!(c.key().copied(), live.iter().find(|&&x| x >= k).copied(), "peek {k}");
+            if let (Some(x), Some(a)) = (c.key().copied(), c.addr()) {
+                assert_eq!(set.find(&x), Some(a), "addr {k}");
+            }
+            let expect: Vec<u64> = live.iter().copied().filter(|x| *x >= k).collect();
+            let got: Vec<u64> = std::iter::from_fn(|| c.next().copied()).collect();
+            assert_eq!(got, expect, "seek({k}) forward");
+            let mut c = set.seek(&k);
+            let expect: Vec<u64> = live.iter().rev().copied().filter(|x| *x < k).collect();
+            let got: Vec<u64> = std::iter::from_fn(|| c.prev().copied()).collect();
+            assert_eq!(got, expect, "seek({k}) back");
+            let mut c = set.seek_after(&k);
+            let expect: Vec<u64> = live.iter().copied().filter(|x| *x > k).collect();
+            let got: Vec<u64> = std::iter::from_fn(|| c.next().copied()).collect();
+            assert_eq!(got, expect, "seek_after({k}) forward");
+            let mut c = set.seek_after(&k);
+            let expect: Vec<u64> = live.iter().rev().copied().filter(|x| *x <= k).collect();
+            let got: Vec<u64> = std::iter::from_fn(|| c.prev().copied()).collect();
+            assert_eq!(got, expect, "seek_after({k}) back");
+        }
+        //round-trip across the FwdEnd ghost; exhaustion is stable, both
+        //sides resume forward correctly
+        let mut c = set.seek(&live[0]);
+        for k in live {
+            assert_eq!(c.next(), Some(k), "roundtrip forward");
+        }
+        assert_eq!(c.next(), None);
+        assert_eq!(c.next(), None, "FwdEnd must be stable");
+        for k in live.iter().rev() {
+            assert_eq!(c.prev(), Some(k), "roundtrip back");
+        }
+        assert_eq!(c.prev(), None);
+        assert_eq!(c.prev(), None, "start must be stable");
+        assert_eq!(c.next(), Some(&live[0]), "start resumes forward");
+        //prev through the start then next again: the first element twice
+        let mut c = set.seek(&live[0]);
+        assert_eq!(c.prev(), None);
+        assert_eq!(c.next(), Some(&live[0]));
+        assert_eq!(c.next(), Some(&live[1]));
+    }
+
+    ///holed mask, forward block: walks match the sorted model. sized for
+    ///miri — the battery sweeps every boundary regardless of n
+    #[test]
+    fn cursor_matches_sorted_model() {
+        let mut set = BlockSet::<u64, u16>::new();
+        let mut d = Deltas::new();
+        //37 coprime 67 ⇒ distinct keys, 7 gaps for hole spots
+        for i in 0..60u64 {
+            let k = (i * 37 + 11) % 67;
+            set.insert(k, &mut d).unwrap();
+            d.clear();
+        }
+        for k in [11u64, 48, 18, 59, 66] {
+            if let Some(a) = set.find(&k) {
+                set.remove(a);
+            }
+        }
+        let mut live: Vec<u64> = set.iter().copied().collect();
+        live.sort_unstable();
+        assert_walks(&set, &live);
+    }
+
+    ///flipped block: identical key-order semantics — the walk runs against
+    ///pos order, names still match find
+    #[test]
+    fn cursor_flipped_block() {
+        let (mut set, _) = insert_all((0..60u64).rev());
+        assert!(set.translator.reversed(), "descending stream must flip");
+        let removed = [3u64, 17, 42];
+        for k in removed {
+            set.remove(set.find(&k).unwrap());
+        }
+        let live: Vec<u64> = (0..60u64).filter(|k| !removed.contains(k)).collect();
+        assert_walks(&set, &live);
+    }
+
+    #[test]
+    fn cursor_empty_and_single() {
+        let set = BlockSet::<u64, u8>::new();
+        let mut c = set.seek(&5);
+        assert_eq!(c.key(), None);
+        assert_eq!(c.addr(), None);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), None);
+        let mut set = set;
+        let mut d = Deltas::new();
+        set.insert(7, &mut d).unwrap();
+        d.clear();
+        let mut c = set.seek(&5);
+        assert_eq!(c.next(), Some(&7));
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), Some(&7));
+        assert_eq!(c.prev(), None);
+        assert_eq!(c.next(), Some(&7));
+        let mut c = set.seek_after(&7);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), Some(&7));
     }
 }
 

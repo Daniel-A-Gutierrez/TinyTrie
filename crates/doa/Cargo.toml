@@ -38,3 +38,7 @@ harness = false
 name = "bimap"
 harness = false
 
+[[bench]]
+name = "cursor"
+harness = false
+

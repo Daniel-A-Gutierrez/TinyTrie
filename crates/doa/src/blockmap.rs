@@ -5,11 +5,13 @@
 //!protocol (addr names — value slots are nameless, a name finds the pair).
 //!order: pos order == key order — pos 0 = min key (Asc) or max (Desc);
 //!the translator carries the direction (see translator.rs).
+//!cursor (`seek`/`seek_after`): key-ordered walk over live pairs,
+//!blockset::Cursor's machine (see blockset).
 
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 
-use crate::blockset::{Deltas, FREE_STRIDE, L2_BYTES, TURN_DEN, TURN_NUM};
+use crate::blockset::{CursorSlot, Deltas, FREE_STRIDE, L2_BYTES, TURN_DEN, TURN_NUM};
 use crate::blockset::NoneSlide;
 use crate::translator::Translator;
 use crate::index::*;
@@ -141,6 +143,30 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
             Iter::Desc { bits: self.mask.iter_set_rev(), map: self }
         } else {
             Iter::Asc { bits: self.mask.iter_set(), map: self }
+        }
+    }
+
+    ///cursor at the first key ≥ k, or the walk's end if none
+    pub fn seek(&self, k: &K) -> Cursor<'_, K, V, A> {
+        let mut cursor = Cursor::new(self);
+        cursor.seek(k);
+        cursor
+    }
+
+    ///cursor at the first key > k — k itself lands in a downward walk
+    pub fn seek_after(&self, k: &K) -> Cursor<'_, K, V, A> {
+        let mut cursor = Cursor::new(self);
+        cursor.seek_after(k);
+        cursor
+    }
+
+    ///first live slot at/after the pos boundary `from`, in KEY order (see
+    ///blockset::key_bound)
+    fn key_bound(&self, from: usize) -> Option<usize> {
+        if self.translator.reversed() {
+            self.mask.prev_set(from)
+        } else {
+            self.mask.next_set(from)
         }
     }
 
@@ -577,6 +603,133 @@ impl<'a, K: Ord, V, A: UnsignedNum> Iterator for Iter<'a, K, V, A> {
     }
 }
 
+///key-ordered bidirectional walk over live pairs — blockset::Cursor's
+///machine, one (key, value) pair per yield, steps on a cached mask word
+///(see blockset::Cursor). invalidated by any mutation — re-seek
+pub struct Cursor<'a, K, V, A> {
+    map:   &'a BlockMap<K, V, A>,
+    ///baked at construction (see blockset::Cursor)
+    rev:   bool,
+    ///the next-to-yield slot, or the forward ghost
+    state: CursorSlot,
+    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
+    word:  u64,
+}
+
+impl<'a, K, V, A: UnsignedNum> Cursor<'a, K, V, A> {
+    fn new(map: &'a BlockMap<K, V, A>) -> Self {
+        Cursor {
+            map,
+            rev: map.translator.reversed(),
+            state: CursorSlot::FwdEnd,
+            word: 0,
+        }
+    }
+}
+
+impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {
+    ///reposition at the first key ≥ k
+    pub fn seek(&mut self, k: &K) {
+        match self.map.bsearch(k) {
+            Ok(p) => self.land(p.0),
+            Err(spot) => match self.map.key_bound(spot.0) {
+                Some(q) => self.land(q),
+                None => self.state = CursorSlot::FwdEnd,
+            },
+        }
+    }
+
+    ///reposition at the first key > k (a dup at k skipped)
+    pub fn seek_after(&mut self, k: &K) {
+        let q = match self.map.bsearch(k) {
+            //past the dup in key order
+            Ok(p) => {
+                if self.rev { self.map.mask.prev_set(p.0) } else { self.map.mask.next_set(p.0 + 1) }
+            }
+            Err(spot) => self.map.key_bound(spot.0),
+        };
+        if let Some(q) = q { self.land(q) } else { self.state = CursorSlot::FwdEnd }
+    }
+
+    ///position at a live slot — the cache load (seeks, ghost resumes)
+    fn land(&mut self, q: usize) {
+        self.word = self.map.mask.word_at(q);
+        self.state = CursorSlot::At(Pos(q));
+    }
+
+    ///yield the current pair, step forward (key-ascending). None at the
+    ///walk's end
+    #[inline(always)]
+    pub fn next(&mut self) -> Option<(&'a K, &'a V)> {
+        let p = match self.state {
+            CursorSlot::FwdEnd => return None,
+            CursorSlot::At(p) => p.0,
+        };
+        //Asc climbs positions; Desc descends them
+        let q = if self.rev {
+            self.map.mask.step_down(p, self.word)
+        } else {
+            self.map.mask.step_up(p, self.word)
+        };
+        self.settle(q);
+        Some(unsafe { self.map.pair(p) })
+    }
+
+    ///step back (key-descending), yield the pair now current. None at
+    ///the walk's start (the state stays at the first pair — next
+    ///re-yields it); from the forward ghost, resumes at the last pair
+    #[inline(always)]
+    pub fn prev(&mut self) -> Option<(&'a K, &'a V)> {
+        //the pair behind the current — the walk's last from FwdEnd
+        let q = match self.state {
+            CursorSlot::At(p) => {
+                if self.rev {
+                    self.map.mask.step_up(p.0, self.word)
+                } else {
+                    self.map.mask.step_down(p.0, self.word)
+                }
+            }
+            CursorSlot::FwdEnd => {
+                let q = (if self.rev { self.map.mask.next_set(0) }
+                    else { self.map.mask.last_set() })?;
+                self.land(q);
+                return Some(unsafe { self.map.pair(q) });
+            }
+        }?;
+        self.settle(Some(q));
+        Some(unsafe { self.map.pair(q.0) })
+    }
+
+    ///land a step result; None is the walk's end (the cache goes stale)
+    fn settle(&mut self, q: Option<(usize, u64)>) {
+        match q {
+            Some((q, w)) => {
+                self.word = w;
+                self.state = CursorSlot::At(Pos(q));
+            }
+            None => self.state = CursorSlot::FwdEnd,
+        }
+    }
+
+    ///the pair next() would yield, without moving
+    pub fn entry(&self) -> Option<(&'a K, &'a V)> {
+        self.slot().map(|p| unsafe { self.map.pair(p) })
+    }
+
+    ///the current entry's name
+    pub fn addr(&self) -> Option<A> {
+        self.slot().map(|p| self.map.translator.p2a(Pos(p)))
+    }
+
+    ///At reads directly; FwdEnd has nothing ahead
+    fn slot(&self) -> Option<usize> {
+        match self.state {
+            CursorSlot::At(p) => Some(p.0),
+            CursorSlot::FwdEnd => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,5 +1004,117 @@ mod tests {
         *map.value_mut(&30).unwrap() = 999;
         assert_eq!(map.value(&30), Some(&999));
         assert_eq!(map.value(&100), None);
+    }
+
+    ///the full cursor battery (see blockset::assert_walks): both seeks ×
+    ///both walk directions at every boundary, peek + addr, ghost
+    ///round-trips. live = sorted live (key, value) pairs
+    fn assert_walks<A: UnsignedNum>(map: &BlockMap<u64, u64, A>, live: &[(u64, u64)]) {
+        let max = live.last().unwrap().0 + 1;
+        for k in 0..=max {
+            let mut c = map.seek(&k);
+            let peek = live.iter().find(|(x, _)| *x >= k).copied();
+            assert_eq!(c.entry().map(|(k, v)| (*k, *v)), peek, "peek {k}");
+            if let (Some((x, _)), Some(a)) = (peek, c.addr()) {
+                assert_eq!(map.find(&x), Some(a), "addr {k}");
+            }
+            let expect: Vec<(u64, u64)> = live.iter().copied().filter(|(x, _)| *x >= k).collect();
+            let got: Vec<(u64, u64)> =
+                std::iter::from_fn(|| c.next().map(|(k, v)| (*k, *v))).collect();
+            assert_eq!(got, expect, "seek({k}) forward");
+            let mut c = map.seek(&k);
+            let expect: Vec<(u64, u64)> =
+                live.iter().rev().copied().filter(|(x, _)| *x < k).collect();
+            let got: Vec<(u64, u64)> =
+                std::iter::from_fn(|| c.prev().map(|(k, v)| (*k, *v))).collect();
+            assert_eq!(got, expect, "seek({k}) back");
+            let mut c = map.seek_after(&k);
+            let expect: Vec<(u64, u64)> = live.iter().copied().filter(|(x, _)| *x > k).collect();
+            let got: Vec<(u64, u64)> =
+                std::iter::from_fn(|| c.next().map(|(k, v)| (*k, *v))).collect();
+            assert_eq!(got, expect, "seek_after({k}) forward");
+            let mut c = map.seek_after(&k);
+            let expect: Vec<(u64, u64)> =
+                live.iter().rev().copied().filter(|(x, _)| *x <= k).collect();
+            let got: Vec<(u64, u64)> =
+                std::iter::from_fn(|| c.prev().map(|(k, v)| (*k, *v))).collect();
+            assert_eq!(got, expect, "seek_after({k}) back");
+        }
+        //round-trip across the FwdEnd ghost; exhaustion is stable, both
+        //sides resume forward correctly
+        let mut c = map.seek(&live[0].0);
+        for kv in live {
+            assert_eq!(c.next(), Some((&kv.0, &kv.1)), "roundtrip forward");
+        }
+        assert_eq!(c.next(), None);
+        assert_eq!(c.next(), None, "FwdEnd must be stable");
+        for kv in live.iter().rev() {
+            assert_eq!(c.prev(), Some((&kv.0, &kv.1)), "roundtrip back");
+        }
+        assert_eq!(c.prev(), None);
+        assert_eq!(c.prev(), None, "start must be stable");
+        assert_eq!(c.next(), Some((&live[0].0, &live[0].1)), "start resumes forward");
+        let mut c = map.seek(&live[0].0);
+        assert_eq!(c.prev(), None);
+        assert_eq!(c.next(), Some((&live[0].0, &live[0].1)));
+        assert_eq!(c.next(), Some((&live[1].0, &live[1].1)));
+    }
+
+    ///holed mask, forward block: cursor walks match the sorted model
+    #[test]
+    fn cursor_matches_sorted_model() {
+        let mut map = BlockMap::<u64, u64, u16>::new();
+        let mut d = Deltas::new();
+        //37 coprime 67 ⇒ distinct keys, 7 gaps for hole spots (sized for miri)
+        for i in 0..60u64 {
+            let k = (i * 37 + 11) % 67;
+            map.insert(k, k * 7 + 3, &mut d).unwrap();
+            d.clear();
+        }
+        for k in [11u64, 48, 18, 59, 66] {
+            if let Some(a) = map.find(&k) {
+                map.remove(a);
+            }
+        }
+        let mut live: Vec<(u64, u64)> = map.iter().map(|(k, v)| (*k, *v)).collect();
+        live.sort_unstable();
+        assert_walks(&map, &live);
+    }
+
+    ///flipped block: identical key-order semantics, values ride (see
+    ///blockset's `cursor_flipped_block`)
+    #[test]
+    fn cursor_flipped_block() {
+        let (mut map, _) = insert_all((0..60u64).rev().map(|k| (k, k * 7)));
+        let removed = [3u64, 17, 42];
+        for k in removed {
+            map.remove_key(&k);
+        }
+        let live: Vec<(u64, u64)> =
+            (0..60u64).filter(|k| !removed.contains(k)).map(|k| (k, k * 7)).collect();
+        assert_walks(&map, &live);
+    }
+
+    #[test]
+    fn cursor_empty_and_single() {
+        let map = BlockMap::<u64, u64, u8>::new();
+        let mut c = map.seek(&5);
+        assert_eq!(c.entry(), None);
+        assert_eq!(c.addr(), None);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), None);
+        let mut map = map;
+        let mut d = Deltas::new();
+        map.insert(7, 70, &mut d).unwrap();
+        d.clear();
+        let mut c = map.seek(&5);
+        assert_eq!(c.next(), Some((&7, &70)));
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), Some((&7, &70)));
+        assert_eq!(c.prev(), None);
+        assert_eq!(c.next(), Some((&7, &70)));
+        let mut c = map.seek_after(&7);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), Some((&7, &70)));
     }
 }

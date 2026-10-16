@@ -204,7 +204,9 @@ substrate:
   (`doa::Fixup`, `doa::treeblock::{search, walker, TreeBlock}`).
 - `index.rs` — numeric trait ladder (`Num`/`UnsignedNum`/`Addr`) + `Pos` +
   type-level const facts underpinning all address math.
-- `mask.rs` — dense occupancy bitmap (see the blockset section).
+- `mask.rs` — dense occupancy bitmap (see the blockset section) + the
+  bidirectional cached-word steppers (`step_up`/`step_down`/`word_at` —
+  the cursor stepping).
 - `translator.rs` — the set/map tier's 2-knob translator, fn-ptr per
   direction + the reversal/turn maps; the one hard rule is position order
   (pos 0 = min, pos len−1 = max).
@@ -214,6 +216,11 @@ tiers:
   ladder + the reversal trigger + the differential `Iter` over
   SetBits/SetBitsRev; `find`/`contains` fast-path beyond either extreme
   (two compares, no bsearch — sequential probes land past the tail).
+  the `Cursor` family: `seek`/`seek_after` (lower/upper bound in KEY
+  order, direction-aware) → `next`/`prev`/`key`/`addr` — a bidirectional
+  walk over raw slots on cached mask words, invalidated by any mutation
+  (state {At, FwdEnd} only — backward exhaustion needs no ghost; walk
+  methods are `#[inline(always)]`, see `Cursor::next`'s doc).
   `Deltas`' event recording (`record_none_slide`/
   `record_gather`, `is_pending`), `NoneSlide` (the deltas-protocol link),
   and `FREE_STRIDE`/`L2_BYTES` are `pub(crate)` — blockmap shares them.
@@ -229,7 +236,9 @@ tiers:
   finds the pair. API beyond the set surface: `get(addr) -> (&K, &V)`,
   `value`/`value_mut` by key, `set_value` by addr (drop-safe overwrite),
   `remove_key`, `iter` over `(&K, &V)`; `find` carries the same
-  extremes fast path as blockset's.
+  extremes fast path as blockset's. the `Cursor` mirror (`seek`/
+  `seek_after`, `next`/`prev` yield pairs, `entry()` peek, `addr`) —
+  blockset's machine, `CursorSlot` shared via `pub(crate)`.
 - `blockbimap.rs` — the bijective tier: `BlockBiMap<K, V, A>` — two lockstep
   BlockMaps, each holding the OTHER's names as its values (both orders native,
   no projection ordering; every pair one hop from either side). insert
@@ -251,6 +260,11 @@ tiers:
   k back — the slides it caused are real, so key-side deltas may be
   PENDING on Err (apply + clear like an Ok; a spot-as-hole placement
   records a no-op event, a push_back records nothing).
+  cursors over both native orders: `seek`/`seek_after` → `Cursor` (key
+  order, yields `(&K, &V)`) and `seek_by_value`/`seek_after_by_value` →
+  `ValueCursor` (`(&V, &K)`) — blockmap cursors with the partner chased
+  one hop per yield (like the iters); `addrs() -> (K-side, V-side)` on
+  both.
 
 consumer:
 - `treeblock/` — ALL the tree machinery: `blocks` (Block + BlockTrait/
@@ -270,7 +284,12 @@ consumer:
   BlockMap vs BTreeMap + the BlockSet same-run reference — u64 values),
   `bimap.rs` (same harness, BlockBiMap vs a two-BTreeMap bidirectional
   control — insert/lookup-both-sides/remove/iter_pairs; findings in
-  session_history 2026-10-15).
+  session_history 2026-10-15), `cursor.rs` (the cursor family vs
+  `BTree{Set,Map}` `range` — the stable surrogate, std's cursor API is
+  nightly-only: fwd = seek + 100 `next`, back = seek_after + 100 `prev`,
+  both tiers × 4 workloads, cursor-vs-range orders verified over a probe
+  prefix; the optimization ladder + final numbers in session_history
+  2026-10-16).
 
 notes: `devlog.md` (design log), `session_history.md` (per-session record),
 `subtle_bugs.md` (solved nuances + their rules).
@@ -307,9 +326,16 @@ streams with random removals, every holder name verified every op, order
 valid in either direction post-flip; the reversal fires in `descending`;
 gather banking by distance + the LEFT-side multi-segment mirror with
 exact hop-pair assertions; front-insert cascades; pending-deltas panic;
-dup rejection; remove/reinsert; NoneSlide expansion). blockbimap inline:
-holder mirror on BOTH name columns, mixed-direction streams, the dup-v
-rollback with pending deltas, 600-op torture, name-space exhaustion.
+dup rejection; remove/reinsert; NoneSlide expansion). cursor batteries
+(2026-10-16): blockset/blockmap `assert_walks` — both seeks × both walk
+directions at EVERY boundary over a holed stride-built block + a flipped
+block, peek/addr checks, ghost round-trips; bimap's macro battery over
+both orders (descending keys force the flip, values ascend — mixed
+internal directions); mask `steps_match_naive` (single steps + full
+cache-riding walks vs naive at every start, the cache invariant asserted
+per hop). sized for miri — 60-key sets over a 67-wide key space (every
+boundary still swept; the flip still trips, gathers still bank), 70-bit
+mask: ~2 min.
 
 Run targeted: `cargo test -p doa --lib blockset` / `blockmap` / `mask` /
 `treeblock::walker`; uninit/leaks: `cargo +nightly miri test -p
@@ -321,6 +347,13 @@ the past — run targeted tests.
 
 ## Future Work
 
+- cursors: `seek`/`seek_after` pay a full bsearch for beyond-the-extremes
+  probes — find's two-compare guard is the candidate (report-only review
+  finding, unbenched; the cursor bench shows the bsearch dominating at
+  DRAM scale, so the guard is a cache-resident-scale win only). bimap's
+  `Cursor`/`ValueCursor` chase wrappers are plain `#[inline]` over
+  `inline(always)` walks — one potential outlined call per yield,
+  unmeasured.
 - blockset: `try_insert`/`try_alloc` split + arena-level occupancy
   decisions; threshold tuning (FREE_STRIDE + the len/8 reversal trigger
   remain unbenchmarked; the turn line is now `TURN_NUM/DEN` and IS

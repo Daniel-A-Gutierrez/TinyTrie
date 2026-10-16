@@ -13,7 +13,7 @@ pub struct Mask {
 }
 ///L0014
 impl Mask {}
-///L0314
+///L0362
 ///`iter_set`'s engine — ascending set bits. None-stable (exhaustion
 ///zeroes the cached word, subtle_bugs §21)
 pub struct SetBits<'a> {
@@ -23,9 +23,9 @@ pub struct SetBits<'a> {
     ///next position to test
     pos:  usize,
 }
-///L0322
+///L0370
 impl Iterator for SetBits<'_> {}
-///L0360
+///L0408
 ///`iter_set_rev`'s engine — the descending mirror. None-stable like
 ///`SetBits`
 pub struct SetBitsRev<'a> {
@@ -34,12 +34,12 @@ pub struct SetBitsRev<'a> {
     ///next position to test; wraps below 0 as the exhaustion sentinel
     pos:   usize,
 }
-///L0367
+///L0415
 impl Iterator for SetBitsRev<'_> {}
-///L0404
+///L0452
 ///bits of x moved to the even positions of a u64 (p → 2p)
 fn spread(x: u32) -> u64;
-///L0415
+///L0463
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +50,12 @@ mod tests {
     fn edges();
     #[test]
     fn shrink_clears_tail();
+    ///the cursor steppers vs naive at every start position — single
+    ///step each way, plus a full walk maintaining the cache across word
+    ///crossings and the partial tail word (cache invariant checked per
+    ///step). 70 bits: a full word + partial tail, sized for miri
+    #[test]
+    fn steps_match_naive();
     #[test]
     fn iter_set_ascending();
     #[test]

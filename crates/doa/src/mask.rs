@@ -118,6 +118,54 @@ impl Mask {
         None
     }
 
+    ///the word containing p — 0 past the tracked range. the cursor
+    ///steppers' cache load; p < bits from callers holding live slots
+    #[inline]
+    pub(crate) fn word_at(&self, p: usize) -> u64 {
+        self.words.get(p >> 6).copied().unwrap_or(0)
+    }
+
+    ///first set bit strictly above p — the bidirectional cursor's
+    ///position-climbing step (next on Asc blocks, prev on Desc). `word`
+    ///is p's cached word (SetBits' optimization): the dense fast path
+    ///tests the adjacent bit in place, no load; a same-word hop tz-scans
+    ///the remainder; a crossing rescans and returns the new word.
+    ///VALUE-passed, not &mut — a pointer would serialize the hot loop on
+    ///store-to-load forwarding. caller holds: `word == word_at(p)`
+    #[inline]
+    pub(crate) fn step_up(&self, p: usize, word: u64) -> Option<(usize, u64)> {
+        let hi = p & 63;
+        if hi < 63 {
+            if word & 1 << (hi + 1) != 0 {
+                return Some((p + 1, word));
+            }
+            let rest = word >> (hi + 1);
+            if rest != 0 {
+                return Some(((p & !63) + (hi + 1) + rest.trailing_zeros() as usize, word));
+            }
+        }
+        let q = self.next_set(p + 1)?;
+        Some((q, self.word_at(q)))
+    }
+
+    ///first set bit strictly below p — the position-descending step (next
+    ///on Desc, prev on Asc). cache contract as `step_up`
+    #[inline]
+    pub(crate) fn step_down(&self, p: usize, word: u64) -> Option<(usize, u64)> {
+        let lo = p & 63;
+        if lo > 0 {
+            if word & 1 << (lo - 1) != 0 {
+                return Some((p - 1, word));
+            }
+            let below = word & ((1 << (lo - 1)) - 1);
+            if below != 0 {
+                return Some(((p & !63) + 63 - below.leading_zeros() as usize, word));
+            }
+        }
+        let q = self.prev_set(p)?;
+        Some((q, self.word_at(q)))
+    }
+
     ///first clear bit ≥ from and < bits, or None
     #[inline]
     pub fn next_clear(&self, from: usize) -> Option<usize> {
@@ -491,6 +539,44 @@ mod tests {
         //tail cleared: nothing past bits even after a re-grow
         m.resize(100);
         assert_eq!(m.iter_set().collect::<Vec<_>>(), vec![50]);
+    }
+
+    ///the cursor steppers vs naive at every start position — single
+    ///step each way, plus a full walk maintaining the cache across word
+    ///crossings and the partial tail word (cache invariant checked per
+    ///step). 70 bits: a full word + partial tail, sized for miri
+    #[test]
+    fn steps_match_naive() {
+        let bits = 70;
+        let set: Vec<usize> = (0..bits).filter(|p| (p * 31 + 7) % 10 < 7).collect();
+        let m = mask_ones(bits, &set);
+        for from in 0..bits {
+            let up = set.iter().copied().find(|q| *q > from);
+            let down = (0..from).rev().find(|q| set.contains(q));
+            //single steps through a fresh cache each
+            let word = m.word_at(from);
+            assert_eq!(m.step_up(from, word).map(|(q, _)| q), up, "step_up {from}");
+            assert_eq!(m.step_down(from, word).map(|(q, _)| q), down, "step_down {from}");
+            //full walks: the cache rides, every hop lands on a set bit
+            let mut word = m.word_at(from);
+            let mut p = from;
+            while let Some((q, w)) = m.step_up(p, word) {
+                assert!(m.get(q), "hole yielded {q}");
+                assert_eq!(w, m.word_at(q), "cache up {q}");
+                p = q;
+                word = w;
+            }
+            assert_eq!(p, set.iter().copied().filter(|q| *q > from).max().unwrap_or(from), "up end {from}");
+            let mut word = m.word_at(from);
+            let mut p = from;
+            while let Some((q, w)) = m.step_down(p, word) {
+                assert!(m.get(q), "hole yielded {q}");
+                assert_eq!(w, m.word_at(q), "cache down {q}");
+                p = q;
+                word = w;
+            }
+            assert_eq!(p, set.iter().copied().filter(|q| *q < from).min().unwrap_or(from), "down end {from}");
+        }
     }
 
     #[test]

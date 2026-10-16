@@ -8,7 +8,9 @@
 //!order: pos order == key order — pos 0 = min (Asc) or max (Desc); a
 //!sequential insert at the key extreme is always a physical tail
 //!push_back. the translator carries the direction (see translator.rs).
-///L0019
+//!cursor (`seek`/`seek_after`): bidirectional key-ordered walk over raw
+//!slots — invalidated by any mutation, re-seek.
+///L0021
 ///one fetch-gather slide-chain link: the hole moves `from → to`. Gather
 ///events speak these in post-prior-slides coordinates (see `Delta::Gather`)
 #[derive(Clone, Copy, Debug)]
@@ -16,9 +18,9 @@ pub struct NoneSlide {
     pub from: Pos,
     pub to:   Pos,
 }
-///L0024
+///L0026
 impl NoneSlide {}
-///L0035
+///L0037
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
 ///nothing)
@@ -38,7 +40,7 @@ enum Delta {
     #[allow(dead_code)]
     Pairs(Vec<(Pos, Pos)>),
 }
-///L0058
+///L0060
 ///expanded `(from, to)` pos pairs of one event. plain slides emit 1-step
 ///cascades (hole-adjacent mover first); gathers walk the recorded
 ///slides' SEGMENTS and emit ONE pair per moved element carrying the
@@ -60,14 +62,14 @@ enum DeltaPairs<'a> {
     },
     Pairs(std::slice::Iter<'a, (Pos, Pos)>),
 }
-///L0075
+///L0077
 ///swap-cascade run state of one hole slide `from → to`
 fn run_of(from: usize, to: usize) -> (usize, i64, usize);
-///L0083
+///L0085
 impl Delta {}
-///L0102
+///L0104
 impl Iterator for DeltaPairs<'_> {}
-///L0177
+///L0179
 ///slot moves of one mutation + the translator snapshot at mutation time.
 ///`iter` expands to (from_addr, to_addr) name swaps applicable in order;
 ///`insert` panics while deltas are pending — apply, then `clear`
@@ -75,9 +77,9 @@ pub struct Deltas<A> {
     event:      Delta,
     translator: Translator<A>,
 }
-///L0182
+///L0184
 impl<A: UnsignedNum> Deltas<A> {}
-///L0233
+///L0235
 ///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
 ///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
 ///preemptive turn line (numerator/denominator): past this density, a
@@ -87,18 +89,18 @@ impl<A: UnsignedNum> Deltas<A> {}
 ///WORSE @1M (turn frequency doubles; each big turn's O(cap) relocation
 ///eats the amortization) + 2× random-build memory — 7/8 stands
 pub(crate) const TURN_NUM: usize = 7;
-///L0234
+///L0236
 pub(crate) const TURN_DEN: usize = 8;
-///L0235
+///L0237
 pub(crate) const FREE_STRIDE: usize = 8;
-///L0242
+///L0244
 ///~L2 residency: the bsearch shape split — cache-resident blocks cmov
 ///(probe compares resolve from L1/L2, mispredicts dominate), DRAM-
 ///resident blocks speculate (the branchy loop issues the next probe's
 ///load ahead of the compare, overlapping the miss). measured both ways
 ///at both scales, see notes/session_history.md
 pub(crate) const L2_BYTES: usize = 512 * 1024;
-///L0246
+///L0248
 ///mask covers data.len() slots; bit ⇔ slot initialized.
 pub struct BlockSet<K, A> {
     translator: Translator<A>,
@@ -109,19 +111,49 @@ pub struct BlockSet<K, A> {
     ///signal for the reversal tier
     pos_sum:    u64,
 }
-///L0256
+///L0258
 impl<K, A> Drop for BlockSet<K, A> {}
-///L0265
+///L0267
 impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {}
-///L0782
+///L0808
 ///`BlockSet::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K, A> {
     Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
     Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
 }
-///L0787
+///L0813
 impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {}
-///L0801
+///L0830
+///the slot `next` yields next, or the forward walk's exhaustion ghost.
+///backward exhaustion needs no ghost: `prev` leaves the state at the
+///first element, where `next` correctly re-yields it. pub(crate):
+///blockmap's cursor is the same machine over pairs
+pub(crate) enum CursorSlot {
+    At(Pos),
+    ///no next
+    FwdEnd,
+}
+///L0841
+///key-ordered bidirectional walk — `seek`/`seek_after` position, `next`
+///walks key-ascending (yield current, then step), `prev` walks back (step,
+///then yield). steps run on a cached mask word (SetBits' optimization —
+///dense steps test it in place; crossings reload). holds raw slots: any
+///mutation (slides, turns, flips) invalidates it — re-seek
+pub struct Cursor<'a, K, A> {
+    set:  &'a BlockSet<K, A>,
+    ///baked at construction — direction only changes by mutation, which
+    ///invalidates anyway
+    rev:  bool,
+    ///the next-to-yield slot, or the forward ghost
+    state: CursorSlot,
+    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
+    word: u64,
+}
+///L0852
+impl<'a, K, A: UnsignedNum> Cursor<'a, K, A> {}
+///L0863
+impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {}
+///L0971
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +217,19 @@ mod tests {
     fn rotate_map_preserves_names_and_order();
     #[test]
     fn remove_and_reinsert();
+    ///the full model battery: both seeks × both walk directions at every
+    ///boundary (below min, between, exact hits, above max), peek + addr,
+    ///ghost round-trips. live = the sorted live keys
+    fn assert_walks<A: UnsignedNum>(set: &BlockSet<u64, A>, live: &[u64]);
+    ///holed mask, forward block: walks match the sorted model. sized for
+    ///miri — the battery sweeps every boundary regardless of n
+    #[test]
+    fn cursor_matches_sorted_model();
+    ///flipped block: identical key-order semantics — the walk runs against
+    ///pos order, names still match find
+    #[test]
+    fn cursor_flipped_block();
+    #[test]
+    fn cursor_empty_and_single();
 }
 ```

@@ -829,3 +829,72 @@ layout bench (BlockMap's design ancestry).
   Work: `value`/`value_mut`/`remove_key` lack the extremes fast path.
 - deferred: blockmap-specific tuning (none — inherited blockset's knobs
   unbenchmarked); `from_vec`; `entry`-style API.
+## 2026-10-16 — cursors: seek + sequential iteration, all three tiers
+
+- landed: the cursor family — lookup followed by sequential iteration, key-ordered,
+  direction-aware. `BlockSet::seek(k)`/`seek_after(k)` (lower/upper bound) →
+  `Cursor`: `next()` yields the current element then steps key-ascending, `prev()`
+  steps back then yields, `key()`/`addr()` peek, `Cursor::seek`/`seek_after`
+  reposition. `BlockMap` mirrors with `entry()` over pairs; `BlockBiMap::seek` →
+  `Cursor` (key order) and `seek_by_value` → `ValueCursor` (value order) wrap the
+  blockmap cursors and chase the partner one hop per yield (like the iters);
+  `addrs() -> (K-side, V-side)` on both. raw-slot state — any mutation
+  invalidates, re-seek. new bench `benches/cursor.rs` (find's harness: 4
+  structures × {fwd = seek + 100 next, back = seek_after + 100 prev} × 4
+  workloads, cursor-vs-range orders verified over a probe prefix; std has no
+  stable cursor — `range(k..)`/`range(..=k).rev()` is the surrogate).
+- landed: `Mask::step_up`/`step_down`/`word_at` — bidirectional cached-word
+  steppers (the SetBits optimization pulled into the cursor): dense fast path
+  tests the adjacent bit in the cached word (no load, no scan entry), same-word
+  hops tz/lz-scan the remainder, crossings delegate to next_set/prev_set and
+  return the fresh word.
+- died: a third cursor ghost (`BackEnd`) — prev-exhaustion needs no ghost: the
+  state stays at At(first), where every op answers what a resume ghost would.
+- died: the `&mut u64` cache-parameter steppers — the pointer serialized the
+  walk loop on store-to-load forwarding (see measured #1); value-passed instead.
+- decided: cursor holds raw POSITIONS, not names — names are semi-stable
+  (slides transfer them, subtle_bugs §17), a read cursor needs no fixup
+  currency; documented invalidation instead of a deltas-applying cursor.
+- measured (best ns/walk = one seek + ≤100 yields; 32B Item keys; the
+  optimization ladder, each step benched at 10k):
+  1. `&mut` cache param: append fwd 125→273 — WORSE. the old next_set's
+     independent same-address L1 load was effectively free; the cache's
+     read-after-write through a pointer is a serialized chain.
+  2. value-passed: 273→220, still 2× — disassembly showed `Cursor::next`
+     OUTLINED (both directions' crossing scans pre-inlined into it blew
+     LLVM's size budget): the walk loop paid a call + cursor spill per step.
+  3. `#[inline(always)]` on the walk methods: 220→134-173, and the back-walk
+     asymmetry closed (append 242→177, random 392→235) — the rationale is
+     documented on `Cursor::next` in blockset.
+
+  final, pre→post optimization:
+
+  | 10k (L2) best | BlockSet | BTreeSet | BlockMap | BTreeMap |
+  |---|---|---|---|---|
+  | fwd, pre | 125-218 | 197-244 | 150-232 | 202-219 |
+  | back, pre | 235-392 | 188-220 | 237-407 | 224-244 |
+  | fwd, post | 134-225 | 180-210 | 154-231 | 204-238 |
+  | back, post | 177-235 | 190-230 | 185-251 | 223-264 |
+
+  | 1M (DRAM), post | BlockSet | BTreeSet | BlockMap | BTreeMap |
+  |---|---|---|---|---|
+  | fwd | 577-859 | 1712-2083 | 678-1029 | 2063-2262 |
+  | back | 653-969 | 1869-2129 | 705-1118 | 2065-2408 |
+
+  - 1M: 2-3× over btree range on every cell, both directions — the walk is a
+    contiguous scan once the seek lands; the btree pays node hops per step.
+    back improved 10-13% over the pre-optimization steppers (append 755→653,
+    random 939→865, runs 1056→969); fwd flat — the bsearch + DRAM dominate.
+  - 10k post: every doa cell beats its std counterpart; pre-optimization std
+    won all four back cells (the own-fwd/back asymmetry was 2×: append 125 vs
+    242; btree fwd/back are symmetric because its cost is pointer-chasing
+    either way).
+  - miri: the cursor batteries sized down to 60-key sets (67-wide key space —
+    every boundary still swept; coverage semantics unchanged, the flip still
+    trips, gathers still bank) + the 70-bit stepper test: 31min → 2m14s,
+    clean. the naive-battery-vs-volume split is the lesson — per-boundary
+    exhaustiveness is what the tests are FOR; the key space can be small.
+- deferred: `seek`/`seek_after` lack find's beyond-the-extremes two-compare
+  fast path (report-only review finding, unbenched); bimap's cursor wrappers
+  are plain `#[inline]` over `inline(always)` walks — one potential outlined
+  call per yield, unmeasured.

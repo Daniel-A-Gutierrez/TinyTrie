@@ -8,8 +8,11 @@
 //!search; bijection guarantees a single partner per pair). the fresh
 //!entry's dummy value is never chased before its patch: only its own
 //!partner points at it, and a placed entry never moves.
+//!cursors (`seek`/`seek_by_value`): blockmap cursors over either native
+//!order, the partner chased one hop per yield (like the iters).
 
 use crate::blockmap::BlockMap;
+use crate::blockmap::Cursor as MapCursor;
 use crate::blockset::Deltas;
 use crate::index::*;
 
@@ -137,6 +140,27 @@ impl<K: Ord, V: Ord, A: UnsignedNum> BlockBiMap<K, V, A> {
         })
     }
 
+    ///cursor at the first key ≥ k, or the walk's end if none
+    pub fn seek(&self, k: &K) -> Cursor<'_, K, V, A> {
+        Cursor { bimap: self, walk: self.keys.seek(k) }
+    }
+
+    ///cursor at the first key > k — k itself lands in a downward walk
+    pub fn seek_after(&self, k: &K) -> Cursor<'_, K, V, A> {
+        Cursor { bimap: self, walk: self.keys.seek_after(k) }
+    }
+
+    ///cursor at the first value ≥ v (value order), or the walk's end
+    pub fn seek_by_value(&self, v: &V) -> ValueCursor<'_, K, V, A> {
+        ValueCursor { bimap: self, walk: self.values.seek(v) }
+    }
+
+    ///cursor at the first value > v (value order) — v lands in a
+    ///downward walk
+    pub fn seek_after_by_value(&self, v: &V) -> ValueCursor<'_, K, V, A> {
+        ValueCursor { bimap: self, walk: self.values.seek_after(v) }
+    }
+
     ///Err returns (k, v) — dup on either side, or a full name space. a
     ///K-SIDE Err mutates no entries and records no deltas — the
     ///orientation heuristic may still have flipped the block (names
@@ -194,9 +218,168 @@ impl<K: Ord, V: Ord, A: UnsignedNum> BlockBiMap<K, V, A> {
     }
 }
 
+///key-ordered bidirectional walk — a blockmap cursor over the keys side,
+///the partner chased one hop per yield (see blockmap::Cursor; invalidated
+///by any mutation — re-seek)
+pub struct Cursor<'a, K, V, A> {
+    bimap: &'a BlockBiMap<K, V, A>,
+    walk:  MapCursor<'a, K, A, A>,
+}
+
+///value-ordered bidirectional walk — Cursor's mirror over the values
+///side, yields (&V, &K)
+pub struct ValueCursor<'a, K, V, A> {
+    bimap: &'a BlockBiMap<K, V, A>,
+    walk:  MapCursor<'a, V, A, A>,
+}
+
+impl<'a, K: Ord, V: Ord, A: UnsignedNum> Cursor<'a, K, V, A> {
+    ///reposition at the first key ≥ k
+    pub fn seek(&mut self, k: &K) {
+        self.walk.seek(k);
+    }
+
+    ///reposition at the first key > k (a dup at k skipped)
+    pub fn seek_after(&mut self, k: &K) {
+        self.walk.seek_after(k);
+    }
+
+    ///yield the current entry, step forward (key-ascending). None at the
+    ///walk's end
+    #[inline]
+    pub fn next(&mut self) -> Option<(&'a K, &'a V)> {
+        let (k, &val_addr) = self.walk.next()?;
+        let (v, _) = self.bimap.values.get(val_addr).expect("bijection: partner live");
+        Some((k, v))
+    }
+
+    ///step back (key-descending), yield the entry now current. None at
+    ///the walk's start; from the forward ghost, resumes at the last entry
+    #[inline]
+    pub fn prev(&mut self) -> Option<(&'a K, &'a V)> {
+        let (k, &val_addr) = self.walk.prev()?;
+        let (v, _) = self.bimap.values.get(val_addr).expect("bijection: partner live");
+        Some((k, v))
+    }
+
+    ///the entry next() would yield, without moving
+    pub fn entry(&self) -> Option<(&'a K, &'a V)> {
+        let (k, &val_addr) = self.walk.entry()?;
+        let (v, _) = self.bimap.values.get(val_addr).expect("bijection: partner live");
+        Some((k, v))
+    }
+
+    ///the current entry's names, (K-side, V-side)
+    pub fn addrs(&self) -> Option<(A, A)> {
+        let (_, &val_addr) = self.walk.entry()?;
+        Some((self.walk.addr()?, val_addr))
+    }
+}
+
+impl<'a, K: Ord, V: Ord, A: UnsignedNum> ValueCursor<'a, K, V, A> {
+    ///reposition at the first value ≥ v
+    pub fn seek(&mut self, v: &V) {
+        self.walk.seek(v);
+    }
+
+    ///reposition at the first value > v (a dup at v skipped)
+    pub fn seek_after(&mut self, v: &V) {
+        self.walk.seek_after(v);
+    }
+
+    ///yield the current entry, step forward (value-ascending). None at
+    ///the walk's end
+    #[inline]
+    pub fn next(&mut self) -> Option<(&'a V, &'a K)> {
+        let (v, &k_addr) = self.walk.next()?;
+        let (k, _) = self.bimap.keys.get(k_addr).expect("bijection: partner live");
+        Some((v, k))
+    }
+
+    ///step back (value-descending), yield the entry now current. None at
+    ///the walk's start; from the forward ghost, resumes at the last entry
+    #[inline]
+    pub fn prev(&mut self) -> Option<(&'a V, &'a K)> {
+        let (v, &k_addr) = self.walk.prev()?;
+        let (k, _) = self.bimap.keys.get(k_addr).expect("bijection: partner live");
+        Some((v, k))
+    }
+
+    ///the entry next() would yield, without moving
+    pub fn entry(&self) -> Option<(&'a V, &'a K)> {
+        let (v, &k_addr) = self.walk.entry()?;
+        let (k, _) = self.bimap.keys.get(k_addr).expect("bijection: partner live");
+        Some((v, k))
+    }
+
+    ///the current entry's names, (K-side, V-side) — Cursor::addrs' order
+    pub fn addrs(&self) -> Option<(A, A)> {
+        let (_, &k_addr) = self.walk.entry()?;
+        Some((k_addr, self.walk.addr()?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    ///one cursor order's battery (see blockset::assert_walks): live =
+    ///sorted live (order-key, partner) pairs — every boundary × both
+    ///seeks × both directions, addrs resolve both ways, ghost round-trip.
+    ///$swap: the walk pairs are (value, key) — addrs orients them
+    macro_rules! cursor_battery {
+        ($map:expr, $live:expr, $seek:ident, $seek_after:ident, $swap:expr) => {{
+            let live: Vec<(u64, u64)> = $live;
+            let max = live.last().unwrap().0 + 1;
+            for k in 0..=max {
+                let mut c = $map.$seek(&k);
+                let peek = live.iter().find(|(x, _)| *x >= k).copied();
+                assert_eq!(c.entry().map(|(x, y)| (*x, *y)), peek, "peek {k}");
+                if let (Some((x, y)), Some((ka, va))) = (peek, c.addrs()) {
+                    let (kk, vv) = if $swap { (y, x) } else { (x, y) };
+                    assert_eq!($map.get_at(ka), Some((&kk, &vv)), "addrs key-side {k}");
+                    assert_eq!($map.get_at_value(va), Some((&vv, &kk)), "addrs value-side {k}");
+                }
+                let expect: Vec<(u64, u64)> =
+                    live.iter().copied().filter(|(x, _)| *x >= k).collect();
+                let got: Vec<(u64, u64)> =
+                    std::iter::from_fn(|| c.next().map(|(x, y)| (*x, *y))).collect();
+                assert_eq!(got, expect, concat!(stringify!($seek), "({}) forward"), k);
+                let mut c = $map.$seek(&k);
+                let expect: Vec<(u64, u64)> =
+                    live.iter().rev().copied().filter(|(x, _)| *x < k).collect();
+                let got: Vec<(u64, u64)> =
+                    std::iter::from_fn(|| c.prev().map(|(x, y)| (*x, *y))).collect();
+                assert_eq!(got, expect, concat!(stringify!($seek), "({}) back"), k);
+                let mut c = $map.$seek_after(&k);
+                let expect: Vec<(u64, u64)> =
+                    live.iter().copied().filter(|(x, _)| *x > k).collect();
+                let got: Vec<(u64, u64)> =
+                    std::iter::from_fn(|| c.next().map(|(x, y)| (*x, *y))).collect();
+                assert_eq!(got, expect, concat!(stringify!($seek_after), "({}) forward"), k);
+                let mut c = $map.$seek_after(&k);
+                let expect: Vec<(u64, u64)> =
+                    live.iter().rev().copied().filter(|(x, _)| *x <= k).collect();
+                let got: Vec<(u64, u64)> =
+                    std::iter::from_fn(|| c.prev().map(|(x, y)| (*x, *y))).collect();
+                assert_eq!(got, expect, concat!(stringify!($seek_after), "({}) back"), k);
+            }
+            //round-trip across the FwdEnd ghost; exhaustion stable, both
+            //sides resume forward correctly
+            let mut c = $map.$seek(&live[0].0);
+            for kv in &live {
+                assert_eq!(c.next(), Some((&kv.0, &kv.1)), "roundtrip forward");
+            }
+            assert_eq!(c.next(), None);
+            assert_eq!(c.next(), None, "FwdEnd must be stable");
+            for kv in live.iter().rev() {
+                assert_eq!(c.prev(), Some((&kv.0, &kv.1)), "roundtrip back");
+            }
+            assert_eq!(c.prev(), None);
+            assert_eq!(c.prev(), None, "start must be stable");
+            assert_eq!(c.next(), Some((&live[0].0, &live[0].1)), "start resumes forward");
+        }};
+    }
 
     ///apply both streams to the holder's two name columns, in order
     fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64, A)>, d: &BiDeltas<A>) {
@@ -422,5 +605,60 @@ mod tests {
         map.insert(500, 500_000, &mut d).unwrap();
         d.clear();
         assert_eq!(map.len(), 256);
+    }
+
+    ///cursors over both native orders: keys descend (the keys map flips),
+    ///values ascend — the orders disagree and the internal directions
+    ///are mixed. every boundary × both seeks × both directions, addrs
+    ///resolve both ways
+    #[test]
+    fn cursor_both_orders() {
+        //sized for miri — the battery sweeps every boundary regardless of n
+        let (mut map, _) = insert_all((0..60u64).rev().map(|k| (k, 60 - k)));
+        let removed = [3u64, 17, 42];
+        for k in removed {
+            map.remove_by_key(&k);
+        }
+        let by_key: Vec<(u64, u64)> = (0..60u64)
+            .filter(|k| !removed.contains(k))
+            .map(|k| (k, 60 - k))
+            .collect();
+        let mut by_value: Vec<(u64, u64)> = by_key.iter().map(|&(k, v)| (v, k)).collect();
+        by_value.sort_unstable();
+        cursor_battery!(map, by_key, seek, seek_after, false);
+        cursor_battery!(map, by_value, seek_by_value, seek_after_by_value, true);
+    }
+
+    #[test]
+    fn cursor_empty_and_single() {
+        let map = BlockBiMap::<u64, u64, u8>::new();
+        let mut c = map.seek(&5);
+        assert_eq!(c.entry(), None);
+        assert_eq!(c.addrs(), None);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), None);
+        let mut c = map.seek_by_value(&5);
+        assert_eq!(c.entry(), None);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), None);
+        let mut map = map;
+        let mut d = BiDeltas::new();
+        map.insert(7, 70, &mut d).unwrap();
+        d.clear();
+        let mut c = map.seek(&5);
+        assert_eq!(c.next(), Some((&7, &70)));
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), Some((&7, &70)));
+        assert_eq!(
+            c.addrs(),
+            Some((map.key_addr(&7).unwrap(), map.value_addr(&70).unwrap()))
+        );
+        let mut c = map.seek_by_value(&5);
+        assert_eq!(c.next(), Some((&70, &7)));
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), Some((&70, &7)));
+        let mut c = map.seek_after_by_value(&70);
+        assert_eq!(c.next(), None);
+        assert_eq!(c.prev(), Some((&70, &7)));
     }
 }
