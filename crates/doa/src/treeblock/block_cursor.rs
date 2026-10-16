@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::block::*;
 use crate::store::{NoneSlide, Store};
-use crate::translator::*;
+use crate::treeblock::translator::*;
 use crate::{Fixup, index::*};
 
 ///block-backed cursor: holds a block ref (`&B` or `&mut B`) via `R`, scans the

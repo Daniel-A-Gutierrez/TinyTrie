@@ -11,8 +11,8 @@
 use crate::{Rel,
             index::Addr,
             index::Pos,
-            translator::{AddressTranslator, Translator},
-            treeblock::store::NoneSlide};
+            treeblock::store::NoneSlide,
+            treeblock::translator::{AddressTranslator, Translator}};
 use std::cmp::Ordering;
 use std::mem;
 use std::ops::{Add, Index, IndexMut, Sub};

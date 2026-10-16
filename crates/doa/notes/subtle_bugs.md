@@ -417,7 +417,7 @@ Pluripotent<u8>: MAX_CAP (256) overstates capacity 16× — only the
 `addressable = 2^8 >> shift`-min guard in its find ladder keeps it honest.
 ```
 
-**Why it stands:** u8 addressing is for the sortedblock tier (devlog: small
+**Why it stands:** u8 addressing is for the blockset tier (devlog: small
 blocks, u8 addrs), whose translator logic (full-width shift-down + rotation
 turns) doesn't use `Half` at all. Reshaping the knob (`Half` type → a
 `HALF_BIT_WIDTH: u8` const, so u8 can name 4) is deferred until that
@@ -455,7 +455,7 @@ this arithmetic.
 
 ## 17. *(open)* stale names alias the new owner — the name-transfer sharp edge
 
-sortedblock's addr = the slot's canonical name, and a slide TRANSFERS names
+blockset's addr = the slot's canonical name, and a slide TRANSFERS names
 (the mover adopts the vacated slot's name, giving up its own). The released
 name isn't retired — the next insert takes it. So a holder that skipped a
 `Deltas` application holds a STALE name, and that name still aliases a live
@@ -478,7 +478,7 @@ used. The contract is name swaps, and an unswapped name is a wrong name.
 
 ## 18. "Full" is a per-resource question: mask-full ≠ names-exhausted
 
-**The bug (2026-10-12, sortedblock insert ladder).** once push_back growth
+**The bug (2026-10-12, blockset insert ladder).** once push_back growth
 landed (sequential biases extend the allocation one slot at a time), the
 block's cap stopped being a power of two tracking len. the old grow rung
 still equated "no hole in the mask" with "turn now" — and the turn was
@@ -608,6 +608,58 @@ exhaustion arm must explicitly zero `self.word` before returning.
   (`iterators_none_stable`): the old `from_fn` iter was None-stable by
   construction; an engine rewrite regresses it silently, and nothing
   in-crate ever polls past None (for loops, collect, Drop all stop).
+
+---
+
+## 22. Deltas consumers must read through NAMES, not pos pairs (2026-10-15)
+
+**The bug (2026-10-15, blockbimap chase — twice in one session).** the
+back-pointer chase first read event pairs as addresses (`iter`) but
+forward, which misidentified chained gather entries (fixed by backward
+composition); the second attempt consumed raw POS pairs (`iter_pos`) to
+skip the "translate then detranslate" round trip — sound algebra, and
+wrong: `descending_keys_ascending_values` failed, because the reversal
+tier RE-PARAMETERS the block's translator AFTER the event is recorded
+(`maybe_reverse` runs at the end of `insert`, past `gather_slots`'s
+record). the event's recorded positions are pre-flip; the emitter's
+physical slots are mirrored; `value_at_pos(to_pos)` read a hole. the
+round trip through name space is what re-anchors the read: names are
+era-stable across the flip by construction (the flip emits zero deltas,
+names follow the mirrored slots), so `get(to_addr)` under the CURRENT
+translator finds the moved entry wherever the block now keeps it.
+
+**Why it stands.** the deltas protocol's entire currency is names —
+pos pairs are a recording-time frame, only valid while the recording
+translator is still current. `a2p ∘ p2a` cancels only under a fixed
+translator, and the block reserves the right to change it after
+recording (the flip today; offset turns are deferred with the same
+shape). "redundant" translation through the stable currency is the
+correctness mechanism.
+
+**The rules.**
+- recorded POS pairs are a recording-time frame, valid only while the
+  emitter's translator is unchanged since the record. events held across
+  mutations MUST go through `iter()`'s names — era-stable by construction.
+- the translator mutation class: the turn happens pre-record (inside
+  `open`); the flip was the one POST-record site (end of insert) — moved
+  to insert's TOP on 2026-10-15, so an event's positions stay valid from
+  the record to the emitter's next mutation. `iter_pos` is therefore
+  `pub(crate)`-legal for IMMEDIATE consumers (bimap's chase runs inside
+  the same insert pair); the public surface stays the name stream.
+
+**Resolution of the chase half (later same day).** the forward/backward
+chase complexity died at the ENCODING level, not the consumer level:
+`DeltaPairs::Gather` now walks the recorded slides' segments and emits
+ONE pair per moved element carrying the FULL hop (crossing count,
+`w − segment index`) instead of chaining k 1-step slides through
+intermediate names — every pair is final, the chase is a single forward
+pass, and first-match holders get one swap per element regardless of
+hop distance. the emission order is load-bearing in the new scheme:
+hop pairs OVERLAP (froms and tos share names when hop < run length), so
+pairs walk away from the spot (right side descends, left ascends,
+far segment first) — every `to` stays ahead of the remaining `from`s,
+or a first-match holder retargets the same entry twice. the
+era-stability half stands unchanged.
 
 ---
 

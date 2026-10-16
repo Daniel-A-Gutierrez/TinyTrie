@@ -11,8 +11,21 @@
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 
-use super::store::NoneSlide;
-use super::translator::Translator;
+use crate::translator::Translator;
+
+///one fetch-gather slide-chain link: the hole moves `from → to`. Gather
+///events speak these in post-prior-slides coordinates (see `Delta::Gather`)
+#[derive(Clone, Copy, Debug)]
+pub struct NoneSlide {
+    pub from: Pos,
+    pub to:   Pos,
+}
+
+impl NoneSlide {
+    pub(crate) fn new(from: Pos, to: Pos) -> Self {
+        Self { from, to }
+    }
+}
 use crate::index::*;
 use crate::mask::{Mask, SetBits, SetBitsRev};
 
@@ -36,17 +49,24 @@ enum Delta {
     Pairs(Vec<(Pos, Pos)>),
 }
 
-///expanded `(from, to)` pos pairs of one event, swap-cascade order
-///(hole-adjacent mover first)
+///expanded `(from, to)` pos pairs of one event. plain slides emit 1-step
+///cascades (hole-adjacent mover first); gathers walk the recorded
+///slides' SEGMENTS and emit ONE pair per moved element carrying the
+///FULL hop (crossing count) — no chained intermediate names. emission
+///order keeps every `to` ahead of the remaining `from`s (first-match
+///holders; overlapping hop pairs otherwise retarget twice)
 enum DeltaPairs<'a> {
     Empty,
     ///one run's cursor: emits `(p, p − step)` per step
     Run { p: usize, step: i64, remaining: usize },
     Gather {
-        slides:    std::slice::Iter<'a, NoneSlide>,
-        p:         usize,
-        step:      i64,
-        remaining: usize,
+        slides: &'a [NoneSlide],
+        right:  bool,
+        ///walk counter over segments, FAR-segment first (segment index
+        ///w−1−seg)
+        seg:    usize,
+        ///position cursor within the segment; `usize::MAX` = fresh
+        q:      usize,
     },
     Pairs(std::slice::Iter<'a, (Pos, Pos)>),
 }
@@ -69,10 +89,10 @@ impl Delta {
                 DeltaPairs::Run { p, step, remaining }
             }
             Delta::Gather(v) => DeltaPairs::Gather {
-                slides:    v.iter(),
-                p:         0,
-                step:      0,
-                remaining: 0,
+                slides: v,
+                right:  v.first().is_some_and(|s| s.from.0 > s.to.0),
+                seg:    0,
+                q:      usize::MAX,
             },
             Delta::Pairs(v) => DeltaPairs::Pairs(v.iter()),
         }
@@ -94,17 +114,57 @@ impl Iterator for DeltaPairs<'_> {
                 *p = (q as i64 + *step) as usize;
                 Some((Pos(q), Pos((q as i64 - *step) as usize)))
             }
-            DeltaPairs::Gather { slides, p, step, remaining } => loop {
-                if *remaining == 0 {
-                    //chain the next slide's run — its coordinates are
-                    //post-prior-slides
-                    let ns = slides.next()?;
-                    (*p, *step, *remaining) = run_of(ns.from.0, ns.to.0);
+            DeltaPairs::Gather { slides, right, seg, q } => loop {
+                let w = slides.len();
+                if *seg >= w {
+                    return None;
                 }
-                *remaining -= 1;
-                let q = *p;
-                *p = (q as i64 + *step) as usize;
-                return Some((Pos(q), Pos((q as i64 - *step) as usize)));
+                //segment (w−1−seg): far segments first, hop = w − segment
+                //index — the crossing count (bounds in pre-event positions)
+                let j = w - 1 - *seg;
+                let (start, end, hop) = if *right {
+                    let spot = slides[0].to.0;
+                    if j == 0 {
+                        (spot, slides[0].from.0, w as i64)
+                    } else {
+                        (
+                            slides[j - 1].from.0 + 1,
+                            slides[j].from.0,
+                            (w - j) as i64,
+                        )
+                    }
+                } else {
+                    let spot = slides[0].to.0 + 1;
+                    if j == 0 {
+                        (slides[0].from.0 + 1, spot, -(w as i64))
+                    } else {
+                        (
+                            slides[j].from.0 + 1,
+                            slides[j - 1].from.0,
+                            -((w - j) as i64),
+                        )
+                    }
+                };
+                //segment entry: walk away from the spot (right descends,
+                //left ascends) so each `to` stays ahead of every remaining
+                //`from` — first-match holders retarget once, never twice
+                if *q == usize::MAX {
+                    if end == start {
+                        *seg += 1;
+                        continue;
+                    }
+                    *q = if *right { end - 1 } else { start };
+                }
+                let from = *q;
+                *q = if *right {
+                    if from == start { usize::MAX } else { from - 1 }
+                } else {
+                    if from == end - 1 { usize::MAX } else { from + 1 }
+                };
+                if *q == usize::MAX {
+                    *seg += 1;
+                }
+                return Some((Pos(from), Pos((from as i64 + hop) as usize)));
             },
             DeltaPairs::Pairs(it) => it.next().copied(),
         }
@@ -129,8 +189,16 @@ impl<A: UnsignedNum> Deltas<A> {
         self.event.pairs().map(|(f, t)| (self.translator.p2a(f), self.translator.p2a(t)))
     }
 
+    ///the raw (from, to) POS pairs — no translation. valid only while
+    ///the emitter's translator is unchanged since the record (immediate
+    ///in-crate consumers — the flip now fires pre-record; `iter`'s names
+    ///remain the era-stable contract for events held across mutations)
+    pub(crate) fn iter_pos(&self) -> impl Iterator<Item = (Pos, Pos)> + '_ {
+        self.event.pairs()
+    }
+
     ///pending until `clear` — the caller contract
-    fn is_pending(&self) -> bool {
+    pub(crate) fn is_pending(&self) -> bool {
         !matches!(self.event, Delta::Empty)
     }
 
@@ -139,18 +207,39 @@ impl<A: UnsignedNum> Deltas<A> {
         self.event = Delta::Empty;
         self.translator = Translator::new()
     }
+
+    ///record a plain hole slide under the block's translator at record
+    ///time (blockmap records the same events over its own slots)
+    pub(crate) fn record_none_slide(&mut self, translator: Translator<A>, from: Pos, to: Pos) {
+        self.translator = translator;
+        self.event = Delta::NoneSlide { from, to };
+    }
+
+    ///record a fetch-gather's slide chain (blockmap's, same protocol)
+    pub(crate) fn record_gather(&mut self, translator: Translator<A>, slides: Vec<NoneSlide>) {
+        self.translator = translator;
+        self.event = Delta::Gather(slides);
+    }
 }
 
 ///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
 ///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
-const FREE_STRIDE: usize = 8;
+///preemptive turn line (numerator/denominator): past this density, a
+///mid-block insert turns instead of gathering — past the line, the
+///expected fetch distance blows through FREE_STRIDE (the stride banking
+///assumption dies). 3/4 measured 2026-10-15: −18% random @10k but 2.25×
+///WORSE @1M (turn frequency doubles; each big turn's O(cap) relocation
+///eats the amortization) + 2× random-build memory — 7/8 stands
+pub(crate) const TURN_NUM: usize = 7;
+pub(crate) const TURN_DEN: usize = 8;
+pub(crate) const FREE_STRIDE: usize = 8;
 
 ///~L2 residency: the bsearch shape split — cache-resident blocks cmov
 ///(probe compares resolve from L1/L2, mispredicts dominate), DRAM-
 ///resident blocks speculate (the branchy loop issues the next probe's
 ///load ahead of the compare, overlapping the miss). measured both ways
-///at both scales, see bench_notes
-const L2_BYTES: usize = 512 * 1024;
+///at both scales, see notes/session_history.md
+pub(crate) const L2_BYTES: usize = 512 * 1024;
 
 
 ///mask covers data.len() slots; bit ⇔ slot initialized.
@@ -161,7 +250,6 @@ pub struct BlockSet<K, A> {
     len:        usize,
     ///running sum of placed slot positions — the mean-insert-position
     ///signal for the reversal tier
-    #[allow(dead_code)]
     pos_sum:    u64,
 }
 
@@ -208,6 +296,20 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
 
     #[inline]
     pub fn find(&self, k: &K) -> Option<A> {
+        //beyond either extreme → absent, no bsearch (see blockmap::find)
+        if self.len > 0 {
+            let tail = self.key_tail();
+            let beyond = if self.translator.reversed() { *k < *tail } else { *tail < *k };
+            if beyond {
+                return None;
+            }
+            //len > 0 ⇒ a first live slot exists
+            let head = unsafe { self.key(self.mask.next_set(0).unwrap()) };
+            let before = if self.translator.reversed() { *head < *k } else { *k < *head };
+            if before {
+                return None;
+            }
+        }
         match self.position(k) {
             Ok(p) => Some(self.translator.p2a(p)),
             Err(_) => None,
@@ -240,6 +342,10 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         if self.len >= Self::max_capacity() {
             return Err(k);
         }
+        //flip check BEFORE the record — no translator mutation happens
+        //between the event record and insert's return, so pos-space
+        //consumers (bimap's chase) read recorded coordinates directly
+        self.maybe_reverse();
         let Some(spot) = self.spot(&k) else {
             return Err(k);
         };
@@ -250,9 +356,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         }
         else {
             let p = self.open(spot, deltas);
-            let a = self.place(k, p);
-            self.maybe_reverse();
-            Ok(a)
+            Ok(self.place(k, p))
         }
     }
 
@@ -271,7 +375,9 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
 
     ///flip a front-biased insert stream so future inserts land at the
     ///tail. fires when mean insert position sits below len/8, committed
-    ///past a 4·stride warmup
+    ///past a 4·stride warmup. the check runs at insert's TOP — the trigger
+    ///sees the pre-insert signal, and no translator mutation follows the
+    ///event record inside insert (pos-space consumers rely on that)
     fn maybe_reverse(&mut self) {
         if self.len > 4 * FREE_STRIDE {
             let len = self.len as u64;
@@ -317,7 +423,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //preemptive turn past 7/8: at one hole per FREE_STRIDE expected,
         //fetches past 7/8 blow through the stride — one O(n) turn beats
         //the long gathers (mid-block inserts only)
-        if self.len.wrapping_mul(8) > self.data.len().wrapping_mul(7)
+        if self.len.wrapping_mul(TURN_DEN) > self.data.len().wrapping_mul(TURN_NUM)
             && self.data.len() - spot.0 > FREE_STRIDE
         {
             let old = self.translator;
@@ -492,8 +598,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //mid-gap inserts) — no fetch, no slide. nearest_clear excludes
         //`spot` by contract, so this is checked first
         if spot.0 < self.cap() && !self.mask.get(spot.0) {
-            deltas.translator = self.translator;
-            deltas.event = Delta::NoneSlide { from: spot, to: spot };
+            deltas.record_none_slide(self.translator, spot, spot);
             return Some(spot);
         }
         //the nearest hole's distance sets the fetch — one hole per
@@ -501,7 +606,6 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //back, banked beside k for the cluster's next inserts); holes all
         //from its side
         let hole = self.mask.nearest_clear(spot.0)?;
-        deltas.translator = self.translator;
         //k's slot: hole right ⇒ `spot` (run shifts up), left ⇒ `spot − 1`
         //(run shifts down)
         let right = hole > spot.0;
@@ -509,12 +613,13 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //the common case: hole within a stride — one plain slide, no fetch
         if hole.abs_diff(spot.0) < FREE_STRIDE {
             self.slide_hole(hole, open);
-            deltas.event = Delta::NoneSlide { from: Pos(hole), to: Pos(open) };
+            deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
             return Some(Pos(open));
         }
         let holes = self.fetch_holes(spot, right, 1 + hole.abs_diff(spot.0) / FREE_STRIDE);
         self.compact_gather(spot, open, right, &holes);
-        deltas.event = Delta::Gather(
+        deltas.record_gather(
+            self.translator,
             holes
                 .iter()
                 .enumerate()
@@ -837,29 +942,39 @@ mod tests {
 
     ///fetch-distance banking: holes 24 slots from the spot fetch 4 (one per
     ///FREE_STRIDE traveled) and land beside k — the next 3 inserts are
-    ///no-ops. the holder rides the 96-pair chain (4 slides × 24-slot runs)
+    ///no-ops. the 24 moved elements each emit ONE full-hop pair (crossing
+    ///count 4; farthest-first, descending — the first-match order)
     #[test]
     fn gather_banks_holes_by_distance() {
         let mut set = BlockSet::<u64, u8>::new();
         let mut d = Deltas::new();
         let mut holder = Vec::new();
-        for k in (0..=10u64).chain(60..=89) {
+        for k in (0..=10u64).chain(60..=89).chain(200..=214) {
             let a = set.insert(k, &mut d).unwrap();
             apply(&mut holder, &d);
             d.clear();
             holder.push((a, k));
         }
-        //the only holes: pos 35..=40, 24 from the spot of key 30
-        for k in 84..=89 {
+        //holes at pos 35..=50 — the 35..40 half is 24 from the spot of
+        //key 30 (the fetched side); the 41..50 half drops density below
+        //the 3/4 turn line so the gather runs
+        for k in (84..=89u64).chain(200..=209) {
             set.remove(set.find(&k).unwrap());
             holder.retain(|(_, hk)| *hk != k);
         }
         let a = set.insert(30, &mut d).unwrap();
-        assert_eq!(d.iter().count(), 96, "4 slides × 24-slot runs");
+        //identity translator (appends only): names = positions; the 4
+        //consecutive fetched holes make segments 1..=3 empty — one
+        //segment, hop 4, farthest element first
+        assert_eq!(
+            d.iter().collect::<Vec<_>>(),
+            (11u8..=34).rev().map(|q| (q, q + 4)).collect::<Vec<_>>(),
+            "24 moved elements, one hop-4 pair each"
+        );
         apply(&mut holder, &d);
         d.clear();
         holder.push((a, 30));
-        assert_eq!(set.cap(), 41, "gather must not turn");
+        assert_eq!(set.cap(), 56, "gather must not turn");
         for k in [31, 32, 33] {
             let a = set.insert(k, &mut d).unwrap();
             assert_eq!(d.iter().count(), 0, "banked hole should absorb insert {k}");
@@ -867,6 +982,45 @@ mod tests {
             d.clear();
             holder.push((a, k));
         }
+        check(&set, &holder, 44);
+    }
+
+    ///the LEFT-side gather mirror: holes below the spot, TWO non-empty
+    ///segments — emission ascends (left walks up), far/low segment first,
+    ///hop = crossing count per element
+    #[test]
+    fn gather_left_side_hop_pairs() {
+        let mut set = BlockSet::<u64, u8>::new();
+        let mut d = Deltas::new();
+        let mut holder = Vec::new();
+        for k in (0..=20u64).chain(100..=129) {
+            let a = set.insert(k, &mut d).unwrap();
+            apply(&mut holder, &d);
+            d.clear();
+            holder.push((a, k));
+        }
+        //holes at pos 0, 5, 10 (below the spot of key 50, nearest 11 away)
+        //and 33..35, 38..40, 43, 48..50 above — the upper holes drop density
+        //below the 3/4 turn line and sit farther than 11, so the gather
+        //runs LEFT with two non-empty segments
+        for k in [0u64, 5, 10, 112, 113, 114, 117, 118, 119, 122, 127, 128, 129] {
+            set.remove(set.find(&k).unwrap());
+            holder.retain(|(_, hk)| *hk != k);
+        }
+        let a = set.insert(50, &mut d).unwrap();
+        //identity translator: segment [6, 10) hops −1 (far), [11, 21)
+        //hops −2 — globally ascending `from`, every `to` behind
+        assert_eq!(
+            d.iter().collect::<Vec<_>>(),
+            (6u8..=9)
+                .chain(11..=20)
+                .map(|q| (q, q - if q < 10 { 1 } else { 2 }))
+                .collect::<Vec<_>>(),
+            "14 moved elements, two non-empty segments, hop 1 then hop 2"
+        );
+        apply(&mut holder, &d);
+        d.clear();
+        holder.push((a, 50));
         check(&set, &holder, 39);
     }
 

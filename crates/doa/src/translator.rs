@@ -1,239 +1,159 @@
-//!address↔position translation, fn-ptr-specialized over the 16
-//!(inner/outer/shift/rotation × zero/nonzero) combos so a steady param is
-//!straight-line with no per-lookup branch. `a2p` is the hot path; `p2a` runs
-//!on remap.
-//!
-//!invariant: `p2a(p) = ((p + inner_offset) << shift).ror(rotation) + outer_offset`,
-//!and `a2p` is the exact inverse — round-trip exact on canonical
-//!(block-handed-out) addrs. addrs may wrap; the only hard rule is position
-//!order: pos 0 = min element, pos len−1 = max.
+//!the set/map tier's 2-knob translator — fn-ptr-specialized per direction so
+//!translation carries no negate/branch: forward `p2a(p) = (p − offset) ror
+//!rotation`, reversed `p2a(p) = (offset − p) ror rotation`. the indirect
+//!call is BTB-predicted (~1 cycle, see treeblock translator's bench
+//!notes), re-dispatched only on rotate/reverse — `reversed` selects the
+//!fns, never touches the math.
+//!invariant: a2p is p2a's exact inverse (round-trip exact on canonical
+//!slots); names survive the rotation turn (`pos → 2·pos` under BOTH
+//!directions — offset doubling cancels the negation) and the reversal
+//!(`p2a_rev_new(p) = p2a_old(cap−1−p)`, names follow the mirrored slots).
 
-use crate::index::Pos;
-use crate::index::UnsignedNum;
-// specialized fn-ptr aliases — the `variant!`/`apply!` macros below generate
-// the 16 specialized bodies.
-// p2a(p) = ((p + inner_offset) << shift) ror rotation + outer_offset.
-// a2p(a) = ((a - outer_offset) rol rotation) >> shift - inner_offset   (exact
-// inverse on canonical slots).
-// inner_offset lives in position space (added before the shift); outer_offset
-// in address space (added after).
-// Each op whose param is 0 is a runtime no-op the CPU does NOT elide (see
-// bench notes), so specialize picks a pre-baked body that skips zero-param ops
-// entirely — straight-line, no per-iter branch, no mispredict risk. Dispatch
-// happens once per set_*, not per lookup; the call target is constant for the
-// life of the params, so the BTB-predicted indirect call costs ~1 cycle on the
-// addr chain (see bench).
-type A2p<A> = fn(A, A, A, u32, u32) -> A; // x, inner, outer, shift, rotation
-type P2a<A> = fn(A, A, A, u32, u32) -> A;
+use crate::index::*;
 
-// apply x.method(arg) only when the param is nonzero (nz); z is a passthrough.
-macro_rules! apply {
-    ($x:expr, z, $method:ident, $arg:expr) => {
-        $x
-    };
-    ($x:expr, nz, $method:ident, $arg:expr) => {
-        $x.$method($arg)
-    };
+type A2p<A> = fn(A, u32, A) -> A;
+type P2a<A> = fn(Pos, u32, A) -> A;
+
+fn a2p_fwd<A: UnsignedNum>(a: A, rotation: u32, offset: A) -> A {
+    a.rotate_left(rotation).wrapping_add(offset)
 }
 
-// generate one a2p/p2a pair for a given (inner, outer, shift, rot) nz/z pattern.
-// a2p inverts p2a in reverse op order: ror, sub outer, shr, sub inner.
-macro_rules! variant {
-    ($a2p:ident / $p2a:ident, inner=$i:tt, outer=$o:tt, shift=$s:tt, rot=$r:tt) => {
-        #[inline]
-        #[allow(unused_variables)]
-        fn $a2p<A: UnsignedNum>(x: A, inner: A, outer: A, shift: u32, rotation: u32) -> A {
-            let x = apply!(x, $o, wrapping_sub, outer);
-            let x = apply!(x, $r, rotate_left, rotation);
-            let x = apply!(x, $s, wrapping_shr, shift);
-            apply!(x, $i, wrapping_sub, inner)
-        }
-        #[inline]
-        #[allow(unused_variables)]
-        fn $p2a<A: UnsignedNum>(x: A, inner: A, outer: A, shift: u32, rotation: u32) -> A {
-            let x = apply!(x, $i, wrapping_add, inner);
-            let x = apply!(x, $s, wrapping_shl, shift);
-            let x = apply!(x, $r, rotate_right, rotation);
-            apply!(x, $o, wrapping_add, outer)
-        }
-    };
+fn a2p_rev<A: UnsignedNum>(a: A, rotation: u32, offset: A) -> A {
+    offset.wrapping_sub(a.rotate_left(rotation))
 }
 
-///address↔position translator using fn-ptr specialization (see bench notes /
-///a2p_fnptr). `set_*` re-points a2p/p2a when the block's params change
-///(grow/spread/graduate). for a statically-known strategy, a const-generic
-///block inlines the math and beats even this — Translator is for the adaptive
-///tier.
-#[derive(Clone)]
+fn p2a_fwd<A: UnsignedNum>(p: Pos, rotation: u32, offset: A) -> A {
+    A::from_usize(p.0).wrapping_sub(offset).rotate_right(rotation)
+}
+
+fn p2a_rev<A: UnsignedNum>(p: Pos, rotation: u32, offset: A) -> A {
+    offset.wrapping_sub(A::from_usize(p.0)).rotate_right(rotation)
+}
+
+///the set tier's 2-knob translator — rotation turn = growth (doubling
+///rule unchanged either direction), reversal re-parameterizes so names
+///follow the mirrored slots
+#[derive(Clone, Copy)]
 pub struct Translator<A> {
-    inner_offset: A,
-    outer_offset: A,
-    shift:        u32,
-    rotation:     u32,
-    a2p:          A2p<A>,
-    p2a:          P2a<A>,
-}
-
-///address ↔ position translation. `A` is the in-block address type; positions
-///are `Pos`. a2p is the hot lookup path, p2a runs on remap.
-pub trait AddressTranslator<A>: Sized {
-    ///address to position
-    fn a2p(&self, addr: A) -> Pos;
-
-    ///position to address
-    fn p2a(&self, pos: Pos) -> A;
-
-    ///position-space abs distance between two addrs;
-    fn adist(&self, a1: A, a2: A) -> usize;
+    rotation: u32,
+    offset:   A,
+    reversed: bool,
+    a2p:      A2p<A>,
+    p2a:      P2a<A>,
 }
 
 impl<A: UnsignedNum> Translator<A> {
-    pub(crate) fn new(inner_offset: A, outer_offset: A, shift: u32, rotation: u32) -> Self {
-        Self {
-            inner_offset,
-            outer_offset,
-            shift,
-            rotation,
-            a2p: a2p_0000::<A>,
-            p2a: p2a_0000::<A>,
+    pub(crate) fn new() -> Self {
+        Translator {
+            rotation: 0,
+            offset:   A::ZERO,
+            reversed: false,
+            a2p:      a2p_fwd,
+            p2a:      p2a_fwd,
         }
-        .specialize(inner_offset, outer_offset, shift, rotation)
     }
-    pub(crate) fn inner_offset(&self) -> A {
-        self.inner_offset
+
+    pub(crate) fn reversed(&self) -> bool {
+        self.reversed
     }
-    pub(crate) fn outer_offset(&self) -> A {
-        self.outer_offset
-    }
-    pub(crate) fn shift(&self) -> u32 {
-        self.shift
-    }
+
     pub(crate) fn rotation(&self) -> u32 {
         self.rotation
     }
 
-    ///per-field setters: re-specialize only when that field's zero/nonzero
-    ///status flips. a steady param (e.g. rotation bumping past 1) is a plain
-    ///field write — no fn-ptr re-dispatch.
-    pub(crate) fn set_inner_offset(&mut self, inner_offset: A) {
-        if (self.inner_offset == A::from_usize(0)) != (inner_offset == A::from_usize(0)) {
-            self.inner_offset = inner_offset;
-            self.specialize_into(inner_offset, self.outer_offset, self.shift, self.rotation);
-        } else {
-            self.inner_offset = inner_offset;
-        }
+    pub(crate) fn offset(&self) -> A {
+        self.offset
     }
-    pub(crate) fn set_outer_offset(&mut self, outer_offset: A) {
-        if (self.outer_offset == A::from_usize(0)) != (outer_offset == A::from_usize(0)) {
-            self.outer_offset = outer_offset;
-            self.specialize_into(self.inner_offset, outer_offset, self.shift, self.rotation);
-        } else {
-            self.outer_offset = outer_offset;
-        }
+
+    ///arbitrary params, forward — e.g. the offset≠0 states grow_rotate
+    ///refuses today; the maps must still hold for them
+    #[cfg(test)]
+    pub(crate) fn with_params(rotation: u32, offset: A) -> Self {
+        Translator { rotation, offset, ..Translator::new() }
     }
-    pub(crate) fn set_shift(&mut self, shift: u32) {
-        if (self.shift == 0) != (shift == 0) {
-            self.shift = shift;
-            self.specialize_into(self.inner_offset, self.outer_offset, shift, self.rotation);
-        } else {
-            self.shift = shift;
-        }
-    }
-    pub(crate) fn set_rotation(&mut self, rotation: u32) {
-        if (self.rotation == 0) != (rotation == 0) {
-            self.rotation = rotation;
-            self.specialize_into(self.inner_offset, self.outer_offset, self.shift, rotation);
-        } else {
-            self.rotation = rotation;
+
+    ///the rotation turn: rotation + 1, offset doubled — names preserved by
+    ///construction under both directions
+    pub(crate) fn rotate(&self) -> Self {
+        //forward: the old rotation cancels leaving `pos → 2·pos`;
+        //reversed: the doubling cancels the negation — same map
+        Translator {
+            rotation: self.rotation + 1,
+            offset:   self.offset.wrapping_add(self.offset),
+            ..*self
         }
     }
 
-    fn specialize(self, inner_offset: A, outer_offset: A, shift: u32, rotation: u32) -> Self {
-        let mut s = self;
-        s.specialize_into(inner_offset, outer_offset, shift, rotation);
-        s
+    ///the reversal: `p2a_new(p) = p2a_old(cap−1−p)` — names follow the
+    ///mirrored slots, holders see nothing
+    pub(crate) fn reverse(&self, cap: usize) -> Self {
+        //offset ≠ 0 afterward (cap > 1), so rotation turns refuse until
+        //offset turns land
+        Translator {
+            offset:   A::from_usize(cap - 1).wrapping_sub(self.offset),
+            reversed: !self.reversed,
+            a2p:      if self.reversed { a2p_fwd } else { a2p_rev },
+            p2a:      if self.reversed { p2a_fwd } else { p2a_rev },
+            ..*self
+        }
     }
 
-    fn specialize_into(&mut self, inner_offset: A, outer_offset: A, shift: u32, rotation: u32) {
-        let nz = (
-            inner_offset != A::from_usize(0),
-            outer_offset != A::from_usize(0),
-            shift != 0,
-            rotation != 0,
-        );
-        self.a2p = match nz {
-            (false, false, false, false) => a2p_0000::<A>,
-            (true, false, false, false) => a2p_1000::<A>,
-            (false, true, false, false) => a2p_0100::<A>,
-            (false, false, true, false) => a2p_0010::<A>,
-            (false, false, false, true) => a2p_0001::<A>,
-            (true, true, false, false) => a2p_1100::<A>,
-            (true, false, true, false) => a2p_1010::<A>,
-            (true, false, false, true) => a2p_1001::<A>,
-            (false, true, true, false) => a2p_0110::<A>,
-            (false, true, false, true) => a2p_0101::<A>,
-            (false, false, true, true) => a2p_0011::<A>,
-            (true, true, true, false) => a2p_1110::<A>,
-            (true, true, false, true) => a2p_1101::<A>,
-            (true, false, true, true) => a2p_1011::<A>,
-            (false, true, true, true) => a2p_0111::<A>,
-            (true, true, true, true) => a2p_1111::<A>,
-        };
-        self.p2a = match nz {
-            (false, false, false, false) => p2a_0000::<A>,
-            (true, false, false, false) => p2a_1000::<A>,
-            (false, true, false, false) => p2a_0100::<A>,
-            (false, false, true, false) => p2a_0010::<A>,
-            (false, false, false, true) => p2a_0001::<A>,
-            (true, true, false, false) => p2a_1100::<A>,
-            (true, false, true, false) => p2a_1010::<A>,
-            (true, false, false, true) => p2a_1001::<A>,
-            (false, true, true, false) => p2a_0110::<A>,
-            (false, true, false, true) => p2a_0101::<A>,
-            (false, false, true, true) => p2a_0011::<A>,
-            (true, true, true, false) => p2a_1110::<A>,
-            (true, true, false, true) => p2a_1101::<A>,
-            (true, false, true, true) => p2a_1011::<A>,
-            (false, true, true, true) => p2a_0111::<A>,
-            (true, true, true, true) => p2a_1111::<A>,
-        };
+    #[inline]
+    pub(crate) fn a2p(&self, a: A) -> Pos {
+        Pos((self.a2p)(a, self.rotation, self.offset).as_usize())
+    }
+
+    #[inline]
+    pub(crate) fn p2a(&self, p: Pos) -> A {
+        (self.p2a)(p, self.rotation, self.offset)
     }
 }
 
-impl<A: UnsignedNum> AddressTranslator<A> for Translator<A> {
-    fn a2p(&self, addr: A) -> Pos {
-        Pos((self.a2p)(addr, self.inner_offset, self.outer_offset, self.shift, self.rotation)
-            .as_usize())
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn p2a(&self, pos: Pos) -> A {
-        (self.p2a)(
-            A::from_usize(pos.0),
-            self.inner_offset,
-            self.outer_offset,
-            self.shift,
-            self.rotation,
-        )
-    }
-
-    fn adist(&self, a1: A, a2: A) -> usize {
-        self.a2p(a2).0.abs_diff(self.a2p(a1).0)
+    ///round-trip exactness + the reversal name-mirror + the reversed turn
+    ///map (upper-half names land odd, one down: `q = 2p − [(offset−p) mod
+    ///2^w ≥ 2^(w−1)]`), every reachable translator
+    #[test]
+    fn names_survive_reversal_and_turns() {
+        const SPACE: usize = 256;
+        const MID: usize = 128;
+        for r in 0..u8::BIT_WIDTH as u32 {
+            for cap in [4usize, 9, 64, 100] {
+                //offset < cap in every reachable state (name 0's slot);
+                //offset turns will relax this
+                for o in (0..cap as u8).step_by((cap / 25).max(1)).chain([0u8, 1]) {
+                    let t = Translator::<u8>::with_params(r, o);
+                    let rev = t.reverse(cap);
+                    let off = rev.offset();
+                    let back = rev.reverse(cap);
+                    for p in 0..cap {
+                        //reversal: the name at the mirrored slot is the old name
+                        assert_eq!(rev.p2a(Pos(cap - 1 - p)), t.p2a(Pos(p)), "r={r} o={o} p={p}");
+                        //round-trip both directions
+                        assert_eq!(rev.a2p(rev.p2a(Pos(p))).0, p, "rev r={r} o={o} p={p}");
+                        assert_eq!(t.a2p(t.p2a(Pos(p))).0, p, "fwd r={r} o={o} p={p}");
+                        //double reversal = identity
+                        assert_eq!(back.p2a(Pos(p)), t.p2a(Pos(p)), "back r={r} o={o} p={p}");
+                    }
+                    //the reversed turn: names hold, q lands odd over the
+                    //band, monotone, q ≥ p (the descending pass's safety)
+                    let turned = rev.rotate();
+                    let mut prev = 0usize;
+                    for p in 0..cap {
+                        let a = rev.p2a(Pos(p));
+                        let q = turned.a2p(a).0;
+                        assert_eq!(turned.p2a(Pos(q)), a, "name r={r} o={o} p={p}");
+                        let band = usize::from((off as usize + SPACE - p) % SPACE >= MID);
+                        assert_eq!(q, (2 * p + SPACE - band) % SPACE, "map r={r} o={o} p={p}");
+                        assert!(q >= prev, "monotone r={r} o={o} p={p}");
+                        assert!(q >= p, "descend-safe r={r} o={o} p={p}");
+                        prev = q;
+                    }
+                }
+            }
+        }
     }
 }
-
-variant!(a2p_0000 / p2a_0000, inner = z, outer = z, shift = z, rot = z);
-variant!(a2p_1000 / p2a_1000, inner = nz, outer = z, shift = z, rot = z);
-variant!(a2p_0100 / p2a_0100, inner = z, outer = nz, shift = z, rot = z);
-variant!(a2p_0010 / p2a_0010, inner = z, outer = z, shift = nz, rot = z);
-variant!(a2p_0001 / p2a_0001, inner = z, outer = z, shift = z, rot = nz);
-variant!(a2p_1100 / p2a_1100, inner = nz, outer = nz, shift = z, rot = z);
-variant!(a2p_1010 / p2a_1010, inner = nz, outer = z, shift = nz, rot = z);
-variant!(a2p_1001 / p2a_1001, inner = nz, outer = z, shift = z, rot = nz);
-variant!(a2p_0110 / p2a_0110, inner = z, outer = nz, shift = nz, rot = z);
-variant!(a2p_0101 / p2a_0101, inner = z, outer = nz, shift = z, rot = nz);
-variant!(a2p_0011 / p2a_0011, inner = z, outer = z, shift = nz, rot = nz);
-variant!(a2p_1110 / p2a_1110, inner = nz, outer = nz, shift = nz, rot = z);
-variant!(a2p_1101 / p2a_1101, inner = nz, outer = nz, shift = z, rot = nz);
-variant!(a2p_1011 / p2a_1011, inner = nz, outer = z, shift = nz, rot = nz);
-variant!(a2p_0111 / p2a_0111, inner = z, outer = nz, shift = nz, rot = nz);
-variant!(a2p_1111 / p2a_1111, inner = nz, outer = nz, shift = nz, rot = nz);

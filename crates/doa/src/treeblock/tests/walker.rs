@@ -7,7 +7,7 @@
 //! from child mins, leaves sorted). run targeted — full-crate runs OOM the IDE.
 
 use crate::index::Pos;
-use crate::translator::Translator;
+use crate::treeblock::translator::Translator;
 use crate::treeblock::blocks::{BlockTrait, OpenSlot, UniformBlock};
 use crate::treeblock::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide,
                                  GrewFixup, HasRoot, PosAncestry, SwapFixup};

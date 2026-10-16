@@ -2,15 +2,18 @@
 //!how a block names its traversal order so tree ops can `match O::ORDER` and
 //!monomorphize per-ordering flows. re-exports `treeblock::metadata::Fixup`.
 //!
-//!two consumers over the shared substrate (`index`/`translator`):
-//!`treeblock` (the walker/tree machinery + its store/fixup protocol) and
-//!`sortedblock` (the set — new, pairs-based feedback).
+//!the set/map tiers are the primary surface, flat in src/: `blockset`/`blockmap`/`blockbimap`
+//!over the `index`/`mask`/`translator` (2-knob) substrate; `treeblock` (the
+//!walker/tree machinery + its store/fixup protocol + its own 4-knob
+//!translator) holds the dense-arena machinery.
 
 pub use treeblock::metadata::Fixup;
 
+pub mod blockbimap;
+pub mod blockmap;
+pub mod blockset;
 pub mod index;
 pub mod mask;
-pub mod sortedblock;
 pub mod translator;
 pub mod treeblock;
 

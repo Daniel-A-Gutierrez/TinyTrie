@@ -6,6 +6,7 @@
 pub mod blocks;
 pub mod metadata;
 pub mod store;
+pub mod translator;
 pub mod walker;
 
 //unwired for the addr/pos terminology refactor — port when they earn a consumer:

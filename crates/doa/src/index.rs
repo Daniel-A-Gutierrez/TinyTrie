@@ -133,7 +133,7 @@ impl_addr!(u16, u8);
 //known flaw: no u4 exists, so u8's `Half` is itself — Pluripotent's
 //`MAX_CAP = 1 << Half::BIT_WIDTH` (2^8) exceeds u8's whole address space and
 //its `SHIFT = BIT_WIDTH/2` math degrades; the `addressable`-min guard in its
-//find ladder stays the binding constraint. revisit when the sortedblock
+//find ladder stays the binding constraint. revisit when the blockset
 //translator settles (see notes/subtle_bugs.md).
 impl_addr!(u8, u8);
 

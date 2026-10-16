@@ -4,13 +4,13 @@
 //!reversed to descending runs, chunk order shuffled) — 32-byte items
 //!(index-sized payload — element moves pay realistic byte costs), insert +
 //!lookup + seq-read (iter first→last, key checksum). size via first CLI
-//!arg (default 10k; must divide 100 — runs chunks are 100 long).
+//!arg (default 10k; must be a multiple of 100 — runs chunks are 100 long).
 //!each structure × workload cell is capped at RUN_BUDGET: fast cells
 //!complete all RUNS reps, a slow one finishes a single partial rep
 //!reported over its completed prefix (marked `[partial done]`). len +
 //!strict order gated before a rep counts.
 
-use doa::sortedblock::sortedblock::{BlockSet, Deltas};
+use doa::blockset::{BlockSet, Deltas};
 use sorted_vec::SortedSet;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;

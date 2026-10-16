@@ -11,7 +11,7 @@ use doa::Fixup;
 use doa::PreOrder;
 use doa::Rel;
 use doa::index::Pos;
-use doa::translator::Translator;
+use doa::treeblock::translator::Translator;
 use doa::treeblock::blocks::{BlockTrait, UniformBlock};
 use doa::treeblock::metadata::{Ancestry, ChildPos, DoubleSlide, Fixable, GatherSlide,
                                GrewFixup, HasRoot, PosAncestry, SwapFixup};

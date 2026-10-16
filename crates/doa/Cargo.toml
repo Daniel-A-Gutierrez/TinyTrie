@@ -30,3 +30,11 @@ harness = false
 name = "sorted_insert"
 harness = false
 
+[[bench]]
+name = "blockmap_insert"
+harness = false
+
+[[bench]]
+name = "bimap"
+harness = false
+

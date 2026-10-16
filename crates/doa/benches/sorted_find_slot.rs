@@ -9,7 +9,7 @@
 
 use doa::Rel;
 use doa::index::Pos;
-use doa::sortedblock::store::{Store, VecStore};
+use doa::treeblock::store::{Store, VecStore};
 use std::hint::black_box;
 use std::time::Instant;
 

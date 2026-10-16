@@ -50,9 +50,9 @@ I'd split them into three kinds — worldview shifts, choreography, and sharp ed
 
 6. The modes as workload bets (breadth, not depth). Uniform, Anchored, Pluripotent aren't three algorithms so much as three answers to "where will space be needed next?" — answered with different initial translator knobs, different store backends, and different find-space ladders. None is individually hard, but their interaction surface (which one pins the root implicitly, which one grows at the edges and compensates the translator instead of moving anything) is a lot of context to hold at once.
 
-## The set consumer — sortedblock
+## The set consumer — blockset
 
-`BlockSet<K, A>` (sortedblock/) is the height-1 consumer: a flat sorted SET
+`BlockSet<K, A>` (blockset.rs) is the height-1 consumer: a flat sorted SET
 over the same substrate. No tree lives inside, so the machinery that exists
 to find and correct a tree's referers disappears. The simplifications vs
 treeblock, each load-bearing:
@@ -66,10 +66,10 @@ treeblock, each load-bearing:
   do this: its consumers hold addrs across arbitrary mutations inside a
   tree it can't see, so names are assigned at birth and slides report
   pos-space fixups for the consumer's own structures to apply.
-- **2-knob translator, fn-ptr per direction (`sortedblock/translator.rs`).**
+- **2-knob translator, fn-ptr per direction (`src/translator.rs`).**
   treeblock's shift knob exists to keep spreads fixup-free while address
   width grows; (offset, rotation) alone provably can't survive width growth
-  + post-rotation adjustment (carries break the rotation) — but sortedblock's
+  + post-rotation adjustment (carries break the rotation) — but blockset's
   address width is FIXED and growth IS the rotation turn (`pos → 2·pos` mod
   A; the new slots mint the idle names rotation leaves between the
   spaced-out old ones). The 4-knob closure degenerates and 2 knobs close.
@@ -96,11 +96,14 @@ treeblock, each load-bearing:
   slide chain, nearest hole first, each slide in post-prior-slides
   coordinates (identical to its pre-read position: a hole's slot is never
   touched before its own slide; a two-sided gather is two chains' worth,
-  side told by `from > to`). `Deltas::iter` lazily expands to the same
-  swap-cascade pairs (hole-adjacent first) the consumer always saw.
-  `Pairs(Vec)` still waits for non-run shapes (bulk). Recording a slide
-  costs one write; the old per-pair Vec pushes cost 2× the memmove they
-  described (bench_notes).
+  side told by `from > to`). `Deltas::iter` expands: plain slides to 1-step
+  cascades (hole-adjacent first), gathers to ONE pair per moved element
+  carrying the FULL hop (crossing count, `w − segment index` — walked
+  away-from-spot so every `to` stays ahead of the remaining `from`s for
+  first-match holders; hop pairs overlap, order is load-bearing —
+  subtle_bugs §22). `Pairs(Vec)` still waits for non-run shapes (bulk).
+  Recording a slide costs one write; the old per-pair Vec pushes cost 2×
+  the memmove they described (session_history).
 - **occupancy = `Mask` (`src/mask.rs`)** — Vec<u64> words, word-at-a-time
   scans (`next_set`/`next_clear`/`prev_clear`/`nearest_clear`; the find
   ladder's primitives; all four carry a dense fast path — the query
@@ -129,15 +132,19 @@ treeblock, each load-bearing:
   flips) below len/8 past a 4·stride warmup — the all-time doubled sum
   is an intentional estimator (each doubling era votes once: biases
   develop early, stickier later). at len/4 a uniform stream flips 4×
-  spuriously (bench_notes); a real front stream's mean sits ≈ 0 either
+  spuriously (session_history); a real front stream's mean sits ≈ 0 either
   way. see subtle_bugs §20 for the reversal turn's band + the
-  `offset < cap` rule offset turns must respect.
+  `offset < cap` rule offset turns must respect. the check runs at
+  insert's TOP (pre-record, before `spot`) — the trigger sees the
+  pre-insert signal, and no translator mutation follows the event record
+  inside insert: pos-space deltas consumers (`iter_pos`, bimap's chase)
+  rely on that (subtle_bugs §22).
 
 Deferred: the `try_alloc`/`try_insert` split + arena-level occupancy
 decisions (`insert`'s ladder owns the in-block heuristics now), offset
 turns (window moves — mask + data halves both handle any offset; the move
 op itself remains), `from_vec`, convenience getters. Benchmarks
-and phase breakdown in `notes/bench_notes.md`.
+and phase breakdown in `notes/session_history.md`.
 
 
 ## Style
@@ -152,13 +159,15 @@ and phase breakdown in `notes/bench_notes.md`.
 - session-end routine, in order: run `skeletonize.py` (regenerates the doc/
   outlines), spawn a **fresh** review agent (not a fork) on the session's diff —
   it reads this file and subtle_bugs.md first so it doesn't re-flag intentional
-  choices — apply findings, update this file + subtle_bugs.md (merge in place,
-  prune stale entries), re-run `skeletonize.py` if src changed, and leave the
-  tree ready for commit — the user commits.
+  choices — apply findings, append the session's entry to
+  notes/session_history.md (format contract at the file's top), update this
+  file + subtle_bugs.md (merge in place, prune stale entries), re-run
+  `skeletonize.py` if src changed, and leave the tree ready for commit — the
+  user commits.
 - review priority: correctness (bugs, invariant breaks, do-not-revive violations) >
   cheap cleanups > doc-record > perf. unbenchmarked perf suggestions are reported,
   never auto-applied.
-- "defer" means written into this file's Status or into subtle_bugs.md — never
+- "defer" means written into this file's Future Work or into subtle_bugs.md — never
   "remembered".
 - do not update the claude.toml until the session is ending. 
 
@@ -186,7 +195,8 @@ Item inventories live in `doc/<name>.md` — generated skeletons (fenced rust,
 `///L####` tags jump to source). This section is the conceptual map only; the
 files' `//!` headers restate purpose + invariants next to the code.
 
-src/ is a shared substrate + two consumers:
+src/ is a shared substrate + the set/map tiers (primary surface, flat) +
+the tree consumer:
 
 substrate:
 - `lib.rs` — module wiring + the ordering/side vocabulary
@@ -194,36 +204,76 @@ substrate:
   (`doa::Fixup`, `doa::treeblock::{search, walker, TreeBlock}`).
 - `index.rs` — numeric trait ladder (`Num`/`UnsignedNum`/`Addr`) + `Pos` +
   type-level const facts underpinning all address math.
-- `mask.rs` — dense occupancy bitmap (see the sortedblock section).
-- `translator.rs` — the 4-knob treeblock translator, fn-ptr-specialized over
-  zero/nonzero params; the one hard rule is position order (pos 0 = min, pos
-  len−1 = max). sortedblock's 2-knob translator lives in its own module (see
-  `sortedblock/translator.rs`).
+- `mask.rs` — dense occupancy bitmap (see the blockset section).
+- `translator.rs` — the set/map tier's 2-knob translator, fn-ptr per
+  direction + the reversal/turn maps; the one hard rule is position order
+  (pos 0 = min, pos len−1 = max).
 
-consumers:
+tiers:
+- `blockset.rs` — the set tier: `BlockSet` + `Deltas` + the fetch-gather
+  ladder + the reversal trigger + the differential `Iter` over
+  SetBits/SetBitsRev; `find`/`contains` fast-path beyond either extreme
+  (two compares, no bsearch — sequential probes land past the tail).
+  `Deltas`' event recording (`record_none_slide`/
+  `record_gather`, `is_pending`), `NoneSlide` (the deltas-protocol link),
+  and `FREE_STRIDE`/`L2_BYTES` are `pub(crate)` — blockmap shares them.
+  (the old blockset store copy — treeblock's store evolved toward pairs
+  feedback — was deleted 2026-10-15: unused by the tier itself; the
+  find bench now runs against treeblock's store.)
+- `blockmap.rs` — the map tier: `BlockMap<K, V, A>` — the blockset
+  substrate with a value riding beside every key: TWO parallel
+  `MaybeUninit` vecs (keys/vals) under ONE shared mask, bit ⇔ the pair
+  live; every slide/gather/turn/reversal relocates the pair in lockstep,
+  the mask half of turn/reversal runs once. borrows blockset's `Deltas`
+  + the 2-knob translator unchanged — value slots are nameless, a name
+  finds the pair. API beyond the set surface: `get(addr) -> (&K, &V)`,
+  `value`/`value_mut` by key, `set_value` by addr (drop-safe overwrite),
+  `remove_key`, `iter` over `(&K, &V)`; `find` carries the same
+  extremes fast path as blockset's.
+- `blockbimap.rs` — the bijective tier: `BlockBiMap<K, V, A>` — two lockstep
+  BlockMaps, each holding the OTHER's names as its values (both orders native,
+  no projection ordering; every pair one hop from either side). insert
+  churns BOTH name spaces — `BiDeltas` carries both `Deltas` streams; the
+  maps consume each other's events by the BACK-POINTER CHASE (`chase`): a
+  delta pair names the emitter's moved entry, and that entry's own value
+  addresses the one partner slot whose held name went stale — O(1) per pair,
+  no search. gather pairs carry the full hop, so every pair is final — the
+  chase is a single forward pass in POS space (`iter_pos` + reads at pos:
+  the flip fires pre-record, so the emitter's translator is unchanged from
+  record to chase; events held across mutations go through `iter`'s
+  era-stable names — subtle_bugs §22). the fresh entry's dummy value (A::ZERO) is never chased before
+  its patch: only its own partner points at it, and a placed entry never
+  moves. no value mutation API — V is a values-map KEY, mutation would
+  break its order. dup detection lives IN the maps' inserts (no pre-check
+  bsearches): a K-side Err mutates no entries and records no deltas — the
+  orientation heuristic may still have flipped the block (names unaffected,
+  invisible through the direction-aware API); a dup-V Err rolls the placed
+  k back — the slides it caused are real, so key-side deltas may be
+  PENDING on Err (apply + clear like an Ok; a spot-as-hole placement
+  records a no-op event, a push_back records nothing).
+
+consumer:
 - `treeblock/` — ALL the tree machinery: `blocks` (Block + BlockTrait/
   BlockOps + the three modes), `walker` (Node contract + walker layers +
   open surface), `treeblock` (TreeBlock marker + constructors), `metadata`
   (the fixup protocol + tree-state types; Pos lives in index now), `store`
-  (slot backends + slide/gather/grow primitives), unwired `block_cursor`/
-  `leafblock`/`inline_leafblock`, and the tests (live `tests/walker.rs`,
-  unwired `tests/store.rs`/`tests/block.rs`).
-- `sortedblock/` — the set tier: `mod.rs` (contract), `store.rs` (COPY of
-  treeblock's store evolving the pairs feedback protocol — `open_slot`
-  emits swap-cascade `(from, to)` pairs; gather/bulk still plan-returning),
-  `translator.rs` (the 2-knob translator, fn-ptr per direction + the
-  reversal/turn maps), `sortedblock.rs` (`BlockSet` + `Deltas` + the
-  fetch-gather ladder + the reversal trigger + the differential `Iter`
-  over SetBits/SetBitsRev).
+  (slot backends + slide/gather/grow primitives), `translator` (the 4-knob
+  translator, fn-ptr-specialized over zero/nonzero params), unwired
+  `block_cursor`/`leafblock`/`inline_leafblock`, and the tests (live
+  `tests/walker.rs`, unwired `tests/store.rs`/`tests/block.rs`).
 - `benches/` — `sorted_find_slot.rs` (mask find vs store scan),
   `sorted_insert.rs` (append/prepend/random/runs × insert/lookup/seqread
   vs sorted-vec + BTreeSet, 32-byte items, size via CLI arg — default
   10k, u32 addrs — with a 3s wall budget per structure×workload cell and
   partial-rep reporting; findings + phase breakdown in
-  `notes/bench_notes.md`).
+  `notes/session_history.md`), `blockmap_insert.rs` (same harness/workloads,
+  BlockMap vs BTreeMap + the BlockSet same-run reference — u64 values),
+  `bimap.rs` (same harness, BlockBiMap vs a two-BTreeMap bidirectional
+  control — insert/lookup-both-sides/remove/iter_pairs; findings in
+  session_history 2026-10-15).
 
-notes: `devlog.md` (design log), `subtle_bugs.md` (solved nuances + their
-rules), `bench_notes.md`.
+notes: `devlog.md` (design log), `session_history.md` (per-session record),
+`subtle_bugs.md` (solved nuances + their rules).
 
 archive: `src/archive/` + `examples/old_btree/` (the live tree consumer is
 `examples/btree.rs`).
@@ -243,7 +293,7 @@ re-enable after porting) — reference-model torture + exhaustive slide/find/
 find-2 matrices for both backends, spread/split/pop coverage, drop accounting,
 contract panics. `block.rs` stays unwired (pre-refactor API — needs adaptation).
 
-sortedblock is inline `#[cfg(test)]`: mask (exhaustive scans vs naive
+blockset + blockmap are inline `#[cfg(test)]`: mask (exhaustive scans vs naive
 comparison at every start position; `rotate_mask` vs naive models at every
 offset — forward prefix/suffix/whole/empty bands, reversed down-band with
 word-edge sweeps; `reverse` mirrors + double-reversal identity) +
@@ -255,304 +305,52 @@ over every reachable (rotation, offset<cap)) + BlockSet
 translated deltas; `mixed_ops_torture` — clustered + descending-bait
 streams with random removals, every holder name verified every op, order
 valid in either direction post-flip; the reversal fires in `descending`;
-gather banking by distance; front-insert cascades; pending-deltas panic;
-dup rejection; remove/reinsert; NoneSlide expansion).
+gather banking by distance + the LEFT-side multi-segment mirror with
+exact hop-pair assertions; front-insert cascades; pending-deltas panic;
+dup rejection; remove/reinsert; NoneSlide expansion). blockbimap inline:
+holder mirror on BOTH name columns, mixed-direction streams, the dup-v
+rollback with pending deltas, 600-op torture, name-space exhaustion.
 
-Run targeted: `cargo test -p doa --lib sortedblock` / `mask` /
-`treeblock::tests::walker::tests`; uninit/leaks: `cargo +nightly miri test -p
-doa --lib <filter>` (slow — recompiles + interprets; sortedblock is
-miri-CLEAN — run via the miri driver directly on this nightly: cargo-miri
-drops a path segment resolving the workspace and fails to launch its
-compiled test binary, see devlog).
+Run targeted: `cargo test -p doa --lib blockset` / `blockmap` / `mask` /
+`treeblock::walker`; uninit/leaks: `cargo +nightly miri test -p
+doa --lib <filter>` (slow — recompiles + interprets; blockset, blockmap
+and blockbimap are miri-CLEAN; miri runs are expensive — filter to small
+subsets, the torture tests dominate).
 ⚠ Running the full `cargo test` in this crate has crashed the IDE out of memory in
 the past — run targeted tests.
 
-## Status
-
-Walker-surface refactor landed (2026-09-19). The crate no longer drives tree
-mutations — it supplies OPEN SLOTS at ordering-correct anchors; all wiring
-(node inserts, drains, reparenting, root promotion) is consumer-side, against
-the block directly. The pieces:
-
-- consumer mask flattened: the walker IS its own state (`NodeCursor` reads +
-  consumer-impl'd `descend`; `NodeWalkerMut: Fixable` + `Snapshot`/save/load/
-  set_position (internal machinery — proposed for deletion 2026-09-19 and
-  KEPT after review: save/load is fixup's correctness instrument, the run
-  walk rewrites entries to post-slide addrs so walking back is unsound,
-  subtle_bugs §5; the per-slide clone is an optimization target, not a
-  subtraction) + set_child/clear_child/set_parent (both kept by decision));
-  `lookup -> Option<ChildPos>` (None = descent terminates — the consumer's
-  equal policy); `children() -> (ChildPos, A)` pairs, DoubleEnded+ExactSize.
-  Died: the `State` assoc type + accessors + `parts`/`parts_mut`, `has_space`,
-  `current_mut`, walker-level insert/remove_child, `SplittableNode`,
-  `Node::Payload`, the `DEGREE >= 3` bound (binary rotations are legal).
-- opens consume the walker (`open_here`/`open_child`/`open_2_child`;
-  preorder adds `open_parent`/`open_parent_child`; in-order adds
-  `rotate_left`/`rotate_right` — physically free, walker survives). Opens
-  return `(slot(s), OpenFixups)` — consumers holding addrs across an open
-  apply the returned fixups (held addrs never survive an open uncorrected).
-  `Suggested`/suggest fns/`hop_current`/postorder impls/`TreeWalkMut`/
-  `SplitWalkHelper`/`SplitTreeWalker` deleted; the sealed `TreeWalkHelper`
-  (slide engine, open engines, `Anchor`) is `pub(crate)`.
-- block surface: `TreeBlock::set_root` + `split_block(self, l, r) ->
-  (Self, Self, N, usize)` (popped root + prefix split boundary; body `todo!` —
-  arena tier), `BlockOps::pin_pos` (Anchored's pin, deduped out of its
-  find/slide impls) + `try_find_slot`/`try_find_2_slots` (scan-only probes —
-  no grow escalations; the split-vs-grow decision's space test).
-- find ladder fix (found by the 240-key ascending torture): append-heavy
-  growth densifies the store edge past the fixed `BIT_WIDTH` budget while
-  mid-span holes remain — forced spreads ran to shift-exhaustion (len 65536,
-  occupied 142). Uniform + Anchored ladders gained a full-len scan rung
-  between the budgeted scan and the spread.
-- `examples/btree.rs` rewritten: preemptive consumer-driven splits (full
-  node on the descent path splits before anything descends into it — the
-  parent of any split target had room by construction), inlined split flows
-  (the opens consume the walker, releasing the block borrow for drain/wire),
-  held-addr + returned-fixup discipline. Runs green: 100 keys, multi root
-  promotions, all anchor kinds, in-run + out-of-run slides.
-- `src/tests/walker.rs` live on the new surface (see Testing) — miri-clean.
-  The old split-driver/hop/postorder torture died with its machinery.
-
-Second session (2026-09-19, same day) — the three agreed directions landed:
-- **rotations → the stand-on-the-riser contract** (agreed direction,
-  2026-09-19): the
-  walker starts ON the riser, all writes via up-navigation over the ancestry
-  stack, ends ON the riser — with the ancestry popped ONE level, because the
-  riser ROSE: "ends where it started" is position-only, and the end state
-  must be TREE-TRUTH (the descent-history entry naming P via slot 0 is stale
-  post-rotation). The final pop is `ascend` + `set_position` — a state-only
-  restore over the fully-consistent post-rotation tree; what died is the old
-  MID-CHOREOGRAPHY reach (walking to the riser through a half-rotated tree).
-  Root/mid-tree uniform; root case ends with an empty stack. The original
-  pseudocode omitted the riser's own stored-parent-field write — kept (the
-  old code's third `set_parent`; parent-free shapes no-op it).
-- **§4b partial**: `set_parent -> Option<B::A>` — the overwritten old parent
-  addr, `None` for parent-free shapes; crate call sites discard it (what a
-  walker does with it is consumer territory — journaling `save`/`load` or
-  ascend-by-old; `Some` returns are unexercised, no parent-field consumer
-  exists). `Ancestry` is inline-backed (8 entries + spill, Index/IndexMut):
-  fixup's per-slide snapshot/restore is a fixed-size copy below depth 8. The
-  clone itself stays — irreducible for stack walkers (§5: popped anchor-path
-  entries can't be re-derived mid-fixup); the heap alloc was the cost.
-- **gather machinery (v1)**: `GatherSlide` (metadata.rs) — the N-None gather
-  as a closed-form CROSSING-COUNT fixup (`delta(pos) = ±#{holes beyond
-  pos}` — NOT sequential `NoneSlide`s: overlapping runs go stale
-  mid-application). `Store::find_n_slots` (rel-side nearest-n, pin-clamped) +
-  per-store `gather_none` — one directional compaction pass (After descends
-  moving members up, Before ascends moving them down; each slot's own
-  iteration precedes any write into it), every member Some crosses the run
-  exactly once. `BlockOps::find_n_slots` ladder (budgeted → full-len →
-  spread+rescan → exhaustion) + `gather_none` (fixes BlockData). Walker:
-  `fixup_gather` (one single-direction run walk, per-visit + endpoint
-  canaries, snapshot/restore), `apply_gather` (`reparent_range` =
-  reparent_run's body generalized to explicit Some-dense bounds),
-  `open_n_at` + surface `open_n_here`/`open_n_child` on both orderings.
-  `OpenFixups.gather` (no longer Copy); `Fixable::gather_fix` (by-ref).
-  v1 scope: holes all on the open's rel side (one walk segment per gather);
-  Pluripotent gets the default ladder (no edge-grow for n>1); Uniform lacks
-  the proactive 3/4-spread rung.
-- tests: the rotation tests reworked (descend to the riser first; end
-  position == start + end-STATE truth asserted — is_root at the root, the
-  true parent mid-tree); `pre_open_n_after` (3-slot gather, held-addr
-  delivery), `pre_open_n_before` (Before child edge, prev() walk),
-  `pre_open_n_before_adjacent` (hand-built store — the anchor-adjacent slot
-  OCCUPIED, the member interval extends to anchor−1),
-  `pre_open_n_deep` (2*h-slot burst — two fresh (h-1)-deep internal chains +
-  leaves into a multi-level map; member internals with moved parents).
-  12 tests, miri-clean. The in-order `open_n_*` surface is untestable against
-  the binary consumer: any 2-node burst needs a slot on each side of the
-  parent gap, or produces leftless-right chains (unwalkable) — it waits for a
-  DEGREE>2 in-order consumer.
-  Fresh-review findings (all fixed pre-commit): the Before member interval
-  stopped at anchor−1 instead of the anchor (adjacent-occupied case tripped
-  the canary / skipped a member's entry rewrite), the rotation end state kept
-  the stale descent entry (is_root/parent lied), and the Before reparent
-  range underflowed on the empty-member edge.
-
-Deferred: `split_block` body; store tests port (still unwired — now also the
-gather matrices). Agreed, not yet implemented: the §4b walk-back USAGE
-(ascend-by-old for parent-field walkers — the return is in place, no
-consumer exercises it).
-
-Known latent flaws: reparent_run's
-`set_position` jumps (unexercised), the unary-internal-riser panic,
-packed-ChildPos nav breaking on sparse-addressed nodes, the STORES_PARENTS
-walker hazard class (unvalidated — no such consumer exists; also the
-unexercised `set_parent` Some-return),
-children()-sortedness unchecked.
-
-Not designed/wired: sparse-ChildPos nav (children()-based sibling walks —
-one-kid in-order nodes are reference-walked in tests, not TreeWalk'd);
-deletion rebalancing/merges; serialization; `leafblock`/`inline_leafblock`;
-`block.rs` test adaptation.
-
-Third stretch (2026-10-06 → 10-12) — module split + BlockSet insert live
-(one commit at this session's end):
-- **module split**: src/ = substrate (`index` + `Pos`, `translator`, `lib`
-  wiring) + `treeblock/` (all tree machinery, byte-identical) +
-  `sortedblock/`. re-exports keep old paths stable. notes/ moved under
-  doa.
-- sortedblock/store.rs pairs protocol (10-06): `open_slot` fused
-  find+slide+record emitting swap-cascade `(from, to)` pairs — the
-  treeblock fixup contract doesn't apply (set holders want plain pairs);
-  gather/bulk still plan-returning. `benches/sorted_find_slot.rs`: mask
-  find 1.28×/1.45× at 80% occupancy (see notes/bench_notes.md).
-- (10-12) `BlockSet` insert basics: bsearch over live slots (Ok = dup,
-  Err = insertion spot — conventional semantics; holes skipped forward,
-  sortedness proves everything before the probe known), `try_alloc`
-  (nearest hole either side via `Mask::nearest_clear`, fails clean),
-  in-place rotation-turn grow (`pos → 2·pos` descending pass +
-  `Mask::spread_double`; false while offset ≠ 0), slide = one
-  `ptr::copy` + O(1) mask, `Delta::NoneSlide` compact event with lazy
-  cascade expansion, `Drop` via `assume_init_drop`, cap 0→4 vec-like
-  first allocation. 10k shuffled inserts: 386 → 87.5 ns (ladder + phase
-  breakdown in bench_notes; the per-pair delta Vec cost 2× its memmove —
-  the compact event killed it). bitvec dropped (miri-unclean in its own
-  internals) for `src/mask.rs`.
-- sortedblock translator settled as the 2-knob degeneration (the devlog's
-  adaptive-translator analysis, lines 21–119, is the reasoning; the
-  sortedblock section above is the map).
-
-Fourth session (2026-10-12 → 10-13) — deltas safety, biases → the unified
-ladder (one commit at this session's end):
-- **deltas safety**: `Delta::Empty` is the explicit sentinel (pending ⇔
-  event ≠ Empty); `insert` panics on pending deltas instead of clearing;
-  `Deltas::clear` public. caller protocol: apply, then clear.
-- **biases → unified ladder**: started as `InsertBias` → (Direction, Growth)
-  split (Desc = reversed blocks: bsearch operand flip via `locate`, reverse
-  `iter`), then Growth DELETED when the ladder unified — the same rungs for
-  every block: strategy-free tail fast path (`spot`), edge rule (`spot ==
-  cap` → `push_back` — Vec's own doubling carries cap; hole every BIT_WIDTH
-  slots by tail-run cadence), then `open`'s rungs: BIT_WIDTH probe →
-  back-open (push_slot + slide when the tail run is within budget) → dense
-  turn (len ≥ cap − cap/5) → local turn (len ≥ cap − cap/3 AND nearest
-  hole > 4·budget — spreads never leave the block below ⅓) → fluke wide
-  slide → mask-full grow. `push_slot` is the single growth primitive
-  (grow_rotate is a layout change, not a capacity change — subtle_bugs
-  §18). `insert` split: `spot`/`insert_first`/`push_back`/`open`/`place`.
-- **rotate_mask(offset, midpoint)** replaces `spread_double`: plain
-  interleave + one masked ripple over the wrap band (prefix/suffix/
-  whole/empty); `grow_rotate` moves via the translator composition
-  `new.a2p(old.p2a(p))` (names by construction), refuses at cap >
-  MIDPOINT. the +1 band is the recycled rol bit (subtle_bugs §19).
-- bench (32B items): sequential 8 both columns after the review's cadence
-  fix (the hole goes BELOW k — appends can't consume it; the pre-fix
-  trailing hole was eaten every append, leaving the block dense so every
-  push_back paid a full-mask prev_clear + doubled push: 64), random 99.3
-  lazy → 88.7 preemptive → 87.0 unified, wrong-direction column (descending
-  into Asc) 692 — irreducible, the fix is Direction. ladder + findings in
-  bench_notes.
-
-Fifth session (2026-10-13) — fetch-gather + the reversal tier (one commit
-at this session's end):
-- **the unified ladder died for fetch-distance**: `FREE_STRIDE = 8` replaces
-  budget; no cadence holes (push_back dense), no 80%/⅔/4·budget turn
-  rungs. `open` = preemptive turn past 7/8 when the insert sits >
-  FREE_STRIDE from the edge (devlog line 199's rule) → `gather_slots` →
-  mask-full: one tail push within FREE_STRIDE of the edge, else turn /
-  refused tail slot. the whole prior ladder's probe/back-open/turn-rungs
-  are gone.
-- **`Delta::Gather(Vec<NoneSlide>)`**: multi-fetch chains as a Vec of
-  hole-journeys, lazily expanded to the same cascades holders always saw;
-  the single-slide fast path stays the alloc-free `NoneSlide`.
-- **reversal tier**: `sortedblock/translator.rs` extracted (fn-ptr per
-  direction — the negate never touches the translation path);
-  `BlockSet::reverse` = data+mask mirror + `offset → cap−1−offset` +
-  pos_sum reflection, ZERO deltas (names follow the mirrored slots —
-  pending events survive). trigger `pos_sum·8 < len²` past a 4·stride
-  warmup (len/4 flipped pure-random 4×; len/8 costs a real front stream
-  nothing — its mean sits ≈ 0). `Direction`/`InsertBias` died; the block
-  reads direction off the translator.
-- **turns under ANY offset + reversal** (the `offset ≠ 0` refusal deleted):
-  the reversed turn's band is the pos-suffix `(offset, cap)` landing
-  `2p−1` — a DOWN-ripple, which crosses word boundaries (bit-0 element
-  falls to the word below's bit 63; the fall carries word by word).
-  `rotate_mask(offset, midpoint, reversed)`. reversed blocks turn again —
-  a flip is no longer a degenerate tail-push trap. the reversed turn
-  requires `offset < cap` (name 0's slot — holds in every reachable
-  state; offset turns must respect it): subtle_bugs §20.
-- **position/bsearch**: direction dispatch outside the loop, monomorphized
-  comparator per arm — no order branch in the hot loop.
-- bench (32B, 10k, best): append 8.5, prepend 8.5 (692 wrong-direction →
-  74 gather-banked → 8.5 flipped), random 99 ≈ parity with the old
-  ladder on the same machine-day. phase table + the chained-gather
-  quadratic (1704) in bench_notes. miri-clean via the driver.
-- fresh-review: no correctness bugs; promoted the mixed-op randomized
-  torture inline, fixed doc drift (Gather coordinates frame, descending
-  comment, mod.rs invariant line), wrapping-mul hygiene in the trigger,
-  deleted the dead `back` field.
-
-Sixth session (2026-10-14) — bench scale-out, seqread engine, lookup
-fast paths (one commit at this session's end):
-- **bench rework**: `sorted_insert.rs` takes a size CLI arg (default 10k;
-  u32 addrs — u16's name space caps at 64k), a 3s wall budget per
-  structure×workload cell (slow cells finish one partial rep, reported
-  over the completed prefix, `[partial done]`-marked — SortedSet's O(n²)
-  columns stay benchable at 1M), a runs workload (chunks of 100
-  sequential keys, half reversed to descending runs, chunk order
-  shuffled), seqread + lookup columns, and the `sorted-vec` crate as a
-  third column (dev-dep). 1M findings: the cache cliff is measured now
-  (random insert 96→487, lookup 68→330), runs is the scale-proof
-  workload (132 at 1M), seqread scale-invariant, BTreeSet's lookup edge
-  — since inverted by the fast paths below.
-- **seqread engine, 3 rounds + inline** (5× end to end, 1.98→0.4
-  ns/elem): the `from_fn`+`next_set`/`prev_set` iter died for the
-  differential `Iter` enum (Asc/Desc picked once) over word-stepping
-  engines; Desc 2.81→1.41 (killing `prev_set`'s keep-mask loop was the
-  biggest algorithmic fix); then the in-place bit test (cached word, `pos`
-  as the state — yields free, the position rebuild was the hidden
-  cost); rotation-mask and tz-jump variants measured worse; then
-  `#[inline]` on the per-element `next`s — 1.4→0.4, the round that
-  mattered most (cross-crate call overhead was the dominant term; check
-  it FIRST, tune loop bodies second). masked scan now 0.4-0.8 ns/elem
-  cache-resident (~1.4 cycles), within 2× of bare memory at both
-  scales.
-- **bsearch fast paths** (lookup 68→57 at 10k, 328→256 at 1M; insert
-  rides it): `next_set` returns the probe position directly when its bit
-  is set — the ~90% case — skipping the shift/tzcnt/rebuild. the other
-  three scans got the same fast path + `#[inline]` (flat on insert:
-  hole-finders' queries are dense by construction — the payoff case
-  there is the 10% case; kept for API uniformity at zero measured cost).
-- **`nearest_clear` excludes its center** (contract; callers pass a
-  position they occupy): initially broke insert — the insert SPOT is
-  usually a HOLE (the bsearch converges lo to k's gap), and
-  `gather_slots` relied on nearest_clear returning the spot for that
-  case; fixed by an explicit spot-is-hole mask test at the top of
-  `gather_slots` (the check the old scan did implicitly).
-- **batched lookup: built, measured, DROPPED.** `lookup_batch<const B>`
-  went through five designs (median-partition descent → level-sync
-  frontier → serial+running-lo → plain sorted → evens/odds two-phase
-  with an adaptive span rule). spread keys are parity-with-singles at
-  every B and both scales (singles' OOO overlap + shared probe pyramid
-  are near the floor; the descent saves only ~log2(B)−2 probes);
-  clustered batches win 3-13× — but the probe-path sharing does most of
-  that WITHOUT any API (a globally sorted probe stream through plain
-  `contains` is the 2.4×/1.7× win). not worth the complexity — do not
-  revive; full analysis in bench_notes (2026-10-14 sections).
-- fresh-review: one real bug found and fixed (iterator re-poll
-  instability — stale cached word after exhaustion yields OOB
-  positions; subtle_bugs §21, `iterators_none_stable` regression test);
-  sorted-vec moved to dev-deps; doc drift updated.
-
-
 ## Future Work
 
-- sortedblock: `try_insert`/`try_alloc` split + arena-level occupancy
-  decisions; threshold tuning (FREE_STRIDE, the 7/8 turn line, the len/8
-  reversal trigger are unbenchmarked knobs); holder-applying bench variant
+- blockset: `try_insert`/`try_alloc` split + arena-level occupancy
+  decisions; threshold tuning (FREE_STRIDE + the len/8 reversal trigger
+  remain unbenchmarked; the turn line is now `TURN_NUM/DEN` and IS
+  benchmarked — 3/4 measured 2026-10-15 and REJECTED: −18% random @10k,
+  2.25× worse @1M + 2× random-build memory, see session_history);
+  holder-applying bench variant
   — the cascade savings (turns/flips are zero-churn) aren't measured by a
   deltas-clearing bench.
-- sortedblock: the 7/8 preemptive turn fires before checking whether the
+- blockset: the 7/8 preemptive turn fires before checking whether the
   spot is already open — delete-max + reinsert-max pays a full turn for a
   free slot (report-only finding; a nearest-hole-within-stride guard is
   the candidate, unbenched).
-- sortedblock: offset turns (window moves — mask + data halves handle any
+- blockset: offset turns (window moves — mask + data halves handle any
   offset now; the move op remains, and it must respect `offset < cap` or
   generalize the reversed band — subtle_bugs §20),
   mixed-side/multi-event deltas (`Delta::Pairs` awaits bulk),
   `from_vec`, convenience getters.
-- sortedblock: find-bench density sweep (90–97%),
-  pairs-based bulk open in store.rs (gather → pairs).
+- blockset: find-bench density sweep (90–97%) — the bench now runs the
+  store side against treeblock's store (the blockset copy is gone).
+- blockmap: `value`/`value_mut`/`remove_key` go through `position()`
+  without find's beyond-the-extremes fast path — an out-of-range probe on
+  the map tier's primary read pays a full bsearch (report-only review
+  finding; two-compare guard the candidate, unbenched).
+- blockbimap: `get_by_key`/`get_by_value` double-get (find→addr, then
+  `get` re-translates + re-reads, then the partner chase) — measured 229ns
+  over the keys map's `value` at 1M (decomposition, session_history
+  2026-10-15); find-returns-pos + read-once should reclaim ~130ns
+  (report-only, unbenched). the chase's insert-side tax (~24% on random
+  @1M) is proportional to moved elements — inherent to the bijection's
+  partner fixups, not obviously reducible.
 - fixup walk-back usage (§4b remainder) — ascend-by-old-value for
   parent-field walkers, over `set_parent`'s `Some(old)` return (in place,
   unexercised); needs a STORES_PARENTS consumer to validate at all.
@@ -570,4 +368,10 @@ fast paths (one commit at this session's end):
 - arena tier — subtrees & forwarding (block_id roots), ordering across splits;
   graduation — pluripotent → concrete strategy at len == the `Half` cap.
 - `Fixup` relevance-check optimization (elide unnecessary runtime checks).
+- known latent flaws (all unexercised): reparent_run's `set_position` jumps,
+  the unary-internal-riser panic, packed-ChildPos nav breaking on
+  sparse-addressed nodes, the STORES_PARENTS walker hazard class +
+  `set_parent`'s Some-return, children()-sortedness unchecked.
+- not designed/wired: deletion rebalancing/merges, serialization,
+  `leafblock`/`inline_leafblock`, `block.rs` test adaptation.
 - trie integration.

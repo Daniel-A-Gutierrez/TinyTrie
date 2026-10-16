@@ -9,9 +9,9 @@
 //!(pos 0 = min) is preserved by every op.
 use crate::{Ordering, Rel, RootPos,
             index::*,
-            translator::{AddressTranslator, Translator},
             treeblock::metadata::{DoubleSlide, Fixable, Fixup, GatherSlide, GrewFixup},
-            treeblock::store::{DequeStore, NoneSlide, Store, VecStore}};
+            treeblock::store::{DequeStore, NoneSlide, Store, VecStore},
+            treeblock::translator::{AddressTranslator, Translator}};
 use std::marker::PhantomData;
 
 pub type UniformBlock<'block, N, A, D, O> = Block<'block, N, A, Uniform, D, O>;

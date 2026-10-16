@@ -2,6 +2,14 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Bimap
+
+Map<K,A> and Map<V,A> where each points at the other
+Vec<(K,V)> + Set<A> + Set<A> where set 1 stores ptrs to vec in K order and set 2 stores pointers to the primary ordered by V
+    maintains insertion order!
+Map<K,V> + Set<A> where set 2 stores pointers to set 1 in V order. 
+
+
 # Fetch Quantity Is proportional to distance, now for reverse
 ok the 'fetch 1 extra per budget length searched' 
 

@@ -13,7 +13,7 @@ pub struct Mask {
 }
 ///L0014
 impl Mask {}
-///L0313
+///L0314
 ///`iter_set`'s engine — ascending set bits. None-stable (exhaustion
 ///zeroes the cached word, subtle_bugs §21)
 pub struct SetBits<'a> {
@@ -23,9 +23,9 @@ pub struct SetBits<'a> {
     ///next position to test
     pos:  usize,
 }
-///L0321
+///L0322
 impl Iterator for SetBits<'_> {}
-///L0359
+///L0360
 ///`iter_set_rev`'s engine — the descending mirror. None-stable like
 ///`SetBits`
 pub struct SetBitsRev<'a> {
@@ -34,12 +34,12 @@ pub struct SetBitsRev<'a> {
     ///next position to test; wraps below 0 as the exhaustion sentinel
     pos:   usize,
 }
-///L0366
+///L0367
 impl Iterator for SetBitsRev<'_> {}
-///L0403
+///L0404
 ///bits of x moved to the even positions of a u64 (p → 2p)
 fn spread(x: u32) -> u64;
-///L0414
+///L0415
 #[cfg(test)]
 mod tests {
     use super::*;
