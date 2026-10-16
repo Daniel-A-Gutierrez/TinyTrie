@@ -33,22 +33,18 @@ pub enum Iter<'a, K, V, A> {
 impl<'a, K: Ord, V, A: UnsignedNum> Iterator for Iter<'a, K, V, A> {}
 ///L0609
 ///key-ordered bidirectional walk over live pairs — blockset::Cursor's
-///machine, one (key, value) pair per yield, steps on a cached mask word
-///(see blockset::Cursor). invalidated by any mutation — re-seek
+///machine (MaskCursor under a pairs-yielding wrapper; see
+///blockset::Cursor). invalidated by any mutation — re-seek
 pub struct Cursor<'a, K, V, A> {
-    map:   &'a BlockMap<K, V, A>,
-    ///baked at construction (see blockset::Cursor)
-    rev:   bool,
-    ///the next-to-yield slot, or the forward ghost
-    state: CursorSlot,
-    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
-    word:  u64,
+    map:  &'a BlockMap<K, V, A>,
+    ///the slot-walk machine; dir = !reversed, baked at construction
+    walk: MaskCursor<'a>,
 }
-///L0619
+///L0615
 impl<'a, K, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
-///L0630
+///L0622
 impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
-///L0734
+///L0679
 #[cfg(test)]
 mod tests {
     use super::*;

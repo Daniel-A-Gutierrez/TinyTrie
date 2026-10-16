@@ -205,8 +205,10 @@ substrate:
 - `index.rs` — numeric trait ladder (`Num`/`UnsignedNum`/`Addr`) + `Pos` +
   type-level const facts underpinning all address math.
 - `mask.rs` — dense occupancy bitmap (see the blockset section) + the
-  bidirectional cached-word steppers (`step_up`/`step_down`/`word_at` —
-  the cursor stepping).
+  bidirectional cached-word steppers (`step_up`/`step_down`/`word_at`)
+  + `MaskCursor` — the slot-walk state machine (slot/ghost/dir/word
+  cache) the set/map cursors wrap; walk-path methods `#[inline(always)]`
+  end to end (subtle_bugs §23).
 - `translator.rs` — the set/map tier's 2-knob translator, fn-ptr per
   direction + the reversal/turn maps; the one hard rule is position order
   (pos 0 = min, pos len−1 = max).
@@ -217,10 +219,11 @@ tiers:
   SetBits/SetBitsRev; `find`/`contains` fast-path beyond either extreme
   (two compares, no bsearch — sequential probes land past the tail).
   the `Cursor` family: `seek`/`seek_after` (lower/upper bound in KEY
-  order, direction-aware) → `next`/`prev`/`key`/`addr` — a bidirectional
-  walk over raw slots on cached mask words, invalidated by any mutation
-  (state {At, FwdEnd} only — backward exhaustion needs no ghost; walk
-  methods are `#[inline(always)]`, see `Cursor::next`'s doc).
+  order, direction-aware) → `next`/`prev`/`key`/`addr` — a key-order
+  wrapper over `MaskCursor` (the slot-walk machine lives in mask),
+  invalidated by any mutation (backward exhaustion needs no ghost;
+  walk-path methods are `#[inline(always)]` end to end, see
+  `Cursor::next`'s doc).
   `Deltas`' event recording (`record_none_slide`/
   `record_gather`, `is_pending`), `NoneSlide` (the deltas-protocol link),
   and `FREE_STRIDE`/`L2_BYTES` are `pub(crate)` — blockmap shares them.
@@ -238,7 +241,7 @@ tiers:
   `remove_key`, `iter` over `(&K, &V)`; `find` carries the same
   extremes fast path as blockset's. the `Cursor` mirror (`seek`/
   `seek_after`, `next`/`prev` yield pairs, `entry()` peek, `addr`) —
-  blockset's machine, `CursorSlot` shared via `pub(crate)`.
+  blockset's machine (`MaskCursor`, over pairs).
 - `blockbimap.rs` — the bijective tier: `BlockBiMap<K, V, A>` — two lockstep
   BlockMaps, each holding the OTHER's names as its values (both orders native,
   no projection ordering; every pair one hop from either side). insert
@@ -288,8 +291,10 @@ consumer:
   `BTree{Set,Map}` `range` — the stable surrogate, std's cursor API is
   nightly-only: fwd = seek + 100 `next`, back = seek_after + 100 `prev`,
   both tiers × 4 workloads, cursor-vs-range orders verified over a probe
-  prefix; the optimization ladder + final numbers in session_history
-  2026-10-16).
+  prefix; + scan rows — full-set iter vs cursor fwd/back, ns/elem
+  (findings 2026-10-16 (b): parity at both scales; the seek+100 cells
+  are bsearch + one cold line, not stepping); the optimization ladder +
+  final numbers in session_history 2026-10-16).
 
 notes: `devlog.md` (design log), `session_history.md` (per-session record),
 `subtle_bugs.md` (solved nuances + their rules).

@@ -2,18 +2,38 @@
 //!dense occupancy bitmap — bit p ⇔ slot p live. word-at-a-time scans
 //!(`next_set`/`next_clear` skip full/empty words, no per-bit loop);
 //!`iter_set`/`iter_set_rev` test positions in place against the cached
-//!current word. bits past `bits` read as clear, so `next_clear` never
-//!returns ≥ `bits`.
-///L0009
+//!current word; `MaskCursor` is the bidirectional cached-word walk the
+//!set/map cursors wrap. bits past `bits` read as clear, so `next_clear`
+//!never returns ≥ `bits`.
+///L0010
 ///invariant: `words.len() == (bits + 63) / 64`; no bit ≥ `bits` is ever set.
 #[derive(Clone, Debug, Default)]
 pub struct Mask {
     words: Vec<u64>,
     bits:  usize,
 }
-///L0014
+///L0015
 impl Mask {}
-///L0362
+///L0369
+///bidirectional walk over set bits on a cached word — the walk machine
+///the set/map cursors wrap. the tiers own key-order semantics (where to
+///land); this owns the stepping, the word cache, and the walk-end states.
+///`dir`: positions ascend when true — baked by the tier at construction;
+///direction only changes by mutation, which invalidates the walk anyway.
+///`slot`: the current slot, or the forward walk's exhaustion ghost —
+///`advance` past the last slot ghosts. backward exhaustion needs no
+///ghost: `retreat` at the walk's start leaves the slot live
+pub(crate) struct MaskCursor<'a> {
+    mask: &'a Mask,
+    dir:  bool,
+    ///the next-to-yield slot, or the forward ghost
+    slot: Option<usize>,
+    ///Some(p) ⇒ p's word; the ghost leaves it stale (at() reloads)
+    word: u64,
+}
+///L0378
+impl<'a> MaskCursor<'a> {}
+///L0456
 ///`iter_set`'s engine — ascending set bits. None-stable (exhaustion
 ///zeroes the cached word, subtle_bugs §21)
 pub struct SetBits<'a> {
@@ -23,9 +43,9 @@ pub struct SetBits<'a> {
     ///next position to test
     pos:  usize,
 }
-///L0370
+///L0464
 impl Iterator for SetBits<'_> {}
-///L0408
+///L0502
 ///`iter_set_rev`'s engine — the descending mirror. None-stable like
 ///`SetBits`
 pub struct SetBitsRev<'a> {
@@ -34,12 +54,12 @@ pub struct SetBitsRev<'a> {
     ///next position to test; wraps below 0 as the exhaustion sentinel
     pos:   usize,
 }
-///L0415
+///L0509
 impl Iterator for SetBitsRev<'_> {}
-///L0452
+///L0546
 ///bits of x moved to the even positions of a u64 (p → 2p)
 fn spread(x: u32) -> u64;
-///L0463
+///L0557
 #[cfg(test)]
 mod tests {
     use super::*;

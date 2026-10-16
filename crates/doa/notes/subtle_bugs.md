@@ -663,6 +663,39 @@ era-stability half stands unchanged.
 
 ---
 
+## 23. The cursor walk's inline chain must be forced end to end (2026-10-16)
+
+**The regression (2026-10-16, MaskCursor — caught by the scan bench,
+verified by objdump).** moving the tier cursors' walk state (slot/ghost/
+direction/word cache) into mask's `MaskCursor` layered the walk:
+`next [always] → advance → step_up`. with `advance` a plain `#[inline]`
+hint, the chain grew past what the inliner forces through and the hot
+scan loop called an OUTLINED `advance` — a real `call MaskCursor::advance`
+in the disassembly, a call + cursor spill per step: cursor full-scans
+0.6 → 1.6 ns/elem (2.5×), same signature as the documented `Cursor::next`
+outlining (blockset's next doc, 2026-10-16 (a)). one trap on the way: a
+perl substitution meant to promote `advance` to `#[inline(always)]`
+silently didn't match (wrong indent), so a "we tried inline(always), no
+change" bench ran unchanged code — the disassembly was what exposed it.
+
+**The rules.**
+- walk-path methods in the cursor machine are `#[inline(always)]` END TO
+  END: the tier wrappers AND `MaskCursor`'s `slot`/`advance`/`retreat`.
+  a hint anywhere in the chain leaves the whole chain one size-budget
+  failure away from an outlined call in someone's hot loop.
+- keep the FORCED bodies small: `advance(p)` takes the slot the caller
+  already read from `slot()` — the internal state re-read both doubled
+  state traffic and grew the body. `step_up`/`step_down` stay plain
+  `#[inline]`: their crossing scans inline fine FROM an always-inlined
+  caller.
+- the word cache living in a `MaskCursor` field does NOT serialize the
+  loop (the value-passed-word warning on `step_up` did not materialize)
+  — the inlined loop keeps it in a register; numbers matched the flat
+  cursor. the warning is about passing a POINTER to the cache, not
+  about which struct owns the field.
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

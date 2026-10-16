@@ -358,99 +358,98 @@ impl Mask {
     }
 }
 
-    ///bidirectional walk over set bits on a cached word — the walk machine
-    ///the set/map cursors wrap. the tiers own key-order semantics (where to
-    ///land); this owns the stepping, the word cache, and the walk-end states.
-    ///`dir`: positions ascend when true — baked by the tier at construction;
-    ///direction only changes by mutation, which invalidates the walk anyway.
-    ///`state`: the current slot, or the forward walk's exhaustion ghost —
-    ///`advance` past the last slot ghosts. backward exhaustion needs no
-    ///ghost: `retreat` at the walk's start leaves the state live
-    pub(crate) struct MaskCursor<'a> {
-        mask: &'a Mask,
-        dir:  bool,
-        ///the next-to-yield slot, or the forward ghost
-        slot: Option<usize>,
-        ///Some(p) ⇒ p's word; the ghost leaves it stale (at() reloads)
-        word: u64,
+///bidirectional walk over set bits on a cached word — the walk machine
+///the set/map cursors wrap. the tiers own key-order semantics (where to
+///land); this owns the stepping, the word cache, and the walk-end states.
+///`dir`: positions ascend when true — baked by the tier at construction;
+///direction only changes by mutation, which invalidates the walk anyway.
+///`slot`: the current slot, or the forward walk's exhaustion ghost —
+///`advance` past the last slot ghosts. backward exhaustion needs no
+///ghost: `retreat` at the walk's start leaves the slot live
+pub(crate) struct MaskCursor<'a> {
+    mask: &'a Mask,
+    dir:  bool,
+    ///the next-to-yield slot, or the forward ghost
+    slot: Option<usize>,
+    ///Some(p) ⇒ p's word; the ghost leaves it stale (at() reloads)
+    word: u64,
+}
+
+impl<'a> MaskCursor<'a> {
+    ///at the forward ghost — the tier's seeks land via at()
+    pub(crate) fn start(mask: &'a Mask, dir: bool) -> Self {
+        MaskCursor { mask, dir, slot: None, word: 0 }
     }
 
-    impl<'a> MaskCursor<'a> {
-        ///at the forward ghost — the tier's seeks land via at()
-        pub(crate) fn start(mask: &'a Mask, dir: bool) -> Self {
-            MaskCursor { mask, dir, slot: None, word: 0 }
-        }
+    ///positions ascend when true — the tier's baked direction
+    pub(crate) fn dir(&self) -> bool {
+        self.dir
+    }
 
-        ///positions ascend when true — the tier's baked direction
-        pub(crate) fn dir(&self) -> bool {
-            self.dir
-        }
+    ///land at a live slot — the cache load (seeks, ghost resumes)
+    #[inline]
+    pub(crate) fn at(&mut self, q: usize) {
+        self.word = self.mask.word_at(q);
+        self.slot = Some(q);
+    }
 
-        ///land at a live slot — the cache load (seeks, ghost resumes)
-        #[inline]
-        pub(crate) fn at(&mut self, q: usize) {
-            self.word = self.mask.word_at(q);
-            self.slot = Some(q);
-        }
+    ///the forward ghost — nothing ahead
+    pub(crate) fn end(&mut self) {
+        self.slot = None;
+    }
 
-        ///the forward ghost — nothing ahead
-        pub(crate) fn end(&mut self) {
-            self.slot = None;
-        }
+    ///the current slot, or None at the ghost
+    #[inline(always)]
+    pub(crate) fn slot(&self) -> Option<usize> {
+        self.slot
+    }
 
-        ///the current slot, or None at the ghost
-        #[inline(always)]
-        pub(crate) fn slot(&self) -> Option<usize> {
-            self.slot
-        }
-
-        ///step past slot `p` (yield-then-step, `next`'s half — the caller
-        ///holds p from slot()). stepping past the last slot ghosts
-        #[inline(always)]
-        pub(crate) fn advance(&mut self, p: usize) {
-            //dir climbs positions; !dir descends them
-            let q = if self.dir {
-                self.mask.step_up(p, self.word)
-            } else {
-                self.mask.step_down(p, self.word)
-            };
-            match q {
-                Some((q, w)) => {
-                    self.word = w;
-                    self.slot = Some(q);
-                }
-                None => self.slot = None,
+    ///step past slot `p` (yield-then-step, `next`'s half — the caller
+    ///holds p from slot()). stepping past the last slot ghosts
+    #[inline(always)]
+    pub(crate) fn advance(&mut self, p: usize) {
+        //dir climbs positions; !dir descends them
+        let q = if self.dir {
+            self.mask.step_up(p, self.word)
+        } else {
+            self.mask.step_down(p, self.word)
+        };
+        match q {
+            Some((q, w)) => {
+                self.word = w;
+                self.slot = Some(q);
             }
-        }
-
-        ///step back (step-then-yield, `prev`'s half): the slot now current,
-        ///or None at the walk's start — the state stays put (the cache is
-        ///live, the tier re-yields); from the ghost, resumes at the far end
-        #[inline(always)]
-        pub(crate) fn retreat(&mut self) -> Option<usize> {
-            //the walk's last element from the ghost: the far end
-            let p = match self.slot {
-                None => {
-                    let q = if self.dir { self.mask.last_set() }
-                        else { self.mask.next_set(0) }?;
-                    self.at(q);
-                    return Some(q);
-                }
-                Some(p) => p,
-            };
-            let q = if self.dir {
-                self.mask.step_down(p, self.word)
-            } else {
-                self.mask.step_up(p, self.word)
-            };
-            //None = the walk's start: state stays put, the cache is live
-            let (r, w) = q?;
-            self.word = w;
-            self.slot = Some(r);
-            Some(r)
+            None => self.slot = None,
         }
     }
 
+    ///step back (step-then-yield, `prev`'s half): the slot now current,
+    ///or None at the walk's start — the state stays put (the cache is
+    ///live, the tier re-yields); from the ghost, resumes at the far end
+    #[inline(always)]
+    pub(crate) fn retreat(&mut self) -> Option<usize> {
+        //the walk's last element from the ghost: the far end
+        let p = match self.slot {
+            None => {
+                let q = if self.dir { self.mask.last_set() }
+                    else { self.mask.next_set(0) }?;
+                self.at(q);
+                return Some(q);
+            }
+            Some(p) => p,
+        };
+        let q = if self.dir {
+            self.mask.step_down(p, self.word)
+        } else {
+            self.mask.step_up(p, self.word)
+        };
+        //None = the walk's start: state stays put, the cache is live
+        let (r, w) = q?;
+        self.word = w;
+        self.slot = Some(r);
+        Some(r)
+    }
+}
 
 ///`iter_set`'s engine — ascending set bits. None-stable (exhaustion
 ///zeroes the cached word, subtle_bugs §21)

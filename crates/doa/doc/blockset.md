@@ -123,37 +123,22 @@ pub enum Iter<'a, K, A> {
 }
 ///L0813
 impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {}
-///L0830
-///the slot `next` yields next, or the forward walk's exhaustion ghost.
-///backward exhaustion needs no ghost: `prev` leaves the state at the
-///first element, where `next` correctly re-yields it. pub(crate):
-///blockmap's cursor is the same machine over pairs
-pub(crate) enum CursorSlot {
-    At(Pos),
-    ///no next
-    FwdEnd,
-}
-///L0841
+///L0831
 ///key-ordered bidirectional walk — `seek`/`seek_after` position, `next`
 ///walks key-ascending (yield current, then step), `prev` walks back (step,
-///then yield). steps run on a cached mask word (SetBits' optimization —
-///dense steps test it in place; crossings reload). holds raw slots: any
-///mutation (slides, turns, flips) invalidates it — re-seek
+///then yield). stepping runs on `MaskCursor` (the cached-word walk, see
+///mask.rs). holds raw slots: any mutation (slides, turns, flips)
+///invalidates it — re-seek
 pub struct Cursor<'a, K, A> {
     set:  &'a BlockSet<K, A>,
-    ///baked at construction — direction only changes by mutation, which
-    ///invalidates anyway
-    rev:  bool,
-    ///the next-to-yield slot, or the forward ghost
-    state: CursorSlot,
-    ///state At(p) ⇒ p's mask word; FwdEnd leaves it stale (land reloads)
-    word: u64,
+    ///the slot-walk machine; dir = !reversed, baked at construction
+    walk: MaskCursor<'a>,
 }
-///L0852
+///L0837
 impl<'a, K, A: UnsignedNum> Cursor<'a, K, A> {}
-///L0863
+///L0844
 impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {}
-///L0971
+///L0905
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -898,3 +898,58 @@ layout bench (BlockMap's design ancestry).
   fast path (report-only review finding, unbenched); bimap's cursor wrappers
   are plain `#[inline]` over `inline(always)` walks — one potential outlined
   call per yield, unmeasured.
+
+## 2026-10-16 (b) — scan bench + MaskCursor: the walk machine moves into mask
+
+- landed: `MaskCursor` (mask.rs) — the slot-walk state machine (slot /
+  ghost / dir / word cache) that blockset's and blockmap's cursors wrap;
+  the tiers keep key-order semantics only (seek landings, key/pair reads,
+  `addr`). the u64 word no longer leaks into tier cursor state.
+- landed: scan rows in `benches/cursor.rs` — full-set `iter` (SetBits/
+  SetBitsRev) vs cursor fwd (seek min + `next`) vs cursor back
+  (seek_after max + `prev`), checksum-gated, 10k + 1M.
+- died: `CursorSlot` — the pub(crate) state enum both tier cursors
+  duplicated; the ghost/walk's-start vocabulary lives in mask beside the
+  steppers now.
+- decided: `prev`'s ~1.4× over `next` is inherent to step-then-yield —
+  the yield slot IS the step output, so the key load serializes behind
+  the step (next's load runs beside its step). the shape restructure
+  (mirror next, no double Option wrap) benched equal-or-better and
+  stays; a lookahead-slot cache was REJECTED — buys back one
+  dependency at seek/ghost complexity. SetBitsRev (iter on a flipped
+  block, 0.8–0.9) acquitted descending stepping — the direction was
+  never the cost.
+- decided: `advance(p)` takes the slot the caller read from `slot()`,
+  and walk-path methods are `#[inline(always)]` end to end. the first
+  cut (hint-inlined `advance`) got the chain outlined at the scan site,
+  0.6→1.6 ns/elem (2.5×) — a real `call` in the objdump. subtle_bugs §23
+  carries the rules, incl. the silent no-op substitution that briefly
+  faked a "tried inline(always), no change" data point.
+- measured: cursor full-scan ns/elem, best, 4 workloads, pre (flat
+  cursors) → post (MaskCursor). iter cells moved ±0.2 on pure code
+  layout luck; the cursor cells are the comparison.
+
+  | 10k | iter | cur fwd | cur back |
+  |---|---|---|---|
+  | append | 0.6 → 0.4 | 0.6 → 0.5 | 1.1 → 0.8 |
+  | prepend | 0.8 → 0.6 | 0.7 → 0.6 | 1.0 → 1.0 |
+  | random | 0.9 → 0.8 | 0.8 → 0.8 | 1.2 → 1.1 |
+  | runs | 0.8 → 0.6 | 0.8 → 0.8 | 1.3 → 1.1 |
+
+  the regression cut (hint `advance`): cur fwd 1.5–1.8, cur back 1.4–2.0.
+
+  | 1M | iter | cur fwd | cur back |
+  |---|---|---|---|
+  | append | 0.7 → 0.7 | 0.7 → 0.6 | 1.1 → 0.9 |
+  | random | 1.7 → 1.5 | 1.7 → 1.5 | 2.1 → 1.8 |
+  | runs | 1.4 → 1.3 | 1.5 → 1.4 | 1.9 → 1.6 |
+
+  the walk cells improved too (the machine inherited prev's restructure
+  and lost a state re-read): 10k append fwd100 155.8→115.7 ns/walk,
+  back100 179.0→138.5; 1M runs fwd100 828.4→788.1. cursor parity with
+  iter holds at both scales — the whack numbers in the seek+100 cells
+  are the seek's bsearch + one cold cache line per walk, not the
+  stepping; the beyond-extremes seek guard stays deferred from (a).
+- miri: cursor batteries across all three tiers (8 tests, flipped blocks
+  included), clean, 2m10s.
+- deferred: nothing new.
