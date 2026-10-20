@@ -127,13 +127,18 @@ treeblock, each load-bearing:
   re-parameterizes (`p2a_new(p) = p2a_old(cap−1−p)` — exactly `offset →
   cap−1−offset` with the direction flipped), names follow the mirrored
   slots BY CONSTRUCTION — a pending deltas event survives the flip
-  untouched (it speaks names; names didn't change). trigger:
-  mean insert position (`pos_sum/len`, doubling at turns, reflecting at
-  flips) below len/8 past a 4·stride warmup — the all-time doubled sum
-  is an intentional estimator (each doubling era votes once: biases
-  develop early, stickier later). at len/4 a uniform stream flips 4×
-  spuriously (session_history); a real front stream's mean sits ≈ 0 either
-  way. see subtle_bugs §20 for the reversal turn's band + the
+  untouched (it speaks names; names didn't change). trigger: mean insert
+  position (`pos_sum/len`, doubling at turns, reflecting at flips) below
+  len/8 past a 4·stride warmup, Z-GATED on the variance (`pos_sq_sum`,
+  reflected `len³−2·len·S+Q` at flips, quadrupled at turns): the low mean
+  must clear 2σ of the observed spread — alternating streams (front-landing
+  chunks from either direction) have huge variance and never look
+  front-biased, so the trigger can't thrash; a tight front cluster
+  (variance ≈ 0) flips as before. multiply-only hot path: the mean gate
+  runs first, the variance test only when it already says front-biased.
+  SkipSet drives reversal MANUALLY (`should_reverse` + `reverse`) — its
+  insert path never auto-flips; plain BlockSet inserts keep the auto
+  trigger. see subtle_bugs §20 for the reversal turn's band + the
   `offset < cap` rule offset turns must respect. the check runs at
   insert's TOP (pre-record, before `spot`) — the trigger sees the
   pre-insert signal, and no translator mutation follows the event record
@@ -212,21 +217,61 @@ substrate:
 - `translator.rs` — the set/map tier's 2-knob translator, fn-ptr per
   direction + the reversal/turn maps; the one hard rule is position order
   (pos 0 = min, pos len−1 = max).
+- `serialize.rs` — the `Archive` trait: a stored K decomposes into a
+  fixed-size POD `Handle` (slots hold handles; handles ARE the
+  serialized form — heap-relative offsets, LE-canonical, so the
+  (slots, heap) pair serializes as-is) + bytes in an append-only side
+  heap. `cmp_key` (stored handle vs query key — the set's total order),
+  `view` (GAT borrow form), `materialize` (spent handle → owned value).
+  impls: integers/char inline by macro (Handle = Self), String (8-byte
+  BE-loaded zero-padded prefix for inline compares + ≤8-byte inline
+  cutoff — no heap bytes), Vec<u32> (LE, 4-aligned). heap offsets are
+  internal, never held outside the block — a future vacuum compacts
+  without fixups. removal leaks heap bytes (v1).
 
 tiers:
-- `blockset.rs` — the set tier: `BlockSet` + `Deltas` + the fetch-gather
-  ladder + the reversal trigger + the differential `Iter` over
-  SetBits/SetBitsRev; `find`/`contains` fast-path beyond either extreme
-  (two compares, no bsearch — sequential probes land past the tail).
-  the `Cursor` family: `seek`/`seek_after` (lower/upper bound in KEY
-  order, direction-aware) → `next`/`prev`/`key`/`addr` — a key-order
-  wrapper over `MaskCursor` (the slot-walk machine lives in mask),
-  invalidated by any mutation (backward exhaustion needs no ghost;
-  walk-path methods are `#[inline(always)]` end to end, see
-  `Cursor::next`'s doc).
-  `Deltas`' event recording (`record_none_slide`/
-  `record_gather`, `is_pending`), `NoneSlide` (the deltas-protocol link),
-  and `FREE_STRIDE`/`L2_BYTES` are `pub(crate)` — blockmap shares them.
+- `blockset.rs` — the set tier: `BlockSet<K: Archive, A>` (slots hold
+  `K::Handle` copies over an append-only side heap; drop machinery gone —
+  handles are POD, heap bytes leak on remove by design) + `Deltas` + the
+  fetch-gather ladder + the z-gated reversal trigger + the differential
+  `Iter` over SetBits/SetBitsRev; `find`/`contains` fast-path beyond
+  either extreme (two compares, no bsearch — sequential probes land past
+  the tail). the `insert_at`/`push_beyond` pair drives SkipSet's descent:
+  insert_at is UNSAFE, window-bounded (`from ≤ to ≤ cap`, bounded
+  `bsearch_bounds` inside), NEVER auto-reverses — SkipSet owns the flip
+  (`should_reverse`/`reverse`); push_beyond takes a caller-guaranteed
+  beyond-tail key. tier/diagnostic accessors: `slot`/`first_live_pos`/
+  `cmp_key`/`pos_of` (pos_of unchecked — live addrs only) + `slides()`
+  (the raw NoneSlide chain — SkipSet coalesces intervals from it, cheaper
+  than pair expansion). the `Cursor` family: `seek`/`seek_after` →
+  `next`/`prev`/`key`/`addr` over `MaskCursor`, invalidated by any
+  mutation. the pos `epoch` (bumped by turn/flip — the skipset staleness
+  guard), `pos_sq_sum` (the z-gate's variance half), the always-on turn
+  census statics, and `live_run_lengths` are SkipSet/bench-facing.
+  `Deltas`' event recording, `NoneSlide`, and `FREE_STRIDE`/`L2_BYTES`
+  are `pub(crate)` — blockmap shares them.
+- `skipset.rs` — the skip-list index over BlockSet: `SkipSet` +
+  `STRIDE`/`STRIDE_SHIFT`/`STRIDE_MASK` consts (power-of-2 — slot math is
+  shift/mask; runtime divisors never compile to shifts). tier0
+  WINDOW-FIRST sampling (slot j = the first live item in base window
+  [j·32, (j+1)·32) via `next_set`; None ONLY when the whole window is
+  empty — banking, turn bands and gridline holes can never empty a
+  sample), upper tiers lift every 32nd slot below. ONE allocation for
+  all tiers: masked slot store, regions [top…tier0] front-to-back,
+  reservations sized 2× the width chain at 2·cap (covers one turn and the
+  cap-creep ceiling). upkeep is incremental: slide chains coalesce into
+  ONE union interval (idempotent re-reads cascading [ceil(lo/s), hi/s]);
+  tail pushes update a window's first iff the placed item IS the first;
+  silent moves (epoch mismatch — turn or the manually-triggered flip)
+  re-read every window's first; `rebuild()` only past the reservation.
+  the descent scans each tier's range for last ≤ k / first > k — the
+  tier0 range maps to base positions (`bhi` clamped to cap) and resolves
+  via `find_window`/`insert_at`. STRIDE=32 settled (root scan must stay
+  ≤ stride — the s² misreading measured +165ns/insert at 1M from the
+  linear root scan alone). `SkipSet::insert` NEVER lets the base
+  auto-flip: it triggers reversal itself (z-gate), then descends.
+  removal unsupported (v0). bench-facing: the A/B phase hooks
+  (`insert_maintain_only`/`insert_descent_only`) are `#[doc(hidden)]`.
   (the old blockset store copy — treeblock's store evolved toward pairs
   feedback — was deleted 2026-10-15: unused by the tier itself; the
   find bench now runs against treeblock's store.)
@@ -294,7 +339,19 @@ consumer:
   prefix; + scan rows — full-set iter vs cursor fwd/back, ns/elem
   (findings 2026-10-16 (b): parity at both scales; the seek+100 cells
   are bsearch + one cold line, not stepping); the optimization ladder +
-  final numbers in session_history 2026-10-16).
+  final numbers in session_history 2026-10-16), `strings.rs` (the string
+  mirror: BlockSet<String> vs SortedSet vs BTreeSet × 3 key shapes —
+  fixed16 / var / digits — the StrHandle cutoff's cells; findings
+  2026-10-19), `skipset.rs` (BlockSet vs SkipSet vs BTreeSet ×
+  append/random/runs — insert (base / wrapper / maintained) + lookup +
+  seqread; a maintained cell builds tiers at the half then times the
+  rest; named-arg "phases" adds the A/B paired insert-path ladder
+  (upkeep/descent/search deltas — paired medians, chained cells measured
+  garbage once); every run prints the turn/slide census (turns timed
+  inside grow_rotate — rare, O(cap), so clocks are free — + slide
+  moved-elements from the deltas + the desert census via
+  `live_run_lengths`; findings 2026-10-19: turns 1–3% of build, the
+  gather tail is count-bounded and quadratic in desert depth).
 
 notes: `devlog.md` (design log), `session_history.md` (per-session record),
 `subtle_bugs.md` (solved nuances + their rules).
@@ -360,13 +417,27 @@ the past — run targeted tests.
   `inline(always)` walks — one potential outlined call per yield,
   unmeasured.
 - blockset: `try_insert`/`try_alloc` split + arena-level occupancy
-  decisions; threshold tuning (FREE_STRIDE + the len/8 reversal trigger
-  remain unbenchmarked; the turn line is now `TURN_NUM/DEN` and IS
-  benchmarked — 3/4 measured 2026-10-15 and REJECTED: −18% random @10k,
-  2.25× worse @1M + 2× random-build memory, see session_history);
+  decisions; threshold tuning (FREE_STRIDE + the z-gate's 2σ remain
+  unbenchmarked; the turn line `TURN_NUM/DEN` is measured TWICE —
+  2026-10-15 and re-benched 2026-10-19 with the turn census: 3/4 REJECTED
+  both times; the second pass showed turn TIME stays ~1% either way —
+  the loss is the LAYOUT: doubled cap → sparser bsearch probes + stretched
+  banking deserts (random @1M lookup 347→1132, moved/insert 13.7→68),
+  while clustered runs DO win — a per-workload bet for the
+  block-of-blocks tier; see session_history);
   holder-applying bench variant
   — the cascade savings (turns/flips are zero-churn) aren't measured by a
   deltas-clearing bench.
+- blockset: distance-bounded fetch — `fetch_holes` is COUNT-bounded
+  (`1 + d/8`): the walk spans to the farthest fetched hole, quadratic in
+  desert depth (measured: 13% of random inserts move 94 elements each at
+  1M, 5× the harmonic share; the census shows 75% of live sits in >8
+  solid runs — banking clusters holes and digs deserts, and loses both
+  bets: random never reuses banked holes, runs refetches). bound the walk
+  by distance, fall through to push_slot. off-grid banking (parking
+  banked holes off the position lattice) is the deeper variant — the
+  window-first tiers no longer care where holes sit, but the
+  ELEMENT-MOVEMENT cost remains.
 - blockset: the 7/8 preemptive turn fires before checking whether the
   spot is already open — delete-max + reinsert-max pays a full turn for a
   free slot (report-only finding; a nearest-hole-within-stride guard is
@@ -410,6 +481,19 @@ the past — run targeted tests.
   the unary-internal-riser panic, packed-ChildPos nav breaking on
   sparse-addressed nodes, the STORES_PARENTS walker hazard class +
   `set_parent`'s Some-return, children()-sortedness unchecked.
-- not designed/wired: deletion rebalancing/merges, serialization,
-  `leafblock`/`inline_leafblock`, `block.rs` test adaptation.
+- skipset: removal (v0 — a mask clear + the window's first re-read;
+  the deltas protocol already reports the slide class). auto-stride +
+  an L2 build gate — tiers lose ~35% on lookups at 10k (cache-resident
+  base); the stride should derive from L2_BYTES/handle size, likely as
+  a const-generic once it un-defers. skipset removal of the epoch's
+  manual-flip coupling to blockmap's auto-flip (the two insert paths
+  differ under tiers).
+- blockmap/bimap: the Archive port — keys AND values get handles over
+  one shared heap (blockmap's parallel MaybeUninit vecs + mask become a
+  three-way lockstep with the heap; bimap untouched — its values are
+  names).
+- not designed/wired: deletion rebalancing/merges, serialization
+  (the (slots, heap) pair IS the serialized form — validation is the
+  only load-time work), `leafblock`/`inline_leafblock`, `block.rs`
+  test adaptation.
 - trie integration.

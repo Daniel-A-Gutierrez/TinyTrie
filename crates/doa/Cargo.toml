@@ -39,6 +39,14 @@ name = "bimap"
 harness = false
 
 [[bench]]
+name = "strings"
+harness = false
+
+[[bench]]
+name = "skipset"
+harness = false
+
+[[bench]]
 name = "cursor"
 harness = false
 

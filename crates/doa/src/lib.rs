@@ -14,6 +14,8 @@ pub mod blockmap;
 pub mod blockset;
 pub mod index;
 pub mod mask;
+pub mod serialize;
+pub mod skipset;
 pub mod translator;
 pub mod treeblock;
 

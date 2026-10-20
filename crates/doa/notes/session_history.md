@@ -953,3 +953,92 @@ layout bench (BlockMap's design ancestry).
 - miri: cursor batteries across all three tiers (8 tests, flipped blocks
   included), clean, 2m10s.
 - deferred: nothing new.
+
+## 2026-10-19 — archive tier + SkipSet
+
+- landed: `serialize.rs` — the `Archive` trait (K/V decompose into a POD
+  `Handle` in slots + bytes in an append-only side heap; `cmp_key`,
+  `view` GAT, `materialize`); integers/char by macro, String (8-byte
+  BE-loaded zero-padded prefix + ≤8-byte inline cutoff — no heap bytes),
+  Vec<u32> (LE, 4-aligned). BlockSet is now `K: Archive` over handles;
+  drop machinery removed (heap bytes leak on remove by design, v1). landed:
+  SkipSet (`skipset.rs`) — deterministic skip list over BlockSet:
+  tier0 WINDOW-FIRST sampling (slot j = first live item in window
+  [j·32, (j+1)·32) via next_set — None only when the whole window is
+  empty, so banking/turn bands/gridline holes can never empty a sample);
+  upper tiers lift every 32nd slot below; ONE allocation for all tiers
+  (regions [top…tier0], reservations cover one turn + the cap ceiling);
+  incremental upkeep — slide chains coalesce to one union interval,
+  tail pushes update a window's first iff the placed item IS the first,
+  silent moves (epoch) re-read all windows, creep extends. SkipSet::insert
+  owns reversal manually (should_reverse + reverse; the base never
+  auto-flips under tiers) and drives `insert_at` (unsafe window-bounded,
+  bounded bsearch inside the descent's [blo, bhi)) or `push_beyond`.
+  landed: `reverse_due` (z-gated reversal: pos_sq_sum variance,
+  2σ, multiply-only hot path); `slides()` (raw NoneSlide chain, replacing
+  pair expansion); bench strings.rs (3-way string bench, 3 shapes) and
+  skipset.rs (3-way + maintained cell + A/B phase ladder + turn/slide
+  census + desert census).
+- died: rank-sampled rebuild-upkeep tiers (v0 — every rank shifts);
+  per-tier Option<Vec> storage (one masked store); rebuild-on-every-insert
+  upkeep; the j→2j interleave + LastMove translator-pair remap
+  (window-first made re-mapping moot — the block knows firsts, slots
+  don't); next_sample cache (const power-of-2 stride made modulo one AND);
+  SkipSet's find_window dup pre-check (insert_at detects dups pre-archive);
+  blockset get_owned/iter_named/find_in/find_below (superseded by
+  slot/first_live_pos/find_window); the s² chain-stop misreading of the
+  DEGREE² rule (root scan must stay ≤ stride).
+- decided: window-first over gridline sampling — gridline slots go
+  phantom-None exactly where banking is hottest; the first-item contract
+  keeps `hi = 32·first_gt` exact (k < first(window w) ⇒ answer below w).
+  decided: single allocation + region reservations over per-tier Vecs
+  (one allocator call per epoch). STRIDE=32 as a module const (runtime
+  divisors never compile to shifts — the div instructions were ~20× the
+  harmonic tier share). 3/4 turn line re-benched: REJECTED at 1M (see
+  measured). rkyv rejected: value-relative offsets vs our heap-relative
+  handles; the free-lunch layer (serialized form == in-memory form) exists
+  by design. two datastructure impls rejected: identity Archive impls
+  monomorphize to today's code (int bench flat ±5%).
+- measured (u64 keys unless noted, best (avg), 1M, same-run cells):
+  lookup — BlockSet 329 vs SkipSet **126.5** (−62%); BlockSet vs BTreeSet
+  329/180; append 121→103 (−15%); runs 174→164 (−6%). insert — maint
+  append 12.4 vs base 8.6 (guards + amortized upkeep, harmonic share
+  ~n/16 ops confirmed by census); random ~330 vs 282 base; runs 129 vs
+  86 (down from 8× base pre-fix). seqread parity everywhere; BTree wins
+  slide-heavy mutation (runs insert 33 vs 86) — node memmove vs scattered
+  short shifts, deferred to block-of-blocks. strings (BlockSet<String>,
+  1M): digits lookup 705→464 (−37%) vs owned-String; seqread −71%; the
+  ≤8-byte cutoff pays (lookup −35% at 1M vs 9-byte keys). turn census:
+  turns are 1.1–2.9% of build time at every workload/scale — the turn is
+  never the cost, the LAYOUT is (3/4 line at 1M random: lookup 347→1132,
+  moved/insert 13.7→68 — doubled cap → sparser probes + stretched banking
+  deserts; runs moved 21.3→19.1, lookup 204→156 — per-workload bet).
+  slide census at 1M random: 13.67 elems/insert — plain 87%×1.3 + gather
+  13%×93.7 (count-bounded fetch `1+d/8` walks the hole chain: quadratic
+  in desert depth; banking loses both bets — random never reuses, runs
+  refetches); deserts: 75% of live sits in runs >8. phase ladder (A/B
+  paired medians): descent +52 vs window-search −53 at 1M (cancellation
+  is real) — upkeep is the entire visible tax (+5 appends, +12 runs after
+  shift/mask + coalescing; pre-fix upkeep was +96/+303).
+- miri: serialize, skipset, blockset clean (multiple runs incl.
+  window-first); census counters #[cfg(test)].
+- deferred: distance-bounded fetch (the gather tail — bound the walk,
+  fall through to push_slot); off-grid banking (element-movement cost
+  remains after window-first fixed the tier cost); blockmap/bimap Archive
+  port; skipset removal (v0); auto-stride + L2 build gate (tiers lose
+  below cache scale — 10k lookup −35%); heap vacuum; block-of-blocks
+  (runs mutation).
+- session-end review (fresh agent, no context): verified sound —
+  insert_at's window contract (incl. the bhi clamp), window-first upkeep
+  under every mutation class (union-interval coverage, no-op (p,p),
+  push_beyond past tail holes, extend-before-slot-math ordering), epoch
+  timing, z-gate reflection, serialize boundaries (7/8/9, NULs, LE).
+  findings fixed: find_window's Asc FIRST probe was unbounded by `to`
+  (empty window could return an out-of-window addr — pub contract, no
+  in-crate caller affected); insert_maintain_only's dup-Err path could
+  leave the epoch un-synced after a mid-insert auto-flip (bench-hook
+  landmine); the pending-deltas assert moved to SkipSet::insert's top
+  (was after the manual flip); reverse_due's spread now documents the
+  no-removals assumption; turn_census's plain/gather split at ≥8;
+  strings bench gained the lookup verify gate. declined: the
+  redundant-apply_slide-after-sync_move flag (cold path, unbenched).

@@ -696,6 +696,39 @@ change" bench ran unchanged code — the disassembly was what exposed it.
 
 ---
 
+## 24. Window-first sampling's `hi` bound is the filter (2026-10-19)
+
+**The trap (skipset.rs, caught in design review before it shipped).**
+`next_set` is distance-UNBOUNDED — asked for the first live slot at or
+after a gridline, it walks as far as it must. the tempting cheap
+contract is "tier0 slot j = first live ≥ 32j, no window filter": a
+5-window hole would fill five slots with the SAME repeated handle, and
+every slot would always be Some. it is WRONG, and not just wasteful:
+the descent's range math is `hi = 32·first_gt`, sound ONLY because the
+sample of window w is the first item OF that window — nothing in
+[32·first_gt, pos(sample)) can hold k's answer. with the repeated
+handle leaking backward into slot w, a query landing inside the gap
+takes `first_gt = w` and `hi = 32w`, silently EXCLUDING its own valid
+answer positions in [32w, pos(X)). the filter `first < window_lo +
+STRIDE` is not an optimization on the sampling — it is the correctness
+condition of the `hi` bound (the `lo` side is symmetric and free).
+
+**The rules.**
+- a tier0 sample must always be the first item STRICTLY INSIDE its
+  window — the window bound is load-bearing, never "tidy up" it away.
+- `None` means "the whole window is empty" and nothing else. that is
+  what lets the IDK descent widen honestly (and only) across real
+  gaps, and what made banking/turn-bands/gridline holes harmless to
+  the tier (the 2026-10-19 gridline-sampling phantom-None class: banked
+  hole runs straddle gridlines exactly where inserts are hottest, so
+  phantom Nones clustered in the hot zone).
+- when a range bound derives from a sample, re-derive its soundness
+  whenever the sample's reach changes. the `bhi` clamp to cap
+  (window_of) exists because width·STRIDE overshoots cap when cap isn't
+  a multiple of 32 — insert_at's Safety contract says `to ≤ cap`.
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

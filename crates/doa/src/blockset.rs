@@ -1,18 +1,27 @@
 //!BlockSet: pos-ordered slot array + 2-knob translator. addr = canonical
 //!name of its slot (`p2a`), semi-stable — rotation turns (growth) preserve
 //!names, slides transfer them (the mover adopts the vacated name). moves
-//!are reported as pos pairs in swap-cascade order (hole-adjacent mover
-//!first) + a translator snapshot; the holder applies `Deltas::iter`'s
-//!(from_addr, to_addr) name swaps in order.
+//!are reported as pos pairs in swap-cascade order for plain slides
+//(hole-adjacent mover first; gathers emit full-hop pairs, far segment
+//!first — see `DeltaPairs`) + a translator snapshot; the holder applies
+//!`Deltas::iter`'s (from_addr, to_addr) name swaps in order.
 //!order: pos order == key order — pos 0 = min (Asc) or max (Desc); a
-//!sequential insert at the key extreme is always a physical tail
-//!push_back. the translator carries the direction (see translator.rs).
+//!sequential insert at the key extreme always lands at the physical tail
+//!edge — push_back, or a direct place in a past-tail hole — never a
+//!slide. the translator carries the direction (see translator.rs).
 //!cursor (`seek`/`seek_after`): bidirectional key-ordered walk over raw
 //!slots — invalidated by any mutation, re-seek.
+//!keys live archived (serialize.rs): `K: Archive`, slots hold `K::Handle`
+//!over an append-only side heap, reads yield `K::View`.
 
 use std::cmp::Ordering;
 use std::mem::MaybeUninit;
+use std::sync::atomic::AtomicU64;
+use std::time::Instant;
 
+use crate::index::*;
+use crate::mask::{Mask, MaskCursor, SetBits, SetBitsRev};
+use crate::serialize::Archive;
 use crate::translator::Translator;
 
 ///one fetch-gather slide-chain link: the hole moves `from → to`. Gather
@@ -28,8 +37,6 @@ impl NoneSlide {
         Self { from, to }
     }
 }
-use crate::index::*;
-use crate::mask::{Mask, MaskCursor, SetBits, SetBitsRev};
 
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
@@ -46,7 +53,7 @@ enum Delta {
     ///slide in post-prior-slides coordinates — identical to its pre-read
     ///position (a hole's slot is never touched before its own slide)
     Gather(Vec<NoneSlide>),
-    ///rare non-run shapes (reversal, bulk)
+    ///bulk non-run shapes (unused; reversal reports no events by design)
     #[allow(dead_code)]
     Pairs(Vec<(Pos, Pos)>),
 }
@@ -63,6 +70,8 @@ enum DeltaPairs<'a> {
     Run { p: usize, step: i64, remaining: usize },
     Gather {
         slides: &'a [NoneSlide],
+        ///holes fetched from the right of the spot (else left) — sets the
+        ///segment/hop direction
         right:  bool,
         ///walk counter over segments, FAR-segment first (segment index
         ///w−1−seg)
@@ -73,12 +82,36 @@ enum DeltaPairs<'a> {
     Pairs(std::slice::Iter<'a, (Pos, Pos)>),
 }
 
-///swap-cascade run state of one hole slide `from → to`
+///swap-cascade run state of one hole slide `from → to`: (first moved
+///position, step ±1, count)
 fn run_of(from: usize, to: usize) -> (usize, i64, usize) {
     if from > to {
         (from - 1, -1, from - to)
     } else {
         (from + 1, 1, to - from)
+    }
+}
+
+///the raw slide chain (see `Deltas::slides`)
+pub(crate) enum Slides<'a> {
+    Empty,
+    One(NoneSlide),
+    Many(std::slice::Iter<'a, NoneSlide>),
+}
+
+impl Iterator for Slides<'_> {
+    type Item = NoneSlide;
+
+    fn next(&mut self) -> Option<NoneSlide> {
+        match self {
+            Slides::Empty => None,
+            Slides::One(s) => {
+                let s = *s;
+                *self = Slides::Empty;
+                Some(s)
+            }
+            Slides::Many(it) => it.next().copied(),
+        }
     }
 }
 
@@ -204,6 +237,18 @@ impl<A: UnsignedNum> Deltas<A> {
         !matches!(self.event, Delta::Empty)
     }
 
+    ///the raw slide chain — compact hole moves; the changed positions of
+    ///each slide are [min(from, to), max(from, to)] inclusive. skipset's
+    ///incremental upkeep reads these instead of the pair expansion
+    pub(crate) fn slides(&self) -> Slides<'_> {
+        match &self.event {
+            Delta::Empty => Slides::Empty,
+            Delta::NoneSlide { from, to } => Slides::One(NoneSlide::new(*from, *to)),
+            Delta::Gather(v) => Slides::Many(v.iter()),
+            Delta::Pairs(_) => Slides::Empty,
+        }
+    }
+
     ///reset to empty — call after applying
     pub fn clear(&mut self) {
         self.event = Delta::Empty;
@@ -226,15 +271,28 @@ impl<A: UnsignedNum> Deltas<A> {
 
 ///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
 ///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
-///preemptive turn line (numerator/denominator): past this density, a
-///mid-block insert turns instead of gathering — past the line, the
-///expected fetch distance blows through FREE_STRIDE (the stride banking
-///assumption dies). 3/4 measured 2026-10-15: −18% random @10k but 2.25×
-///WORSE @1M (turn frequency doubles; each big turn's O(cap) relocation
-///eats the amortization) + 2× random-build memory — 7/8 stands
+///preemptive turn line: past this density, a mid-block insert turns
+///instead of gathering — past the line the expected fetch distance
+///blows through FREE_STRIDE. measured twice (2026-10-15, re-benched
+///2026-10-19 with the turn census): 3/4 loses at 1M — turn TIME stays
+///~1% either way, the loss is the LAYOUT (doubled cap → sparser bsearch
+///probes + stretched banking deserts: random lookup 347→1132,
+///moved/insert 13.7→68) while clustered runs DO win — a per-workload
+///bet; revisit at the block-of-blocks tier
 pub(crate) const TURN_NUM: usize = 7;
 pub(crate) const TURN_DEN: usize = 8;
+///gather banking distance: one hole fetched per FREE_STRIDE of distance
+///to the nearest one
 pub(crate) const FREE_STRIDE: usize = 8;
+
+//FREE_STRIDE (and SkipSet's stride) stay powers of two — every divide and
+//modulo on them compiles to shift/mask
+const _: () = assert!(FREE_STRIDE.count_ones() == 1, "FREE_STRIDE must be a power of 2");
+
+///z² for the reversal confidence gate — the low mean must clear this
+///many standard deviations of the observed spread before flipping
+///(2σ ≈ 95%)
+const REVERSE_Z2: u128 = 4;
 
 ///~L2 residency: the bsearch shape split — cache-resident blocks cmov
 ///(probe compares resolve from L1/L2, mispredicts dominate), DRAM-
@@ -243,35 +301,52 @@ pub(crate) const FREE_STRIDE: usize = 8;
 ///at both scales, see notes/session_history.md
 pub(crate) const L2_BYTES: usize = 512 * 1024;
 
+///turn census — turns are rare and O(cap), so timing them directly is
+///overhead-free (clock reads amortize over microseconds of work). the
+///bench reports the share of build time turns (grow_rotate: relocation
+///loop + rotate_mask) consume. NOT API
+#[doc(hidden)]
+pub static TURN_COUNT: AtomicU64 = AtomicU64::new(0);
+#[doc(hidden)]
+pub static TURN_MOVED: AtomicU64 = AtomicU64::new(0);
+#[doc(hidden)]
+pub static TURN_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
+
+///dense ordered set over archived keys: pos-ordered slot array holding
+///`K::Handle` copies + a side heap of archived bytes.
 ///mask covers data.len() slots; bit ⇔ slot initialized.
-pub struct BlockSet<K, A> {
+pub struct BlockSet<K: Archive, A> {
     translator: Translator<A>,
-    data:       Vec<MaybeUninit<K>>,
+    data:       Vec<MaybeUninit<K::Handle>>,
+    ///K's archived heap bytes — append-only, unordered (see serialize.rs)
+    heap:       Vec<u8>,
     mask:       Mask,
     len:        usize,
     ///running sum of placed slot positions — the mean-insert-position
     ///signal for the reversal tier
     pos_sum:    u64,
+    ///running sum of squared positions — the variance half of the
+    ///z-gated trigger; transformed like pos_sum (reflected on reversal,
+    ///quadrupled on turns)
+    pos_sq_sum: u128,
+    ///bumped by every position-relocating silent move (turns, flips) —
+    ///slides/gathers don't bump (they record deltas). position holders
+    ///(skipset tiers) use it as a staleness guard
+    epoch:      u64,
 }
 
-impl<K, A> Drop for BlockSet<K, A> {
-    fn drop(&mut self) {
-        for p in self.mask.iter_set() {
-            //mask ⇔ init invariant
-            unsafe { self.data[p].assume_init_drop() };
-        }
-    }
-}
-
-impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
+impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     pub fn new() -> Self {
         BlockSet {
             translator: Translator::new(),
             data:      Vec::new(),
+            heap:      Vec::new(),
             mask:      Mask::new(),
             len:       0,
             pos_sum:   0,
+            pos_sq_sum: 0,
+            epoch:     0,
         }
     }
 
@@ -287,13 +362,164 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         A::MAX.as_usize().saturating_add(1)
     }
 
+    ///position epoch — bumped by turns/flips (silent position moves).
+    ///equal epochs ⇒ positions observed earlier still hold
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     ///None if addr names no live element (never-minted names can't alias a
     ///live slot — a2p is injective; STALE pre-delta names can, see
     ///subtle_bugs §17)
-    pub fn get(&self, addr: A) -> Option<&K> {
+    pub fn get<'s>(&'s self, addr: A) -> Option<K::View<'s>> {
         let p = self.translator.a2p(addr);
         (p.0 < self.data.len() && self.mask.get(p.0))
-            .then(|| unsafe { self.data[p.0].assume_init_ref() })
+            .then(|| unsafe { K::view(self.data[p.0].assume_init_ref(), &self.heap) })
+    }
+
+    ///compare a stored handle against a query key — the tiers' compare
+    pub fn cmp_key(&self, h: &K::Handle, k: &K) -> Ordering {
+        K::cmp_key(h, k, &self.heap)
+    }
+
+    ///base position of a live addr — unchecked: a stale/dead addr still
+    ///translates (a2p is total); the tiers pass only live addrs
+    pub fn pos_of(&self, addr: A) -> usize {
+        self.translator.a2p(addr).0
+    }
+
+    ///whether key order runs against pos order (Desc block)
+    pub fn reversed(&self) -> bool {
+        self.translator.reversed()
+    }
+
+    ///k beyond the tail extreme — the end a sequential insert extends.
+    ///SkipSet::insert routes these to push_beyond, skipping its descent
+    pub fn beyond_tail(&self, k: &K) -> bool {
+        if self.len == 0 {
+            return true;
+        }
+        let tail = self.key_tail();
+        let ord = K::cmp_key(tail, k, &self.heap);
+        if self.translator.reversed() {
+            ord == Ordering::Greater
+        } else {
+            ord == Ordering::Less
+        }
+    }
+
+    ///the reversal trigger — mean insert position below len/8 past the
+    ///warmup, z-gated (see reverse_due). SkipSet drives reversal manually
+    ///and reads this; its insert path never auto-flips (see insert_at)
+    pub fn should_reverse(&self) -> bool {
+        self.reverse_due()
+    }
+
+    ///the z-gated trigger: the mean gate (pos_sum·8 < len²) runs first —
+    ///multiply-only, the hot path — and the variance test fires only
+    ///when it already says front-biased. alternating streams (ascending
+    ///chunks in a Desc block land at the front, and vice versa) crash the
+    ///mean repeatedly with a huge spread — the z gate holds the block
+    ///steady instead of thrashing; a tight front cluster (variance ~0)
+    ///passes as before. multiply-only: (n²−8S)² > 64·z²·(Qn−S²) is
+    ///(len/8 − μ)² > z²·σ² with the denominators cleared (n = len)
+    fn reverse_due(&self) -> bool {
+        if self.len <= 4 * FREE_STRIDE {
+            return false;
+        }
+        let len = self.len as u64;
+        if self.pos_sum.wrapping_mul(8) >= len.wrapping_mul(len) {
+            return false;
+        }
+        let n = len as u128;
+        let s = self.pos_sum as u128;
+        let q = self.pos_sq_sum;
+        let dev = n.saturating_mul(n).saturating_sub(8 * s); // ≥ 0: the gate held
+        // Qn − S² ≥ 0 exactly — assuming no removals: the reflection's
+        // n == len hardcode and the moment bookkeeping both drift under
+        // remove; after removals + a flip the spread can go negative,
+        // saturating to 0 and degrading the gate to the bare mean test
+        let spread = q.saturating_mul(n).saturating_sub(s.saturating_mul(s));
+        dev.saturating_mul(dev) > 64 * REVERSE_Z2 * spread
+    }
+
+    ///live handle at a base position — None if out of range or a hole.
+    ///the tiers' incremental re-read
+    pub fn slot(&self, pos: usize) -> Option<K::Handle> {
+        (pos < self.data.len() && self.mask.get(pos)).then(|| unsafe { *self.key(pos) })
+    }
+
+    ///first live position ≥ from — None past the tail. the tiers'
+    ///window-first sampling (tier0 slot j = the first item in window j,
+    ///so banking/turns/bands can never empty a sample)
+    pub fn first_live_pos(&self, from: usize) -> Option<usize> {
+        self.mask.next_set(from)
+    }
+
+    ///live-run lengths between holes (position order) — the desert
+    ///census: banking clusters holes and the solid runs it leaves
+    ///behind are what the fetch walks. NOT API
+    #[doc(hidden)]
+    pub fn live_run_lengths(&self) -> Vec<usize> {
+        let mut runs = Vec::new();
+        let mut run_start: Option<usize> = None;
+        let mut prev = 0usize;
+        for pos in self.mask.iter_set() {
+            match run_start {
+                None => run_start = Some(pos),
+                Some(_) if pos == prev + 1 => {}
+                Some(start) => {
+                    runs.push(prev - start + 1);
+                    run_start = Some(pos);
+                }
+            }
+            prev = pos;
+        }
+        if let Some(start) = run_start {
+            runs.push(prev - start + 1);
+        }
+        runs
+    }
+
+    ///bounded find within a position window [from, to): k's addr among
+    ///live slots there, walked in key order from the window's key-min
+    ///end. caller guarantees nothing — an empty window is None. the
+    ///skipset tier jump; the walk covers the descent's final range
+    pub fn find_window(&self, k: &K, from: usize, to: usize) -> Option<A> {
+        let rev = self.translator.reversed();
+        //key-min end of the window: pos `from` (Asc) / just below `to`
+        //(Desc); the FIRST probe is window-bounded too — the loop's bound
+        //checks only see later steps
+        let mut p = if rev {
+            if to == 0 {
+                return None;
+            }
+            self.mask.prev_set(to)?
+        } else {
+            self.mask.next_set(from).filter(|probe| *probe < to)?
+        };
+        loop {
+            // SAFETY: every step lands on a mask-named slot
+            match unsafe { K::cmp_key(self.key(p), k, &self.heap) } {
+                Ordering::Less => {}
+                Ordering::Equal => return Some(self.translator.p2a(Pos(p))),
+                Ordering::Greater => return None,
+            }
+            let q = if rev {
+                let q = self.mask.prev_set(p)?;
+                if q < from {
+                    return None;
+                }
+                q
+            } else {
+                let q = self.mask.next_set(p + 1)?;
+                if q >= to {
+                    return None;
+                }
+                q
+            };
+            p = q;
+        }
     }
 
     #[inline]
@@ -301,13 +527,15 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //beyond either extreme → absent, no bsearch (see blockmap::find)
         if self.len > 0 {
             let tail = self.key_tail();
-            let beyond = if self.translator.reversed() { *k < *tail } else { *tail < *k };
+            let ord = K::cmp_key(tail, k, &self.heap);
+            let beyond = if self.translator.reversed() { ord == Ordering::Greater } else { ord == Ordering::Less };
             if beyond {
                 return None;
             }
             //len > 0 ⇒ a first live slot exists
             let head = unsafe { self.key(self.mask.next_set(0).unwrap()) };
-            let before = if self.translator.reversed() { *head < *k } else { *k < *head };
+            let ord = K::cmp_key(head, k, &self.heap);
+            let before = if self.translator.reversed() { ord == Ordering::Less } else { ord == Ordering::Greater };
             if before {
                 return None;
             }
@@ -363,7 +591,8 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     pub fn insert(&mut self, k: K, deltas: &mut Deltas<A>) -> Result<A, K> {
         assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
         if self.data.is_empty() {
-            return Ok(self.insert_first(k));
+            let h = K::archive(&k, &mut self.heap);
+            return Ok(self.insert_first(h));
         }
         if self.len >= Self::max_capacity() {
             return Err(k);
@@ -375,20 +604,84 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         let Some(spot) = self.spot(&k) else {
             return Err(k);
         };
+        //archive after the dup check — a rejected key leaves no heap bytes
+        let h = K::archive(&k, &mut self.heap);
+        Ok(self.place_from(h, spot, deltas).0)
+    }
+
+    ///the ladder from a known spot: extend at the tail edge, open
+    ///elsewhere. returns the addr with the placed position — callers
+    ///holding positions skip the a2p round-trip (era-valid until the
+    ///next silent move)
+    fn place_from(&mut self, h: K::Handle, spot: Pos, deltas: &mut Deltas<A>) -> (A, Pos) {
         //sequential at the back: extend instead of sliding
         if spot.0 == self.data.len() && self.data.len() < Self::max_capacity() {
-            let a = self.push_back(k, spot);
-            return Ok(a);
-        }
-        else {
+            (self.push_back(h, spot), spot)
+        } else {
             let p = self.open(spot, deltas);
-            Ok(self.place(k, p))
+            (self.place(h, p), p)
         }
     }
 
+    ///window-driven insert — SkipSet's tier descent provides the bounds.
+    ///NEVER auto-reverses: the caller owns the flip (should_reverse +
+    ///reverse), so caller-computed bounds can't be invalidated mid-call.
+    ///
+    /// # Safety
+    ///
+    /// `from ≤ to ≤ cap`, every live element before `from` in key order
+    /// has key < k, and every element at/after `to` has key > k — k's
+    /// boundary or a dup lies inside [from, to). the bsearch trusts the
+    /// window; a wrong one corrupts the ordering. panics on pending
+    /// deltas, like insert
+    pub(crate) unsafe fn insert_at(
+        &mut self,
+        k: K,
+        deltas: &mut Deltas<A>,
+        from: usize,
+        to: usize,
+    ) -> Result<(A, Pos), K> {
+        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+        if self.data.is_empty() {
+            let h = K::archive(&k, &mut self.heap);
+            return Ok((self.insert_first(h), Pos(0)));
+        }
+        if self.len >= Self::max_capacity() {
+            return Err(k);
+        }
+        match self.bsearch_bounds(&k, from, to) {
+            Ok(_) => return Err(k), //dup
+            Err(spot) => {
+                let h = K::archive(&k, &mut self.heap);
+                Ok(self.place_from(h, spot, deltas))
+            }
+        }
+    }
+
+
+    ///tail push with a caller guarantee: k is beyond the tail extreme
+    ///(max Asc, min Desc — the end a sequential insert extends). no
+    ///scan, no dup possible. SkipSet's beyond_tail pre-check routes
+    ///appends here — one tail scan total instead of three
+    pub(crate) fn push_beyond(&mut self, k: K, deltas: &mut Deltas<A>) -> Result<(A, Pos), K> {
+        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+        if self.data.is_empty() {
+            let h = K::archive(&k, &mut self.heap);
+            return Ok((self.insert_first(h), Pos(0)));
+        }
+        if self.len >= Self::max_capacity() {
+            return Err(k);
+        }
+        let spot = Pos(self.mask.last_set().unwrap() + 1);
+        let h = K::archive(&k, &mut self.heap);
+        Ok(self.place_from(h, spot, deltas))
+    }
+
     ///in-place reversal: pos 0 = max, names follow the slots (the
-    ///translator absorbs it — no deltas; a pending event stays valid)
-    fn reverse(&mut self) {
+    ///translator absorbs it — no deltas; a pending event stays valid).
+    ///SkipSet calls this manually — plain insert auto-flips via
+    ///maybe_reverse, insert_at never does
+    pub(crate) fn reverse(&mut self) {
         self.data.reverse();
         self.mask.reverse();
         self.translator = self.translator.reverse(self.data.len());
@@ -396,21 +689,29 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //reflect the bias signal around len — the trigger's own scale —
         // NOT the physical mirror (cap−1−p): cap imports density noise.
         // fires only when pos_sum < len²/8, so the subtraction never wraps
+        let s = self.pos_sum as u128;
+        let q = self.pos_sq_sum;
         self.pos_sum = len.wrapping_mul(len).wrapping_sub(self.pos_sum);
+        //the reflection maps p → len − p, so Q' = n·len² − 2·len·S + Q
+        //(n == len — the count is the scale)
+        self.pos_sq_sum = (len as u128)
+            .wrapping_mul(len as u128)
+            .wrapping_mul(len as u128)
+            .wrapping_sub((2 * len as u128).wrapping_mul(s))
+            .wrapping_add(q);
+        //positions mirrored — a silent move for pos holders
+        self.epoch += 1;
     }
 
     ///flip a front-biased insert stream so future inserts land at the
-    ///tail. fires when mean insert position sits below len/8, committed
-    ///past a 4·stride warmup. the check runs at insert's TOP — the trigger
-    ///sees the pre-insert signal, and no translator mutation follows the
-    ///event record inside insert (pos-space consumers rely on that)
+    ///tail. fires when the mean sits below len/8 past the warmup,
+    ///z-gated (see reverse_due). the check runs at insert's TOP — the
+    ///trigger sees the pre-insert signal, and no translator mutation
+    ///follows the event record inside insert (pos-space consumers rely
+    ///on that)
     fn maybe_reverse(&mut self) {
-        if self.len > 4 * FREE_STRIDE {
-            let len = self.len as u64;
-            // pos / len < len / 8
-            if self.pos_sum.wrapping_mul(8) < len.wrapping_mul(len) {
-                self.reverse();
-            }
+        if self.reverse_due() {
+            self.reverse();
         }
     }
 
@@ -419,27 +720,30 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         if self.len > 0 {
             //beyond the tail extreme (max Asc, min Desc — the end a
             //sequential insert extends) the spot is known without bsearch
-            let tail = self.key_tail();
-            let beyond = if self.translator.reversed() { k < tail } else { tail < k };
+            //— one last_set serves both the compare and the spot
+            let p = self.mask.last_set().unwrap();
+            // SAFETY: last_set names a live slot — mask ⇔ init
+            let ord = K::cmp_key(unsafe { self.key(p) }, k, &self.heap);
+            let beyond = if self.translator.reversed() { ord == Ordering::Greater } else { ord == Ordering::Less };
             if beyond {
-                return Some(Pos(self.mask.last_set().unwrap() + 1));
+                return Some(Pos(p + 1));
             }
         }
         self.bsearch(k).err()
     }
 
     ///vec-like first allocation: 4 slots, no translator turn until it fills
-    fn insert_first(&mut self, k: K) -> A {
+    fn insert_first(&mut self, h: K::Handle) -> A {
         self.data = (0..4).map(|_| MaybeUninit::uninit()).collect();
         self.mask = Mask::with_bits(4);
-        self.place(k, Pos(0))
+        self.place(h, Pos(0))
     }
 
     ///extend the allocation and place k at the edge — dense, holes never
     ///minted here. caller guarantees spot == cap < max_capacity
-    fn push_back(&mut self, k: K, spot: Pos) -> A {
+    fn push_back(&mut self, h: K::Handle, spot: Pos) -> A {
         self.push_slot();
-        self.place(k, spot)
+        self.place(h, spot)
     }
 
     ///open a slot at/near `spot`: turns and gathers, escalating until a
@@ -486,27 +790,29 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
 
     ///write k at an open slot, mark live, mint its name; the slot position
     ///joins the running insert-position sum
-    fn place(&mut self, k: K, p: Pos) -> A {
-        self.data[p.0] = MaybeUninit::new(k);
+    fn place(&mut self, h: K::Handle, p: Pos) -> A {
+        self.data[p.0] = MaybeUninit::new(h);
         self.mask.set(p.0, true);
         self.len += 1;
         self.pos_sum = self.pos_sum.wrapping_add(p.0 as u64);
+        self.pos_sq_sum = self
+            .pos_sq_sum
+            .wrapping_add((p.0 as u128) * (p.0 as u128));
         self.translator.p2a(p)
     }
 
+    ///None if addr names no live element. the key is materialized back from
+    ///the heap; its heap bytes leak (v1: no reclamation — see serialize.rs)
     pub fn remove(&mut self, addr: A) -> Option<K> {
-        self.remove_pos(self.translator.a2p(addr))
-    }
-
-    ///None if addr names no live element (stale-name hazard: get/remove_pos)
-    fn remove_pos(&mut self, pos: Pos) -> Option<K> {
+        let pos = self.translator.a2p(addr);
         if pos.0 < self.data.len() && self.mask.get(pos.0) {
             self.mask.set(pos.0, false);
             self.len -= 1;
-            //mask ⇔ init invariant
-            return Some(unsafe { self.data[pos.0].assume_init_read() });
+            let h = unsafe { *self.data[pos.0].assume_init_ref() };
+            Some(K::materialize(h, &self.heap))
+        } else {
+            None
         }
-        None
     }
 
     ///bsearch over live slots — the raw boundary. Ok(p) = the
@@ -519,12 +825,20 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //DRAM-resident); the cmov bound has no mispredict (wins
         //cache-resident, where compares are cheap and a branch
         //mispredicts every probe)
-        let big = self.data.len().wrapping_mul(std::mem::size_of::<K>()) > L2_BYTES;
+        self.bsearch_bounds(k, 0, self.data.len())
+    }
+
+    ///bsearch over a position window [lo0, hi0) — insert_at's bounded
+    ///search: the tier descent already narrowed the range, so this pays
+    ///log2(window) probes instead of a linear walk (or the full-block
+    ///log2(cap))
+    fn bsearch_bounds(&self, k: &K, lo0: usize, hi0: usize) -> Result<Pos, Pos> {
+        let big = self.data.len().wrapping_mul(std::mem::size_of::<K::Handle>()) > L2_BYTES;
         match (self.translator.reversed(), big) {
-            (true, true) => self.search_spec::<true>(k),
-            (true, false) => self.search_cmov::<true>(k),
-            (false, true) => self.search_spec::<false>(k),
-            (false, false) => self.search_cmov::<false>(k),
+            (true, true) => self.search_spec::<true>(k, lo0, hi0),
+            (true, false) => self.search_cmov::<true>(k, lo0, hi0),
+            (false, true) => self.search_spec::<false>(k, lo0, hi0),
+            (false, false) => self.search_cmov::<false>(k, lo0, hi0),
         }
     }
 
@@ -533,8 +847,8 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     ///gone, the two-way match compiles to cmov and the speculation (next
     ///probe's load issued ahead of the compare) dies — measured 1M lookup
     ///235→533
-    fn search_spec<const REV: bool>(&self, k: &K) -> Result<Pos, Pos> {
-        let (mut lo, mut hi) = (0, self.data.len());
+    fn search_spec<const REV: bool>(&self, k: &K, lo0: usize, hi0: usize) -> Result<Pos, Pos> {
+        let (mut lo, mut hi) = (lo0, hi0);
         //holes skipped forward — everything live before the probe
         //compare known
         while lo < hi {
@@ -544,8 +858,9 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
                 Some(p) => {
                     let probe = unsafe { self.key(p) };
                     //Desc: key order ascends against pos order — the
-                    //compare operands flip (folded per instantiation)
-                    let ord = if REV { k.cmp(probe) } else { probe.cmp(k) };
+                    //compare flips (folded per instantiation)
+                    let ord = K::cmp_key(probe, k, &self.heap);
+                    let ord = if REV { ord.reverse() } else { ord };
                     match ord {
                         Ordering::Less => lo = p + 1,
                         Ordering::Greater => hi = p,
@@ -560,15 +875,16 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     ///fixed cmov search — no early exit, Equal narrows as Greater (the
     ///dup element stays in range), one final compare resolves it
     ///(cache-resident blocks; core's slice::binary_search)
-    fn search_cmov<const REV: bool>(&self, k: &K) -> Result<Pos, Pos> {
-        let (mut lo, mut hi) = (0, self.data.len());
+    fn search_cmov<const REV: bool>(&self, k: &K, lo0: usize, hi0: usize) -> Result<Pos, Pos> {
+        let (mut lo, mut hi) = (lo0, hi0);
         while lo < hi {
             let mid = (lo + hi) / 2;
             match self.next_live(mid, hi) {
                 None => hi = mid,
                 Some(p) => {
                     let probe = unsafe { self.key(p) };
-                    let ord = if REV { k.cmp(probe) } else { probe.cmp(k) };
+                    let ord = K::cmp_key(probe, k, &self.heap);
+                    let ord = if REV { ord.reverse() } else { ord };
                     if ord == Ordering::Less {
                         lo = p + 1;
                     } else {
@@ -580,8 +896,8 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         //final resolution: the boundary's first live element — the dup,
         //if the narrowing ended on or below it. equality is
         //direction-free
-        if let Some(p) = self.next_live(lo, self.data.len()) {
-            if unsafe { self.key(p) } == k {
+        if let Some(p) = self.next_live(lo, hi0) {
+            if K::cmp_key(unsafe { self.key(p) }, k, &self.heap) == Ordering::Equal {
                 return Ok(Pos(p));
             }
         }
@@ -608,12 +924,21 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     /// # Safety
     ///
     /// p must name a live slot — mask ⇔ init
-    unsafe fn key(&self, p: usize) -> &K {
+    unsafe fn key(&self, p: usize) -> &K::Handle {
         unsafe { self.data[p].assume_init_ref() }
     }
 
+    ///live-slot view through the heap
+    ///
+    /// # Safety
+    ///
+    /// p must name a live slot — mask ⇔ init
+    unsafe fn view_key(&self, p: usize) -> K::View<'_> {
+        K::view(unsafe { self.key(p) }, &self.heap)
+    }
+
     ///key at the physical tail (max Asc, min Desc); panics if len == 0
-    fn key_tail(&self) -> &K {
+    fn key_tail(&self) -> &K::Handle {
         unsafe { self.key(self.mask.last_set().expect("live")) }
     }
 
@@ -666,8 +991,8 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
             }
         }
         //the run between is fully live (nearest hole) — two-bit mask
-        //update; the duplicate ptr::copy leaves in the source range is
-        //uninit by mask, never assume_init'd
+        //update; the stale duplicate bytes ptr::copy leaves behind are
+        //masked clear, never assume_init'd
         self.mask.set(from, true);
         self.mask.set(to, false);
     }
@@ -700,8 +1025,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
     }
 
     ///gather compaction, one pass: the holes compact beside `spot`, every
-    ///member Some crossing exactly once. returns the slot k lands in
-    ///(`open`)
+    ///member Some crossing exactly once. k lands in `open`
     fn compact_gather(&mut self, spot: Pos, open: usize, right: bool, holes: &[usize]) {
         let w = holes.len();
         unsafe {
@@ -710,7 +1034,8 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
             //count; far segments copy first so no live source is read
             //after being overwritten
             if right {
-                //holes ascend; segment 0 spans [spot, h_0), the run k shifts
+                //holes ascend; segment 0 spans [spot, h_0) — the run
+                //that shifts up beside k's slot
                 for j in (0..w).rev() {
                     let (lo, len) = if j == 0 {
                         (spot.0, holes[0] - spot.0)
@@ -765,7 +1090,9 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         {
             return false;
         }
-        let new_tr = self.translator.rotate();
+        let old_tr = self.translator;
+        let turn_start = Instant::now();
+        let new_tr = old_tr.rotate();
         self.data.reserve(old_cap);
         self.data.extend((old_cap..new_cap).map(|_| MaybeUninit::uninit()));
         //the map is monotone with each target ≥ its source — the
@@ -785,8 +1112,15 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
             self.translator.reversed(),
         );
         self.translator = new_tr;
-        //the pos-space doubled — the insert-position sum tracks it
+        //the pos-space doubled — the insert-position sum tracks it, and
+        //squares quadruple
         self.pos_sum = self.pos_sum.wrapping_mul(2);
+        self.pos_sq_sum = self.pos_sq_sum.wrapping_mul(4);
+        //positions spread — a silent move for pos holders
+        self.epoch += 1;
+        TURN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TURN_MOVED.fetch_add(old_cap as u64, std::sync::atomic::Ordering::Relaxed);
+        TURN_TIME_NS.fetch_add(turn_start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
@@ -798,6 +1132,7 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
         self.mask.resize(self.data.len());
     }
 
+    ///deferred — see CLAUDE.md Future Work; panics
     pub fn from_vec(v: Vec<K>) -> Self {
         let _ = v;
         todo!()
@@ -805,20 +1140,20 @@ impl<K: Ord, A: UnsignedNum> BlockSet<K, A> {
 }
 
 ///`BlockSet::iter`'s return type — direction picked at construction
-pub enum Iter<'a, K, A> {
+pub enum Iter<'a, K: Archive, A> {
     Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
     Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
 }
 
-impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {
-    type Item = &'a K;
+impl<'a, K: Archive, A: UnsignedNum> Iterator for Iter<'a, K, A> {
+    type Item = K::View<'a>;
 
     #[inline]
-    fn next(&mut self) -> Option<&'a K> {
+    fn next(&mut self) -> Option<K::View<'a>> {
         match self {
             //mask ⇔ init invariant upholds the read
-            Iter::Asc { bits, set } => bits.next().map(|p| unsafe { set.key(p) }),
-            Iter::Desc { bits, set } => bits.next().map(|p| unsafe { set.key(p) }),
+            Iter::Asc { bits, set } => bits.next().map(|p| unsafe { set.view_key(p) }),
+            Iter::Desc { bits, set } => bits.next().map(|p| unsafe { set.view_key(p) }),
         }
     }
 }
@@ -828,20 +1163,20 @@ impl<'a, K: Ord, A: UnsignedNum> Iterator for Iter<'a, K, A> {
 ///then yield). stepping runs on `MaskCursor` (the cached-word walk, see
 ///mask.rs). holds raw slots: any mutation (slides, turns, flips)
 ///invalidates it — re-seek
-pub struct Cursor<'a, K, A> {
+pub struct Cursor<'a, K: Archive, A> {
     set:  &'a BlockSet<K, A>,
     ///the slot-walk machine; dir = !reversed, baked at construction
     walk: MaskCursor<'a>,
 }
 
-impl<'a, K, A: UnsignedNum> Cursor<'a, K, A> {
+impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
     fn new(set: &'a BlockSet<K, A>) -> Self {
         //dir: positions ascend — unless the block is flipped
         Cursor { set, walk: MaskCursor::start(&set.mask, !set.translator.reversed()) }
     }
 }
 
-impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {
+impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
     ///reposition at the first key ≥ k
     pub fn seek(&mut self, k: &K) {
         match self.set.bsearch(k) {
@@ -868,31 +1203,31 @@ impl<'a, K: Ord, A: UnsignedNum> Cursor<'a, K, A> {
 
     ///yield the current element, step forward (key-ascending). None at
     ///the walk's end.
-    ///#[inline(always)]: plain #[inline] left next outlined (both
-    ///directions' crossing scans inline into it, blowing LLVM's size
-    ///budget) and walk loops paid a call + cursor spill per step —
+    //#[inline(always)]: plain #[inline] left next outlined (both
+    //directions' crossing scans inline into it, blowing LLVM's size
+    //budget) and walk loops paid a call + cursor spill per step —
     ///measured 2× @10k fwd
     #[inline(always)]
-    pub fn next(&mut self) -> Option<&'a K> {
+    pub fn next(&mut self) -> Option<K::View<'a>> {
         let p = self.walk.slot()?;
         let set = self.set;
-        let k = unsafe { set.key(p) };
+        let v = unsafe { set.view_key(p) };
         self.walk.advance(p);
-        Some(k)
+        Some(v)
     }
 
     ///step back (key-descending), yield the element now current. None at
     ///the walk's start (the state stays at the first element — next
     ///re-yields it); from the forward ghost, resumes at the last element
     #[inline(always)]
-    pub fn prev(&mut self) -> Option<&'a K> {
+    pub fn prev(&mut self) -> Option<K::View<'a>> {
         let q = self.walk.retreat()?;
-        Some(unsafe { self.set.key(q) })
+        Some(unsafe { self.set.view_key(q) })
     }
 
     ///the element next() would yield, without moving
-    pub fn key(&self) -> Option<&'a K> {
-        self.walk.slot().map(|p| unsafe { self.set.key(p) })
+    pub fn key(&self) -> Option<K::View<'a>> {
+        self.walk.slot().map(|p| unsafe { self.set.view_key(p) })
     }
 
     ///the current element's name
@@ -1233,6 +1568,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    ///z-gated trigger: alternating chunks (descending-in-Asc and
+    ///ascending-in-Desc both land at the front) crash the mean from
+    ///either direction — the variance gate must hold the block steady
+    ///instead of flip-flopping every few hundred inserts
+    #[test]
+    fn reversal_z_gate_blocks_thrash() {
+        let mut set = BlockSet::<u64, u16>::new();
+        let mut d = Deltas::new();
+        let mut flips = 0;
+        let mut prev = false;
+        for round in 0..30u64 {
+            let base = round * 400;
+            let keys: Vec<u64> = if round % 2 == 0 {
+                (base..base + 100).collect()
+            } else {
+                (base..base + 100).rev().collect()
+            };
+            for k in keys {
+                set.insert(k, &mut d).unwrap();
+                d.clear();
+                if set.translator.reversed() != prev {
+                    prev = set.translator.reversed();
+                    flips += 1;
+                }
+            }
+            //tail filler keeps len growing and the mean bouncing — high
+            //disjoint key range, so every filler lands at the tail
+            for k in (base + 200..base + 400).map(|i| 1_000_000 + i * 3) {
+                set.insert(k, &mut d).unwrap();
+                d.clear();
+                if set.translator.reversed() != prev {
+                    prev = set.translator.reversed();
+                    flips += 1;
+                }
+            }
+        }
+        assert!(flips <= 2, "the z gate must not thrash — {flips} flips");
     }
 
     #[test]

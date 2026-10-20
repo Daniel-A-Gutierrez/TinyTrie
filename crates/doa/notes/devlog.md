@@ -2,6 +2,43 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Gather Heuristic 
+gather n proportional to distance has an issue - it causes deserts to form of barren regions with no live items. adjacent free slots are useless, and huge dense islands make finding free space and moving it to where its needed expensive.
+
+
+
+
+# Treeblock
+ideas first
+1. is grow_rotate taking advantage of vec doubling to avoid copying contents twice? 
+2. dense lookup tree - based on rank or based on 'next_from' every Nth slot? 
+    i think it needs to be dense, idk how we'd tolerate None's in the lookup tree.
+    so it cant just be a BFO - B+ Tree style copy of every Nth element, so we cant reuse the mask. 
+    when we grow_rotate if its address based itd lose half its info
+    but doing it by rank means twice the upkeep right? 
+    insert requires a bsearch normally, or it just goes at the end. 
+    no that just becomes an s+ tree
+    maybe tolerating none's in the tree is right? 
+    grow_rotate can spread the tree out instead of deleting half its elements. 
+    it just grows the same way the underlying data does?
+    grow rotate can place elements from 8th slots onto 16ths, so its not just a spread but also an insert. 
+    effectively a rebuild tbh. 
+    i guess we just have to treat the 'none's as 'IDK'.
+    so if we start at our root and the 5th child is the last < K, but 6th and 7th are none, in the next tier we start at 5th and keep reading right
+        until we find an item > K in that tier. 
+    if we hit the end of a tier or find an item > K we descend to the prior items child. 
+    would be nice if mask supported a fast 'nth' to skip count by DEGREE. 
+    i think in terms of growth logic, when the topmost tier exceeds DEGREE*DEGREE in length, we create a new tier at the front. 
+    so items 0..DEGREE represent the new 'root'. They hold just the handle - the heap isnt copied. 
+    DEGREE+1..DEGREE*DEGREE+1 hold the next tier of the tree.
+    its probably wise to keep a second mask for them? 
+    wonder how much overhead itd be to just store a `Vec<Vec<Handle>>`. 
+    I think regarding growth, each time the bottom tier runs out of space we need to realloc.
+    each tier has enough empty room at the end of it before the next starts to fully address the bottom tier once it fills its capacity, and once it does each doubles. 
+    so if the leaf layer appends a 257th item at degree 16, the root goes from 16 wide to 32 wide, the leaf layer goes from 256 wide to 512 wide, so overall we go from 268 to 544. 
+    So then, tree block is distinguished by the prefix of a BFO B+Tree/skip-list like structure. Every nth slot of the leaves is represented in the next higher tier of the tree.
+    I think skip list may be more accurate as the tree doesnt necessarily have a root right?   
+
 # Bimap
 
 Map<K,A> and Map<V,A> where each points at the other
@@ -9,6 +46,7 @@ Vec<(K,V)> + Set<A> + Set<A> where set 1 stores ptrs to vec in K order and set 2
     maintains insertion order!
 Map<K,V> + Set<A> where set 2 stores pointers to set 1 in V order. 
 
+did 1, perf is comparable to btreemapx2, memory is generally better while lookup/insert are often worse. 
 
 # Fetch Quantity Is proportional to distance, now for reverse
 ok the 'fetch 1 extra per budget length searched' 

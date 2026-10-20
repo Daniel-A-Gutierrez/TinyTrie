@@ -58,6 +58,17 @@ impl Ord for Item {
     }
 }
 
+///inline archive — Item is its own handle (32-byte POD)
+impl doa::serialize::Archive for Item {
+    type Handle = Item;
+    type View<'h> = &'h Item;
+
+    fn archive(k: &Self, _heap: &mut Vec<u8>) -> Self::Handle { *k }
+    fn cmp_key(h: &Self::Handle, k: &Self, _heap: &[u8]) -> Ordering { h.cmp(k) }
+    fn view<'h>(h: &'h Self::Handle, _heap: &'h [u8]) -> Self::View<'h> { h }
+    fn materialize(h: Self::Handle, _heap: &[u8]) -> Self { h }
+}
+
 ///best/avg ns per op over the reps that fit the cell budget. `partial` =
 ///Some(ops done) when the last rep was cut at the deadline
 struct Cell {
