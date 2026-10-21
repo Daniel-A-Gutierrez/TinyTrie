@@ -1,17 +1,17 @@
 //!SkipSet trial: a deterministic skip-list index stacked over a `BlockSet`
 //!base (the devlog sketch). tier0 WINDOW-FIRST SAMPLING: slot j holds a
 //!COPIED handle (`K::Handle`, POD) of the FIRST live item in base window
-//!j·STRIDE — or None when the whole window is empty. Nothing else can
-//!empty a sample: gather banking, turn bands (odd-landing names) and
-//!gridline holes all leave a first item in every occupied window. None
-//!always means "no data in this window", so the unknown-slot descent
-//!(the devlog's "IDK": empty slots don't narrow) only widens across
-//!genuinely empty windows, and its range math is exact:
+//!j·STRIDE — an empty window BORROWS the left slot's handle (`K::MIN` at
+//!the region head). real window-firsts strictly increase, so a REPEATED
+//!value marks a hole: the descent treats repeats as transparent (the
+//!devlog's "IDK": holes don't narrow, only widen — the safe direction),
+//!and its range math is exact:
 //!k < first(window w) ⇒ the answer lies strictly below w, so lo/hi are
-//!the sample windows' gridlines — 32·last_le / 32·first_gt.
-//!upper tiers sample every STRIDE-th slot of the tier below.
-//!STORAGE: every tier lives in ONE allocation — slots + one mask over the
-//!whole store (the substrate's own shape: bit ⇔ init), regions packed
+//!the sample windows' gridlines — STRIDE·last_le / STRIDE·first_gt.
+//!upper tiers lift the first REAL value of each STRIDE-wide below-grid
+//!run (the block min); an all-empty run borrows in turn.
+//!STORAGE: every tier lives in ONE allocation — handle slots only, NO
+//!MASK (holes are borrowed values, detected by Eq), regions packed
 //!front-to-back [top … tier0] with per-region reservations. tier0 is the
 //!TAIL region: base-cap creep only extends its grid, so growth is
 //!allocation-free within an epoch; regions are sized for the epoch's
@@ -37,16 +37,14 @@
 //!node). removal unsupported (v0).
 
 use std::cmp::Ordering;
-use std::mem::MaybeUninit;
 
 use crate::blockset::{BlockSet, Deltas, Iter};
 use crate::index::UnsignedNum;
-use crate::mask::Mask;
 use crate::serialize::Archive;
 
 ///the settled skip stride — power of two (compile-time assert) so slot
 ///math is shift/mask; the div-vs-shift cost story lives in the header
-pub(crate) const STRIDE: usize = 32;
+pub(crate) const STRIDE: usize = 16;
 ///log2(STRIDE)
 const STRIDE_SHIFT: u32 = STRIDE.trailing_zeros();
 ///the grid mask, STRIDE − 1
@@ -63,39 +61,107 @@ struct Region {
     capacity: usize,
 }
 
-///the single-allocation tier store: [top … tier0] regions + one mask
+///the single-allocation tier store: [top … tier0] regions, handle slots
+///only — plain Vec (no MaybeUninit: set writes Some-or-borrow, so every
+///in-width slot is initialized; reservation slots hold K::MIN and are
+///never read)
 struct Store<K: Archive> {
-    slots:   Vec<MaybeUninit<K::Handle>>,
-    ///bit ⇔ slot initialized — the substrate's own invariant
-    mask:    Mask,
+    slots:   Vec<K::Handle>,
     ///front-to-back, [top … tier0]
     regions: Vec<Region>,
+    ///a borrow was ever written — set by set(None), reset by rebuild.
+    ///false ⇒ the descent skips the repeat check entirely (dense store,
+    ///the fast path); true ⇒ repeats mark holes and must be skipped
+    holes: bool,
 }
 
 impl<K: Archive> Store<K> {
-    ///write tier i's slot j (mask ⇔ init — clear leaves stale bytes,
-    ///never read)
+    ///write tier i's slot j. None = empty window/block: BORROW the left
+    ///slot's handle (K::MIN at the region head) — a repeated value is the
+    ///hole marker the descent detects. callers write ASCENDING within a
+    ///region (fill, slide pass, sync, extend): the left slot is current
+    ///when borrowed — load-bearing. FILL paths only: a full ascending
+    ///fill leaves no stale holes; partial updates need set_cascade
     fn set(&mut self, tier: usize, slot: usize, handle: Option<K::Handle>) {
         let pos = self.regions[tier].start + slot;
-        match handle {
-            Some(handle) => {
-                self.slots[pos] = MaybeUninit::new(handle);
-                self.mask.set(pos, true);
+        let handle = match handle {
+            Some(handle) => handle,
+            None => {
+                self.holes = true;
+                if slot == 0 {
+                    K::MIN
+                } else {
+                    self.slots[pos - 1]
+                }
             }
-            None => self.mask.set(pos, false),
+        };
+        self.slots[pos] = handle;
+    }
+
+    ///maintenance write: set() plus the BORROW CASCADE — when the value
+    ///at `slot` changes, the run of holes to its right that copied the
+    ///OLD value are stale (a hole mirrors its left neighbor, and its left
+    ///neighbor just changed); rewrite them with the new value. real
+    ///values strictly increase, so `== old` names exactly that run
+    fn set_cascade(&mut self, tier: usize, slot: usize, handle: Option<K::Handle>) {
+        let (start, width) = {
+            let region = &self.regions[tier];
+            (region.start, region.width)
+        };
+        let pos = start + slot;
+        let old = self.slots[pos];
+        self.set(tier, slot, handle);
+        let new = self.slots[pos];
+        if new == old {
+            return;
+        }
+        //rewrite the stale borrow run; stops at the first differing slot
+        //(real or fresh) — never reads past region width (reservation)
+        let mut i = pos + 1;
+        let end = start + width;
+        while i < end {
+            let next = self.slots[i];
+            if next != old {
+                break;
+            }
+            self.slots[i] = new;
+            i += 1;
         }
     }
 
-    ///tier i's slot j lifted from the tier below's grid slot j·STRIDE
+    ///tier i's slot j lifted from the tier below: the first REAL value in
+    ///the below-grid run [j·STRIDE, …) — real iff the value differs from
+    ///its own left neighbor's (real values strictly increase; repeats are
+    ///borrows). fast path: a real run head IS the block min (O(1)); a
+    ///holed head scans forward. an all-empty run lifts None → the caller
+    ///borrows here too
     fn lifted(&self, tier: usize, slot: usize) -> Option<K::Handle> {
         let below = &self.regions[tier + 1];
-        let grid_slot = slot * STRIDE;
-        if grid_slot < below.width && self.mask.get(below.start + grid_slot) {
-            // SAFETY: mask-gated
-            Some(unsafe { *self.slots[below.start + grid_slot].assume_init_ref() })
-        } else {
-            None
+        let grid = slot * STRIDE;
+        if grid >= below.width {
+            return None;
         }
+        //the run head's realness: differs from its left neighbor. a region
+        //head (grid == 0) is real by convention — a MIN borrow there is
+        //indistinguishable from a real K::MIN key; sound ONLY because the
+        //descent seeds prev = K::MIN at lo == 0 and skips it (widening
+        //both directions; a Desc head borrow comparing Greater once
+        //narrowed bhi to 0 — every probe dead)
+        let head = self.slots[below.start + grid];
+        let real = grid == 0 || {
+            let left = self.slots[below.start + grid - 1];
+            head != left
+        };
+        if real {
+            return Some(head);
+        }
+        let end = (grid + STRIDE).min(below.width);
+        for i in grid + 1..end {
+            if self.slots[below.start + i] != self.slots[below.start + i - 1] {
+                return Some(self.slots[below.start + i]);
+            }
+        }
+        None
     }
 }
 
@@ -268,7 +334,27 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
             if self.base.first_live_pos(window << STRIDE_SHIFT) == Some(placed) {
                 let handle = self.base.slot(placed);
                 let store = self.store.as_mut().unwrap();
-                store.set(store.regions.len() - 1, window, handle);
+                let tier0 = store.regions.len() - 1;
+                store.set_cascade(tier0, window, handle);
+                //empty→real at a GRIDLINE window changes the lifted value
+                //of every upper tier whose grid names it — the old lift is
+                //stale, but STALE-LIFTS ARE SAFE (a smaller-than-current
+                //block min only widens; a borrow is still equal to its
+                //left neighbor and repeat-detected). this re-lift is
+                //TIGHTNESS, not correctness: it restores exact block mins
+                //so later descents keep stride-width windows
+                if window & STRIDE_MASK == 0 && tier0 > 0 {
+                    let (mut tier, mut slot) = (tier0 - 1, window >> STRIDE_SHIFT);
+                    loop {
+                        let lifted = store.lifted(tier, slot);
+                        store.set_cascade(tier, slot, lifted);
+                        if slot & STRIDE_MASK != 0 || tier == 0 {
+                            break;
+                        }
+                        slot >>= STRIDE_SHIFT;
+                        tier -= 1;
+                    }
+                }
             }
         }
     }
@@ -369,9 +455,9 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
         let regions = self.fresh_regions(cap, widths);
         let total: usize = regions.iter().map(|region| region.capacity).sum();
         let mut store = Store {
-            slots: (0..total).map(|_| MaybeUninit::uninit()).collect(),
-            mask: Mask::with_bits(total),
+            slots: vec![K::MIN; total],
             regions,
+            holes: false,
         };
         self.fill_all(&mut store);
         self.store = Some(store);
@@ -472,7 +558,7 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
                 } else {
                     store.lifted(tier, slot)
                 };
-                store.set(tier, slot, handle);
+                store.set_cascade(tier, slot, handle);
             }
             (lo, hi) = (first_slot, last_slot);
         }
@@ -502,19 +588,37 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
             let mut first_gt = hi.min(region.width);
             let end = region.start + first_gt;
             let mut scan = region.start + lo;
+            //hole detection: a borrowed slot repeats its left neighbor's
+            //handle (real values strictly increase) — transparent to both
+            //bounds. dense stores (never a borrow written) skip the check
+            //outright. the HEAD seeds prev from slot lo−1: an inherited lo
+            //can name a borrowed slot (a lifted parent value's grid origin
+            //may itself be a hole), and a head hole repeats lo−1 exactly
+            //— without the seed it poses as real and narrows last_le a
+            //block too deep (the mask version's next_set skipped it). lo==0
+            //seeds K::MIN instead: the region head holds a MIN borrow when
+            //window 0 is empty, and under Desc that borrow compares Greater
+            //(mirrored) and would narrow bhi to 0 — every probe dead.
+            //skipping a head MIN is widening-only and safe in both
+            //directions (a real head MIN — Asc, key MIN in window 0 —
+            //drops to the leaf walk, which finds it)
+            let holes = store.holes;
+            let mut prev: Option<K::Handle> = match (holes, lo) {
+                (false, _) => None,
+                (true, 0) => Some(K::MIN),
+                (true, _) => Some(store.slots[region.start + lo - 1]),
+            };
             while scan < end {
-                //next live slot in [scan, end) — mask-skipped holes
-                let Some(live) = store.mask.next_set(scan) else { break };
-                if live >= end {
-                    break;
+                let handle = store.slots[scan];
+                let slot = scan - region.start;
+                scan += 1;
+                if holes && prev == Some(handle) {
+                    continue;
                 }
-                // SAFETY: mask-gated
-                let handle = unsafe { *store.slots[live].assume_init_ref() };
-                let slot = live - region.start;
+                prev = Some(handle);
                 match compare(&handle) {
                     Ordering::Less => {
                         last_le = Some(slot);
-                        scan = live + 1;
                     }
                     Ordering::Equal => {
                         last_le = Some(slot);
@@ -705,25 +809,22 @@ mod tests {
         set.rebuild();
         let store = set.store.as_ref().unwrap();
         let tier_count = store.regions.len();
+        //tier0: the window's first, holes borrowed left (K::MIN at the head)
+        let mut prev = u64::MIN;
         for slot in 0..store.regions[tier_count - 1].width {
-            let got = store.mask.get(store.regions[tier_count - 1].start + slot).then(|| unsafe {
-                // SAFETY: mask-gated
-                *store.slots[store.regions[tier_count - 1].start + slot].assume_init_ref()
-            });
-            assert_eq!(
-                got,
-                SkipSet::window_handle(&set.base, slot),
-                "tier0 slot {slot}"
-            );
+            let want = SkipSet::window_handle(&set.base, slot).unwrap_or(prev);
+            let got = store.slots[store.regions[tier_count - 1].start + slot];
+            assert_eq!(got, want, "tier0 slot {slot}");
+            prev = want;
         }
+        //upper tiers: lifted block-mins, all-empty runs borrowed left
         for tier in 0..tier_count - 1 {
+            let mut prev = u64::MIN;
             for slot in 0..store.regions[tier].width {
-                let want = store.lifted(tier, slot);
-                let got = store.mask.get(store.regions[tier].start + slot).then(|| unsafe {
-                    // SAFETY: mask-gated
-                    *store.slots[store.regions[tier].start + slot].assume_init_ref()
-                });
+                let want = store.lifted(tier, slot).unwrap_or(prev);
+                let got = store.slots[store.regions[tier].start + slot];
                 assert_eq!(got, want, "tier {tier} slot {slot}");
+                prev = want;
             }
         }
         //regions: [top … tier0], each with its epoch reservation

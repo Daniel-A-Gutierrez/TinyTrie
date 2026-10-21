@@ -19,10 +19,14 @@ use std::cmp::Ordering;
 ///the handle; cmp orders a stored handle against a query key; view reads
 ///back. Handle is Copy, owns nothing, serializes as-is.
 pub trait Archive: Sized + Ord {
-    ///fixed-size slot representation; POD
-    type Handle: Copy;
+    ///fixed-size slot representation; POD. Eq is structural — borrowed
+    ///slots copy a handle verbatim, and real values never repeat
+    type Handle: Copy + Eq;
     ///borrowed read form over heap bytes
     type View<'h>;
+    ///least handle: the head placeholder for borrowed tier slots. compares
+    ///≤ every real handle (cmp_key never Greater)
+    const MIN: Self::Handle;
 
     ///append k's heap bytes, return its handle. panics past a 4 GiB heap
     fn archive(k: &Self, heap: &mut Vec<u8>) -> Self::Handle;
@@ -65,6 +69,7 @@ fn prefix(bytes: &[u8]) -> [u8; 8] {
 impl Archive for String {
     type Handle = StrHandle;
     type View<'h> = &'h str;
+    const MIN: Self::Handle = StrHandle { pfx: [0; 8], off: 0, len: 0 };
 
     fn archive(k: &Self, heap: &mut Vec<u8>) -> Self::Handle {
         let bytes = k.as_bytes();
@@ -150,6 +155,7 @@ impl ExactSizeIterator for U32s<'_> {}
 impl Archive for Vec<u32> {
     type Handle = Span;
     type View<'h> = U32s<'h>;
+    const MIN: Self::Handle = Span { off: 0, end: 0 };
 
     fn archive(k: &Self, heap: &mut Vec<u8>) -> Self::Handle {
         //4-align: future zero-copy &[u32] views + the derive's packed arrays
@@ -180,6 +186,7 @@ macro_rules! impl_archive_inline {
         impl Archive for $t {
             type Handle = $t;
             type View<'h> = &'h $t;
+            const MIN: Self::Handle = Self::MIN;
 
             fn archive(k: &Self, _heap: &mut Vec<u8>) -> Self::Handle { *k }
             fn cmp_key(h: &Self::Handle, k: &Self, _heap: &[u8]) -> Ordering { h.cmp(k) }
@@ -204,6 +211,10 @@ mod tests {
             for (j, b) in ks.iter().enumerate() {
                 assert_eq!(K::cmp_key(&hs[i], b, &heap), a.cmp(b), "pair ({i}, {j})");
             }
+        }
+        //MIN ≤ every archived handle — the skipset head-borrow contract
+        for b in ks {
+            assert_ne!(K::cmp_key(&K::MIN, b, &heap), Ordering::Greater, "MIN not minimal");
         }
     }
 

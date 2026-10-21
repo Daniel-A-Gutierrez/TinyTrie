@@ -56,6 +56,7 @@ impl Ord for Item {
 impl doa::serialize::Archive for Item {
     type Handle = Item;
     type View<'h> = &'h Item;
+    const MIN: Self::Handle = Item { key: 0, _pad: [0; 24] };
 
     fn archive(k: &Self, _heap: &mut Vec<u8>) -> Self::Handle { *k }
     fn cmp_key(h: &Self::Handle, k: &Self, _heap: &[u8]) -> Ordering { h.cmp(k) }

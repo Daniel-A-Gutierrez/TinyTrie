@@ -1139,3 +1139,82 @@ layout bench (BlockMap's design ancestry).
   semantics — no Rebalance events reach bimap); streak window after a
   turn halves (anchor ×2, FREE_STRIDE unscaled); BORROW_MIN/streak-boost
   tuning; skipset/bench surface for the new event mix.
+
+## 2026-10-21 — SkipSet vs BTreeSet at scale, STRIDE 16, the maskless tier store
+
+- landed: the skipset tier store is MASKLESS — empty slots BORROW their
+  left neighbor's handle (`K::MIN` at region heads), the descent skips
+  repeats as holes (real values strictly increase), `Store::holes` gates
+  the per-slot repeat-check off entirely for dense stores. `Archive`
+  gained `const MIN: Handle` + `Handle: Eq` (structural — repeat
+  detection); Store.slots is plain `Vec<K::Handle>` (MaybeUninit dropped
+  — every in-width slot initialized, `vec![K::MIN; total]` at rebuild).
+  STRIDE 32→16. bench `Item` impls gained MIN consts.
+- died: the tier-store occupancy Mask (the borrow scheme replaces it —
+  a mask's stale None was inert, a borrow's stale value is not, and the
+  two needed three new invariants to tame, subtle_bugs §26); the
+  walk_window family in blockset (linear leaf scan behind insert_at —
+  measured worse, see decided); the sentinel no-mask hack (0xFF bytes,
+  unsound on interior empty windows — the borrow scheme is its sound
+  successor).
+- decided: STRIDE=16 over 32/8/4 (sweep at 1k/10k/1M/100M: lookup floor
+  sits at 16 cache-resident — 32 LOSES to the plain bsearch at 1k, 30
+  vs 23 — DRAM-scale wash; upkeep tax grows as stride shrinks, 4 pays
+  +27–34%; root scan must stay ≤ stride). borrow scheme over the mask
+  (−16% dense lookup 1k append, ~+3–5% holed 10k, upkeep + DRAM wash —
+  the mask stays sound-for-free, the borrow needs the §26 discipline).
+  bsearch over the walk for insert_at's window (a linear scan with
+  mask-cursor stepping, two-way Less-first compare, and a 2-word
+  occupancy prologue still measured −6ns/insert at 10k vs branchless
+  cmov probes; the walk's hole-spot idea deferred as a bsearch
+  post-check — Future Work).
+- measured (u64, best, machine-day 2026-10-21 — background miri load on
+  some runs, paired A/B where noted; stride-16 mask binary = baseline):
+
+  | random lookup | 10k | 1M | 100M |
+  |---|---|---|---|
+  | mask | 55.0 | 155.0* | 444* |
+  | borrow | 56.5 | 148.0* | — |
+  | BTreeSet lookup (random-built) | 38.9 | 626 | 709* |
+  | raw BlockSet | 66–69 | 149–164 | 794–886 |
+
+  | borrow scheme vs mask (paired A/B) | dense 1k | holed 10k |
+  |---|---|---|
+  | lookup | 21.1 → 17.8 (holes-gate) | ~+3–5% |
+  | insert full path | parity | parity (walk runs excluded) |
+  | maintain Δ | +7.2 vs +7.8 | wash |
+
+  100M head-to-head (stride 16/32 era): SkipSet lookup 444 vs BTree 709
+  (sorted-build; 626 random-built) vs raw BlockSet 886; seqread parity
+  1.6–1.7. BTreeSet build order: sorted-build seqread 2.1 but
+  random-built 19.4 ns/elem (leaf allocation order = insert order — 9×
+  scatter penalty); random build IMPROVES lookup 13% (69% fill vs 50%,
+  one level shallower). the skipset A/B phases ladder caught a +10%
+  "maint regression" that cross-run cells invented — paired medians
+  killed it (methodology note: never trust unpaired cells on a loaded
+  machine).
+- fixed during the session (all subtle_bugs §26): descent head-seed
+  (prev from slot lo−1 — inherited lo can name a borrowed grid origin;
+  and K::MIN at lo==0 — review agent found the Desc variant: an empty
+  window-0 MIN borrow compares Greater mirrored, pins bhi to 0, every
+  probe dead; minted by front bank + turn doubling + z-gate flip);
+  set_cascade (maintenance writes rewrite the ==old borrow run — a
+  hole's content depends on its left neighbor's VALUE, position
+  intervals don't cover it — this was the ≥20k corruption root cause);
+  gridline re-lift on tail pushes (tightness only — landed in the same
+  batch and initially mis-credited; single-tier `tier0 > 0` guard after
+  a small-cap underflow). correctness gauntlet: 47 unit tests, order
+  checks 20k–1M clean, miri-clean, MIN-contract asserts added to every
+  serialize cmp family.
+- session-end review (fresh agent): one conditional BUG (the lo==0 Desc
+  head — applied: prev seeds K::MIN, widening-only both directions),
+  comments mis-locating the hazard (applied — cascade/head are the
+  load-bearing sites, gridline demoted to tightness in code + docs),
+  vestigial SAFETY comments on plain Vec reads (removed), MIN contract
+  untested (asserts added). verified: repeat-detection soundness both
+  directions, lifted fast path, apply_slide coverage, holes flag,
+  bounds exactness, every Archive::MIN byte-wise.
+- deferred: insert_at gap-first-hole spot pick (bsearch post-check,
+  unbenched); a clean-machine re-run of the contested 1M/100M cells;
+  skipset removal; the 5/6 ceiling threshold-luck sweep carried from
+  2026-10-20.

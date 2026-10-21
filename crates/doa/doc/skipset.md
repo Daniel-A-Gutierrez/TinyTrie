@@ -2,17 +2,17 @@
 //!SkipSet trial: a deterministic skip-list index stacked over a `BlockSet`
 //!base (the devlog sketch). tier0 WINDOW-FIRST SAMPLING: slot j holds a
 //!COPIED handle (`K::Handle`, POD) of the FIRST live item in base window
-//!j·STRIDE — or None when the whole window is empty. Nothing else can
-//!empty a sample: gather banking, turn bands (odd-landing names) and
-//!gridline holes all leave a first item in every occupied window. None
-//!always means "no data in this window", so the unknown-slot descent
-//!(the devlog's "IDK": empty slots don't narrow) only widens across
-//!genuinely empty windows, and its range math is exact:
+//!j·STRIDE — an empty window BORROWS the left slot's handle (`K::MIN` at
+//!the region head). real window-firsts strictly increase, so a REPEATED
+//!value marks a hole: the descent treats repeats as transparent (the
+//!devlog's "IDK": holes don't narrow, only widen — the safe direction),
+//!and its range math is exact:
 //!k < first(window w) ⇒ the answer lies strictly below w, so lo/hi are
-//!the sample windows' gridlines — 32·last_le / 32·first_gt.
-//!upper tiers sample every STRIDE-th slot of the tier below.
-//!STORAGE: every tier lives in ONE allocation — slots + one mask over the
-//!whole store (the substrate's own shape: bit ⇔ init), regions packed
+//!the sample windows' gridlines — STRIDE·last_le / STRIDE·first_gt.
+//!upper tiers lift the first REAL value of each STRIDE-wide below-grid
+//!run (the block min); an all-empty run borrows in turn.
+//!STORAGE: every tier lives in ONE allocation — handle slots only, NO
+//!MASK (holes are borrowed values, detected by Eq), regions packed
 //!front-to-back [top … tier0] with per-region reservations. tier0 is the
 //!TAIL region: base-cap creep only extends its grid, so growth is
 //!allocation-free within an epoch; regions are sized for the epoch's
@@ -36,19 +36,19 @@
 //!  (turn refused / pathological growth) → full re-derive.
 //!the top tier is rootless (skip-list shape, not a bounded-arity B-tree
 //!node). removal unsupported (v0).
-///L0049
+///L0047
 ///the settled skip stride — power of two (compile-time assert) so slot
 ///math is shift/mask; the div-vs-shift cost story lives in the header
-pub(crate) const STRIDE: usize = 32;
-///L0051
+pub(crate) const STRIDE: usize = 16;
+///L0049
 ///log2(STRIDE)
 const STRIDE_SHIFT: u32 = STRIDE.trailing_zeros();
-///L0053
+///L0051
 ///the grid mask, STRIDE − 1
 const STRIDE_MASK: usize = STRIDE - 1;
-///L0054
+///L0052
 const _: () = assert!(STRIDE >= 2 && STRIDE.is_power_of_two(), "STRIDE must be a power of 2 ≥ 2");
-///L0060
+///L0058
 ///one tier's footprint in the shared store: slots [start, start+width)
 ///used, [start+width, start+capacity) reserved — capacity is 2× the
 ///width chain at 2·cap, covering one turn doubling AND the grid
@@ -58,18 +58,23 @@ struct Region {
     width:    usize,
     capacity: usize,
 }
-///L0067
-///the single-allocation tier store: [top … tier0] regions + one mask
+///L0068
+///the single-allocation tier store: [top … tier0] regions, handle slots
+///only — plain Vec (no MaybeUninit: set writes Some-or-borrow, so every
+///in-width slot is initialized; reservation slots hold K::MIN and are
+///never read)
 struct Store<K: Archive> {
-    slots:   Vec<MaybeUninit<K::Handle>>,
-    ///bit ⇔ slot initialized — the substrate's own invariant
-    mask:    Mask,
+    slots:   Vec<K::Handle>,
     ///front-to-back, [top … tier0]
     regions: Vec<Region>,
+    ///a borrow was ever written — set by set(None), reset by rebuild.
+    ///false ⇒ the descent skips the repeat check entirely (dense store,
+    ///the fast path); true ⇒ repeats mark holes and must be skipped
+    holes: bool,
 }
-///L0075
+///L0078
 impl<K: Archive> Store<K> {}
-///L0105
+///L0171
 ///maintenance-path counters — diagnostic tests only, zero release cost
 #[cfg(test)]
 #[derive(Default)]
@@ -86,7 +91,7 @@ struct Ops {
     ///tail-push inserts routed to push_beyond
     tail_pushes:  usize,
 }
-///L0121
+///L0187
 ///deterministic skip-list index over a `BlockSet` base: tiers built by
 ///`rebuild()`, maintained incrementally thereafter. removal unsupported
 pub struct SkipSet<K: Archive, A: UnsignedNum> {
@@ -98,9 +103,9 @@ pub struct SkipSet<K: Archive, A: UnsignedNum> {
     #[cfg(test)]
     ops: Ops,
 }
-///L0131
+///L0197
 impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {}
-///L0559
+///L0663
 #[cfg(test)]
 mod tests {
     use super::*;

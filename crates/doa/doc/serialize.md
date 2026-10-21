@@ -18,10 +18,14 @@
 ///the handle; cmp orders a stored handle against a query key; view reads
 ///back. Handle is Copy, owns nothing, serializes as-is.
 pub trait Archive: Sized + Ord {
-    ///fixed-size slot representation; POD
-    type Handle: Copy;
+    ///fixed-size slot representation; POD. Eq is structural — borrowed
+    ///slots copy a handle verbatim, and real values never repeat
+    type Handle: Copy + Eq;
     ///borrowed read form over heap bytes
     type View<'h>;
+    ///least handle: the head placeholder for borrowed tier slots. compares
+    ///≤ every real handle (cmp_key never Greater)
+    const MIN: Self::Handle;
     ///append k's heap bytes, return its handle. panics past a 4 GiB heap
     fn archive(k: &Self, heap: &mut Vec<u8>) -> Self::Handle;
     ///order of a stored handle vs a query key — equals `Ord` on the pair
@@ -32,7 +36,7 @@ pub trait Archive: Sized + Ord {
     ///or out-of-range handle
     fn materialize(h: Self::Handle, heap: &[u8]) -> Self;
 }
-///L0043
+///L0047
 ///String handle: 8 zero-padded inline bytes + heap range. strings ≤ 8
 ///bytes live ENTIRELY in `pfx` (len = the inline length, off unused, no
 ///heap bytes); longer strings store their full bytes in the heap (`pfx`
@@ -44,29 +48,29 @@ pub struct StrHandle {
     off: u32,
     len: u32,
 }
-///L0050
+///L0054
 impl StrHandle {}
-///L0058
+///L0062
 ///first ≤8 bytes zero-padded — the inline compare form
 fn prefix(bytes: &[u8]) -> [u8; 8];
-///L0065
+///L0069
 impl Archive for String {}
-///L0114
+///L0119
 ///heap byte range — Vec<u32>'s handle
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     off: u32,
     end: u32,
 }
-///L0119
+///L0124
 impl Span {}
-///L0127
+///L0132
 ///LE u32 stream over a heap byte range — Vec<u32>'s View
 pub struct U32s<'h> {
     bytes: &'h [u8],
 }
-///L0131
+///L0136
 impl Iterator for U32s<'_> {}
-///L0148
+///L0153
 impl ExactSizeIterator for U32s<'_> {}
 ```

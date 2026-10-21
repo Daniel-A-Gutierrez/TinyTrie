@@ -758,6 +758,88 @@ fallback (the near/bank guards since deleted were masking exactly this).
 
 ---
 
+## 26. A stale borrow looks real: the mask was safe by omission (2026-10-21)
+
+**The trap (skipset.rs `Store`, the borrow scheme's debut).** the tier
+store dropped its occupancy Mask: empty slots BORROW the left
+neighbor's handle, and the descent detects holes as repeated values
+(real window-firsts strictly increase). the Mask version had a silent
+safety property the replacement lost: a *stale* Mask bit could only
+ever be `None`-shaped — clear, skipped by `next_set`, NEVER narrowing.
+a *stale borrow* still holds a plausible-looking value, so the descent
+treats it as a REAL slot and narrows past the true answer. three
+independent sites committed exactly this, in escalating subtlety:
+
+```
+1. READ side — the scan head: lo inherited from the parent tier can
+   name a BORROWED grid origin (the parent's lifted value came from a
+   real slot deeper in its block, but the origin slot itself is a
+   hole). the mask's next_set(lo) skipped it for free; the borrow
+   version read it with prev unset → it compared Less → last_le
+   corrupted one block too deep. the lo==0 variant is worse: window 0
+   empty puts a K::MIN borrow at every tier's head, and under Desc
+   that compares Greater (mirrored) → first_gt = 0 → bhi = 0: every
+   probe dead, every insert dup-blind. minted by a front bank + turn
+   doubling + the z-gate flip. fix: seed prev from slot lo−1, and
+   K::MIN at lo==0 — skipping a head MIN is widening-only, safe in
+   both directions.
+
+2. WRITE side — value changes: a hole's CONTENT depends on its left
+   neighbor's VALUE, not its position. apply_slide's interval covers
+   changed positions — holes' positions are never in it. slot r goes
+   V→V'; the holes right of r still hold V and now pose as real.
+   fix: `set_cascade` rewrites the `== old` run (strict monotonicity
+   of real values makes the run unambiguous).
+
+3. WRITE side — empty→real at a gridline (the tail push): making
+   window j·s real changes every upper tier's lifted value for that
+   block. this one is TIGHTNESS, not correctness — a stale borrow
+   still equals its current left neighbor (repeat-detected), a stale
+   lift is smaller-than-current and widening-only — the re-lift
+   restores exact block mins so descents keep stride-width windows.
+   (it looked like a correctness bug while bisecting because it
+   landed in the same fix batch as 2; the 1M order-panics only
+   cleared when the CASCADE arrived.)
+```
+
+the first two pass every test under 10k; only ≥ 20k random builds
+(deep tiers + real deserts) wire the combos. symptom: `check_order`
+panics — inserts placed after greater elements.
+
+**The rule.** when replacing an "absent" marker whose stale state is
+inert (None, 0, clear) with one whose stale state is
+indistinguishable-from-valid (a borrowed value), every read path needs
+the head seeded (read lo−1 before trusting the scan head), and every
+write path must propagate: partial updates go through
+`set_cascade` (rewrite the right run that copied the old value —
+`== old` unambiguously names it, since real values never repeat),
+tier0-only writes must re-lift the gridline chain, and fill paths
+(full ascending coverage) alone may use plain `set`.
+
+---
+
+## 27. Young tiers hand down windows wider than stride (2026-10-21)
+
+**The trap (blockset.rs window code, found by the walk_window
+experiment).** the descent's final base window is "tier-narrowed," which
+reads as "≤ stride wide" — false until the tier chain matures. the TOP
+tier's width can be up to stride, and when it fails to narrow (first
+probes at the range ends), tier0's [blo, bhi) spans
+`top_width · stride` base positions — 256 at stride 16. the
+incremental_maintenance test hit an 80-wide window; a word-cache
+prologue that assembled the window's occupancy from ≤ 2 mask words
+panicked on a debug assert. the same assumption would break any
+window-bounded code that preallocates per-stride or indexes a fixed
+number of words.
+
+**The rule.** the window contract is `[from, to)` with
+`to − from ≤ top_width · stride`, converging to ~stride only for
+mature tiers over a dense base. window code takes the range it is
+given or gates its fast paths by measured width (the reverted walk
+gated its 2-word occupancy read at ≤ 64 and fell to next_set).
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

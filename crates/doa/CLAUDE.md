@@ -243,7 +243,10 @@ substrate:
   serialized form — heap-relative offsets, LE-canonical, so the
   (slots, heap) pair serializes as-is) + bytes in an append-only side
   heap. `cmp_key` (stored handle vs query key — the set's total order),
-  `view` (GAT borrow form), `materialize` (spent handle → owned value).
+  `view` (GAT borrow form), `materialize` (spent handle → owned value);
+  `Handle: Copy + Eq` (Eq structural — skipset borrow holes are detected
+  as repeated handles) + `const MIN: Handle` (the skipset borrow seed at
+  tier-region heads; compares ≤ every real handle).
   impls: integers/char inline by macro (Handle = Self), String (8-byte
   BE-loaded zero-padded prefix for inline compares + ≤8-byte inline
   cutoff — no heap bytes), Vec<u32> (LE, 4-aligned). heap offsets are
@@ -275,23 +278,54 @@ tiers:
   `STRIDE`/`STRIDE_SHIFT`/`STRIDE_MASK` consts (power-of-2 — slot math is
   shift/mask; runtime divisors never compile to shifts). tier0
   WINDOW-FIRST sampling (slot j = the first live item in base window
-  [j·32, (j+1)·32) via `next_set`; None ONLY when the whole window is
-  empty — banking, turn bands and gridline holes can never empty a
-  sample), upper tiers lift every 32nd slot below. ONE allocation for
-  all tiers: masked slot store, regions [top…tier0] front-to-back,
-  reservations sized 2× the width chain at 2·cap (covers one turn and the
-  cap-creep ceiling). upkeep is incremental: slide chains coalesce into
-  ONE union interval (idempotent re-reads cascading [ceil(lo/s), hi/s]);
-  tail pushes update a window's first iff the placed item IS the first;
-  silent moves (epoch mismatch — turn or the manually-triggered flip)
-  re-read every window's first; `rebuild()` only past the reservation.
-  the descent scans each tier's range for last ≤ k / first > k — the
-  tier0 range maps to base positions (`bhi` clamped to cap) and resolves
-  via `find_window`/`insert_at`. STRIDE=32 settled (root scan must stay
-  ≤ stride — the s² misreading measured +165ns/insert at 1M from the
-  linear root scan alone). `SkipSet::insert` NEVER lets the base
-  auto-flip: it triggers reversal itself (z-gate), then descends.
-  removal unsupported (v0). bench-facing: the A/B phase hooks
+  [j·STRIDE, (j+1)·STRIDE) via `next_set`); upper tiers lift the block
+  MIN — the first REAL value of each STRIDE-wide below-grid run
+  (`lifted`: head real iff it differs from its left neighbor — O(1) fast
+  path, forward scan only on holed heads). NO MASK (2026-10-21, the
+  borrow scheme): empty slots BORROW their left neighbor's handle
+  (`K::MIN` at the region head) — real values strictly increase, so a
+  repeated value IS a hole, and the descent skips repeats exactly as the
+  old mask skipped clear bits ("doesn't narrow, only widens" — the safe
+  direction). Store is plain `Vec<K::Handle>` (`vec![K::MIN; total]` at
+  rebuild — no MaybeUninit; every in-width slot initialized, reservation
+  slots never read), ONE allocation, regions [top…tier0] front-to-back,
+  reservations sized 2× the width chain at 2·cap (covers one turn and
+  the cap-creep ceiling). STALENESS IS THE SCHEME'S SHARP EDGE
+  (subtle_bugs §26) — two sites are correctness-load-bearing, one is
+  tightness: the descent HEAD must seed its hole-check (prev from slot
+  lo−1 — an inherited lo can name a borrowed grid origin — and K::MIN
+  at lo==0, where a Desc head borrow once compared Greater and pinned
+  bhi to 0, every probe dead); maintenance writes must go through
+  `set_cascade` (rewrite the run of holes to the right that copied the
+  old value — a hole's content depends on its left neighbor's VALUE,
+  which apply_slide's position intervals don't cover); the tail-push
+  empty→real at a gridline re-lifts the upper gridline chain as
+  TIGHTNESS only (a stale borrow still equals its left neighbor and
+  repeat-detects; a stale lift is widening-only; `tier0 > 0` guard).
+  `Store::holes`
+  (set by any borrow, reset by rebuild) gates the descent's per-slot
+  repeat-check OFF entirely for dense stores — the fast path that pays
+  for the scheme (−16% lookup at 1k append vs the mask version; holed
+  stores pay ~+3–5%, DRAM-scale wash; upkeep wash). upkeep is
+  incremental: slide chains coalesce into ONE union interval
+  (idempotent re-reads cascading [ceil(lo/s), hi/s]); tail pushes update
+  a window's first iff the placed item IS the first; silent moves
+  (epoch mismatch — turn or the manually-triggered flip) re-read every
+  window's first; `rebuild()` only past the reservation. the descent
+  scans each tier's range for last ≤ k / first > k — the tier0 range
+  maps to base positions (`bhi` clamped to cap) and resolves via
+  `find_window`/`insert_at` (windowed `bsearch_bounds` — a linear
+  walk experiment lost ~6ns/insert at 10k and was reverted 2026-10-21;
+  young coarse tiers can hand down windows up to top_width·stride wide,
+  so window code must not assume ≤ stride — subtle_bugs §27). STRIDE=16
+  settled (2026-10-21 sweep, 1k–100M: lookup floor sits at stride 16
+  cache-resident — 32 actively loses to the plain bsearch at 1k, 30 vs
+  23 — and is a wash at DRAM scale; upkeep tax grows as stride shrinks,
+  4 pays +27–34% insert; the root scan must stay ≤ stride — the s²
+  misreading measured +165ns/insert at 1M from the linear root scan
+  alone). `SkipSet::insert` NEVER lets the base auto-flip: it triggers
+  reversal itself (z-gate), then descends. removal unsupported (v0).
+  bench-facing: the A/B phase hooks
   (`insert_maintain_only`/`insert_descent_only`) are `#[doc(hidden)]`.
   (the old blockset store copy — treeblock's store evolved toward pairs
   feedback — was deleted 2026-10-15: unused by the tier itself; the
@@ -509,7 +543,14 @@ the past — run targeted tests.
   base); the stride should derive from L2_BYTES/handle size, likely as
   a const-generic once it un-defers. skipset removal of the epoch's
   manual-flip coupling to blockmap's auto-flip (the two insert paths
-  differ under tiers).
+  differ under tiers). insert_at spot-picking: a linear window walk
+  measured −6ns/insert WORSE than the windowed bsearch at 10k random
+  (branchy per-live-slot stepping vs branchless cmov probes) and was
+  reverted, but its one good idea stands — after `bsearch_bounds`
+  returns the gap, one `next_clear` probe inside [spot, first-greater)
+  picks the gap's first HOLE as the insert spot when one exists (free
+  space, no slide — unbenched; movement was 3.46/insert at 10k so the
+  ceiling is one slide's worth).
 - blockmap/bimap: the Archive port — keys AND values get handles over
   one shared heap (blockmap's parallel MaybeUninit vecs + mask become a
   three-way lockstep with the heap; bimap untouched — its values are
