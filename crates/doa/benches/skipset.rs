@@ -4,9 +4,11 @@
 //!storage must not tax iteration). u64 keys, workload-order builds,
 //!cell budget + partial reps (see sorted_insert.rs). SkipSet lookups
 //!verified equal to BlockSet's over a probe prefix before timing. size
-//!via first CLI arg (default 10k, multiple of 100); a second arg
-//!("phases") enables the A/B insert-path ladder, otherwise each
-//!workload prints the turn/slide census.
+//!via first CLI arg (default 10k, multiple of 100); workload names
+//!among the args (append/random/runs) select a subset; "phases" enables
+//!the A/B insert-path ladder, otherwise each workload prints the
+//!turn/slide census twice — plain base, then the maintained skipset
+//!path (the deltas-consumer view).
 
 use doa::blockset::{BlockSet, Deltas};
 use doa::skipset::SkipSet;
@@ -452,10 +454,8 @@ fn turn_census(name: &str, keys: &[u64]) {
         set.insert(key, &mut deltas).unwrap();
         let moved = deltas.iter().filter(|(from, to)| from != to).count() as u64;
         moved_elements += moved;
-        //plain slide (≤ FREE_STRIDE) vs gather (fetch walks past the
-        //nearest hole)
-        //plain slides move < FREE_STRIDE (8) elements; a gather can move
-        //exactly 8 — it fetched, so it counts as a gather
+        //small vs large movement — a size-class split, not FREE_STRIDE:
+        //word-scoped near/borrow slides legitimately reach ~62 elements
         if moved >= 8 {
             gather_inserts += 1;
             gather_moved += moved;
@@ -466,10 +466,41 @@ fn turn_census(name: &str, keys: &[u64]) {
         deltas.clear();
     }
     let build_ns = start.elapsed().as_nanos() as u64;
+    census_print(
+        name,
+        &set,
+        build_ns,
+        keys.len() as u64,
+        moved_elements,
+        plain_inserts,
+        plain_moved,
+        gather_inserts,
+        gather_moved,
+    );
+}
+
+///census tail shared by both paths: desert profile + build/turn/slide
+///decomposition. the turn statics are caller-scoped — the blockset
+///census reads them over its whole build, the maintained census resets
+///them after rebuild so only the timed half counts
+#[allow(clippy::too_many_arguments)]
+fn census_print(
+    name: &str,
+    set: &BlockSet<u64, u32>,
+    build_ns: u64,
+    count: u64,
+    moved_elements: u64,
+    plain_inserts: u64,
+    plain_moved: u64,
+    gather_inserts: u64,
+    gather_moved: u64,
+) {
+    use doa::blockset::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
+    use std::sync::atomic::Ordering;
     let turns = TURN_COUNT.load(Ordering::Relaxed);
     let turn_moved = TURN_MOVED.load(Ordering::Relaxed);
     let turn_ns = TURN_TIME_NS.load(Ordering::Relaxed);
-    let count = keys.len() as f64;
+    let count = count as f64;
     //desert census: solid runs the banking left behind
     let mut runs = set.live_run_lengths();
     runs.sort_unstable();
@@ -501,20 +532,76 @@ fn turn_census(name: &str, keys: &[u64]) {
     );
 }
 
+///maintained-path census: the same decomposition through SkipSet with
+///tiers live — half build, rebuild, then the timed half runs full
+///inserts (upkeep included), so the deltas stats are exactly what the
+///tier upkeep had to absorb
+fn skip_census(name: &str, keys: &[u64]) {
+    use doa::blockset::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
+    use std::sync::atomic::Ordering;
+    let half = keys.len() / 2;
+    let mut set = SkipSet::<u64, u32>::new();
+    let mut deltas = Deltas::new();
+    for &k in &keys[..half] {
+        set.insert(k, &mut deltas).unwrap();
+        deltas.clear();
+    }
+    set.rebuild();
+    TURN_COUNT.store(0, Ordering::Relaxed);
+    TURN_MOVED.store(0, Ordering::Relaxed);
+    TURN_TIME_NS.store(0, Ordering::Relaxed);
+    let start = Instant::now();
+    let (mut moved_elements, mut plain_inserts, mut plain_moved, mut gather_inserts, mut gather_moved) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    for &k in &keys[half..] {
+        set.insert(k, &mut deltas).unwrap();
+        //same ≥8 split as turn_census: plain slides move < FREE_STRIDE (8)
+        let moved = deltas.iter().filter(|(from, to)| from != to).count() as u64;
+        moved_elements += moved;
+        if moved >= 8 {
+            gather_inserts += 1;
+            gather_moved += moved;
+        } else {
+            plain_inserts += 1;
+            plain_moved += moved;
+        }
+        deltas.clear();
+    }
+    let build_ns = start.elapsed().as_nanos() as u64;
+    assert_eq!(set.len(), keys.len());
+    check_order(set.iter().copied());
+    black_box(&set);
+    census_print(
+        name,
+        set.base(),
+        build_ns,
+        (keys.len() - half) as u64,
+        moved_elements,
+        plain_inserts,
+        plain_moved,
+        gather_inserts,
+        gather_moved,
+    );
+}
+
 fn main() {
-    let n: usize = std::env::args()
-        .nth(1)
-        .map(|a| a.parse().expect("size arg"))
-        .unwrap_or(DEFAULT_N);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let n: usize = args.first().map(|a| a.parse().expect("size arg")).unwrap_or(DEFAULT_N);
     let probes = shuffled(n);
-    let workloads: [(&str, Vec<u64>); 3] = [
+    //named workload args select a subset; no names = all three
+    const NAMES: [&str; 3] = ["append", "random", "runs"];
+    let picked: Vec<&str> = args.iter().filter_map(|a| NAMES.iter().find(|w| a == *w)).copied().collect();
+    let workloads: Vec<(&str, Vec<u64>)> = [
         ("append", (0..n as u64).collect()),
         ("random", shuffled(n)),
         ("runs", runs(n)),
-    ];
+    ]
+    .into_iter()
+    .filter(|(w, _)| picked.is_empty() || picked.contains(w))
+    .collect();
     //named flag "phases" enables the A/B phase ladder (cargo injects its
     //own positional args, so position-based gating misfires)
-    let phases = std::env::args().any(|arg| arg == "phases");
+    let phases = args.iter().any(|arg| arg == "phases");
     for (name, keys) in &workloads {
         let cells = [
             insert_block(keys),
@@ -549,6 +636,7 @@ fn main() {
         );
         if !phases {
             turn_census(name, keys);
+            skip_census(name, keys);
             continue;
         }
         //A/B region tests, one at a time: each pair's median delta

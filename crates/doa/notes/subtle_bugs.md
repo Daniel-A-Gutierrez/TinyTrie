@@ -729,6 +729,35 @@ condition of the `hi` bound (the `lo` side is symmetric and free).
 
 ---
 
+## 25. Direction-asymmetric bound sentinels: MAX is a ceiling, not a floor (2026-10-20)
+
+**The trap (blockset.rs `fetch_holes`, caught by the holder-verify tests
+after the borrow rung's introduction).** the fetch gained a position
+`bound` to keep the borrow's bank inside the lending word: right =
+exclusive CEILING (`h >= bound → break`), left = inclusive FLOOR
+(`h < bound → break`). the unbounded callers passed `usize::MAX` as a
+"no bound" sentinel — valid as a ceiling (nothing is ≥ MAX) but
+ALWAYS-TRUE as a floor: every real hole is < MAX, so the left branch
+broke before its first `prev_clear` and returned an EMPTY hole list.
+`compact_gather(&[])` is a silent no-op — no data move, no mask change —
+and the ladder then reported k placed at `spot − 1` without opening
+anything: k OVERWROTE a live element, mask count unchanged, len +1. the
+desync preserved every invariant the count-based probes checked
+(`mask.count() == len` held until the *next* element vanished), and the
+empty event made the overwriting insert look like a direct place. found
+by sweeping a `mask.count() == len` invariant per-op plus a first-match
+holder mirror (the stride torture failed at op 184 with an `event []` —
+an empty gather is itself the tell).
+
+**The rule.** a direction-asymmetric bound must take its sentinel from
+its own direction: right-unbounded = `usize::MAX` (ceiling), left-
+unbounded = `0` (floor). passing one sentinel for both directions reuses
+a value that is only half-valid; and any "gather" rung whose fetch comes
+back empty must not report an open — treat empty as a bug, not a
+fallback (the near/bank guards since deleted were masking exactly this).
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

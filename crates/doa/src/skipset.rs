@@ -143,6 +143,12 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
         self.base.len()
     }
 
+    ///bench/diagnostic access to the base (census surface)
+    #[doc(hidden)]
+    pub fn base(&self) -> &BlockSet<K, A> {
+        &self.base
+    }
+
     pub fn iter(&self) -> Iter<'_, K, A> {
         self.base.iter()
     }

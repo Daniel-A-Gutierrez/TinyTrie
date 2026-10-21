@@ -353,6 +353,42 @@ impl Mask {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
+    ///occupancy of [from, to) relocated to start at bit 0 — the
+    ///rebalance delta's from-record (set bit j ⇔ region slot j live)
+    pub fn copy_region(&self, from: usize, to: usize) -> Mask {
+        assert!(from <= to && to <= self.bits, "region [{from}, {to}) out of range");
+        let bits = to - from;
+        let mut region = Mask::with_bits(bits);
+        if bits == 0 {
+            return region;
+        }
+        let wlo = from >> 6;
+        let off = from & 63;
+        for j in 0..(bits + 63) >> 6 {
+            let low = self.word_at((wlo + j) << 6) >> off;
+            //the word above's low bits shift in as the high bits — off == 0
+            //would shift by 64 (UB); the word is already in place
+            let high = if off == 0 { 0 } else { self.word_at((wlo + j + 1) << 6) << (64 - off) };
+            region.words[j] = low | high;
+        }
+        let tail = bits % 64;
+        if tail != 0 {
+            *region.words.last_mut().unwrap() &= (1 << tail) - 1;
+        }
+        region
+    }
+
+    ///set bits in [0, p) — the rebalance's boundary rank. panics if p > bits
+    pub fn count_below(&self, p: usize) -> usize {
+        assert!(p <= self.bits, "count_below {p} > {}", self.bits);
+        let (w, off) = (p >> 6, p & 63);
+        let mut n: usize = self.words[..w].iter().map(|x| x.count_ones() as usize).sum();
+        if off > 0 {
+            n += (self.words[w] & (1 << off) - 1).count_ones() as usize;
+        }
+        n
+    }
+
     pub fn clear(&mut self) {
         self.words.iter_mut().for_each(|w| *w = 0);
     }
@@ -770,6 +806,37 @@ mod tests {
             assert_eq!(m.iter_set().collect::<Vec<_>>(), naive, "offset {offset}");
             assert_eq!(m.count(), set.len(), "offset {offset}");
             assert_eq!(m.bits(), 2 * bits, "offset {offset}");
+        }
+    }
+
+    ///copy_region/count_below vs naive at every word-edge combination —
+    ///misaligned starts, partial tails, empty and whole-range regions
+    #[test]
+    fn region_copy_matches_naive() {
+        let bits = 200;
+        let set: Vec<usize> = (0..bits).filter(|p| (p * 31 + 7) % 10 < 7).collect();
+        let m = mask_ones(bits, &set);
+        for from in [0usize, 1, 31, 63, 64, 65, 100, 128, 199] {
+            for len in [0usize, 1, 2, 63, 64, 65, 100, 200] {
+                let to = (from + len).min(bits);
+                let region = m.copy_region(from, to);
+                let naive: Vec<usize> = set
+                    .iter()
+                    .copied()
+                    .filter(|p| (from..to).contains(p))
+                    .map(|p| p - from)
+                    .collect();
+                assert_eq!(region.iter_set().collect::<Vec<_>>(), naive, "region [{from}, {to})");
+                assert_eq!(region.count(), naive.len(), "count [{from}, {to})");
+                for cut in [0usize, 1, len / 2, len] {
+                    let expect = naive.iter().copied().filter(|p| *p < cut).count();
+                    assert_eq!(
+                        region.count_below(cut.min(to - from)),
+                        expect,
+                        "below {cut} of [{from}, {to})"
+                    );
+                }
+            }
         }
     }
 

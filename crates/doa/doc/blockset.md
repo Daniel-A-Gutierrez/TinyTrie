@@ -3,9 +3,11 @@
 //!name of its slot (`p2a`), semi-stable — rotation turns (growth) preserve
 //!names, slides transfer them (the mover adopts the vacated name). moves
 //!are reported as pos pairs in swap-cascade order for plain slides
-//(hole-adjacent mover first; gathers emit full-hop pairs, far segment
-//!first — see `DeltaPairs`) + a translator snapshot; the holder applies
-//!`Deltas::iter`'s (from_addr, to_addr) name swaps in order.
+//(hole-adjacent mover first; rebalances emit right-movers descending,
+//!then left-movers ascending — see `DeltaPairs`) + a translator snapshot;
+//!the holder applies `Deltas::iter`'s (from_addr, to_addr) name swaps in
+//!order. far holes water-level their region instead of fetching (see
+//!`rebalance_region`).
 //!order: pos order == key order — pos 0 = min (Asc) or max (Desc); a
 //!sequential insert at the key extreme always lands at the physical tail
 //!edge — push_back, or a direct place in a past-tail hole — never a
@@ -14,7 +16,7 @@
 //!slots — invalidated by any mutation, re-seek.
 //!keys live archived (serialize.rs): `K: Archive`, slots hold `K::Handle`
 //!over an append-only side heap, reads yield `K::View`.
-///L0030
+///L0032
 ///one fetch-gather slide-chain link: the hole moves `from → to`. Gather
 ///events speak these in post-prior-slides coordinates (see `Delta::Gather`)
 #[derive(Clone, Copy, Debug)]
@@ -22,9 +24,9 @@ pub struct NoneSlide {
     pub from: Pos,
     pub to:   Pos,
 }
-///L0035
+///L0037
 impl NoneSlide {}
-///L0044
+///L0046
 ///one mutation event, compact. `Empty` = nothing pending (initial state;
 ///`clear` restores it — a no-op slide is still pending, `iter` just yields
 ///nothing)
@@ -38,19 +40,39 @@ enum Delta {
     },
     ///a fetch-distance gather's slide chain, nearest hole first, each
     ///slide in post-prior-slides coordinates — identical to its pre-read
-    ///position (a hole's slot is never touched before its own slide)
+    ///position (a hole's slot is never touched before its own slide).
+    ///blockmap's ladder only — blockset water-levels instead (see
+    ///Rebalance)
     Gather(Vec<NoneSlide>),
+    ///a region's water-leveling rewrite: the region's live elements PLUS
+    ///k (at rank `at` among them) redistribute onto the uniform
+    ///one-hole-per-stride lattice `u(i) = i + i/(stride−1)` — old-rank i
+    ///< at lands at u(i), i ≥ at at u(i+1); k takes u(at), a hole by
+    ///construction. `mask` is the region's PRE-move occupancy (bit j ⇔
+    ///region slot j live); pairs re-derive both endpoints from it
+    Rebalance {
+        base:   Pos,
+        at:     usize,
+        stride: usize,
+        mask:    Mask,
+    },
     ///bulk non-run shapes (unused; reversal reports no events by design)
     #[allow(dead_code)]
     Pairs(Vec<(Pos, Pos)>),
 }
-///L0067
+///L0089
 ///expanded `(from, to)` pos pairs of one event. plain slides emit 1-step
 ///cascades (hole-adjacent mover first); gathers walk the recorded
 ///slides' SEGMENTS and emit ONE pair per moved element carrying the
 ///FULL hop (crossing count) — no chained intermediate names. emission
 ///order keeps every `to` ahead of the remaining `from`s (first-match
-///holders; overlapping hop pairs otherwise retarget twice)
+///holders; overlapping hop pairs otherwise retarget twice). rebalances
+///emit right-movers first in DESCENDING rank (every `to` sits above the
+///remaining `from`s), then left-movers ascending (every `to` below them)
+///— a target slot's old inhabitant, when live, moves the SAME direction
+///and was already emitted (its rank is higher in the descending pass,
+///lower in the ascending one), so first-match holders retarget exactly
+///once
 enum DeltaPairs<'a> {
     Empty,
     ///one run's cursor: emits `(p, p − step)` per step
@@ -66,26 +88,42 @@ enum DeltaPairs<'a> {
         ///position cursor within the segment; `usize::MAX` = fresh
         q:      usize,
     },
+    ///the rebalance's two passes over the saved region mask: descending
+    ///right-movers, then ascending left-movers (see the enum doc)
+    Rebalance {
+        down: SetBitsRev<'a>,
+        up:   SetBits<'a>,
+        ///region start — endpoints are region-local + base
+        base: usize,
+        ///k's rank — old-rank i shifts one up past it
+        at:   usize,
+        ///stride − 1: the lattice's live count per period
+        s1:   usize,
+        ///old-rank of the bit the active pass yields next
+        rank: usize,
+        ///the ascending pass started
+        up_phase: bool,
+    },
     Pairs(std::slice::Iter<'a, (Pos, Pos)>),
 }
-///L0087
+///L0125
 ///swap-cascade run state of one hole slide `from → to`: (first moved
 ///position, step ±1, count)
 fn run_of(from: usize, to: usize) -> (usize, i64, usize);
-///L0096
+///L0134
 ///the raw slide chain (see `Deltas::slides`)
 pub(crate) enum Slides<'a> {
     Empty,
     One(NoneSlide),
     Many(std::slice::Iter<'a, NoneSlide>),
 }
-///L0102
+///L0140
 impl Iterator for Slides<'_> {}
-///L0118
+///L0156
 impl Delta {}
-///L0137
+///L0186
 impl Iterator for DeltaPairs<'_> {}
-///L0212
+///L0291
 ///slot moves of one mutation + the translator snapshot at mutation time.
 ///`iter` expands to (from_addr, to_addr) name swaps applicable in order;
 ///`insert` panics while deltas are pending — apply, then `clear`
@@ -93,56 +131,87 @@ pub struct Deltas<A> {
     event:      Delta,
     translator: Translator<A>,
 }
-///L0217
+///L0296
 impl<A: UnsignedNum> Deltas<A> {}
-///L0282
+///L0383
 ///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
 ///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
 ///preemptive turn line: past this density, a mid-block insert turns
-///instead of gathering — past the line the expected fetch distance
-///blows through FREE_STRIDE. measured twice (2026-10-15, re-benched
-///2026-10-19 with the turn census): 3/4 loses at 1M — turn TIME stays
-///~1% either way, the loss is the LAYOUT (doubled cap → sparser bsearch
-///probes + stretched banking deserts: random lookup 347→1132,
-///moved/insert 13.7→68) while clustered runs DO win — a per-workload
-///bet; revisit at the block-of-blocks tier
-pub(crate) const TURN_NUM: usize = 7;
-///L0283
-pub(crate) const TURN_DEN: usize = 8;
-///L0286
-///gather banking distance: one hole fetched per FREE_STRIDE of distance
-///to the nearest one
-pub(crate) const FREE_STRIDE: usize = 8;
-//FREE_STRIDE (and SkipSet's stride) stay powers of two — every divide and
-//modulo on them compiles to shift/mask
-///L0290
-const _: () = assert!(FREE_STRIDE.count_ones() == 1, "FREE_STRIDE must be a power of 2");
-///L0295
+///instead of gathering. 5/6 (2026-10-20): the ceiling = the scan stop —
+///global density can never exceed workability, so a whole-block region
+///search always terminates on its own (the growth panic's "impossible"
+///invariant, now actually true), and the wide target-to-ceiling gap
+///measured favorable. earlier lines: 7/8 (measured solid), 3/4 REJECTED
+///twice (2026-10-15/19 — the loss is the LAYOUT: doubled cap → sparser
+///probes + stretched deserts, random lookup 347→1132 at 1M)
+pub(crate) const TURN_NUM: usize = 5;
+///L0384
+pub(crate) const TURN_DEN: usize = 6;
+///L0387
+///none-stride 2/(1−R) for R = 2/3 — the stride cap; not a power of two,
+///the only divide left on it is the fetch count
+pub(crate) const FREE_STRIDE: usize = 6;
+///L0400
+///water-leveling workability line (FREE_NUM/FREE_DEN): the region scan
+///extends words outward while the scanned density is at or over 5/6 —
+///a region is workable iff it fits a stride-≤ FREE_STRIDE lattice
+///(live·FREE_DEN < span·FREE_NUM strictly; equality would need stride
+///FREE_STRIDE+1), so the stop IS the stride cap. lower stops (the
+///sketch's 3/4, then 7/8) are KNIFE-EDGED against the block's own
+///steady state: a leveled area sits just above the stop and can never
+///average DOWN to it — the scan ran to the nearest empty pocket
+///(measured span-7522 rebalances). the BORROW rung is the hysteresis:
+///rebalanced words lend until High, then one rebalance resets the area.
+///see notes/session_history.md 2026-10-20
+pub(crate) const FREE_NUM: usize = 5;
+///L0401
+pub(crate) const FREE_DEN: usize = 6;
+///L0406
+///the borrow line: a word lends holes while under 5/6 of capacity
+///(53 of 64). borrows milk rebalanced words toward High before the
+///next rebalance — ~5 lends per stride-4-lattice word per cycle
+const HIGH: u32 = 53;
+///L0411
+///holes per borrow event: lendable guarantees ≥ 11 clear bits
+///(popcount < HIGH), so one event banks 10 beside k — the old fetch's
+///amortization bounded to the lending word
+const BORROW_MIN: usize = 10;
+///L0417
+///the bank fork: a streak this hot banks (bulk-gather) instead of
+///balancing or sliding — clusters amortize via banks, scattered
+///inserts level via rebalances (balancing wins random, banking wins
+///runs — measured both ways, session_history 2026-10-20)
+const STREAK_BANK: usize = 2;
+//only SkipSet's STRIDE stays a power of two (its slot math is
+//shift/mask); the one divide left on FREE_STRIDE is the fetch count
+///L0421
+const _: () = assert!(FREE_STRIDE >= 2, "FREE_STRIDE must be ≥ 2");
+///L0426
 ///z² for the reversal confidence gate — the low mean must clear this
 ///many standard deviations of the observed spread before flipping
 ///(2σ ≈ 95%)
 const REVERSE_Z2: u128 = 4;
-///L0302
+///L0433
 ///~L2 residency: the bsearch shape split — cache-resident blocks cmov
 ///(probe compares resolve from L1/L2, mispredicts dominate), DRAM-
 ///resident blocks speculate (the branchy loop issues the next probe's
 ///load ahead of the compare, overlapping the miss). measured both ways
 ///at both scales, see notes/session_history.md
 pub(crate) const L2_BYTES: usize = 512 * 1024;
-///L0309
+///L0440
 ///turn census — turns are rare and O(cap), so timing them directly is
 ///overhead-free (clock reads amortize over microseconds of work). the
 ///bench reports the share of build time turns (grow_rotate: relocation
 ///loop + rotate_mask) consume. NOT API
 #[doc(hidden)]
 pub static TURN_COUNT: AtomicU64 = AtomicU64::new(0);
-///L0311
+///L0442
 #[doc(hidden)]
 pub static TURN_MOVED: AtomicU64 = AtomicU64::new(0);
-///L0313
+///L0444
 #[doc(hidden)]
 pub static TURN_TIME_NS: AtomicU64 = AtomicU64::new(0);
-///L0319
+///L0450
 ///dense ordered set over archived keys: pos-ordered slot array holding
 ///`K::Handle` copies + a side heap of archived bytes.
 ///mask covers data.len() slots; bit ⇔ slot initialized.
@@ -164,18 +233,25 @@ pub struct BlockSet<K: Archive, A> {
     ///slides/gathers don't bump (they record deltas). position holders
     ///(skipset tiers) use it as a staleness guard
     epoch:      u64,
+    ///the previous insert's position — the locality streak's anchor,
+    ///scaled like pos_sum across turns and flips
+    last_insert: usize,
+    ///consecutive inserts that landed within FREE_STRIDE of the
+    ///previous one — the banking rungs' adaptive gather signal: a hot
+    ///cluster banks deeper, so its next inserts find holes adjacent
+    streak:     usize,
 }
-///L0339
+///L0477
 impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {}
-///L1143
+///L1534
 ///`BlockSet::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K: Archive, A> {
     Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
     Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
 }
-///L1148
+///L1539
 impl<'a, K: Archive, A: UnsignedNum> Iterator for Iter<'a, K, A> {}
-///L1166
+///L1557
 ///key-ordered bidirectional walk — `seek`/`seek_after` position, `next`
 ///walks key-ascending (yield current, then step), `prev` walks back (step,
 ///then yield). stepping runs on `MaskCursor` (the cached-word walk, see
@@ -186,11 +262,11 @@ pub struct Cursor<'a, K: Archive, A> {
     ///the slot-walk machine; dir = !reversed, baked at construction
     walk: MaskCursor<'a>,
 }
-///L1172
+///L1563
 impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {}
-///L1179
+///L1570
 impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {}
-///L1240
+///L1631
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,17 +293,37 @@ mod tests {
     ///turn-minted hole — no second turn
     #[test]
     fn appends_dense_mid_insert_turns();
-    ///fetch-distance banking: holes 24 slots from the spot fetch 4 (one per
-    ///FREE_STRIDE traveled) and land beside k — the next 3 inserts are
-    ///no-ops. the 24 moved elements each emit ONE full-hop pair (crossing
-    ///count 4; farthest-first, descending — the first-match order)
+    ///BORROW: k's word full, the right neighbor under High and holed —
+    ///it lends its nearest hole across the boundary; no rebalance, no
+    ///turn
     #[test]
-    fn gather_banks_holes_by_distance();
-    ///the LEFT-side gather mirror: holes below the spot, TWO non-empty
-    ///segments — emission ascends (left walks up), far/low segment first,
-    ///hop = crossing count per element
+    fn borrow_lends_across_words();
+    ///FAR: both neighbor words at/over High — the region scan levels the
+    ///block to a stride-4 lattice, k rides it at its boundary slot, no
+    ///turn
     #[test]
-    fn gather_left_side_hop_pairs();
+    fn far_words_rebalance_region();
+    ///the rebalance pair expansion is first-match-safe: lattice targets
+    ///can coincide with other elements' sources (dense sub-regions), and
+    ///the two-pass order (right-movers descending, left-movers ascending)
+    ///must retarget each holder exactly once — verified by applying with
+    ///first-match against hand-built region masks, at the boundary edges
+    ///(at == 0, at == live, dense heads, holed tails)
+    #[test]
+    fn rebalance_pairs_first_match_safe();
+    ///one-off diagnostic: the ladder's census over insertion patterns —
+    ///slides (near + borrow + forced), rebalances (count, region span,
+    ///moved), declined-path fetches, turns, total moved per insert.
+    ///distinguishes by event shape: a slide's pairs == its single link
+    ///span, a rebalance's pairs < it. run with --nocapture
+    #[test]
+    fn ladder_census();
+    ///TAIL GROWTH: the region scan reaches the array end still above
+    ///target — the block grows just enough to fit the lattice (nothing
+    ///relocates to make room; fresh slots ARE the room), the rebalance
+    ///levels including the last word, no turn
+    #[test]
+    fn tail_grows_to_target_density();
     ///front insert below cap: plain slide, name transfer without any turn —
     ///the run 20,10 cascades right (hole-adjacent first), 5 takes name 0
     #[test]

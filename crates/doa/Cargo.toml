@@ -50,3 +50,7 @@ harness = false
 name = "cursor"
 harness = false
 
+[[bench]]
+name = "mask"
+harness = false
+

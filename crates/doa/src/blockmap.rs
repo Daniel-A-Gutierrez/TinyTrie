@@ -844,8 +844,8 @@ mod tests {
         //first (see blockset's version)
         assert_eq!(
             d.iter().collect::<Vec<_>>(),
-            (11u8..=34).rev().map(|q| (q, q + 4)).collect::<Vec<_>>(),
-            "24 moved elements, one hop-4 pair each"
+            (11u8..=34).rev().map(|q| (q, q + 5)).collect::<Vec<_>>(),
+            "24 moved elements, one hop-5 pair each"
         );
         apply(&mut holder, &d);
         d.clear();

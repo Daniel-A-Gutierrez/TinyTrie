@@ -1042,3 +1042,100 @@ layout bench (BlockMap's design ancestry).
   no-removals assumption; turn_census's plain/gather split at ≥8;
   strings bench gained the lookup verify gate. declined: the
   redundant-apply_slide-after-sync_move flag (cold path, unbenched).
+
+## 2026-10-20 — gather-heuristic rebalancing: the word-classified ladder
+
+- landed: mask `copy_region` (region occupancy → fresh Mask, word-shift
+  with carry) + `count_below` (prefix popcount — the boundary rank).
+  `Delta::Rebalance { base, at, stride, mask }`: the region's live+1
+  elements — k included at its rank boundary — redistribute onto the
+  lattice `u(i) = i + i/(stride−1)`; `DeltaPairs::Rebalance` re-derives
+  pairs from the pre-move mask in two passes (right-movers descending,
+  left-movers ascending — first-match safe: targets are strictly
+  monotone in rank, so a target's old inhabitant moved the same
+  direction, earlier in its pass); `slides()` reports the region as one
+  synthetic link (skipset's union upkeep unchanged). blockset's ladder
+  rewritten word-classified: direct / NEAR (own-word hole; plain slide,
+  or an in-word bank when the streak is hot and the hole is past
+  FREE_STRIDE) / BORROW (a neighbor under High banks BORROW_MIN+streak
+  holes) / the fork — cold streak rebalances, hot banks, both ending in
+  `rebalance_region` (whole-block scan, sparser side first, tail-growth
+  valve `push_slots`, name-ceiling slide fallback). `streak`/`last_insert`
+  fields (locality signal; scaled ×2 on turns, reflected on flips).
+  append fastpath in open(). `gather_slots` INFALLIBLE (returns Pos; the
+  len/2 + REGION_WORDS bails, forced retries and Option plumbing deleted;
+  the review agent falsified the growth panic's invariant in the
+  turn-refused regime — now a slide). constants: FREE_STRIDE 8→6,
+  scan stop 5/6 strict (= stride-6 lattice capacity), HIGH 53, BORROW_MIN
+  10, TURN line 7/8→5/6 (ceiling = stop), STREAK_BANK 2. bench: workload
+  name filter, maintained-path census (skip_census), blockset
+  ladder_census (event-shape classification, DOA_CENSUS_N). skipset: a
+  `#[doc(hidden)] base()` accessor. tests: 3 ladder tests + pair-safety
+  battery; miri clean incl. the mixed torture.
+- died: the count-bounded fetch ladder as the primary far rung
+  (fetch_holes/compact_gather demoted to the bank arms — banking's
+  desert-digging only ever bit scattered inserts, which now rebalance
+  first); the distance (< FREE_STRIDE) near/far split (a banking
+  artifact — rungs are word-classified now); single-hole borrows (one
+  hole per frontier insert re-pays the full run — 79% of runs inserts ×
+  ~54); decline rungs (mid-block bails, decline→turn, decline→fetch);
+  the 7/8 preemptive ceiling; FREE_STRIDE's power-of-2 assert.
+- decided: the fork — the streak decides balance vs bank (balancing wins
+  random's layout, banking wins runs' amortization; measured both ways
+  at 1M). k rides the (live+1) lattice so the rebalance IS the open —
+  Deltas holds ONE event, no follow-up slide (the two-record overwrite
+  bug this forces is why the lattice includes k). scan stop = the stride
+  cap, NOT the sketch's 3/4: any stop below the block's steady state is
+  KNIFE-EDGED (a leveled area sits just above 3/4 and can never average
+  down — measured span-7522/8293 rebalances, every slot re-leveled
+  ~790×/build); 7/8 had the same edge at the 76-84% steady state. ceiling
+  = stop keeps density under workability, making the whole-block search
+  self-terminating — and the wide target-to-ceiling gap measured
+  favorable. borrow banks the lendable surplus (HIGH guarantees ≥ 11
+  clear bits): one word-bounded event amortizes a cluster, a milked word
+  lands at High and stops lending. the tail grows instead of declining
+  (~1/7 of the region's live at worst, vs a turn's 2× doubling).
+- measured (u64 keys, 1M, best, same-run cells, machine-day 2026-10-20;
+  baseline = the count-bounded fetch ladder at HEAD):
+
+  | | baseline | final | Δ |
+  |---|---|---|---|
+  | random insert (census build) | 346.7 | 191.2 | −45% |
+  | random moved/ins | 13.67 | 3.64 | −73% |
+  | random maintained | 301.7 | 162.4 | −46% |
+  | random lookup base/skip | 326.2 / 115.3 | 142.4 / 125.4 | −56% / +9% |
+  | random seqread | 1.2 | 1.6 | +33% |
+  | runs insert (census build) | 194.5 | 212.9 | +9% |
+  | runs moved/ins | 21.3 | 16.6 | −22% |
+  | runs lookup base/skip | 188 / 155 | 213 / 172 | +13% / +11% |
+  | runs seqread | 0.8 | 0.9 | parity |
+  | runs cap | 1.74M | 2.27M | +30% |
+
+  iteration ladder at 1M runs insert (census): baseline 194.5 →
+  rebalance-first +49% (borrow-milking's per-hole cost) → banked borrow
+  +40% → streak boost +49%→ banked-near/fork +14% → decline removal
+  +12% → 5/6 ceiling +9%. random insert: −5% (rebalance) → −8% → −35%
+  (2/3 family: density is the dominant variable, not the desert census)
+  → −40% → −45% (ceiling 5/6). runs' final read regression is THRESHOLD
+  LUCK: len 1M sits between the 5/6 (873k) and 7/8 (917k) turn lines of
+  cap 2^20 — one extra doubling fires at 5/6 (cap 1.18M→2.27M). at 10k:
+  runs −8% insert, movement −41%, reads parity; random parity on the
+  census build, lookup +34% (cache-resident sparsity hurts — layout wins
+  need DRAM scale).
+- session-end review (fresh agent): verified sound — the two-pass
+  move/vacancy algebra and pair order for every geometry, bound
+  sentinels, the fastpath gate, copy_region edges, single-event
+  contract. findings applied: the growth panic was REACHABLE in the
+  turn-refused regime (u8 probe: cap 256, len 254, free holes, panic) —
+  now a slide to the nearest hole (len < ceiling always leaves one);
+  borrow test's second half passed for the wrong reason (the 5/6 turn
+  fired at len 67 — pinned under the line now); a dead near-bank guard;
+  the flip's streak-anchor wrap; stale 7/8/3/4 doc numbers throughout;
+  bench census's ≥8 split relabeled a size-class heuristic.
+- deferred: size sweep across the 2^20 turn-line boundary (separates
+  the 5/6 ceiling's runs-read regression from threshold luck);
+  multi-word banking (closes the residual runs insert tax, re-digs
+  deserts); blockmap's ladder port (still fetch-gather, distance
+  semantics — no Rebalance events reach bimap); streak window after a
+  turn halves (anchor ×2, FREE_STRIDE unscaled); BORROW_MIN/streak-boost
+  tuning; skipset/bench surface for the new event mix.

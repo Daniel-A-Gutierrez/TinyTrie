@@ -79,26 +79,45 @@ treeblock, each load-bearing:
   treeblock's translator). Offset turns (window moves) are the
   unimplemented third move; rotation turns work under ANY offset and
   either direction now.
-- **no walker, no `Fixable`, no anchor discipline.** `gather_slots` =
-  fetch-distance gather: the nearest hole's distance sets the fetch (one
-  hole per FREE_STRIDE=8 traveled — the further the look, the more Nones
-  banked beside k); within a stride it's one plain slide (a single
-  `ptr::copy`, source's bitwise duplicate uninit-by-mask — the mask is the
-  only init oracle; O(1) mask update: nearest hole ⇒ the run is fully
-  live). farther: `fetch_holes` pre-reads the chain, `compact_gather`
-  applies it as one segment pass — each member crosses exactly once, far
-  segments copy first so no live source is overwritten. No run-walk fixup
+- **no walker, no `Fixable`, no anchor discipline.** `gather_slots` is
+  the WORD-CLASSIFIED ladder (2026-10-20): DIRECT (spot a hole) / NEAR (a
+  hole in k's own word — one plain slide, or a word-bounded bank of
+  `1+streak` holes when the locality streak is hot and the hole is past
+  FREE_STRIDE) / BORROW (a neighbor word under the HIGH line banks
+  `BORROW_MIN+streak` holes — the lendable surplus; a milked word lands at
+  High and stops lending) / the FORK — cold streak (< STREAK_BANK)
+  balances, hot banks; both arms end in `rebalance_region`, and a failed
+  bank (hole past len/2) falls to the same growth-rebalance (its tail
+  arm). `rebalance_region` scans words outward (sparser side first) until
+  density < FREE_NUM/FREE_DEN strictly (= the stride-FREE_STRIDE lattice
+  capacity — the stop IS the stride cap), grows the tail via
+  `push_slots` when the scan hits the end, and past the name ceiling
+  (turn-refused, §18) slides from the nearest hole. open()'s APPEND
+  FASTPATH sits above the ladder: a solid tail run within FREE_STRIDE of
+  the edge extends the block and slides ≤ FREE_STRIDE elements. the
+  ladder is INFALLIBLE — no bails, no forced retries, no Option plumbing.
+  No run-walk fixup
   choreography, no ancestry.
-- **Deltas = one compact event.** `enum Delta { NoneSlide{from,to}, Gather,
-  Pairs }` — the common contiguous slide records the hole's `from → to`
-  (elements between shift one step toward `from`; `from == to` = no-op
-  direct place); a multi-fetch records `Gather(Vec<NoneSlide>)` — the
-  slide chain, nearest hole first, each slide in post-prior-slides
-  coordinates (identical to its pre-read position: a hole's slot is never
-  touched before its own slide; a two-sided gather is two chains' worth,
-  side told by `from > to`). `Deltas::iter` expands: plain slides to 1-step
-  cascades (hole-adjacent first), gathers to ONE pair per moved element
-  carrying the FULL hop (crossing count, `w − segment index` — walked
+- **Deltas = one compact event.** `enum Delta { NoneSlide{from,to},
+  Gather, Rebalance{base,at,stride,mask}, Pairs }` — the common
+  contiguous slide records the hole's `from → to` (elements between
+  shift one step toward `from`; `from == to` = no-op direct place); a
+  bank records `Gather(Vec<NoneSlide>)` — the slide chain, nearest hole
+  first, each slide in post-prior-slides coordinates (identical to its
+  pre-read position: a hole's slot is never touched before its own
+  slide; a two-sided gather is two chains' worth, side told by
+  `from > to`). a `Rebalance` is the region's water-leveling rewrite:
+  the live+1 elements (k at rank `at`) redistribute onto the lattice
+  `u(i) = i + i/(stride−1)`; the stored mask is the PRE-move occupancy,
+  and `Deltas::iter` re-derives every pair from it in two passes
+  (right-movers descending, left-movers ascending — first-match safe by
+  strict monotonicity of targets in rank), while `slides()` reports the
+  region as one synthetic link (skipset unions it). k rides the lattice
+  so the rebalance IS the open — one insert, one event; a second record
+  would overwrite the first (that constraint shaped the design).
+  `Deltas::iter` also expands plain slides to 1-step cascades
+  (hole-adjacent first), gathers to ONE pair per moved element carrying
+  the FULL hop (crossing count, `w − segment index` — walked
   away-from-spot so every `to` stays ahead of the remaining `from`s for
   first-match holders; hop pairs overlap, order is load-bearing —
   subtle_bugs §22). `Pairs(Vec)` still waits for non-run shapes (bulk).
@@ -112,7 +131,9 @@ treeblock, each load-bearing:
   cached word, `pos` as the state so yields are free; holes advance one
   bit, whole-empty word tails skip; exhaustion must zero the cached word
   at EVERY site or a re-poll yields out-of-range positions — subtle_bugs
-  §21), `rotate_mask` (the turn's mask half: interleave + one band
+  §21), `copy_region`/`count_below` (region occupancy → a fresh Mask,
+  and prefix popcount — `rebalance_region`'s from-record and boundary
+  rank; naive-swept at every word edge), `rotate_mask` (the turn's mask half: interleave + one band
   ripple — upper-half names land odd; the reversed band ripples DOWN
   over the suffix `(offset, cap)` and can cross word boundaries, so the
   fall carries word by word) + `reverse` (the reversal's mirror).
@@ -417,31 +438,32 @@ the past — run targeted tests.
   `inline(always)` walks — one potential outlined call per yield,
   unmeasured.
 - blockset: `try_insert`/`try_alloc` split + arena-level occupancy
-  decisions; threshold tuning (FREE_STRIDE + the z-gate's 2σ remain
-  unbenchmarked; the turn line `TURN_NUM/DEN` is measured TWICE —
-  2026-10-15 and re-benched 2026-10-19 with the turn census: 3/4 REJECTED
-  both times; the second pass showed turn TIME stays ~1% either way —
-  the loss is the LAYOUT: doubled cap → sparser bsearch probes + stretched
-  banking deserts (random @1M lookup 347→1132, moved/insert 13.7→68),
-  while clustered runs DO win — a per-workload bet for the
-  block-of-blocks tier; see session_history);
+  decisions; threshold tuning (the z-gate's 2σ remains
+  unbenchmarked; the turn line `TURN_NUM/DEN`: 3/4 REJECTED twice
+  (2026-10-15/19 — the loss is the LAYOUT: doubled cap → sparser
+  probes + stretched deserts, random @1M lookup 347→1132), 7/8 the
+  settled value until 2026-10-20's 5/6 — the ceiling = the scan stop,
+  holding density under workability; 5/6 won random −45% insert/
+  −73% movement at 1M but runs' reads sit on THRESHOLD LUCK at
+  len 1M (between the 5/6 and 7/8 lines of cap 2^20, one extra
+  doubling fires) — a size sweep across the boundary is the missing
+  measurement; BORROW_MIN/streak-boost also unbenched);
   holder-applying bench variant
   — the cascade savings (turns/flips are zero-churn) aren't measured by a
   deltas-clearing bench.
-- blockset: distance-bounded fetch — `fetch_holes` is COUNT-bounded
-  (`1 + d/8`): the walk spans to the farthest fetched hole, quadratic in
-  desert depth (measured: 13% of random inserts move 94 elements each at
-  1M, 5× the harmonic share; the census shows 75% of live sits in >8
-  solid runs — banking clusters holes and digs deserts, and loses both
-  bets: random never reuses banked holes, runs refetches). bound the walk
-  by distance, fall through to push_slot. off-grid banking (parking
-  banked holes off the position lattice) is the deeper variant — the
-  window-first tiers no longer care where holes sit, but the
-  ELEMENT-MOVEMENT cost remains.
-- blockset: the 7/8 preemptive turn fires before checking whether the
+- blockset: multi-word banking — the bank arms are word-bounded
+  (BORROW ~1 event per ~10 inserts per word), so runs still pays ~+9%
+  insert over the fetch baseline at 1M; widening banks re-digs the
+  deserts the rebalance arm levels — the fork trades them (see
+  session_history 2026-10-20 for both directions measured).
+- blockset: the preemptive turn (now the 5/6 line) fires before checking whether the
   spot is already open — delete-max + reinsert-max pays a full turn for a
   free slot (report-only finding; a nearest-hole-within-stride guard is
   the candidate, unbenched).
+- blockmap: ladder port — blockmap still runs the old fetch-gather
+  distance ladder (its own copy; FREE_STRIDE now 6 there too); a
+  Rebalance port would touch its slide/turn plumbing but not bimap
+  (its chase consumes blockmap events, which never include Rebalance).
 - blockset: offset turns (window moves — mask + data halves handle any
   offset now; the move op remains, and it must respect `offset < cap` or
   generalize the reversed band — subtle_bugs §20),

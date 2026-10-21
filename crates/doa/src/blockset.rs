@@ -2,9 +2,11 @@
 //!name of its slot (`p2a`), semi-stable — rotation turns (growth) preserve
 //!names, slides transfer them (the mover adopts the vacated name). moves
 //!are reported as pos pairs in swap-cascade order for plain slides
-//(hole-adjacent mover first; gathers emit full-hop pairs, far segment
-//!first — see `DeltaPairs`) + a translator snapshot; the holder applies
-//!`Deltas::iter`'s (from_addr, to_addr) name swaps in order.
+//(hole-adjacent mover first; rebalances emit right-movers descending,
+//!then left-movers ascending — see `DeltaPairs`) + a translator snapshot;
+//!the holder applies `Deltas::iter`'s (from_addr, to_addr) name swaps in
+//!order. far holes water-level their region instead of fetching (see
+//!`rebalance_region`).
 //!order: pos order == key order — pos 0 = min (Asc) or max (Desc); a
 //!sequential insert at the key extreme always lands at the physical tail
 //!edge — push_back, or a direct place in a past-tail hole — never a
@@ -51,8 +53,22 @@ enum Delta {
     },
     ///a fetch-distance gather's slide chain, nearest hole first, each
     ///slide in post-prior-slides coordinates — identical to its pre-read
-    ///position (a hole's slot is never touched before its own slide)
+    ///position (a hole's slot is never touched before its own slide).
+    ///blockmap's ladder only — blockset water-levels instead (see
+    ///Rebalance)
     Gather(Vec<NoneSlide>),
+    ///a region's water-leveling rewrite: the region's live elements PLUS
+    ///k (at rank `at` among them) redistribute onto the uniform
+    ///one-hole-per-stride lattice `u(i) = i + i/(stride−1)` — old-rank i
+    ///< at lands at u(i), i ≥ at at u(i+1); k takes u(at), a hole by
+    ///construction. `mask` is the region's PRE-move occupancy (bit j ⇔
+    ///region slot j live); pairs re-derive both endpoints from it
+    Rebalance {
+        base:   Pos,
+        at:     usize,
+        stride: usize,
+        mask:    Mask,
+    },
     ///bulk non-run shapes (unused; reversal reports no events by design)
     #[allow(dead_code)]
     Pairs(Vec<(Pos, Pos)>),
@@ -63,7 +79,13 @@ enum Delta {
 ///slides' SEGMENTS and emit ONE pair per moved element carrying the
 ///FULL hop (crossing count) — no chained intermediate names. emission
 ///order keeps every `to` ahead of the remaining `from`s (first-match
-///holders; overlapping hop pairs otherwise retarget twice)
+///holders; overlapping hop pairs otherwise retarget twice). rebalances
+///emit right-movers first in DESCENDING rank (every `to` sits above the
+///remaining `from`s), then left-movers ascending (every `to` below them)
+///— a target slot's old inhabitant, when live, moves the SAME direction
+///and was already emitted (its rank is higher in the descending pass,
+///lower in the ascending one), so first-match holders retarget exactly
+///once
 enum DeltaPairs<'a> {
     Empty,
     ///one run's cursor: emits `(p, p − step)` per step
@@ -78,6 +100,22 @@ enum DeltaPairs<'a> {
         seg:    usize,
         ///position cursor within the segment; `usize::MAX` = fresh
         q:      usize,
+    },
+    ///the rebalance's two passes over the saved region mask: descending
+    ///right-movers, then ascending left-movers (see the enum doc)
+    Rebalance {
+        down: SetBitsRev<'a>,
+        up:   SetBits<'a>,
+        ///region start — endpoints are region-local + base
+        base: usize,
+        ///k's rank — old-rank i shifts one up past it
+        at:   usize,
+        ///stride − 1: the lattice's live count per period
+        s1:   usize,
+        ///old-rank of the bit the active pass yields next
+        rank: usize,
+        ///the ascending pass started
+        up_phase: bool,
     },
     Pairs(std::slice::Iter<'a, (Pos, Pos)>),
 }
@@ -128,6 +166,17 @@ impl Delta {
                 right:  v.first().is_some_and(|s| s.from.0 > s.to.0),
                 seg:    0,
                 q:      usize::MAX,
+            },
+            Delta::Rebalance { base, at, stride, mask } => DeltaPairs::Rebalance {
+                down: mask.iter_set_rev(),
+                up:   mask.iter_set(),
+                base: base.0,
+                at:   *at,
+                s1:   stride - 1,
+                //the descending pass yields the HIGHEST bit first —
+                //old-rank live−1
+                rank: mask.count() - 1,
+                up_phase: false,
             },
             Delta::Pairs(v) => DeltaPairs::Pairs(v.iter()),
         }
@@ -201,6 +250,36 @@ impl Iterator for DeltaPairs<'_> {
                 }
                 return Some((Pos(from), Pos((from as i64 + hop) as usize)));
             },
+            DeltaPairs::Rebalance { down, up, base, at, s1, rank, up_phase } => {
+                let base = *base;
+                if !*up_phase {
+                    //pass 1: descending rank, right-movers only
+                    while let Some(p) = down.next() {
+                        let i = *rank;
+                        //the last bit's decrement would underflow — the
+                        //counter is dead once the pass ends
+                        *rank = i.saturating_sub(1);
+                        let j = i + usize::from(i >= *at);
+                        let q = base + j + j / *s1;
+                        if q > base + p {
+                            return Some((Pos(base + p), Pos(q)));
+                        }
+                    }
+                    *up_phase = true;
+                    *rank = 0;
+                }
+                //pass 2: ascending rank, left-movers
+                while let Some(p) = up.next() {
+                    let i = *rank;
+                    *rank = i + 1;
+                    let j = i + usize::from(i >= *at);
+                    let q = base + j + j / *s1;
+                    if q < base + p {
+                        return Some((Pos(base + p), Pos(q)));
+                    }
+                }
+                None
+            }
             DeltaPairs::Pairs(it) => it.next().copied(),
         }
     }
@@ -245,6 +324,11 @@ impl<A: UnsignedNum> Deltas<A> {
             Delta::Empty => Slides::Empty,
             Delta::NoneSlide { from, to } => Slides::One(NoneSlide::new(*from, *to)),
             Delta::Gather(v) => Slides::Many(v.iter()),
+            //the whole region changed — one synthetic link spans it;
+            //maintain only unions min/max, and re-reads are idempotent
+            Delta::Rebalance { base, mask, .. } => {
+                Slides::One(NoneSlide::new(*base, Pos(base.0 + mask.bits() - 1)))
+            }
             Delta::Pairs(_) => Slides::Empty,
         }
     }
@@ -267,27 +351,74 @@ impl<A: UnsignedNum> Deltas<A> {
         self.translator = translator;
         self.event = Delta::Gather(slides);
     }
+
+    ///record a region rebalance (blockset's water-leveling rung). `mask`
+    ///= the region's pre-move occupancy, `at` = k's rank in it (the
+    ///lattice reserves u(at) for k), `stride` ≥ 2 (the lattice fit is
+    ///rebalance_region's guarantee)
+    pub(crate) fn record_rebalance(
+        &mut self,
+        translator: Translator<A>,
+        base: Pos,
+        at: usize,
+        stride: usize,
+        mask: Mask,
+    ) {
+        debug_assert!(stride >= 2);
+        self.translator = translator;
+        self.event = Delta::Rebalance { base, at, stride, mask };
+    }
 }
 
 ///fetch distance per banked hole: a gather fetches one hole per FREE_STRIDE
 ///of distance to the nearest one (distance 0..=FREE_STRIDE ⇒ 1, etc.)
 ///preemptive turn line: past this density, a mid-block insert turns
-///instead of gathering — past the line the expected fetch distance
-///blows through FREE_STRIDE. measured twice (2026-10-15, re-benched
-///2026-10-19 with the turn census): 3/4 loses at 1M — turn TIME stays
-///~1% either way, the loss is the LAYOUT (doubled cap → sparser bsearch
-///probes + stretched banking deserts: random lookup 347→1132,
-///moved/insert 13.7→68) while clustered runs DO win — a per-workload
-///bet; revisit at the block-of-blocks tier
-pub(crate) const TURN_NUM: usize = 7;
-pub(crate) const TURN_DEN: usize = 8;
-///gather banking distance: one hole fetched per FREE_STRIDE of distance
-///to the nearest one
-pub(crate) const FREE_STRIDE: usize = 8;
+///instead of gathering. 5/6 (2026-10-20): the ceiling = the scan stop —
+///global density can never exceed workability, so a whole-block region
+///search always terminates on its own (the growth panic's "impossible"
+///invariant, now actually true), and the wide target-to-ceiling gap
+///measured favorable. earlier lines: 7/8 (measured solid), 3/4 REJECTED
+///twice (2026-10-15/19 — the loss is the LAYOUT: doubled cap → sparser
+///probes + stretched deserts, random lookup 347→1132 at 1M)
+pub(crate) const TURN_NUM: usize = 5;
+pub(crate) const TURN_DEN: usize = 6;
+///none-stride 2/(1−R) for R = 2/3 — the stride cap; not a power of two,
+///the only divide left on it is the fetch count
+pub(crate) const FREE_STRIDE: usize = 6;
 
-//FREE_STRIDE (and SkipSet's stride) stay powers of two — every divide and
-//modulo on them compiles to shift/mask
-const _: () = assert!(FREE_STRIDE.count_ones() == 1, "FREE_STRIDE must be a power of 2");
+///water-leveling workability line (FREE_NUM/FREE_DEN): the region scan
+///extends words outward while the scanned density is at or over 5/6 —
+///a region is workable iff it fits a stride-≤ FREE_STRIDE lattice
+///(live·FREE_DEN < span·FREE_NUM strictly; equality would need stride
+///FREE_STRIDE+1), so the stop IS the stride cap. lower stops (the
+///sketch's 3/4, then 7/8) are KNIFE-EDGED against the block's own
+///steady state: a leveled area sits just above the stop and can never
+///average DOWN to it — the scan ran to the nearest empty pocket
+///(measured span-7522 rebalances). the BORROW rung is the hysteresis:
+///rebalanced words lend until High, then one rebalance resets the area.
+///see notes/session_history.md 2026-10-20
+pub(crate) const FREE_NUM: usize = 5;
+pub(crate) const FREE_DEN: usize = 6;
+
+///the borrow line: a word lends holes while under 5/6 of capacity
+///(53 of 64). borrows milk rebalanced words toward High before the
+///next rebalance — ~5 lends per stride-4-lattice word per cycle
+const HIGH: u32 = 53;
+
+///holes per borrow event: lendable guarantees ≥ 11 clear bits
+///(popcount < HIGH), so one event banks 10 beside k — the old fetch's
+///amortization bounded to the lending word
+const BORROW_MIN: usize = 10;
+
+///the bank fork: a streak this hot banks (bulk-gather) instead of
+///balancing or sliding — clusters amortize via banks, scattered
+///inserts level via rebalances (balancing wins random, banking wins
+///runs — measured both ways, session_history 2026-10-20)
+const STREAK_BANK: usize = 2;
+
+//only SkipSet's STRIDE stays a power of two (its slot math is
+//shift/mask); the one divide left on FREE_STRIDE is the fetch count
+const _: () = assert!(FREE_STRIDE >= 2, "FREE_STRIDE must be ≥ 2");
 
 ///z² for the reversal confidence gate — the low mean must clear this
 ///many standard deviations of the observed spread before flipping
@@ -334,6 +465,13 @@ pub struct BlockSet<K: Archive, A> {
     ///slides/gathers don't bump (they record deltas). position holders
     ///(skipset tiers) use it as a staleness guard
     epoch:      u64,
+    ///the previous insert's position — the locality streak's anchor,
+    ///scaled like pos_sum across turns and flips
+    last_insert: usize,
+    ///consecutive inserts that landed within FREE_STRIDE of the
+    ///previous one — the banking rungs' adaptive gather signal: a hot
+    ///cluster banks deeper, so its next inserts find holes adjacent
+    streak:     usize,
 }
 
 impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
@@ -347,6 +485,8 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             pos_sum:   0,
             pos_sq_sum: 0,
             epoch:     0,
+            last_insert: 0,
+            streak:     0,
         }
     }
 
@@ -699,7 +839,10 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             .wrapping_mul(len as u128)
             .wrapping_sub((2 * len as u128).wrapping_mul(s))
             .wrapping_add(q);
-        //positions mirrored — a silent move for pos holders
+        //positions mirrored — a silent move for pos holders; the streak
+        //anchor reflects like the sums (clamped: a position past len
+        //would wrap and just reset the streak, keep it meaningful)
+        self.last_insert = (len as usize).saturating_sub(self.last_insert);
         self.epoch += 1;
     }
 
@@ -750,9 +893,23 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///hole opens
     fn open(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
         let mut spot = spot;
-        //preemptive turn past 7/8: at one hole per FREE_STRIDE expected,
-        //fetches past 7/8 blow through the stride — one O(n) turn beats
-        //the long gathers (mid-block inserts only)
+        //APPEND FASTPATH: a solid tail run within a stride of the edge —
+        //extend the block and shift the run up. ≤ FREE_STRIDE elements
+        //move, no ladder rung, no banking; holed tails fall through (a
+        //near hole within the stride slides even cheaper and grows
+        //nothing), as does the spot-hole case (direct place)
+        if spot.0 < self.cap()
+            && self.cap() - spot.0 <= FREE_STRIDE
+            && self.cap() < Self::max_capacity()
+            && self.mask.get(spot.0)
+            && (spot.0..self.cap()).all(|p| self.mask.get(p))
+        {
+            let from = self.cap();
+            self.push_slot();
+            return self.slide_open(from, spot.0, deltas);
+        }
+        //preemptive turn past the ceiling (TURN_NUM/DEN): one O(n)
+        //turn beats the long scans (mid-block inserts only)
         if self.len.wrapping_mul(TURN_DEN) > self.data.len().wrapping_mul(TURN_NUM)
             && self.data.len() - spot.0 > FREE_STRIDE
         {
@@ -761,23 +918,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                 spot = self.turned_spot(old, spot);
             }
         }
-        if let Some(p) = self.gather_slots(spot, deltas) {
-            return p;
-        }
-        //mask full: one tail push when the edge is within FREE_STRIDE,
-        //else a turn; refused ⇒ plain tail slot (room always exists:
-        //mask full + len < name ceiling)
-        if self.data.len() - spot.0 <= FREE_STRIDE && self.data.len() < Self::max_capacity() {
-            self.push_slot();
-        } else {
-            let old = self.translator;
-            if self.grow_rotate() {
-                spot = self.turned_spot(old, spot);
-            } else {
-                self.push_slot();
-            }
-        }
-        self.gather_slots(spot, deltas).expect("mask had a hole minted")
+        self.gather_slots(spot, deltas)
     }
 
     ///k's spot under a completed turn: the old spot's name relocates via
@@ -798,6 +939,10 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.pos_sq_sum = self
             .pos_sq_sum
             .wrapping_add((p.0 as u128) * (p.0 as u128));
+        //locality streak: this insert within a stride of the previous
+        self.streak =
+            if p.0.abs_diff(self.last_insert) <= FREE_STRIDE { self.streak + 1 } else { 0 };
+        self.last_insert = p.0;
         self.translator.p2a(p)
     }
 
@@ -942,42 +1087,134 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         unsafe { self.key(self.mask.last_set().expect("live")) }
     }
 
-    ///open a slot at/near `spot`; None ⇒ hole-free mask. the opened slot
-    ///arrives as one `Delta` event (NoneSlide or Gather)
-    fn gather_slots(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Option<Pos> {
+    ///open a slot at/near `spot` — the ladder never fails: the region
+    ///scan runs the whole block for space and the tail grows on demand
+    ///(global density sits under the ratio, so space always exists);
+    ///only the name ceiling is fatal. one `Delta` event per open. the
+    ///rungs are WORD-CLASSIFIED (the old < FREE_STRIDE distance bound
+    ///was a banking artifact):
+    ///- NEAR: a hole in k's own word — one plain slide, or a bank when
+    ///  the streak is hot and the hole is past a stride
+    ///- BORROW: a neighboring word under the High line banks up to
+    ///  BORROW_MIN (+ streak) holes beside k
+    ///- FAR: the streak forks — cold balances (region rebalance + the
+    ///  tail-growth valve), hot banks (the nearest hole within len/2,
+    ///  else the growth-rebalance mints tail space)
+    fn gather_slots(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
         //k's slot already open (the bsearch converges on holes for
         //mid-gap inserts) — no fetch, no slide. nearest_clear excludes
         //`spot` by contract, so this is checked first
         if spot.0 < self.cap() && !self.mask.get(spot.0) {
             deltas.record_none_slide(self.translator, spot, spot);
-            return Some(spot);
+            return spot;
         }
-        //the nearest hole's distance sets the fetch — one hole per
-        //FREE_STRIDE traveled (the further the look, the more Nones come
-        //back, banked beside k for the cluster's next inserts); holes all
-        //from its side
-        let hole = self.mask.nearest_clear(spot.0)?;
-        //k's slot: hole right ⇒ `spot` (run shifts up), left ⇒ `spot − 1`
-        //(run shifts down)
-        let right = hole > spot.0;
-        let open = if right { spot.0 } else { spot.0 - 1 };
-        //the common case: hole within a stride — one plain slide, no fetch
-        if hole.abs_diff(spot.0) < FREE_STRIDE {
-            self.slide_hole(hole, open);
-            deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
-            return Some(Pos(open));
+        //the nearest hole's distance picks the rung: within a stride one
+        //plain slide; farther, the region water-levels instead of a
+        //distance-proportitional fetch — banking dug deserts (the count-
+        //bounded walk is quadratic in their depth); the rebalance
+        //re-plants holes behind every element of the region
+        let word_lo = spot.0 & !63;
+        let up = self.mask.next_clear(spot.0 + 1);
+        let down = spot.0.checked_sub(1).and_then(|b| self.mask.prev_clear(b));
+        let nearest = |up: Option<usize>, down: Option<usize>| match (up, down) {
+            (Some(u), Some(d)) => Some(if u - spot.0 <= spot.0 - d { u } else { d }),
+            (u, d) => u.or(d),
+        };
+        //NEAR: a hole in k's own word — one plain slide, or a bank when
+        //the streak is hot and the hole is further than a stride out (the
+        //chunk frontier would otherwise re-pay the full run per insert)
+        if let Some(hole) = nearest(up.filter(|h| *h < word_lo + 64), down.filter(|h| *h >= word_lo)) {
+            if self.streak >= STREAK_BANK && hole.abs_diff(spot.0) > FREE_STRIDE {
+                let right = hole > spot.0;
+                let open = if right { spot.0 } else { spot.0 - 1 };
+                let bound = if right { word_lo + 64 } else { word_lo };
+                let holes = self.fetch_holes(spot, right, 1 + self.streak, bound);
+                self.compact_gather(spot, open, right, &holes);
+                deltas.record_gather(
+                    self.translator,
+                    holes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
+                        .collect(),
+                );
+                return Pos(open);
+            }
+            return self.slide_open(hole, spot.0, deltas);
         }
-        let holes = self.fetch_holes(spot, right, 1 + hole.abs_diff(spot.0) / FREE_STRIDE);
-        self.compact_gather(spot, open, right, &holes);
-        deltas.record_gather(
-            self.translator,
-            holes
-                .iter()
-                .enumerate()
-                .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
-                .collect(),
-        );
-        Some(Pos(open))
+        //BORROW: a neighboring word under the High line lends — one
+        //event banks up to BORROW_MIN holes beside k (the old fetch's
+        //amortization, bounded to the lending word; a word milked from
+        //3/4 lands at exactly High and stops lending). lendable implies
+        //holes exist, so an eligible side's nearest hole is inside its
+        //neighbor word (k's own word has none)
+        let lend_left = word_lo > 0 && self.mask.word_at(word_lo - 64).count_ones() < HIGH;
+        let lend_right = word_lo + 64 < self.cap() && self.mask.word_at(word_lo + 64).count_ones() < HIGH;
+        if let Some(hole) = nearest(up.filter(|_| lend_right), down.filter(|_| lend_left)) {
+            let right = hole > spot.0;
+            let open = if right { spot.0 } else { spot.0 - 1 };
+            let bound = if right { word_lo + 128 } else { word_lo - 64 };
+            //a hot streak banks deeper — the cluster's next inserts land
+            //right here, and the hole is further than a stride out
+            let want = BORROW_MIN
+                + usize::from(hole.abs_diff(spot.0) > FREE_STRIDE) * self.streak;
+            let holes = self.fetch_holes(spot, right, want, bound);
+            if holes.is_empty() {
+                //a truncated lendable word with no holes: the single
+                //nearest hole, however far
+                return self.slide_open(hole, spot.0, deltas);
+            }
+            self.compact_gather(spot, open, right, &holes);
+            deltas.record_gather(
+                self.translator,
+                holes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
+                    .collect(),
+            );
+            return Pos(open);
+        }
+        {
+            //the fork: cold streaks balance, hot streaks bank
+            if self.streak < STREAK_BANK {
+                return self.rebalance_region(spot, deltas);
+            }
+            //hot: bank the nearest existing hole within len/2
+            if let Some(hole) = self.mask.nearest_clear(spot.0)
+                && hole.abs_diff(spot.0) <= self.len / 2
+            {
+                let right = hole > spot.0;
+                let open = if right { spot.0 } else { spot.0 - 1 };
+                //no region bound: right = no ceiling, left = no floor
+                let bound = if right { usize::MAX } else { 0 };
+                let want = 1 + hole.abs_diff(spot.0) / FREE_STRIDE
+                    + usize::from(hole.abs_diff(spot.0) > FREE_STRIDE) * self.streak;
+                let holes = self.fetch_holes(spot, right, want, bound);
+                self.compact_gather(spot, open, right, &holes);
+                deltas.record_gather(
+                    self.translator,
+                    holes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
+                        .collect(),
+                );
+                return Pos(open);
+            }
+            //past len/2 (or a full mask): the growth-rebalance mints
+            //tail space — the bank's tail arm
+            self.rebalance_region(spot, deltas)
+        }
+    }
+
+    ///slide the hole to k's edge and record — near, borrow and forced
+    ///share it. caller guarantees `hole` is the nearest on its side
+    fn slide_open(&mut self, hole: usize, spot: usize, deltas: &mut Deltas<A>) -> Pos {
+        let open = if hole > spot { spot } else { spot - 1 };
+        self.slide_hole(hole, open);
+        deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
+        Pos(open)
     }
 
     ///one plain slide: hole `from` → `to`
@@ -997,16 +1234,31 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.mask.set(to, false);
     }
 
+    ///one element relocation inside a rebalance pass. the pass orders
+    ///make every target vacant when written (see rebalance_region); the
+    ///stale source bytes are masked clear, never assume_init'd
+    fn move_slot(&mut self, from: usize, to: usize) {
+        self.data[to] = std::mem::replace(&mut self.data[from], MaybeUninit::uninit());
+        self.mask.set(from, false);
+        self.mask.set(to, true);
+    }
+
     ///the `want` nearest holes on one side of `spot`, nearest-first
-    ///(right: ascending, left: descending) — pre-read for
-    ///`compact_gather`, no further scans
-    fn fetch_holes(&self, spot: Pos, right: bool, want: usize) -> Vec<usize> {
+    ///(right: ascending, left: descending), within `bound` — the allowed
+    ///region's far edge (right: exclusive ceiling, left: inclusive
+    ///floor) — pre-read for `compact_gather`, no further scans. two
+    ///callers: the borrow (the lending word's far edge) and the declined
+    ///fetch (unbounded: MAX / 0)
+    fn fetch_holes(&self, spot: Pos, right: bool, want: usize, bound: usize) -> Vec<usize> {
         let mut holes = Vec::with_capacity(want);
         if right {
             let mut cursor = spot.0;
             while holes.len() < want
                 && let Some(h) = self.mask.next_clear(cursor)
             {
+                if h >= bound {
+                    break;
+                }
                 holes.push(h);
                 cursor = h + 1;
             }
@@ -1014,6 +1266,9 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             let mut cursor = spot.0 - 1;
             while holes.len() < want {
                 let Some(h) = self.mask.prev_clear(cursor) else { break };
+                if h < bound {
+                    break;
+                }
                 holes.push(h);
                 if h == 0 {
                     break;
@@ -1075,6 +1330,131 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         }
     }
 
+    ///water-leveling rung: scan words outward from `spot` until the
+    ///scanned region's density drops under FREE_NUM/FREE_DEN, then
+    ///redistribute the region's live elements PLUS k (at its rank
+    ///boundary `r`) onto the uniform one-hole-per-stride lattice
+    ///`u(i) = i + i/(stride−1)` — the minimal stride fitting live+1 in
+    ///the region (≤ 8 at < 7/8 density). order-preserving; k's slot
+    ///u(r) is a hole by construction, so the rebalance IS the open —
+    ///the returned position is where the caller places k, and the ONE
+    ///event covers everything. when the scan reaches the TAIL still
+    ///above target, the block grows just enough to fit the lattice —
+    ///fresh slots are the cheapest space. the scan never declines:
+    ///global density sits under the ratio, so a whole-block search
+    ///always finds space (or grows it); past the name ceiling (turns
+    ///refused, §18) the nearest hole slides, however far
+    fn rebalance_region(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
+        let mut cap = self.data.len();
+        //spot's word, clamped: spot == cap (dense tail) scans the last
+        //word rather than reading past the range
+        let mut wlo = spot.0.min(cap - 1) >> 6;
+        let mut whi = wlo;
+        let mut live = self.mask.word_at(wlo << 6).count_ones() as usize;
+        let mut span = ((whi + 1) << 6).min(cap) - (wlo << 6);
+        //extend word by word, sparser side first, until the region fits
+        //a stride-≤ FREE_STRIDE lattice (strictly under FREE_NUM/FREE_DEN
+        //— equality would need stride FREE_STRIDE+1)
+        while live * FREE_DEN >= span * FREE_NUM {
+            let left = wlo > 0;
+            let right = (whi + 1) << 6 < cap;
+            //the tail bounds the region and no free word lies left:
+            //GROW it — fresh slots are the cheapest space (nothing
+            //relocates, names mint on demand), ~1/7 of the region's live
+            //at worst. this replaces the whole-block decline: the tail
+            //word keeps refusing lends above High, so second-to-last
+            //word inserts reach FAR and land here
+            if !right && (!left || self.mask.word_at((wlo - 1) << 6).count_ones() > 0) {
+                let need = live * FREE_DEN / FREE_NUM + 1;
+                let grow = need - span;
+                if cap + grow > Self::max_capacity() {
+                    //the turn-refused regime (§18): growth is blocked,
+                    //but the ladder's entry contract (len < ceiling)
+                    //leaves room somewhere — a hole to slide, or one
+                    //slot to mint (mask full implies cap == len <
+                    //ceiling). the long slide is the only correct move
+                    let hole = match self.mask.nearest_clear(spot.0) {
+                        Some(hole) => hole,
+                        None => {
+                            self.push_slot();
+                            self.cap() - 1
+                        }
+                    };
+                    return self.slide_open(hole, spot.0, deltas);
+                }
+                self.push_slots(grow);
+                cap = self.data.len();
+                whi = (cap - 1) >> 6;
+                span = cap - (wlo << 6);
+                continue; //density now under target — the loop exits
+            }
+            let take_left = match (left, right) {
+                (true, true) => {
+                    let lw = self.mask.word_at((wlo - 1) << 6).count_ones();
+                    let rw = self.mask.word_at((whi + 1) << 6).count_ones();
+                    lw <= rw
+                }
+                (true, false) => true,
+                _ => false,
+            };
+            if take_left {
+                wlo -= 1;
+                live += self.mask.word_at(wlo << 6).count_ones() as usize;
+            } else {
+                live += self.mask.word_at((whi + 1) << 6).count_ones() as usize;
+                whi += 1;
+            }
+            span = ((whi + 1) << 6).min(cap) - (wlo << 6);
+        }
+        let base = wlo << 6;
+        //clamped: the tail word may extend past cap, and the lattice's
+        //positions must stay < cap
+        let end = ((whi + 1) << 6).min(cap);
+        if live == 0 {
+            //an empty region (the holey tail word past the last live):
+            //k takes the region's floor, no lattice needed
+            deltas.record_none_slide(self.translator, Pos(base), Pos(base));
+            return Pos(base);
+        }
+        let region = self.mask.copy_region(base, end);
+        //k's rank among the region's live — the boundary is count-below
+        //in the pre-move mask (order is preserved)
+        let r = region.count_below((spot.0.min(end) - base).min(region.bits()));
+        //minimal stride whose lattice holds live+1 (k included): u(live) < span
+        let mut stride = 2;
+        while live + live / (stride - 1) >= span {
+            stride += 1;
+        }
+        debug_assert!(stride <= FREE_STRIDE, "density ≤ {FREE_NUM}/{FREE_DEN} bounds the stride");
+        let s1 = stride - 1;
+        //old-rank i's lattice slot: one past k from `r` up
+        let target = |i: usize| i + usize::from(i >= r) + (i + usize::from(i >= r)) / s1 + base;
+        debug_assert!(target(live - 1) < end, "the lattice must fit the region");
+        //the two passes exactly as the pair emission (DeltaPairs::
+        //Rebalance): right-movers descending — every target is vacant
+        //when written (its old inhabitant, when live, is a right-mover
+        //of higher rank, already moved) — then left-movers ascending,
+        //the mirrored argument
+        let mut i = live;
+        for p in region.iter_set_rev() {
+            i -= 1;
+            let q = target(i);
+            if q > base + p {
+                self.move_slot(base + p, q);
+            }
+        }
+        let mut i = 0;
+        for p in region.iter_set() {
+            let q = target(i);
+            if q < base + p {
+                self.move_slot(base + p, q);
+            }
+            i += 1;
+        }
+        deltas.record_rebalance(self.translator, Pos(base), r, stride, region);
+        Pos(base + r + r / s1)
+    }
+
     ///rotation turn (in-place): cap doubles, every live element relocates
     ///to `a2p_new(name)` — names preserved by construction. false ⇒
     ///refused (name-space midpoint passed, or rotation budget spent)
@@ -1116,7 +1496,10 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //squares quadruple
         self.pos_sum = self.pos_sum.wrapping_mul(2);
         self.pos_sq_sum = self.pos_sq_sum.wrapping_mul(4);
-        //positions spread — a silent move for pos holders
+        //positions spread — a silent move for pos holders; the streak
+        //anchor scales with them (approximate — the turn's band adds
+        //one, like every stream signal here)
+        self.last_insert = self.last_insert.wrapping_mul(2);
         self.epoch += 1;
         TURN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TURN_MOVED.fetch_add(old_cap as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1129,6 +1512,14 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     fn push_slot(&mut self) {
         assert!(self.data.len() < Self::max_capacity(), "name space exhausted");
         self.data.push(MaybeUninit::uninit());
+        self.mask.resize(self.data.len());
+    }
+
+    ///extend by `n` uninit slots (mask clear) in one resize — the
+    ///rebalance's tail-growth valve. caller checks the name ceiling
+    fn push_slots(&mut self, n: usize) {
+        assert!(self.data.len() + n <= Self::max_capacity(), "name space exhausted");
+        self.data.extend((0..n).map(|_| MaybeUninit::uninit()));
         self.mask.resize(self.data.len());
     }
 
@@ -1379,88 +1770,275 @@ mod tests {
         assert_eq!(set.len(), 102);
     }
 
-    ///fetch-distance banking: holes 24 slots from the spot fetch 4 (one per
-    ///FREE_STRIDE traveled) and land beside k — the next 3 inserts are
-    ///no-ops. the 24 moved elements each emit ONE full-hop pair (crossing
-    ///count 4; farthest-first, descending — the first-match order)
+    ///BORROW: k's word full, the right neighbor under High and holed —
+    ///it lends its nearest hole across the boundary; no rebalance, no
+    ///turn
     #[test]
-    fn gather_banks_holes_by_distance() {
+    fn borrow_lends_across_words() {
         let mut set = BlockSet::<u64, u8>::new();
         let mut d = Deltas::new();
         let mut holder = Vec::new();
-        for k in (0..=10u64).chain(60..=89).chain(200..=214) {
+        //words 0-1 dense (80 keys), then word 1's tail holed by removals
+        for k in (0..80u64).map(|i| i * 2) {
             let a = set.insert(k, &mut d).unwrap();
             apply(&mut holder, &d);
             d.clear();
             holder.push((a, k));
         }
-        //holes at pos 35..=50 — the 35..40 half is 24 from the spot of
-        //key 30 (the fetched side); the 41..50 half drops density below
-        //the 3/4 turn line so the gather runs
-        for k in (84..=89u64).chain(200..=209) {
+        //positions 66..79 clear — word 1 at 2/16 valid, well under
+        //High; len 66 keeps the block under the 5/6 turn line
+        for k in (66..80u64).map(|i| i * 2) {
             set.remove(set.find(&k).unwrap());
             holder.retain(|(_, hk)| *hk != k);
         }
-        let a = set.insert(30, &mut d).unwrap();
-        //identity translator (appends only): names = positions; the 4
-        //consecutive fetched holes make segments 1..=3 empty — one
-        //segment, hop 4, farthest element first
-        assert_eq!(
-            d.iter().collect::<Vec<_>>(),
-            (11u8..=34).rev().map(|q| (q, q + 4)).collect::<Vec<_>>(),
-            "24 moved elements, one hop-4 pair each"
-        );
+        let a = set.insert(51, &mut d).unwrap();
+        //spot 26 (key 51 between 50@25 and 52@26): one event banks the
+        //14 holes word 1 holds — the 40-element run [26, 66) shifts up,
+        //k takes 26, holes land at 27..39
+        assert_eq!(d.iter().count(), 40, "borrow bank pairs");
+        assert_eq!(set.cap(), 80, "borrow must not turn");
+        assert_eq!(set.get(26), Some(&51));
         apply(&mut holder, &d);
         d.clear();
-        holder.push((a, 30));
-        assert_eq!(set.cap(), 56, "gather must not turn");
-        for k in [31, 32, 33] {
-            let a = set.insert(k, &mut d).unwrap();
-            assert_eq!(d.iter().count(), 0, "banked hole should absorb insert {k}");
-            apply(&mut holder, &d);
-            d.clear();
-            holder.push((a, k));
-        }
-        check(&set, &holder, 44);
+        holder.push((a, 51));
+        //len back under the 5/6 turn line, then the bank absorbs the
+        //next insert: key 53 slides ONE element from a banked hole
+        set.remove(set.find(&130).unwrap());
+        holder.retain(|(_, hk)| *hk != 130);
+        let a = set.insert(53, &mut d).unwrap();
+        assert_eq!(set.cap(), 80, "no turn — the banked hole absorbs");
+        assert_eq!(d.iter().count(), 1, "banked hole should absorb the insert");
+        apply(&mut holder, &d);
+        d.clear();
+        holder.push((a, 53));
+        check(&set, &holder, 67);
     }
 
-    ///the LEFT-side gather mirror: holes below the spot, TWO non-empty
-    ///segments — emission ascends (left walks up), far/low segment first,
-    ///hop = crossing count per element
+    ///FAR: both neighbor words at/over High — the region scan levels the
+    ///block to a stride-4 lattice, k rides it at its boundary slot, no
+    ///turn
     #[test]
-    fn gather_left_side_hop_pairs() {
+    fn far_words_rebalance_region() {
         let mut set = BlockSet::<u64, u8>::new();
         let mut d = Deltas::new();
         let mut holder = Vec::new();
-        for k in (0..=20u64).chain(100..=129) {
+        //190 keys dense: words 0-1 full, word 2 holds 62 of 64 bits
+        for k in (0..190u64).map(|i| i * 2) {
             let a = set.insert(k, &mut d).unwrap();
             apply(&mut holder, &d);
             d.clear();
             holder.push((a, k));
         }
-        //holes at pos 0, 5, 10 (below the spot of key 50, nearest 11 away)
-        //and 33..35, 38..40, 43, 48..50 above — the upper holes drop density
-        //below the 3/4 turn line and sit farther than 11, so the gather
-        //runs LEFT with two non-empty segments
-        for k in [0u64, 5, 10, 112, 113, 114, 117, 118, 119, 122, 127, 128, 129] {
+        //word 2 emptied — the scan's ≤ 3/4 pocket
+        for k in (128..190u64).map(|i| i * 2) {
             set.remove(set.find(&k).unwrap());
             holder.retain(|(_, hk)| *hk != k);
         }
-        let a = set.insert(50, &mut d).unwrap();
-        //identity translator: segment [6, 10) hops −1 (far), [11, 21)
-        //hops −2 — globally ascending `from`, every `to` behind
-        assert_eq!(
-            d.iter().collect::<Vec<_>>(),
-            (6u8..=9)
-                .chain(11..=20)
-                .map(|q| (q, q - if q < 10 { 1 } else { 2 }))
-                .collect::<Vec<_>>(),
-            "14 moved elements, two non-empty segments, hop 1 then hop 2"
-        );
+        //a far landing cools the streak, the removal restores len —
+        //the probe must take the BALANCE arm of the fork (hot streaks
+        //bank instead) and the len/2 bail stays dormant (len ≤ 128)
+        let a = set.insert(261, &mut d).unwrap();
+        assert_eq!(d.iter().count(), 0, "direct place, no movement");
         apply(&mut holder, &d);
         d.clear();
-        holder.push((a, 50));
-        check(&set, &holder, 39);
+        holder.push((a, 261));
+        set.remove(a);
+        holder.retain(|(_, hk)| *hk != 261);
+        let a = set.insert(51, &mut d).unwrap();
+        //spot 26 (key 51 between 50@25 and 52@26): k's word full, right
+        //neighbor full (not borrowable) → FAR; region [0, 190), 128
+        //live, density 67% < 5/6 → stride 4; k rides the lattice at
+        //u(26) = 34; ranks 0..=2 keep their slots
+        assert_eq!(d.iter().count(), 125, "rebalance pairs");
+        assert_eq!(set.cap(), 190, "rebalance must not turn");
+        assert_eq!(set.get(34), Some(&51), "k's reserved lattice slot");
+        apply(&mut holder, &d);
+        d.clear();
+        holder.push((a, 51));
+        check(&set, &holder, 129);
+        //uniform lattice: stride 4 ⇒ runs of ≤ 3
+        assert!(set.live_run_lengths().into_iter().max().unwrap() <= 3, "lattice runs");
+    }
+
+    ///the rebalance pair expansion is first-match-safe: lattice targets
+    ///can coincide with other elements' sources (dense sub-regions), and
+    ///the two-pass order (right-movers descending, left-movers ascending)
+    ///must retarget each holder exactly once — verified by applying with
+    ///first-match against hand-built region masks, at the boundary edges
+    ///(at == 0, at == live, dense heads, holed tails)
+    #[test]
+    fn rebalance_pairs_first_match_safe() {
+        let cases: [(usize, usize, usize, usize, Vec<usize>); 6] = [
+            (0, 0, 2, 64, (0..32).collect()),
+            (10, 11, 4, 64, (0..45).collect()),
+            (5, 20, 4, 128, (0..90).collect()),
+            (0, 40, 5, 64, (0..48).collect()),
+            (0, 45, 4, 64, (0..45).collect()),
+            (64, 45, 2, 100, (0..35).chain(90..100).collect()),
+        ];
+        for (base, at, stride, bits, set) in cases {
+            let mut mask = Mask::with_bits(bits);
+            for p in &set {
+                mask.set(*p, true);
+            }
+            let mut d = Deltas::<u8>::new();
+            d.record_rebalance(Translator::new(), Pos(base), at, stride, mask);
+            //holders: one per live element, named by its slot
+            let mut holders: Vec<(u8, usize)> = set.iter().map(|p| ((base + p) as u8, *p)).collect();
+            for (from, to) in d.iter() {
+                for h in &mut holders {
+                    if h.0 == from {
+                        h.0 = to;
+                        break;
+                    }
+                }
+            }
+            //expected: old-rank i lands at u(i + [i ≥ at])
+            let s1 = stride - 1;
+            let mut expected: Vec<(u8, usize)> = set
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let j = i + usize::from(i >= at);
+                    ((base + j + j / s1) as u8, *p)
+                })
+                .collect();
+            expected.sort_unstable();
+            holders.sort_unstable();
+            assert_eq!(holders, expected, "base {base} at {at} stride {stride}");
+        }
+    }
+
+    ///one-off diagnostic: the ladder's census over insertion patterns —
+    ///slides (near + borrow + forced), rebalances (count, region span,
+    ///moved), declined-path fetches, turns, total moved per insert.
+    ///distinguishes by event shape: a slide's pairs == its single link
+    ///span, a rebalance's pairs < it. run with --nocapture
+    #[test]
+    fn ladder_census() {
+        let report = |name: &str, keys: Vec<u64>| {
+            let mut set = BlockSet::<u64, u32>::new();
+            let mut d = Deltas::new();
+            let (mut slides, mut s_moved, mut rebal, mut r_span, mut r_moved, mut gath, mut g_moved, mut turns) =
+                (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            let mut epoch = set.epoch();
+            for k in keys {
+                set.insert(k, &mut d).unwrap();
+                if set.epoch() != epoch {
+                    epoch = set.epoch();
+                    turns += 1;
+                }
+                let pairs = d.iter().count() as u64;
+                let links: Vec<_> = d.slides().collect();
+                if links.is_empty() || links[0].from == links[0].to {
+                    //push_back or a direct place — no movement
+                } else if links.len() > 1 {
+                    //banked event — borrow or declined fetch
+                    gath += 1;
+                    g_moved += pairs;
+                } else {
+                    let span = links[0].from.0.abs_diff(links[0].to.0) as u64;
+                    if pairs == span {
+                        //near / borrow / forced — one run slide
+                        slides += 1;
+                        s_moved += pairs;
+                    } else {
+                        rebal += 1;
+                        r_span += span;
+                        r_moved += pairs;
+                    }
+                }
+                d.clear();
+            }
+            let n = set.len() as u64;
+            println!(
+                "{name:>8}: slides {slides} ({:.0}% of ins) moved {s_moved} | rebal {rebal} ({:.0}%) span {:.0} moved {:.0} | banked {gath} moved {g_moved} | turns {turns} | moved/ins {:.2}",
+                slides * 100 / n,
+                rebal * 100 / n,
+                r_span / rebal.max(1),
+                r_moved / rebal.max(1),
+                (s_moved + r_moved + g_moved) / n,
+            );
+        };
+        //scale via DOA_CENSUS_N (default 10k) — the runs-tiling
+        //geometries diverge with scale
+        let n: u64 = std::env::var("DOA_CENSUS_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+        report("append", (0..n).collect());
+        report("random", {
+            let mut keys: Vec<u64> = (0..n).collect();
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            for i in (1..keys.len()).rev() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                keys.swap(i, (state % (i as u64 + 1)) as usize);
+            }
+            keys
+        });
+        report("runs", {
+            let mut chunks: Vec<Vec<u64>> = (0..n as usize / 100)
+                .map(|chunk| ((chunk * 100) as u64..((chunk + 1) * 100) as u64).collect())
+                .collect();
+            for chunk in chunks.iter_mut().step_by(2) {
+                chunk.reverse();
+            }
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            for i in (1..chunks.len()).rev() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                chunks.swap(i, (state % (i as u64 + 1)) as usize);
+            }
+            chunks.into_iter().flatten().collect()
+        });
+    }
+
+    ///TAIL GROWTH: the region scan reaches the array end still above
+    ///target — the block grows just enough to fit the lattice (nothing
+    ///relocates to make room; fresh slots ARE the room), the rebalance
+    ///levels including the last word, no turn
+    #[test]
+    fn tail_grows_to_target_density() {
+        let mut set = BlockSet::<u64, u8>::new();
+        let mut d = Deltas::new();
+        let mut holder = Vec::new();
+        //200 dense: word 3 = the 8-valid tail word; then holes at the
+        //HEAD (global 75% ≤ 7/8, so no preemptive turn)
+        for k in (0..200u64).map(|i| i * 2) {
+            let a = set.insert(k, &mut d).unwrap();
+            apply(&mut holder, &d);
+            d.clear();
+            holder.push((a, k));
+        }
+        for k in (0..50u64).map(|i| i * 2) {
+            set.remove(set.find(&k).unwrap());
+            holder.retain(|(_, hk)| *hk != k);
+        }
+        //a far landing cools the streak — the probe must take the
+        //BALANCE arm (hot streaks bank instead)
+        let a = set.insert(1, &mut d).unwrap();
+        assert_eq!(d.iter().count(), 0, "direct place, no movement");
+        apply(&mut holder, &d);
+        d.clear();
+        holder.push((a, 1));
+        let epoch = set.epoch();
+        let a = set.insert(301, &mut d).unwrap();
+        //spot 151 (key 301 between 300@150 and 302@151): no hole at or
+        //above the spot, the left word full → FAR; the scan takes the
+        //sparse tail word,
+        //hits the end, and grows 15 slots: region [128, 215), 72 live,
+        //84% just under 5/6 → stride 6; k rides at u(23) = 155; ranks 0..=4 stay
+        assert_eq!(set.cap(), 215, "the tail must grow by exactly need − span");
+        assert_eq!(set.epoch(), epoch, "growth is silent-adjacent: no turn");
+        assert_eq!(d.iter().count(), 67, "rebalance pairs");
+        assert_eq!(set.get(155), Some(&301), "k's reserved lattice slot");
+        apply(&mut holder, &d);
+        d.clear();
+        holder.push((a, 301));
+        check(&set, &holder, 152);
     }
 
     ///front insert below cap: plain slide, name transfer without any turn —
@@ -1733,5 +2311,3 @@ mod tests {
         assert_eq!(c.prev(), Some(&7));
     }
 }
-
-

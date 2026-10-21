@@ -14,7 +14,7 @@ pub struct Mask {
 }
 ///L0015
 impl Mask {}
-///L0369
+///L0405
 ///bidirectional walk over set bits on a cached word — the walk machine
 ///the set/map cursors wrap. the tiers own key-order semantics (where to
 ///land); this owns the stepping, the word cache, and the walk-end states.
@@ -31,9 +31,9 @@ pub(crate) struct MaskCursor<'a> {
     ///Some(p) ⇒ p's word; the ghost leaves it stale (at() reloads)
     word: u64,
 }
-///L0378
+///L0414
 impl<'a> MaskCursor<'a> {}
-///L0456
+///L0492
 ///`iter_set`'s engine — ascending set bits. None-stable (exhaustion
 ///zeroes the cached word, subtle_bugs §21)
 pub struct SetBits<'a> {
@@ -43,9 +43,9 @@ pub struct SetBits<'a> {
     ///next position to test
     pos:  usize,
 }
-///L0464
+///L0500
 impl Iterator for SetBits<'_> {}
-///L0502
+///L0538
 ///`iter_set_rev`'s engine — the descending mirror. None-stable like
 ///`SetBits`
 pub struct SetBitsRev<'a> {
@@ -54,12 +54,12 @@ pub struct SetBitsRev<'a> {
     ///next position to test; wraps below 0 as the exhaustion sentinel
     pos:   usize,
 }
-///L0509
+///L0545
 impl Iterator for SetBitsRev<'_> {}
-///L0546
+///L0582
 ///bits of x moved to the even positions of a u64 (p → 2p)
 fn spread(x: u32) -> u64;
-///L0557
+///L0593
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +94,10 @@ mod tests {
     ///mid-word junctions
     #[test]
     fn rotate_mask_matches_naive();
+    ///copy_region/count_below vs naive at every word-edge combination —
+    ///misaligned starts, partial tails, empty and whole-range regions
+    #[test]
+    fn region_copy_matches_naive();
     ///reversed turn: bit p → 2p − [name ∈ upper half] — the upper-half
     ///names form the suffix past the wrap point (a2p(0) = offset), landing
     ///one slot DOWN. the down-ripple crosses word boundaries (a word's

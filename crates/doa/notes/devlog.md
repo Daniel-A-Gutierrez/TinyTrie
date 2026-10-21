@@ -5,7 +5,61 @@ This file used to be notes/doa.md
 # Gather Heuristic 
 gather n proportional to distance has an issue - it causes deserts to form of barren regions with no live items. adjacent free slots are useless, and huge dense islands make finding free space and moving it to where its needed expensive.
 
+ideas
+- water leveling - find a way to keep regional density uniform
+    - if one word has more zeros than another it steals some and distributes them? only if the difference is beyond some threshold.
+    - it does probably help perf for items to be closer to the start of a skip-stride 
+    - when moving a none, the only closed form feedback we give is a single none-stride. probably worth 1 'balance' op periodically for a word to keep the average insertion simple. 
+    - perhaps if a single 'word's occupancy exceeds our early growth threshold it will steal from neighbors, which in turn do the same?
+    - that one could be done in a close form with a copy of the mask word before rank-rebalancing. 
+    - low occupancy blocks steal items then? 
+- words as mini blocks? 
+    - store a vec<Translator> and do adaptation on a word by word basis.
+    - only works if we never move a block. we only append blocks then reuse the least significant bits as an in-mini-block address.
+    - skip list stops functioning in its current form, would need to become an actual list.  
 
+maybe a combination of both? 
+1. look for space in-word
+    - brick mask? 2 overlapping words per region? would it be faster? 
+        - nearest queries choose appropriate mask up front and can look further without changing words. 
+        - iteration just skip counts words, shouldnt really be slower. 
+        - more upkeep setting bits tho
+        - nah
+2. if word density is high relative to neighbors, bump items over. 
+3. if both neighbors density is also too high, rebalance region.
+    - balancing op 
+        - choose a free-stride to hit target density for a word/words.
+        - there should be hysterisis here - the whole collection will grow once it hits grow_threshold, so balance_threshold should be higher than it so we dont waste time doing it. 
+        - start scanning, for each word count ones. 
+            - continue scanning words until the region scanned has an average density <= total density. 
+            - rebalance the region with a stride that approximates density and is greater than density. 
+            - delta can be represented as from,to,free-stride.
+            - after rebalance region follows a repeating pattern of xx_xx_xx_ (free-stride=3 example for density < 66%). 
+
+Say the we decide on a ratio, FreeRatio = 3/4
+High then is 1 - (1 - (FREE_RATIO) / 2) = 7/8
+Low is 7/16
+none-stride is 2/(1-Free_Ratio)
+
+So in our free-search
+look for any space within word ?
+else If either neighbor density < High, borrow space
+else Search region (both directions) until total scanned region density <= FREE_RATIO
+if range span grows to 1/2 len just grow_rotate and go from the top. 
+else balance region with minimum stride to achieve density.  
+
+conversely when removing items, if density falls below LOW, borrow live items from neighboring blocks. 
+not gonna type it out bc idc that much but its the mirror pattern of insert. 
+
+should be possible to express a delta for this in closed form, the one alloc we need is a Vec<Mask Word>. If mask supported slicing and copy construction the new delta could just store a mask thats a clone of the region, and use its iter to get the positions of each moved item's from. 'to' can be calculated from a counter within the iterator and the none-stride. 
+
+
+
+
+## Trivial todos
+- investigate mask perf at u32 and u128
+    - result : theyre bad
+- remove for skipset
 
 
 # Treeblock
