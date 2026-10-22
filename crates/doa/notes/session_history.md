@@ -1218,3 +1218,82 @@ layout bench (BlockMap's design ancestry).
   unbenched); a clean-machine re-run of the contested 1M/100M cells;
   skipset removal; the 5/6 ceiling threshold-luck sweep carried from
   2026-10-20.
+
+## 2026-10-21 (b) — ceiling bank escape, the spot hint, and the arena plan
+
+the session opened the arena final form (many small blocks over one index). this entry
+records the landed pieces AND the multi-session plan; later sessions append below it.
+
+- the plan (order fixed; each phase is a session-scale chunk):
+  - phase 1 — deltas into the block: `Deltas` becomes a `BlockSet`/`BlockMap` field
+    (`deltas(&mut self)` accessor), the consumer-supplied `&mut Deltas` parameter dies
+    on every tier, `iter` drains (exhaust = auto-clear; partial consumption still trips
+    the pending assert), and the event payloads (Gather's slide Vec, Rebalance's region
+    Mask) become reused scratch — the per-bank/per-rebalance allocs die. the translator
+    snapshot STAYS (era-stability for events held across mutations — bimap's
+    pending-on-Err).
+  - phase 2 — runs: banked holes placed by run direction (centered default, a signed
+    Σ(pos−prev) streak sum biases), hot point migrates toward a block edge.
+  - phase 3 — the arena: Vec of ≤256-slot BlockSets (A=u8), `BTreeMap<K, AA>` index v0,
+    boundary-spawn split trick (append/prepend splits carry NO renames — k never
+    landed), mid-gap splits and cross-block bumps share ONE closed-form event: a
+    position predicate + the two translator snapshots. split trigger v0 = len == 256
+    (cap-ceiling splits deferred until measured). arena-driven reversal is
+    load-bearing: the z-gate cannot fire post-split (lifetime pos_sum after a dense
+    128-prefill needs len > 255 — unreachable under the 256 ceiling).
+  - phase 4 — presumed-SE reversal test (drops `pos_sq_sum`): measurement-GATED — the
+    uniform-null z test fires on diluted front traffic (~10% front hits + 90% uniform
+    reads ~5σ) that the observed-variance gate correctly holds; structural, not
+    tunable away.
+- landed (blockset): the len/2 bank gate's ceiling escape (`cap >= max_capacity`
+  allows the long fetch — the gate's "mint instead" premise is void at the name
+  ceiling); the stranded-holes ceiling phase collapsed from ~31 same-length slides to
+  one bank pass (~7050 → <1000 moved, `ceiling_banks_stranded_holes` bounds it). the
+  streak-hinted spot search `spot_near` (blockset.rs): bounded walk 2·FREE_STRIDE from
+  `last_insert` on streak > 0, returns bsearch's canonical boundary, falls back on any
+  miss; agreement asserted (`spot_near_agrees_with_bsearch`, both directions, holed);
+  the staleness diagnostic answered banking-does-NOT-break-streaks
+  (`streak_anchor_staleness`). new bench `mid_band` (dense 128 prefill + desc/asc
+  nested bands) — keep or drop at session end.
+- measured (same machine-day; word-size and small-block cells ran in a throwaway
+  agent worktree — w16/w32 feature-gated experiment, NOT merged):
+
+  word-size sweep (BlockSet insert/lookup, ns medians; u128 previously measured worse):
+
+  | cell | u16 | u32 | u64 |
+  |---|---|---|---|
+  | random insert 1M | 203.3 | 174.5 | 169.5 |
+  | runs insert 1M | 130.1 | 116.8 | 109.9 |
+  | random lookup 1M | 197.5 | 161.6 | 156.0 |
+  | random insert 1k (cache-resident) | 48.2 | 44.0 | 48.0 |
+  | runs insert 1k (cache-resident) | 65.2 | 52.8 | 63.3 |
+
+  small-block (u8 addrs, cap 256; MIDPOINT 128 → turn-refused past cap 128):
+
+  | geometry | asc | desc | desc pre-flipped |
+  |---|---|---|---|
+  | fresh fill 256 | 9.2 | 17.2 | — |
+  | 128-prefill, run at tail / below-min | 9.0 | 62.5 | 9.3 |
+  | 128-prefill, inside run | 34.2 | 72.0 | 34.0 |
+  | 200-prefill, below-min | 8.9 | 70.1 | 9.8 |
+
+  spot_near A/B (10k, u64 keys, gate off → on): runs insert 84.5 → 59.5 (−30%);
+  random insert 89.5 → 87.6 (wash); mid-band at 256-cap 87.8/93.5 → 82.0/86.8 —
+  the hint's win scales with the bsearch it kills (sparse-mask probes at DRAM scale).
+  mid-band direction is SYMMETRIC (desc 87.8 vs asc 93.5, 0 flips — the z-gate never
+  fires mid-band); the desc penalty is edge-only.
+- decided:
+  - u64 mask words stay (rejected u16 — loses everywhere, ~10× bank events dig
+    deserts; rejected u32 — wins only cache-resident, pays 2–4× loads on sparse-zone
+    probes at DRAM scale). word size becomes a generic through mask consumers later.
+  - split feedback = the position predicate + to_translator (rejected: explicit
+    (BA,BA) pair Vecs — strictly dominated; rejected: arithmetic name offset —
+    rotation-fragile, two code paths). at-split blocks are DENSE (len == cap == 256 ⇒
+    mask full) so the moved run is contiguous positions — that is what makes the
+    closed form possible.
+  - index v0 = BTreeMap<K, AA> (rejected: native tiered index now — the K: Ord cost is
+    accepted for v0; the eventual index compares min-clones).
+  - fork 2 remainder OPEN: (AA,BA) pair vs packed opaque addr as the user-facing form.
+- deferred: the (AA,BA) packing representation; cap-ceiling split trigger (vs len ==
+  256 — the ceiling fix removed the worst of the turn-refused grind, re-measure
+  first); blockmap's ladder port inherits the ceiling escape when it happens.

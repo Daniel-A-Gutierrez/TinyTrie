@@ -10,7 +10,7 @@
 //!reported over its completed prefix (marked `[partial done]`). len +
 //!strict order gated before a rep counts.
 
-use doa::blockset::{BlockSet, Deltas};
+use doa::blockset::BlockSet;
 use sorted_vec::SortedSet;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -148,14 +148,13 @@ fn check_order(keys: impl Iterator<Item = u64>) {
 fn insert_block(keys: &[u64]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut set = BlockSet::<Item, u32>::new();
-        let mut deltas = Deltas::new();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for &k in keys {
-            set.insert(Item::new(k), &mut deltas)
+            set.insert(Item::new(k))
                 .unwrap_or_else(|k| panic!("insert failed at {}", k.key));
-            deltas.clear();
+            set.deltas().clear();
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;
@@ -220,10 +219,9 @@ fn lookup_block(keys: &[u64], probes: &[u64]) -> Cell {
     //workload-order build — the block's layout (Asc/Desc, holes) is the
     //workload's
     let mut set = BlockSet::<Item, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        set.insert(Item::new(k), &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(Item::new(k)).unwrap();
+        set.deltas().clear();
     }
     timed_probes(probes, |item| {
         black_box(set.contains(item));
@@ -277,10 +275,9 @@ fn timed_probes(probes: &[u64], mut probe: impl FnMut(&Item)) -> Cell {
 ///timing). a pass is ms-scale — the deadline is checked between passes
 fn scan_block(keys: &[u64]) -> Cell {
     let mut set = BlockSet::<Item, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        set.insert(Item::new(k), &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(Item::new(k)).unwrap();
+        set.deltas().clear();
     }
     assert_eq!(set.len(), keys.len());
     check_order(set.iter().map(|i| i.key));

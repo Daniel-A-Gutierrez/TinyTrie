@@ -12,7 +12,7 @@
 //!next) and back (seek_after max + prev) — ns per element.
 
 use doa::blockmap::BlockMap;
-use doa::blockset::{BlockSet, Deltas};
+use doa::blockset::BlockSet;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
@@ -345,12 +345,11 @@ fn main() {
         let mut bset = BlockSet::<Item, u32>::new();
         let mut tmap = BTreeMap::new();
         let mut tset = BTreeSet::new();
-        let mut deltas = Deltas::new();
         for &k in keys {
-            bmap.insert(Item::new(k), k, &mut deltas).unwrap();
-            deltas.clear();
-            bset.insert(Item::new(k), &mut deltas).unwrap();
-            deltas.clear();
+            bmap.insert(Item::new(k), k).unwrap();
+            bmap.deltas().clear();
+            bset.insert(Item::new(k)).unwrap();
+            bset.deltas().clear();
             tmap.insert(Item::new(k), k);
             tset.insert(Item::new(k));
         }

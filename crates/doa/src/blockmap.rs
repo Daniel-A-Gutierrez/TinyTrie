@@ -12,7 +12,6 @@ use std::cmp::Ordering;
 use std::mem::MaybeUninit;
 
 use crate::blockset::{Deltas, FREE_STRIDE, L2_BYTES, TURN_DEN, TURN_NUM};
-use crate::blockset::NoneSlide;
 use crate::translator::Translator;
 use crate::index::*;
 use crate::mask::{Mask, MaskCursor, SetBits, SetBitsRev};
@@ -26,6 +25,8 @@ pub struct BlockMap<K, V, A> {
     len:       usize,
     ///running sum of placed slot positions — the reversal tier's signal
     pos_sum:   u64,
+    ///the block's own event slot — the mutation feedback (see blockset)
+    deltas:    Deltas<A>,
 }
 
 impl<K, V, A> Drop for BlockMap<K, V, A> {
@@ -49,7 +50,13 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
             mask:      Mask::new(),
             len:       0,
             pos_sum:   0,
+            deltas:    Deltas::new(),
         }
+    }
+
+    ///the block's event slot — pull `iter` to apply (exhausting clears)
+    pub fn deltas(&mut self) -> &mut Deltas<A> {
+        &mut self.deltas
     }
 
     pub fn len(&self) -> usize {
@@ -170,10 +177,9 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
         }
     }
 
-    ///deltas must be empty (applied + cleared) — panics if pending. Err
-    ///returns (k, v) (dup, or out of names)
-    pub fn insert(&mut self, k: K, v: V, deltas: &mut Deltas<A>) -> Result<A, (K, V)> {
-        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+    ///Err returns (k, v) (dup, or out of names)
+    pub fn insert(&mut self, k: K, v: V) -> Result<A, (K, V)> {
+        assert!(!self.deltas.is_pending(), "pending deltas: apply + exhaust before reuse");
         if self.keys.is_empty() {
             return Ok(self.insert_first(k, v));
         }
@@ -193,7 +199,7 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
             return Ok(a);
         }
         else {
-            let p = self.open(spot, deltas);
+            let p = self.open(spot);
             let a = self.place(k, v, p);
             Ok(a)
         }
@@ -251,7 +257,7 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
 
     ///open a slot at/near `spot`: turns and gathers, escalating until a
     ///hole opens (see blockset::open)
-    fn open(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
+    fn open(&mut self, spot: Pos) -> Pos {
         let mut spot = spot;
         //preemptive turn past 7/8 (see blockset::open)
         if self.len.wrapping_mul(TURN_DEN) > self.keys.len().wrapping_mul(TURN_NUM)
@@ -262,7 +268,7 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
                 spot = self.turned_spot(old, spot);
             }
         }
-        if let Some(p) = self.gather_slots(spot, deltas) {
+        if let Some(p) = self.gather_slots(spot) {
             return p;
         }
         //mask full: tail push within FREE_STRIDE, else a turn (see
@@ -277,7 +283,7 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
                 self.push_slot();
             }
         }
-        self.gather_slots(spot, deltas).expect("mask had a hole minted")
+        self.gather_slots(spot).expect("mask had a hole minted")
     }
 
     ///k's spot under a completed turn (see blockset::turned_spot)
@@ -415,10 +421,10 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
 
     ///open a slot at/near `spot`; None ⇒ hole-free mask. the opened slot
     ///arrives as one `Delta` event (NoneSlide or Gather — see blockset)
-    fn gather_slots(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Option<Pos> {
+    fn gather_slots(&mut self, spot: Pos) -> Option<Pos> {
         //k's slot already open — no fetch, no slide (see blockset)
         if spot.0 < self.cap() && !self.mask.get(spot.0) {
-            deltas.record_none_slide(self.translator, spot, spot);
+            self.deltas.record_none_slide(self.translator, spot, spot);
             return Some(spot);
         }
         //the nearest hole's distance sets the fetch (see blockset)
@@ -427,19 +433,12 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
         let open = if right { spot.0 } else { spot.0 - 1 };
         if hole.abs_diff(spot.0) < FREE_STRIDE {
             self.slide_hole(hole, open);
-            deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
+            self.deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
             return Some(Pos(open));
         }
         let holes = self.fetch_holes(spot, right, 1 + hole.abs_diff(spot.0) / FREE_STRIDE);
         self.compact_gather(spot, open, right, &holes);
-        deltas.record_gather(
-            self.translator,
-            holes
-                .iter()
-                .enumerate()
-                .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
-                .collect(),
-        );
+        self.deltas.record_gather(self.translator, open, right, &holes);
         Some(Pos(open))
     }
 
@@ -679,9 +678,12 @@ impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {
 mod tests {
     use super::*;
 
-    ///apply translated deltas as name swaps, in the given order
-    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64)>, deltas: &Deltas<A>) {
+    ///apply translated deltas as name swaps, in the given order; returns
+    ///the pair count (assert-and-apply in one pull)
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64)>, deltas: &mut Deltas<A>) -> usize {
+        let mut pairs = 0;
         for (from, to) in deltas.iter() {
+            pairs += 1;
             for (a, _, _) in &mut *holder {
                 if *a == from {
                     *a = to;
@@ -689,6 +691,7 @@ mod tests {
                 }
             }
         }
+        pairs
     }
 
     fn insert_all(
@@ -696,12 +699,10 @@ mod tests {
     ) -> (BlockMap<u64, u64, u8>, Vec<(u8, u64, u64)>) {
         let mut map = BlockMap::new();
         let mut holder = Vec::new();
-        let mut deltas = Deltas::new();
         for (k, v) in entries {
-            match map.insert(k, v, &mut deltas) {
+            match map.insert(k, v) {
                 Ok(addr) => {
-                    apply(&mut holder, &deltas);
-                    deltas.clear();
+                    apply(&mut holder, map.deltas());
                     holder.push((addr, k, v));
                 }
                 Err((k, v)) => panic!("insert of ({k}, {v}) failed"),
@@ -750,7 +751,6 @@ mod tests {
     #[test]
     fn mixed_ops_torture() {
         let mut map = BlockMap::<u64, u64, u16>::new();
-        let mut d = Deltas::new();
         let mut holder = Vec::new();
         let mut s = 0x2545_F491_4F6C_DD1Du64;
         let mut rnd = move || {
@@ -767,13 +767,12 @@ mod tests {
                     (i / 40) * 700 + rnd() % 300
                 };
                 let v = k.wrapping_mul(3);
-                match map.insert(k, v, &mut d) {
+                match map.insert(k, v) {
                     Ok(a) => {
-                        apply(&mut holder, &d);
-                        d.clear();
+                        apply(&mut holder, map.deltas());
                         holder.push((a, k, v));
                     }
-                    Err(_) => d.clear(),
+                    Err(_) => map.deltas().clear(),
                 }
             } else {
                 let j = (rnd() % holder.len() as u64) as usize;
@@ -796,18 +795,17 @@ mod tests {
     #[test]
     fn appends_dense_mid_insert_turns() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
         for k in (0..100u64).map(|i| i * 2) {
-            map.insert(k, k + 500, &mut d).unwrap();
-            d.clear();
+            map.insert(k, k + 500).unwrap();
+            map.deltas().clear();
         }
         assert!(map.cap() < 128, "cap {} — turned instead of pushing back", map.cap());
         assert_eq!(map.cap() - map.len(), 0, "appends left holes");
-        map.insert(101, 601, &mut d).unwrap();
-        d.clear();
+        map.insert(101, 601).unwrap();
+        map.deltas().clear();
         assert_eq!(map.cap(), 200, "mid insert into full mask must turn");
-        map.insert(103, 603, &mut d).unwrap();
-        d.clear();
+        map.insert(103, 603).unwrap();
+        map.deltas().clear();
         assert_eq!(map.cap(), 200, "second mid insert must not turn");
         let keys: Vec<u64> = map.iter().map(|(k, _)| *k).collect();
         let mut sorted = keys.clone();
@@ -825,12 +823,10 @@ mod tests {
     #[test]
     fn gather_banks_holes_by_distance() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
         let mut holder = Vec::new();
         for k in (0..=10u64).chain(60..=89).chain(200..=214) {
-            let a = map.insert(k, k + 100, &mut d).unwrap();
-            apply(&mut holder, &d);
-            d.clear();
+            let a = map.insert(k, k + 100).unwrap();
+            apply(&mut holder, map.deltas());
             holder.push((a, k, k + 100));
         }
         //holes at pos 35..=50 — the 35..40 half is 24 from the spot of
@@ -839,23 +835,29 @@ mod tests {
             map.remove(map.find(&k).unwrap());
             holder.retain(|(_, hk, _)| *hk != k);
         }
-        let a = map.insert(30, 130, &mut d).unwrap();
+        let a = map.insert(30, 130).unwrap();
         //identity translator: one hop-4 pair per moved element, farthest
-        //first (see blockset's version)
+        //first (see blockset's version). the collect drains — apply the
+        //collected pairs to the holder directly
+        let pairs: Vec<_> = map.deltas().iter().collect();
         assert_eq!(
-            d.iter().collect::<Vec<_>>(),
+            pairs,
             (11u8..=34).rev().map(|q| (q, q + 5)).collect::<Vec<_>>(),
             "24 moved elements, one hop-5 pair each"
         );
-        apply(&mut holder, &d);
-        d.clear();
+        for (from, to) in pairs {
+            for (addr, _, _) in &mut holder {
+                if *addr == from {
+                    *addr = to;
+                    break;
+                }
+            }
+        }
         holder.push((a, 30, 130));
         assert_eq!(map.cap(), 56, "gather must not turn");
         for k in [31, 32, 33] {
-            let a = map.insert(k, k + 100, &mut d).unwrap();
-            assert_eq!(d.iter().count(), 0, "banked hole should absorb insert {k}");
-            apply(&mut holder, &d);
-            d.clear();
+            let a = map.insert(k, k + 100).unwrap();
+            assert_eq!(apply(&mut holder, map.deltas()), 0, "banked hole should absorb insert {k}");
             holder.push((a, k, k + 100));
         }
         check(&map, &holder, 44);
@@ -865,14 +867,13 @@ mod tests {
     #[test]
     fn front_insert_renames_min() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
-        map.insert(10, 110, &mut d).unwrap();
-        d.clear();
-        map.insert(20, 120, &mut d).unwrap();
-        d.clear();
-        let a = map.insert(5, 105, &mut d).unwrap();
+        map.insert(10, 110).unwrap();
+        map.deltas().clear();
+        map.insert(20, 120).unwrap();
+        map.deltas().clear();
+        let a = map.insert(5, 105).unwrap();
         assert_eq!(a, 0);
-        assert_eq!(d.iter().collect::<Vec<_>>(), vec![(1, 2), (0, 1)]);
+        assert_eq!(map.deltas().iter().collect::<Vec<_>>(), vec![(1, 2), (0, 1)]);
         assert_eq!(map.get(0), Some((&5, &105)));
         assert_eq!(map.get(1), Some((&10, &110)));
         assert_eq!(map.get(2), Some((&20, &120)));
@@ -883,14 +884,13 @@ mod tests {
     #[test]
     fn front_insert_back_opens() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
         for k in [10, 20, 30, 40] {
-            map.insert(k, k + 1, &mut d).unwrap();
-            d.clear();
+            map.insert(k, k + 1).unwrap();
+            map.deltas().clear();
         }
-        let a = map.insert(5, 6, &mut d).unwrap();
+        let a = map.insert(5, 6).unwrap();
         assert_eq!(a, 0);
-        assert_eq!(d.iter().collect::<Vec<_>>(), vec![(3, 4), (2, 3), (1, 2), (0, 1)]);
+        assert_eq!(map.deltas().iter().collect::<Vec<_>>(), vec![(3, 4), (2, 3), (1, 2), (0, 1)]);
         assert_eq!(map.get(0), Some((&5, &6)));
         assert_eq!(map.get(1), Some((&10, &11)));
         assert_eq!(map.get(4), Some((&40, &41)));
@@ -900,9 +900,8 @@ mod tests {
     #[test]
     fn duplicates_rejected() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
-        map.insert(1, 11, &mut d).unwrap();
-        assert_eq!(map.insert(1, 99, &mut d), Err((1, 99)));
+        map.insert(1, 11).unwrap();
+        assert_eq!(map.insert(1, 99), Err((1, 99)));
         assert_eq!(map.len(), 1);
         assert_eq!(map.value(&1), Some(&11), "rejected insert must not overwrite");
     }
@@ -912,25 +911,23 @@ mod tests {
     #[should_panic(expected = "pending deltas")]
     fn insert_panics_on_pending_deltas() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
-        map.insert(1, 11, &mut d).unwrap();
-        map.insert(2, 12, &mut d).unwrap();
-        map.insert(3, 13, &mut d).unwrap();
+        map.insert(1, 11).unwrap();
+        map.insert(2, 12).unwrap();
+        map.insert(3, 13).unwrap();
     }
 
     #[test]
     fn remove_and_reinsert() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
         for k in 0..50u64 {
-            map.insert(k, k * 2, &mut d).unwrap();
-            d.clear();
+            map.insert(k, k * 2).unwrap();
+            map.deltas().clear();
         }
         let a = map.find(&25).unwrap();
         assert_eq!(map.remove(a), Some((25, 50)));
         assert_eq!(map.remove(a), None);
         assert_eq!(map.remove_key(&25), None);
-        map.insert(25, 50, &mut d).unwrap();
+        map.insert(25, 50).unwrap();
         let mut keys: Vec<u64> = map.iter().map(|(k, _)| *k).collect();
         keys.sort();
         assert_eq!(keys, (0..50).collect::<Vec<_>>());
@@ -940,10 +937,9 @@ mod tests {
     #[test]
     fn value_lookup_and_mut() {
         let mut map = BlockMap::<u64, u64, u8>::new();
-        let mut d = Deltas::new();
         for k in (0..60u64).rev() {
-            map.insert(k, k + 1, &mut d).unwrap();
-            d.clear();
+            map.insert(k, k + 1).unwrap();
+            map.deltas().clear();
         }
         assert!(map.iter().all(|(k, v)| *v == k + 1));
         *map.value_mut(&30).unwrap() = 999;
@@ -1009,12 +1005,11 @@ mod tests {
     #[test]
     fn cursor_matches_sorted_model() {
         let mut map = BlockMap::<u64, u64, u16>::new();
-        let mut d = Deltas::new();
         //37 coprime 67 ⇒ distinct keys, 7 gaps for hole spots (sized for miri)
         for i in 0..60u64 {
             let k = (i * 37 + 11) % 67;
-            map.insert(k, k * 7 + 3, &mut d).unwrap();
-            d.clear();
+            map.insert(k, k * 7 + 3).unwrap();
+            map.deltas().clear();
         }
         for k in [11u64, 48, 18, 59, 66] {
             if let Some(a) = map.find(&k) {
@@ -1049,9 +1044,7 @@ mod tests {
         assert_eq!(c.next(), None);
         assert_eq!(c.prev(), None);
         let mut map = map;
-        let mut d = Deltas::new();
-        map.insert(7, 70, &mut d).unwrap();
-        d.clear();
+        map.insert(7, 70).unwrap();
         let mut c = map.seek(&5);
         assert_eq!(c.next(), Some((&7, &70)));
         assert_eq!(c.next(), None);

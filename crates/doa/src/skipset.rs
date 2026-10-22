@@ -223,14 +223,14 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
         self.base.get(addr)
     }
 
-    ///deltas protocol unchanged — the base's events pass through. with
-    ///tiers live: reversal is OURS (never the base's mid-insert flip),
-    ///the tier descent bounds insert_at's search, and a ladder turn
-    ///re-syncs via wholesale window re-read (maintain)
-    pub fn insert(&mut self, k: K, deltas: &mut Deltas<A>) -> Result<A, K> {
-        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+    ///the deltas protocol passes through the base's own slot — apply +
+    ///exhaust before the next insert. with tiers live: reversal is OURS
+    ///(never the base's mid-insert flip), the tier descent bounds
+    ///insert_at's search, and a ladder turn re-syncs via wholesale window
+    ///re-read (maintain)
+    pub fn insert(&mut self, k: K) -> Result<A, K> {
         if self.store.is_none() {
-            return self.base.insert(k, deltas);
+            return self.base.insert(k);
         }
         if self.base.should_reverse() {
             self.base.reverse();
@@ -242,19 +242,24 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
             {
                 self.ops.tail_pushes += 1;
             }
-            self.base.push_beyond(k, deltas)
+            self.base.push_beyond(k)
         } else {
             let (blo, bhi) = self.window_of(&k);
             // SAFETY: the window contract holds — no live element before
             // `blo` in key order has key ≥ k, none at/after `bhi` has
             // key ≤ k; insert_at detects dups itself (Err before
             // archiving)
-            unsafe { self.base.insert_at(k, deltas, blo, bhi) }
+            unsafe { self.base.insert_at(k, blo, bhi) }
         };
         result.map(|(addr, placed)| {
-            self.maintain(placed.0, deltas);
+            self.maintain(placed.0);
             addr
         })
+    }
+
+    ///the base's event slot — the deltas protocol surface
+    pub fn deltas(&mut self) -> &mut Deltas<A> {
+        self.base.deltas()
     }
 
     ///bench phase-ablation hooks (see benches/skipset.rs): decompose the
@@ -263,13 +268,13 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
     ///pos_of (the full path gets the Pos from insert_at) — a ~1.5ns
     ///overcount on the maintenance delta. NOT API
     #[doc(hidden)]
-    pub fn insert_maintain_only(&mut self, k: K, deltas: &mut Deltas<A>) -> Result<A, K> {
-        let result = self.base.insert(k, deltas);
+    pub fn insert_maintain_only(&mut self, k: K) -> Result<A, K> {
+        let result = self.base.insert(k);
         match &result {
             Ok(addr) => {
                 if self.store.is_some() {
                     let placed = self.base.pos_of(*addr);
-                    self.maintain(placed, deltas);
+                    self.maintain(placed);
                 }
             }
             //a dup Err can still have auto-flipped the base mid-insert —
@@ -285,12 +290,12 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
 
     ///descent runs (and is discarded) before the base's own search
     #[doc(hidden)]
-    pub fn insert_descent_only(&mut self, k: K, deltas: &mut Deltas<A>) -> Result<A, K> {
+    pub fn insert_descent_only(&mut self, k: K) -> Result<A, K> {
         if self.store.is_some() {
             let (blo, bhi) = self.window_of(&k);
             std::hint::black_box((blo, bhi));
         }
-        self.insert_maintain_only(k, deltas)
+        self.insert_maintain_only(k)
     }
 
     ///post-insert tier upkeep: silent-move sync, grid extension, the
@@ -301,7 +306,7 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
     ///records its slides like any insert — either way the union covers
     ///the placed item. the no-record path (a dense-tail push) updates
     ///the window's first iff nothing live precedes the placed item
-    fn maintain(&mut self, placed: usize, deltas: &Deltas<A>) {
+    fn maintain(&mut self, placed: usize) {
         //silent-move sync: the epoch moved since the last sync (a turn
         //inside the ladder, or the manual flip before the descent)
         if self.epoch != self.base.epoch() {
@@ -315,7 +320,7 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
         }
         let mut moved = false;
         let (mut lo, mut hi) = (usize::MAX, 0);
-        for slide in deltas.slides() {
+        for slide in self.base.deltas().slides() {
             lo = lo.min(slide.from.0.min(slide.to.0));
             hi = hi.max(slide.from.0.max(slide.to.0));
             moved = true;
@@ -683,16 +688,15 @@ mod tests {
     ///maintenance must survive every subsequent slide, turn and flip
     fn torture(keys: impl IntoIterator<Item = u64>) {
         let mut set = SkipSet::<u64, u16>::new();
-        let mut deltas = Deltas::new();
         let mut model = BTreeSet::new();
         let mut live = Vec::new();
         for (i, key) in keys.into_iter().enumerate() {
             //random streams carry dups — the model tracks only the accepted
-            if set.insert(key, &mut deltas).is_err() {
-                deltas.clear();
+            if set.insert(key).is_err() {
+                set.deltas().clear();
                 continue;
             }
-            deltas.clear();
+            set.deltas().clear();
             model.insert(key);
             live.push(key);
             if i == 40 {
@@ -715,15 +719,14 @@ mod tests {
     fn maintenance_paths_census() {
         let report = |name: &str, keys: Vec<u64>| {
             let mut set = SkipSet::<u64, u32>::new();
-            let mut deltas = Deltas::new();
             for &key in &keys[..100] {
-                set.insert(key, &mut deltas).unwrap();
-                deltas.clear();
+                set.insert(key).unwrap();
+                set.deltas().clear();
             }
             set.rebuild();
             for &key in &keys[100..] {
-                set.insert(key, &mut deltas).unwrap();
-                deltas.clear();
+                set.insert(key).unwrap();
+                set.deltas().clear();
             }
             assert_eq!(set.len(), keys.len());
             let ops = &set.ops;
@@ -801,10 +804,9 @@ mod tests {
     #[test]
     fn tier_sampling() {
         let mut set = SkipSet::<u64, u16>::new();
-        let mut deltas = Deltas::new();
         for key in (0..80u64).map(|i| i * 3 + 1) {
-            set.insert(key, &mut deltas).unwrap();
-            deltas.clear();
+            set.insert(key).unwrap();
+            set.deltas().clear();
         }
         set.rebuild();
         let store = set.store.as_ref().unwrap();
@@ -840,36 +842,35 @@ mod tests {
     #[test]
     fn incremental_maintenance() {
         let mut set = SkipSet::<u64, u16>::new();
-        let mut deltas = Deltas::new();
         for key in (0..100u64).map(|i| i * 2) {
-            set.insert(key, &mut deltas).unwrap();
-            deltas.clear();
+            set.insert(key).unwrap();
+            set.deltas().clear();
         }
         set.rebuild();
         for key in (100..200u64).map(|i| i * 2) {
-            set.insert(key, &mut deltas).unwrap();
-            deltas.clear();
+            set.insert(key).unwrap();
+            set.deltas().clear();
         }
         assert!(set.contains(&198), "creep-maintained tiers");
         assert!(set.contains(&0));
         //mid insert into the dense block: turn fires → window re-read
-        set.insert(45, &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(45).unwrap();
+        set.deltas().clear();
         assert!(set.contains(&45), "after the turn");
         assert!(set.contains(&198));
         //post-turn holes absorb mid inserts — maintained, not rebuilt
-        set.insert(91, &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(91).unwrap();
+        set.deltas().clear();
         assert!(set.contains(&91));
         for key in (200..250u64).map(|i| i * 2) {
-            set.insert(key, &mut deltas).unwrap();
-            deltas.clear();
+            set.insert(key).unwrap();
+            set.deltas().clear();
         }
         assert!(set.contains(&498));
         //descending bait flips the block — re-read, no rebuild
         for key in (500..560u64).rev() {
-            set.insert(key, &mut deltas).unwrap();
-            deltas.clear();
+            set.insert(key).unwrap();
+            set.deltas().clear();
         }
         assert!(set.contains(&500) && set.contains(&559));
         let keys: Vec<u64> = set.iter().copied().collect();

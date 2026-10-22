@@ -2,6 +2,74 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Deltas
+up till now deltas has been something supplied by the consumer - but its a necessary part of the block's state. 
+i think we make it a part of the block, and provide it by a call to fn deltas(&mut self) -> &mut Deltas. 
+When deltas iter exhausts or its otherwise used up, it sets its state to empty. 
+with that, deltas can store a &self right, like iter(). 
+with that maybe we can avoid some allocations? 
+
+# Runs Optimization
+1. i want runs 'hot point' to naturally migrate towards an end, either 0 or len, by bumping.
+
+  say we bank 10 slots after sequential insertions in the middle of a block. do the 10 go at 32..42, 22..32, or 27..37? if theyre monotonically increasing, we want the prev element to be on the left of
+  the gap, likewise if theyre monotonically decreasing we want the greater element on the right of the gap. when bsearching i believe we look for the first item gt K and place the item to the left of it
+  right? thats ideal for decreasing runs, but suboptimal for increasing runs. also since we can go to the tail for free space, i think all runs will eventually migrate right... could be wrong though.
+
+  instead if we place an item in the middle of the gap between lt and gt, then we get log(bank) free inserts regardless of run direction, then cheap ones after that, with more sparsity on the left if
+  the series is increasing and on the right if its decreasing. or, we only slap the new K in the middle when we bank, afterward we go back to 'insert after prev', which gets us bank/2 free slots and bank/2 slots at bank/2. 
+
+  even better - this avoids spuriously breaking our streak, so long as the free space is roughly centered on the position we wanted to make space at. 
+
+  one thing we can do - when doing a far-run for a bank (not a balance, no point), 0 also counts as a location we can get space from - by shoving items from the blocks low slots to the prev blocks high
+  slots, or by creating a previous block otherwise. Those items would've already had to be repointed if they shifted via a delta anyway, and the computer doesnt care how far away the location we're
+  copying them to is. Better if its not overlapping actually right?
+
+  we want the 'hot end' of the run to end up at the edge of a block. so if we're on a streak and we need space, bank, making space from the nearest end. 
+  
+  how about this - while we're on a streak, we keep a signed sum of pos-prev. when the streak ends we set it to 0. 
+  that way we can figure out the direction of runs. 
+
+  if we're not on a run, we dont bump.
+  the block just says it wants to bump off some items between K and an end, the arena decides if thats a split or a bump to a existing block.
+  the cost - O(neighbor len)  if the insert direction is a mismatch for the neighbor's direction.
+  ie bumping right when the right neighbor is an append block. it can eat the repoints by offsetting the translator but its still a O(len) slide. 
+  conversely bumping left when the neighbor is append or bumping right when the neighbor is prepend are cheap and fine. 
+  In the off-strategy case, we just make a new block for the bumped items instead. 
+
+  i actually think measuring the average or sq avg pos-prev may be more informative than the block variance.
+  maybe we dont need to store block variance but instead refute a random hypothesis. presume the variance from len and if avg is 2 sigma off from it in the wrong direction reverse.
+  would have to test that for spurious reversals though. 
+
+
+
+# Block Arena
+Denser = better at lookup, which ironically makes insertion faster to an extent. 
+Random really likes space to be evenly distributed though. 
+How do i break 1 big block up into many little blocks...
+
+Max cap = 256
+The block arena is a linked list bottom with a skip list over it.
+The linked list lives in a vec. 
+
+So our arena has a Vec<ArenaBlock> where Arena block has min() and max() K.
+So if the block::A is u8, blocks cap is 256. if its a u16 their cap is 65536. etc. 
+Lets call that the arena address and the block address - AA and BA, where BA is the one with the familiar translator bits. 
+Actually we dont need the 'max' do we , just the min. 
+But the blocks arent ordered in the arena, each points to its next but their index doesnt imply ordering. 
+Its best if the skip list is dense and in order though so i guess it stores (k, AA)
+A full identifying address then for a key is (AA,BA). 
+
+the intent for later is that individual blocks can be kept unloaded and on disk - just their arena block representation with that blocks min K stored in the arena. 
+but since K's are stored in the block, the handle alone cant be enough to compare them against a query key, so they need to be cloned. 
+also of course when the min of a block changes it needs to update the arena. 
+i suppose we can just check the first value in the block before and after. 
+
+We're gaining an additional lever for control that the blocks dont pull on their own - splitting and bumping. 
+Try insert has to be made on skipset and thus on blockset - when insertion fails on a block, due to capacity exhaustion (cant grow, cant rebalance, 100% occupancy...)
+we put a new free block at the end of the arena, dump items into it according to the insertion placement, and splice it into the linked list and skip list. 
+
+
 # Gather Heuristic 
 gather n proportional to distance has an issue - it causes deserts to form of barren regions with no live items. adjacent free slots are useless, and huge dense islands make finding free space and moving it to where its needed expensive.
 

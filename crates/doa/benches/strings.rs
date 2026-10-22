@@ -8,7 +8,7 @@
 //!100). each structure × workload cell capped at RUN_BUDGET (partial reps
 //!reported over the completed prefix).
 
-use doa::blockset::{BlockSet, Deltas};
+use doa::blockset::BlockSet;
 use sorted_vec::SortedSet;
 use std::collections::BTreeSet;
 use std::hint::black_box;
@@ -113,14 +113,13 @@ fn checksum(items: impl Iterator<Item: AsRef<str>>, seed: u64) -> u64 {
 fn insert_block(keys: &[String]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut set = BlockSet::<String, u32>::new();
-        let mut deltas = Deltas::new();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for k in keys {
-            set.insert(k.clone(), &mut deltas)
+            set.insert(k.clone())
                 .unwrap_or_else(|k| panic!("insert failed at {k}"));
-            deltas.clear();
+            set.deltas().clear();
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;
@@ -184,10 +183,9 @@ fn insert_btree(keys: &[String]) -> Cell {
 fn lookup_block(keys: &[String], probes: &[String]) -> Cell {
     //workload-order build — the block's layout is the workload's
     let mut set = BlockSet::<String, u32>::new();
-    let mut deltas = Deltas::new();
     for k in keys {
-        set.insert(k.clone(), &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(k.clone()).unwrap();
+        set.deltas().clear();
     }
     timed_probes(probes, |p| {
         black_box(set.contains(p));
@@ -239,10 +237,9 @@ fn timed_probes(probes: &[String], mut probe: impl FnMut(&String)) -> Cell {
 ///seq read: iter first→last, ns per element
 fn scan_block(keys: &[String]) -> Cell {
     let mut set = BlockSet::<String, u32>::new();
-    let mut deltas = Deltas::new();
     for k in keys {
-        set.insert(k.clone(), &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(k.clone()).unwrap();
+        set.deltas().clear();
     }
     assert_eq!(set.len(), keys.len());
     check_order(set.iter());
@@ -309,11 +306,10 @@ fn main() {
             //String-cmp regression must not time silently-wrong lookups
             {
                 let mut set = BlockSet::<String, u32>::new();
-                let mut deltas = Deltas::new();
                 let mut model = BTreeSet::new();
                 for key in &keys {
-                    set.insert(key.clone(), &mut deltas).unwrap();
-                    deltas.clear();
+                    set.insert(key.clone()).unwrap();
+                    set.deltas().clear();
                     model.insert(key.clone());
                 }
                 for probe in probes.iter().take(1000) {

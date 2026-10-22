@@ -7,7 +7,14 @@
 //!RUN_BUDGET (best/avg over the reps that fit; partial reps marked).
 //!bimap's deltas are applied-and-cleared inline — holder churn unmeasured.
 
-use doa::blockbimap::{BiDeltas, BlockBiMap};
+use doa::blockbimap::BlockBiMap;
+
+///drain both event slots — this bench holds no name mirrors
+fn drain(map: &mut BlockBiMap<Item, u64, u32>) {
+    let (keys, values) = map.deltas();
+    keys.clear();
+    values.clear();
+}
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -134,10 +141,9 @@ fn check_order(keys: impl Iterator<Item = u64>) {
 ///workload-order build — the block's layout is the workload's
 fn build_bimap(keys: &[u64]) -> BlockBiMap<Item, u64, u32> {
     let mut map = BlockBiMap::new();
-    let mut d = BiDeltas::<u32>::new();
     for &k in keys {
-        map.insert(Item::new(k), Item::val(k), &mut d).unwrap();
-        d.clear();
+        map.insert(Item::new(k), Item::val(k)).unwrap();
+        drain(&mut map);
     }
     assert_eq!(map.len(), keys.len());
     check_order(map.iter().map(|(i, _)| i.key));
@@ -161,14 +167,13 @@ fn build_ctrl(keys: &[u64]) -> (BTreeMap<Item, u64>, BTreeMap<u64, Item>) {
 fn insert_bimap(keys: &[u64]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut map = BlockBiMap::new();
-        let mut d = BiDeltas::<u32>::new();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for &k in keys {
-            map.insert(Item::new(k), Item::val(k), &mut d)
+            map.insert(Item::new(k), Item::val(k))
                 .unwrap_or_else(|(i, _)| panic!("insert failed at {}", i.key));
-            d.clear();
+            drain(&mut map);
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;

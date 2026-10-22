@@ -54,9 +54,12 @@ enum Delta {
     ///a fetch-distance gather's slide chain, nearest hole first, each
     ///slide in post-prior-slides coordinates — identical to its pre-read
     ///position (a hole's slot is never touched before its own slide).
-    ///blockmap's ladder only — blockset water-levels instead (see
-    ///Rebalance)
-    Gather(Vec<NoneSlide>),
+    ///the slides live in `Deltas::buf[..n]` — the payload is reused
+    ///scratch, no per-bank alloc. blockmap's ladder only — blockset
+    ///water-levels instead (see Rebalance)
+    Gather {
+        n: usize,
+    },
     ///a region's water-leveling rewrite: the region's live elements PLUS
     ///k (at rank `at` among them) redistribute onto the uniform
     ///one-hole-per-stride lattice `u(i) = i + i/(stride−1)` — old-rank i
@@ -86,38 +89,32 @@ enum Delta {
 ///and was already emitted (its rank is higher in the descending pass,
 ///lower in the ascending one), so first-match holders retarget exactly
 ///once
-enum DeltaPairs<'a> {
-    Empty,
+enum PairState {
+    Idle,
     ///one run's cursor: emits `(p, p − step)` per step
     Run { p: usize, step: i64, remaining: usize },
     Gather {
-        slides: &'a [NoneSlide],
         ///holes fetched from the right of the spot (else left) — sets the
         ///segment/hop direction
-        right:  bool,
+        right: bool,
         ///walk counter over segments, FAR-segment first (segment index
         ///w−1−seg)
-        seg:    usize,
+        seg:   usize,
         ///position cursor within the segment; `usize::MAX` = fresh
-        q:      usize,
+        q:     usize,
     },
-    ///the rebalance's two passes over the saved region mask: descending
-    ///right-movers, then ascending left-movers (see the enum doc)
+    ///the rebalance's two passes over the region mask: descending
+    ///right-movers (`down_pos` walks `prev_set`), then ascending
+    ///left-movers (`up_pos` walks `next_set`) — see the enum doc above
     Rebalance {
-        down: SetBitsRev<'a>,
-        up:   SetBits<'a>,
-        ///region start — endpoints are region-local + base
-        base: usize,
-        ///k's rank — old-rank i shifts one up past it
-        at:   usize,
-        ///stride − 1: the lattice's live count per period
-        s1:   usize,
-        ///old-rank of the bit the active pass yields next
-        rank: usize,
-        ///the ascending pass started
+        rank:     usize,
         up_phase: bool,
+        down_pos: usize,
+        up_pos:   usize,
     },
-    Pairs(std::slice::Iter<'a, (Pos, Pos)>),
+    Pairs {
+        idx: usize,
+    },
 }
 
 ///swap-cascade run state of one hole slide `from → to`: (first moved
@@ -153,167 +150,194 @@ impl Iterator for Slides<'_> {
     }
 }
 
-impl Delta {
-    fn pairs(&self) -> DeltaPairs<'_> {
-        match self {
-            Delta::Empty => DeltaPairs::Empty,
-            Delta::NoneSlide { from, to } => {
-                let (p, step, remaining) = run_of(from.0, to.0);
-                DeltaPairs::Run { p, step, remaining }
-            }
-            Delta::Gather(v) => DeltaPairs::Gather {
-                slides: v,
-                right:  v.first().is_some_and(|s| s.from.0 > s.to.0),
-                seg:    0,
-                q:      usize::MAX,
-            },
-            Delta::Rebalance { base, at, stride, mask } => DeltaPairs::Rebalance {
-                down: mask.iter_set_rev(),
-                up:   mask.iter_set(),
-                base: base.0,
-                at:   *at,
-                s1:   stride - 1,
-                //the descending pass yields the HIGHEST bit first —
-                //old-rank live−1
-                rank: mask.count() - 1,
-                up_phase: false,
-            },
-            Delta::Pairs(v) => DeltaPairs::Pairs(v.iter()),
+///seed an expansion cursor from the event; None = nothing to expand
+fn seed_state(event: &Delta, buf: &[NoneSlide]) -> Option<PairState> {
+    Some(match event {
+        Delta::Empty => return None,
+        Delta::NoneSlide { from, to } => {
+            let (p, step, remaining) = run_of(from.0, to.0);
+            PairState::Run { p, step, remaining }
         }
-    }
+        Delta::Gather { n } => PairState::Gather {
+            right: buf[..*n].first().is_some_and(|s| s.from.0 > s.to.0),
+            seg:   0,
+            q:     usize::MAX,
+        },
+        Delta::Rebalance { mask, .. } => PairState::Rebalance {
+            //the descending pass yields the HIGHEST bit first —
+            //old-rank live−1
+            rank:     mask.count() - 1,
+            up_phase: false,
+            down_pos: mask.bits(),
+            up_pos:   0,
+        },
+        Delta::Pairs(_) => PairState::Pairs { idx: 0 },
+    })
 }
 
-impl Iterator for DeltaPairs<'_> {
-    type Item = (Pos, Pos);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            DeltaPairs::Empty => None,
-            DeltaPairs::Run { p, step, remaining } => {
-                if *remaining == 0 {
-                    return None;
-                }
-                *remaining -= 1;
-                let q = *p;
-                *p = (q as i64 + *step) as usize;
-                Some((Pos(q), Pos((q as i64 - *step) as usize)))
+///advance one expansion cursor; None = exhausted
+fn step_state(state: &mut PairState, event: &Delta, buf: &[NoneSlide]) -> Option<(Pos, Pos)> {
+    match (state, event) {
+        (PairState::Run { p, step, remaining }, _) => {
+            if *remaining == 0 {
+                return None;
             }
-            DeltaPairs::Gather { slides, right, seg, q } => loop {
-                let w = slides.len();
-                if *seg >= w {
-                    return None;
-                }
-                //segment (w−1−seg): far segments first, hop = w − segment
-                //index — the crossing count (bounds in pre-event positions)
-                let j = w - 1 - *seg;
-                let (start, end, hop) = if *right {
-                    let spot = slides[0].to.0;
-                    if j == 0 {
-                        (spot, slides[0].from.0, w as i64)
-                    } else {
-                        (
-                            slides[j - 1].from.0 + 1,
-                            slides[j].from.0,
-                            (w - j) as i64,
-                        )
-                    }
+            *remaining -= 1;
+            let q = *p;
+            *p = (q as i64 + *step) as usize;
+            Some((Pos(q), Pos((q as i64 - *step) as usize)))
+        }
+        (PairState::Gather { right, seg, q }, Delta::Gather { n }) => loop {
+            let w = *n;
+            if *seg >= w {
+                return None;
+            }
+            //segment (w−1−seg): far segments first, hop = w − segment
+            //index — the crossing count (bounds in pre-event positions)
+            let j = w - 1 - *seg;
+            let (start, end, hop) = if *right {
+                let spot = buf[0].to.0;
+                if j == 0 {
+                    (spot, buf[0].from.0, w as i64)
                 } else {
-                    let spot = slides[0].to.0 + 1;
-                    if j == 0 {
-                        (slides[0].from.0 + 1, spot, -(w as i64))
-                    } else {
-                        (
-                            slides[j].from.0 + 1,
-                            slides[j - 1].from.0,
-                            -((w - j) as i64),
-                        )
-                    }
-                };
-                //segment entry: walk away from the spot (right descends,
-                //left ascends) so each `to` stays ahead of every remaining
-                //`from` — first-match holders retarget once, never twice
-                if *q == usize::MAX {
-                    if end == start {
-                        *seg += 1;
-                        continue;
-                    }
-                    *q = if *right { end - 1 } else { start };
+                    (buf[j - 1].from.0 + 1, buf[j].from.0, (w - j) as i64)
                 }
-                let from = *q;
-                *q = if *right {
-                    if from == start { usize::MAX } else { from - 1 }
+            } else {
+                let spot = buf[0].to.0 + 1;
+                if j == 0 {
+                    (buf[0].from.0 + 1, spot, -(w as i64))
                 } else {
-                    if from == end - 1 { usize::MAX } else { from + 1 }
-                };
-                if *q == usize::MAX {
+                    (buf[j].from.0 + 1, buf[j - 1].from.0, -((w - j) as i64))
+                }
+            };
+            //segment entry: walk away from the spot (right descends,
+            //left ascends) so each `to` stays ahead of every remaining
+            //`from` — first-match holders retarget once, never twice
+            if *q == usize::MAX {
+                if end == start {
                     *seg += 1;
+                    continue;
                 }
-                return Some((Pos(from), Pos((from as i64 + hop) as usize)));
-            },
-            DeltaPairs::Rebalance { down, up, base, at, s1, rank, up_phase } => {
-                let base = *base;
-                if !*up_phase {
-                    //pass 1: descending rank, right-movers only
-                    while let Some(p) = down.next() {
-                        let i = *rank;
-                        //the last bit's decrement would underflow — the
-                        //counter is dead once the pass ends
-                        *rank = i.saturating_sub(1);
-                        let j = i + usize::from(i >= *at);
-                        let q = base + j + j / *s1;
-                        if q > base + p {
-                            return Some((Pos(base + p), Pos(q)));
-                        }
-                    }
-                    *up_phase = true;
-                    *rank = 0;
-                }
-                //pass 2: ascending rank, left-movers
-                while let Some(p) = up.next() {
+                *q = if *right { end - 1 } else { start };
+            }
+            let from = *q;
+            *q = if *right {
+                if from == start { usize::MAX } else { from - 1 }
+            } else {
+                if from == end - 1 { usize::MAX } else { from + 1 }
+            };
+            if *q == usize::MAX {
+                *seg += 1;
+            }
+            return Some((Pos(from), Pos((from as i64 + hop) as usize)));
+        },
+        (
+            PairState::Rebalance { rank, up_phase, down_pos, up_pos },
+            Delta::Rebalance { base, at, stride, mask },
+        ) => {
+            let (base, at, s1) = (base.0, *at, stride - 1);
+            if !*up_phase {
+                //pass 1: descending rank, right-movers only
+                while let Some(p) = mask.prev_set(*down_pos) {
+                    *down_pos = p;
                     let i = *rank;
-                    *rank = i + 1;
-                    let j = i + usize::from(i >= *at);
-                    let q = base + j + j / *s1;
-                    if q < base + p {
+                    //the last bit's decrement would underflow — the
+                    //counter is dead once the pass ends
+                    *rank = i.saturating_sub(1);
+                    let j = i + usize::from(i >= at);
+                    let q = base + j + j / s1;
+                    if q > base + p {
                         return Some((Pos(base + p), Pos(q)));
                     }
                 }
-                None
+                *up_phase = true;
+                *rank = 0;
             }
-            DeltaPairs::Pairs(it) => it.next().copied(),
+            //pass 2: ascending rank, left-movers
+            while let Some(p) = mask.next_set(*up_pos) {
+                *up_pos = p + 1;
+                let i = *rank;
+                *rank = i + 1;
+                let j = i + usize::from(i >= at);
+                let q = base + j + j / s1;
+                if q < base + p {
+                    return Some((Pos(base + p), Pos(q)));
+                }
+            }
+            None
         }
+        (PairState::Pairs { idx }, Delta::Pairs(v)) => {
+            let p = v.get(*idx).copied()?;
+            *idx += 1;
+            Some(p)
+        }
+        //state/event mismatch — unreachable (states seed from events)
+        _ => None,
     }
 }
 
 ///slot moves of one mutation + the translator snapshot at mutation time.
-///`iter` expands to (from_addr, to_addr) name swaps applicable in order;
-///`insert` panics while deltas are pending — apply, then `clear`
+///the BLOCK owns its Deltas; consumers pull the expansion (`iter` /
+///`next_pos`) — exhausting it clears the event, so apply loops need no
+///`clear`; breaking early leaves it pending and the next insert panics.
 pub struct Deltas<A> {
     event:      Delta,
     translator: Translator<A>,
+    ///reused gather payload — `buf[..n]` while the event is Gather; the
+    ///per-bank alloc dies
+    buf:        Vec<NoneSlide>,
+    ///the user's expansion cursor (see PairState)
+    pair_state: PairState,
+    ///bimap's chase cursor — a second pass over the same event, without
+    ///consuming it (see next_chase)
+    chase_state: PairState,
 }
 
 impl<A: UnsignedNum> Deltas<A> {
     pub fn new() -> Self {
-        Deltas { event: Delta::Empty, translator: Translator::new() }
+        Deltas {
+            event:       Delta::Empty,
+            translator:  Translator::new(),
+            buf:         Vec::new(),
+            pair_state:  PairState::Idle,
+            chase_state: PairState::Idle,
+        }
     }
 
-    ///(from_addr, to_addr) name swaps, applicable in order
-    pub fn iter(&self) -> impl Iterator<Item = (A, A)> + '_ {
-        self.event.pairs().map(|(f, t)| (self.translator.p2a(f), self.translator.p2a(t)))
-    }
-
-    ///the raw (from, to) POS pairs — no translation. valid only while
-    ///the emitter's translator is unchanged since the record (immediate
-    ///in-crate consumers — the flip now fires pre-record; `iter`'s names
-    ///remain the era-stable contract for events held across mutations)
-    pub(crate) fn iter_pos(&self) -> impl Iterator<Item = (Pos, Pos)> + '_ {
-        self.event.pairs()
-    }
-
-    ///pending until `clear` — the caller contract
-    pub(crate) fn is_pending(&self) -> bool {
+    ///pending until exhausted or `clear`
+    pub fn is_pending(&self) -> bool {
         !matches!(self.event, Delta::Empty)
+    }
+
+    ///(from_addr, to_addr) name swaps, applicable in order; exhausting
+    ///clears the event
+    pub fn iter(&mut self) -> DeltaIter<'_, A> {
+        DeltaIter(self)
+    }
+
+    ///one expanded (from, to) POS pair, or None (the event is exhausted —
+    ///cleared). pub(crate): the pos-space consumers (bimap's chase)
+    ///pull directly; name-space holders use `iter`
+    pub(crate) fn next_pos(&mut self) -> Option<(Pos, Pos)> {
+        if matches!(self.pair_state, PairState::Idle) {
+            self.pair_state = seed_state(&self.event, &self.buf)?;
+        }
+        let pair = step_state(&mut self.pair_state, &self.event, &self.buf);
+        if pair.is_none() {
+            self.event = Delta::Empty;
+            self.pair_state = PairState::Idle;
+        }
+        pair
+    }
+
+    ///bimap's chase pass: pulls the full expansion through its OWN cursor
+    ///without clearing or touching the user's — the event stays pending
+    ///for the holder to drain through `iter`
+    pub(crate) fn next_chase(&mut self) -> Option<(Pos, Pos)> {
+        if matches!(self.chase_state, PairState::Idle) {
+            self.chase_state = seed_state(&self.event, &self.buf)?;
+        }
+        step_state(&mut self.chase_state, &self.event, &self.buf)
     }
 
     ///the raw slide chain — compact hole moves; the changed positions of
@@ -323,7 +347,7 @@ impl<A: UnsignedNum> Deltas<A> {
         match &self.event {
             Delta::Empty => Slides::Empty,
             Delta::NoneSlide { from, to } => Slides::One(NoneSlide::new(*from, *to)),
-            Delta::Gather(v) => Slides::Many(v.iter()),
+            Delta::Gather { n } => Slides::Many(self.buf[..*n].iter()),
             //the whole region changed — one synthetic link spans it;
             //maintain only unions min/max, and re-reads are idempotent
             Delta::Rebalance { base, mask, .. } => {
@@ -333,29 +357,46 @@ impl<A: UnsignedNum> Deltas<A> {
         }
     }
 
-    ///reset to empty — call after applying
+    ///force-clear without exhausting — the caller skipped the expansion
     pub fn clear(&mut self) {
         self.event = Delta::Empty;
-        self.translator = Translator::new()
+        self.translator = Translator::new();
+        self.pair_state = PairState::Idle;
+        self.chase_state = PairState::Idle;
     }
 
     ///record a plain hole slide under the block's translator at record
     ///time (blockmap records the same events over its own slots)
     pub(crate) fn record_none_slide(&mut self, translator: Translator<A>, from: Pos, to: Pos) {
         self.translator = translator;
+        self.pair_state = PairState::Idle;
+        self.chase_state = PairState::Idle;
         self.event = Delta::NoneSlide { from, to };
     }
 
-    ///record a fetch-gather's slide chain (blockmap's, same protocol)
-    pub(crate) fn record_gather(&mut self, translator: Translator<A>, slides: Vec<NoneSlide>) {
+    ///record a fetch-gather: hole i compacts to `open ± i` (nearest
+    ///first). the payload reuses `buf` — no per-bank alloc
+    pub(crate) fn record_gather(
+        &mut self,
+        translator: Translator<A>,
+        open: usize,
+        right: bool,
+        holes: &[usize],
+    ) {
         self.translator = translator;
-        self.event = Delta::Gather(slides);
+        self.buf.clear();
+        self.buf
+            .extend(holes.iter().enumerate().map(|(i, &h)| {
+                NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i }))
+            }));
+        self.pair_state = PairState::Idle;
+        self.chase_state = PairState::Idle;
+        self.event = Delta::Gather { n: holes.len() };
     }
 
-    ///record a region rebalance (blockset's water-leveling rung). `mask`
-    ///= the region's pre-move occupancy, `at` = k's rank in it (the
-    ///lattice reserves u(at) for k), `stride` ≥ 2 (the lattice fit is
-    ///rebalance_region's guarantee)
+    ///record a region rebalance. `mask` = the region's pre-move occupancy,
+    ///`at` = k's rank in it (the lattice reserves u(at) for k), `stride`
+    ///≥ 2 (the lattice fit is rebalance_region's guarantee)
     pub(crate) fn record_rebalance(
         &mut self,
         translator: Translator<A>,
@@ -366,7 +407,24 @@ impl<A: UnsignedNum> Deltas<A> {
     ) {
         debug_assert!(stride >= 2);
         self.translator = translator;
+        self.pair_state = PairState::Idle;
+        self.chase_state = PairState::Idle;
         self.event = Delta::Rebalance { base, at, stride, mask };
+    }
+}
+
+///`Deltas::iter`'s return — pulls name pairs through the block-owned
+///expansion, clearing at exhaust
+pub struct DeltaIter<'a, A>(&'a mut Deltas<A>);
+
+impl<A: UnsignedNum> Iterator for DeltaIter<'_, A> {
+    type Item = (A, A);
+
+    fn next(&mut self) -> Option<(A, A)> {
+        let translator = self.0.translator;
+        self.0
+            .next_pos()
+            .map(|(f, t)| (translator.p2a(f), translator.p2a(t)))
     }
 }
 
@@ -472,6 +530,8 @@ pub struct BlockSet<K: Archive, A> {
     ///previous one — the banking rungs' adaptive gather signal: a hot
     ///cluster banks deeper, so its next inserts find holes adjacent
     streak:     usize,
+    ///the block's own event slot — the mutation feedback (see Deltas)
+    deltas:     Deltas<A>,
 }
 
 impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
@@ -487,7 +547,14 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             epoch:     0,
             last_insert: 0,
             streak:     0,
+            deltas:     Deltas::new(),
         }
+    }
+
+    ///the block's event slot — pull `iter` to apply (exhausting clears);
+    ///the next insert panics while an expansion is left half-consumed
+    pub fn deltas(&mut self) -> &mut Deltas<A> {
+        &mut self.deltas
     }
 
     pub fn len(&self) -> usize {
@@ -726,10 +793,9 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         }
     }
 
-    ///deltas must be empty (applied + cleared) — panics if pending. Err
-    ///returns k (dup, or out of names).
-    pub fn insert(&mut self, k: K, deltas: &mut Deltas<A>) -> Result<A, K> {
-        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+    ///Err returns k (dup, or out of names)
+    pub fn insert(&mut self, k: K) -> Result<A, K> {
+        assert!(!self.deltas.is_pending(), "pending deltas: apply + exhaust before reuse");
         if self.data.is_empty() {
             let h = K::archive(&k, &mut self.heap);
             return Ok(self.insert_first(h));
@@ -746,19 +812,19 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         };
         //archive after the dup check — a rejected key leaves no heap bytes
         let h = K::archive(&k, &mut self.heap);
-        Ok(self.place_from(h, spot, deltas).0)
+        Ok(self.place_from(h, spot).0)
     }
 
     ///the ladder from a known spot: extend at the tail edge, open
     ///elsewhere. returns the addr with the placed position — callers
     ///holding positions skip the a2p round-trip (era-valid until the
     ///next silent move)
-    fn place_from(&mut self, h: K::Handle, spot: Pos, deltas: &mut Deltas<A>) -> (A, Pos) {
+    fn place_from(&mut self, h: K::Handle, spot: Pos) -> (A, Pos) {
         //sequential at the back: extend instead of sliding
         if spot.0 == self.data.len() && self.data.len() < Self::max_capacity() {
             (self.push_back(h, spot), spot)
         } else {
-            let p = self.open(spot, deltas);
+            let p = self.open(spot);
             (self.place(h, p), p)
         }
     }
@@ -777,11 +843,10 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     pub(crate) unsafe fn insert_at(
         &mut self,
         k: K,
-        deltas: &mut Deltas<A>,
         from: usize,
         to: usize,
     ) -> Result<(A, Pos), K> {
-        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+        assert!(!self.deltas.is_pending(), "pending deltas: apply + exhaust before reuse");
         if self.data.is_empty() {
             let h = K::archive(&k, &mut self.heap);
             return Ok((self.insert_first(h), Pos(0)));
@@ -793,7 +858,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             Ok(_) => return Err(k), //dup
             Err(spot) => {
                 let h = K::archive(&k, &mut self.heap);
-                Ok(self.place_from(h, spot, deltas))
+                Ok(self.place_from(h, spot))
             }
         }
     }
@@ -803,8 +868,8 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///(max Asc, min Desc — the end a sequential insert extends). no
     ///scan, no dup possible. SkipSet's beyond_tail pre-check routes
     ///appends here — one tail scan total instead of three
-    pub(crate) fn push_beyond(&mut self, k: K, deltas: &mut Deltas<A>) -> Result<(A, Pos), K> {
-        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+    pub(crate) fn push_beyond(&mut self, k: K) -> Result<(A, Pos), K> {
+        assert!(!self.deltas.is_pending(), "pending deltas: apply + exhaust before reuse");
         if self.data.is_empty() {
             let h = K::archive(&k, &mut self.heap);
             return Ok((self.insert_first(h), Pos(0)));
@@ -814,7 +879,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         }
         let spot = Pos(self.mask.last_set().unwrap() + 1);
         let h = K::archive(&k, &mut self.heap);
-        Ok(self.place_from(h, spot, deltas))
+        Ok(self.place_from(h, spot))
     }
 
     ///in-place reversal: pos 0 = max, names follow the slots (the
@@ -839,10 +904,15 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             .wrapping_mul(len as u128)
             .wrapping_sub((2 * len as u128).wrapping_mul(s))
             .wrapping_add(q);
-        //positions mirrored — a silent move for pos holders; the streak
-        //anchor reflects like the sums (clamped: a position past len
-        //would wrap and just reset the streak, keep it meaningful)
-        self.last_insert = (len as usize).saturating_sub(self.last_insert);
+        //positions mirrored — a silent move for pos holders. the streak
+        //anchor follows its element EXACTLY (the array mirrors p →
+        //cap−1−p — anything else misreads the next streak compare);
+        //the trigger sums keep the len-reflection above
+        self.last_insert = self
+            .data
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(self.last_insert);
         self.epoch += 1;
     }
 
@@ -872,7 +942,59 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                 return Some(Pos(p + 1));
             }
         }
+        //hot streak: the previous insert landed close to its predecessor,
+        //so k's bracket likely sits within a walk of it — bounded walk
+        //from the anchor beats the full bsearch, falls back on any miss
+        if self.streak > 0 {
+            match self.spot_near(k) {
+                Some(Ok(p)) => return Some(p),
+                Some(Err(())) => return None,
+                None => {}
+            }
+        }
         self.bsearch(k).err()
+    }
+
+    ///hinted bracket from `last_insert`: walk live slots within
+    ///2·FREE_STRIDE of the anchor until the compare crosses k; the
+    ///crossing pair's pos-lower slot + 1 is the same boundary bsearch
+    ///returns. Some(Err(())) = dup; None = out of reach, caller falls
+    ///back
+    fn spot_near(&self, k: &K) -> Option<Result<Pos, ()>> {
+        let anchor = self.last_insert;
+        if !self.mask.get(anchor) {
+            return None; //removed since the streak landed
+        }
+        // SAFETY: mask names the anchor live
+        let first = self.cmp_key(unsafe { self.key(anchor) }, k);
+        if first == Ordering::Equal {
+            return Some(Err(()));
+        }
+        let rev = self.translator.reversed();
+        //Asc: k beyond the anchor's key walks pos-up, else pos-down;
+        //Desc runs key order against pos order — the walk mirrors
+        let up = if rev { first == Ordering::Greater } else { first == Ordering::Less };
+        let bound = 2 * FREE_STRIDE;
+        let mut prev = anchor;
+        let mut cursor = anchor;
+        loop {
+            let q = if up { self.mask.next_set(cursor + 1) } else { self.mask.prev_set(cursor) };
+            let Some(q) = q else { return None };
+            if q + bound < anchor || q > anchor + bound {
+                return None; //past the streak's reach
+            }
+            // SAFETY: the steppers name live slots
+            let ord = self.cmp_key(unsafe { self.key(q) }, k);
+            match ord {
+                Ordering::Equal => return Some(Err(())),
+                //keys are monotone along the walk — the first opposite-side
+                //key IS the crossing; the bracket pair is (prev, q)
+                ord if ord == first.reverse() => return Some(Ok(Pos(prev.min(q) + 1))),
+                _ => {}
+            }
+            prev = q;
+            cursor = q;
+        }
     }
 
     ///vec-like first allocation: 4 slots, no translator turn until it fills
@@ -891,7 +1013,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
 
     ///open a slot at/near `spot`: turns and gathers, escalating until a
     ///hole opens
-    fn open(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
+    fn open(&mut self, spot: Pos) -> Pos {
         let mut spot = spot;
         //APPEND FASTPATH: a solid tail run within a stride of the edge —
         //extend the block and shift the run up. ≤ FREE_STRIDE elements
@@ -906,19 +1028,24 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         {
             let from = self.cap();
             self.push_slot();
-            return self.slide_open(from, spot.0, deltas);
+            return self.slide_open(from, spot.0);
         }
         //preemptive turn past the ceiling (TURN_NUM/DEN): one O(n)
-        //turn beats the long scans (mid-block inserts only)
+        //turn beats the long scans (mid-block inserts only). refused ⇒
+        //the ceiling valve: the block cannot double, so water-level the
+        //whole block onto the minimal-stride lattice that fits the
+        //remaining name space (see rebalance_block)
         if self.len.wrapping_mul(TURN_DEN) > self.data.len().wrapping_mul(TURN_NUM)
             && self.data.len() - spot.0 > FREE_STRIDE
         {
             let old = self.translator;
             if self.grow_rotate() {
                 spot = self.turned_spot(old, spot);
+            } else {
+                return self.rebalance_block(spot);
             }
         }
-        self.gather_slots(spot, deltas)
+        self.gather_slots(spot)
     }
 
     ///k's spot under a completed turn: the old spot's name relocates via
@@ -1100,12 +1227,12 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///- FAR: the streak forks — cold balances (region rebalance + the
     ///  tail-growth valve), hot banks (the nearest hole within len/2,
     ///  else the growth-rebalance mints tail space)
-    fn gather_slots(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
+    fn gather_slots(&mut self, spot: Pos) -> Pos {
         //k's slot already open (the bsearch converges on holes for
         //mid-gap inserts) — no fetch, no slide. nearest_clear excludes
         //`spot` by contract, so this is checked first
         if spot.0 < self.cap() && !self.mask.get(spot.0) {
-            deltas.record_none_slide(self.translator, spot, spot);
+            self.deltas.record_none_slide(self.translator, spot, spot);
             return spot;
         }
         //the nearest hole's distance picks the rung: within a stride one
@@ -1128,19 +1255,16 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                 let right = hole > spot.0;
                 let open = if right { spot.0 } else { spot.0 - 1 };
                 let bound = if right { word_lo + 64 } else { word_lo };
+                //a hot streak banks deeper — the cluster's next inserts
+                //land right here, and the hole is further than a stride
+                //out
                 let holes = self.fetch_holes(spot, right, 1 + self.streak, bound);
+                let land = self.bank_landing(open, right, holes.len());
                 self.compact_gather(spot, open, right, &holes);
-                deltas.record_gather(
-                    self.translator,
-                    holes
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
-                        .collect(),
-                );
-                return Pos(open);
+                self.deltas.record_gather(self.translator, open, right, &holes);
+                return Pos(land);
             }
-            return self.slide_open(hole, spot.0, deltas);
+            return self.slide_open(hole, spot.0);
         }
         //BORROW: a neighboring word under the High line lends — one
         //event banks up to BORROW_MIN holes beside k (the old fetch's
@@ -1162,27 +1286,23 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             if holes.is_empty() {
                 //a truncated lendable word with no holes: the single
                 //nearest hole, however far
-                return self.slide_open(hole, spot.0, deltas);
+                return self.slide_open(hole, spot.0);
             }
+            let land = self.bank_landing(open, right, holes.len());
             self.compact_gather(spot, open, right, &holes);
-            deltas.record_gather(
-                self.translator,
-                holes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
-                    .collect(),
-            );
-            return Pos(open);
+            self.deltas.record_gather(self.translator, open, right, &holes);
+            return Pos(land);
         }
         {
             //the fork: cold streaks balance, hot streaks bank
             if self.streak < STREAK_BANK {
-                return self.rebalance_region(spot, deltas);
+                return self.rebalance_region(spot);
             }
-            //hot: bank the nearest existing hole within len/2
+            //hot: bank the nearest hole within len/2 — or however far at
+            //the name ceiling: nothing is mintable there, and the declined
+            //fetch's fallback pays a same-length slide PER remaining hole
             if let Some(hole) = self.mask.nearest_clear(spot.0)
-                && hole.abs_diff(spot.0) <= self.len / 2
+                && (hole.abs_diff(spot.0) <= self.len / 2 || self.cap() >= Self::max_capacity())
             {
                 let right = hole > spot.0;
                 let open = if right { spot.0 } else { spot.0 - 1 };
@@ -1191,29 +1311,39 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                 let want = 1 + hole.abs_diff(spot.0) / FREE_STRIDE
                     + usize::from(hole.abs_diff(spot.0) > FREE_STRIDE) * self.streak;
                 let holes = self.fetch_holes(spot, right, want, bound);
+                let land = self.bank_landing(open, right, holes.len());
                 self.compact_gather(spot, open, right, &holes);
-                deltas.record_gather(
-                    self.translator,
-                    holes
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &h)| NoneSlide::new(Pos(h), Pos(if right { open + i } else { open - i })))
-                        .collect(),
-                );
-                return Pos(open);
+                self.deltas.record_gather(self.translator, open, right, &holes);
+                return Pos(land);
             }
             //past len/2 (or a full mask): the growth-rebalance mints
             //tail space — the bank's tail arm
-            self.rebalance_region(spot, deltas)
+            self.rebalance_region(spot)
         }
+    }
+
+    ///k's landing slot inside a bank's compacted hole range (right: the
+    ///range is [open, open+w); left: [open+1−w, open]) — any slot in it
+    ///is order-legal. CENTERED, clamped by the streak's remaining stride
+    ///slack measured from `open` — where the offset actually starts: a
+    ///left fetch's open is spot−1, and budgeting from the spot let Δ7
+    ///landings through a Δ6 budget (measured). centering won both band
+    ///directions over spot-adjacent and direction-biased landings
+    ///(session_history 2026-10-21 (b))
+    fn bank_landing(&self, open: usize, right: bool, w: usize) -> usize {
+        //offset from the spot-adjacent end toward the far end
+        let target = (w - 1) / 2;
+        let slack = FREE_STRIDE.saturating_sub(open.abs_diff(self.last_insert));
+        let offset = target.min(slack);
+        if right { open + offset } else { open - offset }
     }
 
     ///slide the hole to k's edge and record — near, borrow and forced
     ///share it. caller guarantees `hole` is the nearest on its side
-    fn slide_open(&mut self, hole: usize, spot: usize, deltas: &mut Deltas<A>) -> Pos {
+    fn slide_open(&mut self, hole: usize, spot: usize) -> Pos {
         let open = if hole > spot { spot } else { spot - 1 };
         self.slide_hole(hole, open);
-        deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
+        self.deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
         Pos(open)
     }
 
@@ -1232,6 +1362,15 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //masked clear, never assume_init'd
         self.mask.set(from, true);
         self.mask.set(to, false);
+        //the previous k may ride the run — the anchor follows its element
+        //(a stale anchor misreads the next streak compare)
+        if from > to {
+            if (to..from).contains(&self.last_insert) {
+                self.last_insert += 1;
+            }
+        } else if (from + 1..=to).contains(&self.last_insert) {
+            self.last_insert -= 1;
+        }
     }
 
     ///one element relocation inside a rebalance pass. the pass orders
@@ -1241,6 +1380,9 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.data[to] = std::mem::replace(&mut self.data[from], MaybeUninit::uninit());
         self.mask.set(from, false);
         self.mask.set(to, true);
+        if from == self.last_insert {
+            self.last_insert = to;
+        }
     }
 
     ///the `want` nearest holes on one side of `spot`, nearest-first
@@ -1328,6 +1470,78 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                 self.mask.set(t, false);
             }
         }
+        //the previous k rides its segment by its crossing count — the
+        //anchor follows (right: shift = w − holes below it; left:
+        //shift = w − holes above it; the far side doesn't move)
+        let anchor = &mut self.last_insert;
+        if right {
+            if *anchor >= spot.0 {
+                let below = holes.iter().filter(|h| **h < *anchor).count();
+                *anchor += w - below;
+            }
+        } else if *anchor < spot.0 {
+            let above = holes.iter().filter(|h| **h > *anchor).count();
+            *anchor -= w - above;
+        }
+    }
+
+    ///the ceiling valve: the preemptive turn's replacement when the
+    ///block cannot double (past the name midpoint, or the rotation
+    ///budget spent) — nothing can be minted by growth, and repeatedly
+    ///shifting O(n) elements for O(streak) holes is the worst trade in
+    ///the block. instead, water-level the WHOLE block onto the
+    ///minimal-stride lattice that fits len live elements (k included)
+    ///below the name ceiling, extending the tail just enough — e.g.
+    ///len 180, ceiling 256: stride 4 (3/4 density) spans 241, and the
+    ///headroom above stays unallocated. one Rebalance event covers
+    ///the block; k rides the lattice at its rank. after it, the turn
+    ///line no longer holds ((s−1)/s < 5/6), so it amortizes
+    fn rebalance_block(&mut self, spot: Pos) -> Pos {
+        let live = self.len;
+        let ceiling = Self::max_capacity();
+        //minimal stride whose lattice fits: live + live/(stride−1) < ceiling
+        let mut stride = 2;
+        while live + live / (stride - 1) >= ceiling {
+            stride += 1;
+        }
+        let s1 = stride - 1;
+        //the tight lattice extent; the region is the WHOLE allocation
+        //(end ≥ cap — lives in a trailing desert must be inside it),
+        //extended only when the tight fit demands. degenerate at full
+        //density: the search rounds live/(s−1) to 0 and the lattice is
+        //a whole-block shift-by-one past k's rank
+        let end = self.cap().max(live + live / s1 + 1);
+        if end > self.cap() {
+            self.push_slots(end - self.cap());
+        }
+        let region = self.mask.copy_region(0, end);
+        //k's rank among the whole block — the boundary is count-below
+        //in the pre-move mask (order is preserved)
+        let r = region.count_below(spot.0.min(end).min(region.bits()));
+        //the two passes exactly as the pair emission (see DeltaPairs'
+        //Rebalance): right-movers descending, then left-movers ascending.
+        //no FREE_STRIDE bound here — near the ceiling the minimal
+        //lattice is legitimately denser than 5/6
+        let target = |i: usize| i + usize::from(i >= r) + (i + usize::from(i >= r)) / s1;
+        debug_assert!(target(live - 1) < end, "the lattice must fit the block");
+        let mut i = live;
+        for p in region.iter_set_rev() {
+            i -= 1;
+            let q = target(i);
+            if q > p {
+                self.move_slot(p, q);
+            }
+        }
+        let mut i = 0;
+        for p in region.iter_set() {
+            let q = target(i);
+            if q < p {
+                self.move_slot(p, q);
+            }
+            i += 1;
+        }
+        self.deltas.record_rebalance(self.translator, Pos(0), r, stride, region);
+        Pos(r + r / s1)
     }
 
     ///water-leveling rung: scan words outward from `spot` until the
@@ -1344,7 +1558,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///global density sits under the ratio, so a whole-block search
     ///always finds space (or grows it); past the name ceiling (turns
     ///refused, §18) the nearest hole slides, however far
-    fn rebalance_region(&mut self, spot: Pos, deltas: &mut Deltas<A>) -> Pos {
+    fn rebalance_region(&mut self, spot: Pos) -> Pos {
         let mut cap = self.data.len();
         //spot's word, clamped: spot == cap (dense tail) scans the last
         //word rather than reading past the range
@@ -1380,7 +1594,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                             self.cap() - 1
                         }
                     };
-                    return self.slide_open(hole, spot.0, deltas);
+                    return self.slide_open(hole, spot.0);
                 }
                 self.push_slots(grow);
                 cap = self.data.len();
@@ -1413,7 +1627,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         if live == 0 {
             //an empty region (the holey tail word past the last live):
             //k takes the region's floor, no lattice needed
-            deltas.record_none_slide(self.translator, Pos(base), Pos(base));
+            self.deltas.record_none_slide(self.translator, Pos(base), Pos(base));
             return Pos(base);
         }
         let region = self.mask.copy_region(base, end);
@@ -1451,7 +1665,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             }
             i += 1;
         }
-        deltas.record_rebalance(self.translator, Pos(base), r, stride, region);
+        self.deltas.record_rebalance(self.translator, Pos(base), r, stride, region);
         Pos(base + r + r / s1)
     }
 
@@ -1479,10 +1693,15 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //descending pass writes every target before its source is read.
         //any offset, either direction: the band (upper-half names land
         //odd) is rotate_mask's job
+        let mut anchor_moved = false;
         for p in (0..old_cap).rev() {
             if self.mask.get(p) {
                 let q = new_tr.a2p(self.translator.p2a(Pos(p)));
                 debug_assert!(q.0 >= p, "turn must not move an element down");
+                if p == self.last_insert {
+                    self.last_insert = q.0;
+                    anchor_moved = true;
+                }
                 self.data[q.0] = std::mem::replace(&mut self.data[p], MaybeUninit::uninit());
             }
         }
@@ -1496,10 +1715,12 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //squares quadruple
         self.pos_sum = self.pos_sum.wrapping_mul(2);
         self.pos_sq_sum = self.pos_sq_sum.wrapping_mul(4);
-        //positions spread — a silent move for pos holders; the streak
-        //anchor scales with them (approximate — the turn's band adds
-        //one, like every stream signal here)
-        self.last_insert = self.last_insert.wrapping_mul(2);
+        //positions spread — a silent move for pos holders. the streak
+        //anchor followed its element exactly in the loop; the ×2
+        //approximation is only the fallback for a dead (removed) anchor
+        if !anchor_moved {
+            self.last_insert = self.last_insert.wrapping_mul(2);
+        }
         self.epoch += 1;
         TURN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TURN_MOVED.fetch_add(old_cap as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1631,9 +1852,13 @@ impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
 mod tests {
     use super::*;
 
-    ///apply translated deltas as name swaps, in the given order
-    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64)>, deltas: &Deltas<A>) {
+    ///apply translated deltas as name swaps, in the given order; returns
+    ///the pair count (assert-and-apply in one pull — the drain IS the
+    ///application)
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64)>, deltas: &mut Deltas<A>) -> usize {
+        let mut pairs = 0;
         for (from, to) in deltas.iter() {
+            pairs += 1;
             for (a, _) in &mut *holder {
                 if *a == from {
                     *a = to;
@@ -1641,17 +1866,16 @@ mod tests {
                 }
             }
         }
+        pairs
     }
 
     fn insert_all(keys: impl IntoIterator<Item = u64>) -> (BlockSet<u64, u8>, Vec<(u8, u64)>) {
         let mut set = BlockSet::new();
         let mut holder = Vec::new();
-        let mut deltas = Deltas::new();
         for k in keys {
-            match set.insert(k, &mut deltas) {
+            match set.insert(k) {
                 Ok(addr) => {
-                    apply(&mut holder, &deltas);
-                    deltas.clear();
+                    apply(&mut holder, set.deltas());
                     holder.push((addr, k));
                 }
                 Err(k) => panic!("insert of {k} failed"),
@@ -1703,7 +1927,6 @@ mod tests {
     #[test]
     fn mixed_ops_torture() {
         let mut set = BlockSet::<u64, u16>::new();
-        let mut d = Deltas::new();
         let mut holder = Vec::new();
         let mut s = 0x2545_F491_4F6C_DD1Du64;
         let mut rnd = move || {
@@ -1720,13 +1943,12 @@ mod tests {
                 } else {
                     (i / 40) * 700 + rnd() % 300
                 };
-                match set.insert(k, &mut d) {
+                match set.insert(k) {
                     Ok(a) => {
-                        apply(&mut holder, &d);
-                        d.clear();
+                        apply(&mut holder, set.deltas());
                         holder.push((a, k));
                     }
-                    Err(_) => d.clear(),
+                    Err(_) => set.deltas().clear(),
                 }
             } else {
                 let j = (rnd() % holder.len() as u64) as usize;
@@ -1750,18 +1972,17 @@ mod tests {
     #[test]
     fn appends_dense_mid_insert_turns() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
         for k in (0..100u64).map(|i| i * 2) {
-            set.insert(k, &mut d).unwrap();
-            d.clear();
+            set.insert(k).unwrap();
+            set.deltas().clear();
         }
         assert!(set.cap() < 128, "cap {} — turned instead of pushing back", set.cap());
         assert_eq!(set.cap() - set.len(), 0, "appends left holes");
-        set.insert(101, &mut d).unwrap();
-        d.clear();
+        set.insert(101).unwrap();
+        set.deltas().clear();
         assert_eq!(set.cap(), 200, "mid insert into full mask must turn");
-        set.insert(103, &mut d).unwrap();
-        d.clear();
+        set.insert(103).unwrap();
+        set.deltas().clear();
         assert_eq!(set.cap(), 200, "second mid insert must not turn");
         let keys: Vec<u64> = set.iter().copied().collect();
         let mut sorted = keys.clone();
@@ -1770,19 +1991,319 @@ mod tests {
         assert_eq!(set.len(), 102);
     }
 
+    ///the ceiling regime (cap == name space): a descending fill strands
+    ///turn-minted holes past the push edge; the last inserts must BANK
+    ///them in one gather (the len/2 gate's mint premise is void at the
+    ///ceiling), not pay a same-length slide per remaining hole
+    #[test]
+    fn ceiling_banks_stranded_holes() {
+        let mut set = BlockSet::<u64, u8>::new();
+        let mut moved = 0usize;
+        for k in (0..256u64).rev() {
+            set.insert(k).unwrap();
+            moved += set.deltas().iter().count();
+        }
+        assert_eq!(set.len(), 256);
+        assert_eq!(set.cap(), 256);
+        let keys: Vec<u64> = set.iter().copied().collect();
+        assert_eq!(keys, (0..256).collect::<Vec<_>>());
+        //one bank pass ≈ one run; the pre-fix slide chain moved ~7000
+        assert!(moved < 1000, "ceiling paid {moved} moves");
+    }
+
+    ///one-off diagnostic: the anchor-follow check — the previous k's
+    ///element rides the current insert's event, and `last_insert` must
+    ///track it through every move site. for pair-recording events the
+    ///event's own account is the oracle: apply the pos-pairs to the
+    ///pre-insert anchor like a holder and compare against the element's
+    ///true position. turn/flip moves are silent (no pairs) and verified
+    ///internally instead — grow_rotate tracks exactly in its relocation
+    ///loop, reverse mirrors exactly. run with --release --nocapture. NOT
+    ///API
+    #[test]
+    fn streak_anchor_staleness() {
+        let track = |name: &str, keys: Vec<u64>| {
+            let mut set = BlockSet::<u64, u16>::new();
+            let mut prev: Option<u16> = None;
+            let (mut stale, mut resets) = (0usize, 0);
+            for k in keys {
+                let anchor = set.last_insert;
+                let streak_before = set.streak;
+                let epoch = set.epoch();
+                let Ok(a) = set.insert(k) else {
+                    set.deltas().clear();
+                    continue; //dup — nothing landed, prev stays live
+                };
+                resets += usize::from(set.streak == 0 && streak_before > 0);
+                if let Some(mut prev_name) = prev
+                    && set.epoch() == epoch
+                {
+                    //one pass over the event: replay the pos pairs onto
+                    //the anchor (the expected tracking) AND apply the
+                    //name swaps to our held name (honest-holder
+                    //semantics — names transfer on slides)
+                    let tr = set.deltas().translator;
+                    let mut expected = anchor;
+                    while let Some((f, t)) = set.deltas().next_pos() {
+                        if f.0 == expected {
+                            expected = t.0;
+                        }
+                        if tr.p2a(f) == prev_name {
+                            prev_name = tr.p2a(t);
+                        }
+                    }
+                    let true_pos = set.pos_of(prev_name);
+                    if true_pos != expected && stale < 6 {
+                        println!(
+                            "{name} MISMATCH anchor {anchor} expected {expected} true {true_pos} k={k}",
+                        );
+                    }
+                    if true_pos != expected {
+                        stale += 1;
+                    }
+                }
+                set.deltas().clear();
+                prev = Some(a);
+            }
+            println!(
+                "{name:>12}: stale {stale:>4} | streak resets {resets:>3} / {}",
+                set.len(),
+            );
+        };
+        //the mid-band shapes from benches/mid_band.rs, plus clustered random
+        let base: Vec<u64> = (0..128).map(|i| i as u64 * 8).collect();
+        track("mid desc", base.iter().copied().chain((0..128u64).rev().map(|i| 258 + i * 4)).collect());
+        track("mid asc", base.iter().copied().chain((0..128u64).map(|i| 258 + i * 4)).collect());
+        track("clust rand", {
+            let mut s = 0x2545_F491_4F6C_DD1Du64;
+            let mut rnd = move || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            (0..600u64).map(|i| (i / 40) * 700 + rnd() % 300).collect()
+        });
+        track("random", {
+            let mut s = 0x2545_F491_4F6C_DD1Du64;
+            let mut rnd = move || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            (0..600u64).map(|_| rnd() % 1200).collect()
+        });
+    }
+
+    ///the hinted bracket must agree with the bsearch everywhere it
+    ///answers: Some(Ok) = the same boundary position, Some(Err) = the
+    ///same dup. holed blocks in both directions, probed at every key
+    #[test]
+    fn spot_near_agrees_with_bsearch() {
+        let mut set = BlockSet::<u64, u16>::new();
+        for i in 0..120u64 {
+            set.insert((i * 37 + 11) % 131).unwrap();
+            set.deltas().clear();
+        }
+        for k in [11u64, 48, 18, 59] {
+            set.remove(set.find(&k).unwrap());
+        }
+        let check = |set: &BlockSet<u64, u16>| {
+            for k in 0..=132u64 {
+                match set.spot_near(&k) {
+                    Some(Ok(p)) => {
+                        let b = set.bsearch(&k);
+                        assert_eq!(b.err(), Some(p), "k {k} boundary mismatch");
+                    }
+                    Some(Err(())) => {
+                        assert!(set.bsearch(&k).is_ok(), "k {k} false dup");
+                    }
+                    None => {} //out of reach — bsearch carries it
+                }
+            }
+        };
+        check(&set);
+        set.reverse(); //Desc — the walk mirrors
+        check(&set);
+    }
+
+    ///one-off diagnostic: the mid-band bench's streak health — resets
+    ///(a landing > FREE_STRIDE from the anchor) vs hot inserts
+    ///(streak ≥ STREAK_BANK) per band, isolated on fresh prefills like
+    ///the bench's independent rows. run with --release --nocapture. NOT API
+    #[test]
+    fn mid_band_streak_census() {
+        let track = |name: &str, keys: Vec<u64>| {
+            let mut set = BlockSet::<u64, u16>::new();
+            let (mut resets, mut hot, mut cold) = (0usize, 0, 0);
+            for k in keys {
+                let before = set.streak;
+                set.insert(k).unwrap();
+                set.deltas().clear();
+                resets += usize::from(set.streak == 0 && before > 0);
+                hot += usize::from(set.streak >= STREAK_BANK);
+                cold += usize::from(set.streak == 0);
+            }
+            println!("{name:>14}: resets {resets:>3} | hot {hot:>3} | cold {cold:>3} / {n}", n = set.len());
+        };
+        let base: Vec<u64> = (0..128).map(|i| i as u64 * 8).collect();
+        let prefill = |track: &dyn Fn(&str, Vec<u64>), band: Vec<u64>, name: &str| {
+            let mut keys = base.clone();
+            keys.extend(band);
+            track(name, keys);
+        };
+        prefill(&track, (0..128u64).rev().map(|i| 258 + i * 4).collect(), "desc band iso");
+        prefill(&track, (0..128u64).map(|i| 385 + i * 2).collect(), "asc band iso");
+        let mut nested = base.clone();
+        nested.extend((0..128u64).rev().map(|i| 258 + i * 4));
+        nested.extend((0..128u64).map(|i| 385 + i * 2));
+        track("nested both", nested);
+    }
+
+    ///one-off diagnostic: the exact anatomy of each streak break in the
+    ///mid-band workloads — insert index, landing vs anchor, the event
+    ///class that fired, and the anchor's true post-event position (a
+    ///stale anchor names a false break). also logs turns/rebalances for
+    ///correlation. run with --release --nocapture. NOT API
+    #[test]
+    fn mid_band_break_forensics() {
+        let track = |name: &str, keys: Vec<u64>| {
+            let mut set = BlockSet::<u64, u16>::new();
+            
+            for (i, k) in keys.into_iter().enumerate() {
+                let anchor = set.last_insert;
+                let epoch = set.epoch();
+                set.insert(k).unwrap();
+                let links: Vec<_> = set.deltas().slides().collect();
+                let moved = set.deltas().iter().count();
+                let kind = if set.epoch() != epoch {
+                    "TURN/FLIP"
+                } else if links.is_empty() || links[0].from == links[0].to {
+                    "direct"
+                } else if links.len() > 1 {
+                    "bank"
+                } else if moved == links[0].from.0.abs_diff(links[0].to.0) {
+                    "slide"
+                } else {
+                    "REBALANCE"
+                };
+                let drift = set.last_insert.abs_diff(anchor);
+                //true_prev resolves a name this test never applies swaps
+                //to — the honest-holder check lives in
+                //streak_anchor_staleness (0 mismatches); this line only
+                //flags silent moves (turns/flips), which preserve names
+                let trace = set.streak == 0
+                    || drift > FREE_STRIDE
+                    || matches!(kind, "TURN/FLIP" | "REBALANCE" | "bank");
+                if trace {
+                    println!(
+                        "{name} i={i:>3} k={k:>4}: landed {land:>4} Δ{drift:>3} {kind:>8} moved {moved:>3} streak {streak:>2} cap {cap}",
+                        land = set.last_insert, streak = set.streak, cap = set.cap(),
+                    );
+                }
+                set.deltas().clear();
+
+            }
+        };
+        let base: Vec<u64> = (0..128).map(|i| i as u64 * 8).collect();
+        let mut desc = base.clone();
+        desc.extend((0..128u64).rev().map(|i| 258 + i * 4));
+        track("desc", desc);
+        let mut asc = base.clone();
+        asc.extend((0..128u64).map(|i| 385 + i * 2));
+        track("asc", asc);
+        //the runs shape (chunked, alternating reversed) — bank-to-bank
+        //gaps: how many inserts does one bank actually serve?
+        let mut runs_keys: Vec<u64> = Vec::new();
+        let mut chunks: Vec<Vec<u64>> = (0..50)
+            .map(|c| ((c * 300) as u64..((c * 300) as u64 + 200)).collect())
+            .collect();
+        for c in chunks.iter_mut().step_by(2) {
+            c.reverse();
+        }
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for i in (1..chunks.len()).rev() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            chunks.swap(i, (s % (i as u64 + 1)) as usize);
+        }
+        runs_keys.extend(chunks.into_iter().flatten());
+        let mut set = BlockSet::<u64, u32>::new();
+        let mut last_bank = 0usize;
+        let mut banks = 0usize;
+        for (i, k) in runs_keys.into_iter().enumerate() {
+            set.insert(k).unwrap();
+            let links: Vec<_> = set.deltas().slides().collect();
+            let moved = set.deltas().iter().count();
+            set.deltas().clear();
+            if links.len() > 1 {
+                banks += 1;
+                if banks <= 24 {
+                    println!(
+                        "runs bank #{banks} i={i} gap {} moved {moved} streak {}",
+                        i - last_bank,
+                        set.streak,
+                    );
+                }
+                last_bank = i;
+            }
+        }
+        println!("runs total banks {banks} / {}", set.len());
+    }
+
+    ///the ceiling valve: a u8 block past the doubling midpoint, dense —
+    ///a mid-block insert cannot turn, so the whole block water-levels
+    ///onto the minimal-stride lattice that fits the remaining name
+    ///space: 200 live, ceiling 256 → stride 5 (4/5 density), tail
+    ///extended to the tight 251, and the lattice serves the following
+    ///mid inserts cheaply instead of O(n) slides per insert
+    #[test]
+    fn ceiling_rebalances_whole_block() {
+        let mut set = BlockSet::<u64, u8>::new();
+        for k in (0..200u64).map(|i| i * 2) {
+            set.insert(k).unwrap();
+            set.deltas().clear();
+        }
+        assert_eq!(set.cap(), 200);
+        //turn line holds, spot mid-block, doubling refused (cap 200 >
+        //MIDPOINT 128) — the valve fires instead
+        set.insert(201).unwrap();
+        set.deltas().clear();
+        assert_eq!(set.cap(), 251, "extended to the tight stride-5 lattice");
+        assert!(set.len() == 201);
+        //stride 5 ⇒ live runs of ≤ 4, no second valve (4/5 < the 5/6 line)
+        assert!(set.live_run_lengths().into_iter().max().unwrap() <= 4, "lattice runs");
+        let keys: Vec<u64> = set.iter().copied().collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted);
+        assert!(sorted.binary_search(&201).is_ok());
+        //the lattice serves the next mid inserts: the stride-5 holes
+        //absorb them, with the ladder's normal small slides/banks
+        //between hole refills — the O(n)-per-insert ceiling grind is
+        //gone (measured: 1, 4, 15, 1)
+        let mut moved = 0usize;
+        for k in [203u64, 205, 207, 209] {
+            set.insert(k).unwrap();
+            moved += set.deltas().iter().count();
+        }
+        assert!(moved < 40, "lattice must amortize mid inserts, moved {moved}");
+        assert_eq!(set.cap(), 251, "no second valve");
+    }
+
     ///BORROW: k's word full, the right neighbor under High and holed —
     ///it lends its nearest hole across the boundary; no rebalance, no
     ///turn
     #[test]
     fn borrow_lends_across_words() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
         let mut holder = Vec::new();
         //words 0-1 dense (80 keys), then word 1's tail holed by removals
         for k in (0..80u64).map(|i| i * 2) {
-            let a = set.insert(k, &mut d).unwrap();
-            apply(&mut holder, &d);
-            d.clear();
+            let a = set.insert(k).unwrap();
+            apply(&mut holder, set.deltas());
             holder.push((a, k));
         }
         //positions 66..79 clear — word 1 at 2/16 valid, well under
@@ -1791,25 +2312,22 @@ mod tests {
             set.remove(set.find(&k).unwrap());
             holder.retain(|(_, hk)| *hk != k);
         }
-        let a = set.insert(51, &mut d).unwrap();
+        let a = set.insert(51).unwrap();
         //spot 26 (key 51 between 50@25 and 52@26): one event banks the
         //14 holes word 1 holds — the 40-element run [26, 66) shifts up,
-        //k takes 26, holes land at 27..39
-        assert_eq!(d.iter().count(), 40, "borrow bank pairs");
+        //k takes 26 (the cold anchor sits in the hole region — slack 0,
+        //the streak is dead either way), holes land at 27..39
         assert_eq!(set.cap(), 80, "borrow must not turn");
         assert_eq!(set.get(26), Some(&51));
-        apply(&mut holder, &d);
-        d.clear();
+        assert_eq!(apply(&mut holder, set.deltas()), 40, "borrow bank pairs");
         holder.push((a, 51));
         //len back under the 5/6 turn line, then the bank absorbs the
         //next insert: key 53 slides ONE element from a banked hole
         set.remove(set.find(&130).unwrap());
         holder.retain(|(_, hk)| *hk != 130);
-        let a = set.insert(53, &mut d).unwrap();
+        let a = set.insert(53).unwrap();
         assert_eq!(set.cap(), 80, "no turn — the banked hole absorbs");
-        assert_eq!(d.iter().count(), 1, "banked hole should absorb the insert");
-        apply(&mut holder, &d);
-        d.clear();
+        assert_eq!(apply(&mut holder, set.deltas()), 1, "banked hole should absorb the insert");
         holder.push((a, 53));
         check(&set, &holder, 67);
     }
@@ -1820,13 +2338,11 @@ mod tests {
     #[test]
     fn far_words_rebalance_region() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
         let mut holder = Vec::new();
         //190 keys dense: words 0-1 full, word 2 holds 62 of 64 bits
         for k in (0..190u64).map(|i| i * 2) {
-            let a = set.insert(k, &mut d).unwrap();
-            apply(&mut holder, &d);
-            d.clear();
+            let a = set.insert(k).unwrap();
+            apply(&mut holder, set.deltas());
             holder.push((a, k));
         }
         //word 2 emptied — the scan's ≤ 3/4 pocket
@@ -1837,23 +2353,19 @@ mod tests {
         //a far landing cools the streak, the removal restores len —
         //the probe must take the BALANCE arm of the fork (hot streaks
         //bank instead) and the len/2 bail stays dormant (len ≤ 128)
-        let a = set.insert(261, &mut d).unwrap();
-        assert_eq!(d.iter().count(), 0, "direct place, no movement");
-        apply(&mut holder, &d);
-        d.clear();
+        let a = set.insert(261).unwrap();
+        assert_eq!(apply(&mut holder, set.deltas()), 0, "direct place, no movement");
         holder.push((a, 261));
         set.remove(a);
         holder.retain(|(_, hk)| *hk != 261);
-        let a = set.insert(51, &mut d).unwrap();
+        let a = set.insert(51).unwrap();
         //spot 26 (key 51 between 50@25 and 52@26): k's word full, right
         //neighbor full (not borrowable) → FAR; region [0, 190), 128
         //live, density 67% < 5/6 → stride 4; k rides the lattice at
         //u(26) = 34; ranks 0..=2 keep their slots
-        assert_eq!(d.iter().count(), 125, "rebalance pairs");
         assert_eq!(set.cap(), 190, "rebalance must not turn");
         assert_eq!(set.get(34), Some(&51), "k's reserved lattice slot");
-        apply(&mut holder, &d);
-        d.clear();
+        assert_eq!(apply(&mut holder, set.deltas()), 125, "rebalance pairs");
         holder.push((a, 51));
         check(&set, &holder, 129);
         //uniform lattice: stride 4 ⇒ runs of ≤ 3
@@ -1918,18 +2430,18 @@ mod tests {
     fn ladder_census() {
         let report = |name: &str, keys: Vec<u64>| {
             let mut set = BlockSet::<u64, u32>::new();
-            let mut d = Deltas::new();
             let (mut slides, mut s_moved, mut rebal, mut r_span, mut r_moved, mut gath, mut g_moved, mut turns) =
                 (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
             let mut epoch = set.epoch();
             for k in keys {
-                set.insert(k, &mut d).unwrap();
+                set.insert(k).unwrap();
                 if set.epoch() != epoch {
                     epoch = set.epoch();
                     turns += 1;
                 }
-                let pairs = d.iter().count() as u64;
-                let links: Vec<_> = d.slides().collect();
+                //slides read first — the pair pull drains the event
+                let links: Vec<_> = set.deltas().slides().collect();
+                let pairs = set.deltas().iter().count() as u64;
                 if links.is_empty() || links[0].from == links[0].to {
                     //push_back or a direct place — no movement
                 } else if links.len() > 1 {
@@ -1948,7 +2460,6 @@ mod tests {
                         r_moved += pairs;
                     }
                 }
-                d.clear();
             }
             let n = set.len() as u64;
             println!(
@@ -2003,14 +2514,12 @@ mod tests {
     #[test]
     fn tail_grows_to_target_density() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
         let mut holder = Vec::new();
         //200 dense: word 3 = the 8-valid tail word; then holes at the
         //HEAD (global 75% ≤ 7/8, so no preemptive turn)
         for k in (0..200u64).map(|i| i * 2) {
-            let a = set.insert(k, &mut d).unwrap();
-            apply(&mut holder, &d);
-            d.clear();
+            let a = set.insert(k).unwrap();
+            apply(&mut holder, set.deltas());
             holder.push((a, k));
         }
         for k in (0..50u64).map(|i| i * 2) {
@@ -2019,13 +2528,11 @@ mod tests {
         }
         //a far landing cools the streak — the probe must take the
         //BALANCE arm (hot streaks bank instead)
-        let a = set.insert(1, &mut d).unwrap();
-        assert_eq!(d.iter().count(), 0, "direct place, no movement");
-        apply(&mut holder, &d);
-        d.clear();
+        let a = set.insert(1).unwrap();
+        assert_eq!(apply(&mut holder, set.deltas()), 0, "direct place, no movement");
         holder.push((a, 1));
         let epoch = set.epoch();
-        let a = set.insert(301, &mut d).unwrap();
+        let a = set.insert(301).unwrap();
         //spot 151 (key 301 between 300@150 and 302@151): no hole at or
         //above the spot, the left word full → FAR; the scan takes the
         //sparse tail word,
@@ -2033,10 +2540,8 @@ mod tests {
         //84% just under 5/6 → stride 6; k rides at u(23) = 155; ranks 0..=4 stay
         assert_eq!(set.cap(), 215, "the tail must grow by exactly need − span");
         assert_eq!(set.epoch(), epoch, "growth is silent-adjacent: no turn");
-        assert_eq!(d.iter().count(), 67, "rebalance pairs");
         assert_eq!(set.get(155), Some(&301), "k's reserved lattice slot");
-        apply(&mut holder, &d);
-        d.clear();
+        assert_eq!(apply(&mut holder, set.deltas()), 67, "rebalance pairs");
         holder.push((a, 301));
         check(&set, &holder, 152);
     }
@@ -2046,14 +2551,13 @@ mod tests {
     #[test]
     fn front_insert_renames_min() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
-        set.insert(10, &mut d).unwrap();
-        d.clear();
-        set.insert(20, &mut d).unwrap();
-        d.clear();
-        let a = set.insert(5, &mut d).unwrap();
+        set.insert(10).unwrap();
+        set.deltas().clear();
+        set.insert(20).unwrap();
+        set.deltas().clear();
+        let a = set.insert(5).unwrap();
         assert_eq!(a, 0);
-        assert_eq!(d.iter().collect::<Vec<_>>(), vec![(1, 2), (0, 1)]);
+        assert_eq!(set.deltas().iter().collect::<Vec<_>>(), vec![(1, 2), (0, 1)]);
         assert_eq!(set.get(0), Some(&5));
         assert_eq!(set.get(1), Some(&10));
         assert_eq!(set.get(2), Some(&20));
@@ -2065,14 +2569,13 @@ mod tests {
     #[test]
     fn front_insert_back_opens() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
         for k in [10, 20, 30, 40] {
-            set.insert(k, &mut d).unwrap();
-            d.clear();
+            set.insert(k).unwrap();
+            set.deltas().clear();
         }
-        let a = set.insert(5, &mut d).unwrap();
+        let a = set.insert(5).unwrap();
         assert_eq!(a, 0);
-        assert_eq!(d.iter().collect::<Vec<_>>(), vec![(3, 4), (2, 3), (1, 2), (0, 1)]);
+        assert_eq!(set.deltas().iter().collect::<Vec<_>>(), vec![(3, 4), (2, 3), (1, 2), (0, 1)]);
         assert_eq!(set.get(0), Some(&5));
         assert_eq!(set.get(1), Some(&10));
         assert_eq!(set.get(4), Some(&40));
@@ -2082,9 +2585,8 @@ mod tests {
     #[test]
     fn duplicates_rejected() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
-        set.insert(1, &mut d).unwrap();
-        assert!(set.insert(1, &mut d).is_err());
+        set.insert(1).unwrap();
+        assert!(set.insert(1).is_err());
         assert_eq!(set.len(), 1);
     }
 
@@ -2093,7 +2595,9 @@ mod tests {
     #[test]
     fn none_slide_expands_to_cascade() {
         let expand = |from: usize, to: usize| -> Vec<(Pos, Pos)> {
-            Delta::NoneSlide { from: Pos(from), to: Pos(to) }.pairs().collect()
+            let mut d = Deltas::<u8>::new();
+            d.record_none_slide(Translator::new(), Pos(from), Pos(to));
+            std::iter::from_fn(|| d.next_pos()).collect()
         };
         assert_eq!(
             expand(10, 5),
@@ -2119,10 +2623,9 @@ mod tests {
     #[should_panic(expected = "pending deltas")]
     fn insert_panics_on_pending_deltas() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
-        set.insert(1, &mut d).unwrap();
-        set.insert(2, &mut d).unwrap();
-        set.insert(3, &mut d).unwrap();
+        set.insert(1).unwrap();
+        set.insert(2).unwrap();
+        set.insert(3).unwrap();
     }
 
     ///the turn map (`a2p_new ∘ p2a_old`) is name-stable, order-preserving
@@ -2155,7 +2658,6 @@ mod tests {
     #[test]
     fn reversal_z_gate_blocks_thrash() {
         let mut set = BlockSet::<u64, u16>::new();
-        let mut d = Deltas::new();
         let mut flips = 0;
         let mut prev = false;
         for round in 0..30u64 {
@@ -2166,8 +2668,8 @@ mod tests {
                 (base..base + 100).rev().collect()
             };
             for k in keys {
-                set.insert(k, &mut d).unwrap();
-                d.clear();
+                set.insert(k).unwrap();
+                set.deltas().clear();
                 if set.translator.reversed() != prev {
                     prev = set.translator.reversed();
                     flips += 1;
@@ -2176,8 +2678,8 @@ mod tests {
             //tail filler keeps len growing and the mean bouncing — high
             //disjoint key range, so every filler lands at the tail
             for k in (base + 200..base + 400).map(|i| 1_000_000 + i * 3) {
-                set.insert(k, &mut d).unwrap();
-                d.clear();
+                set.insert(k).unwrap();
+                set.deltas().clear();
                 if set.translator.reversed() != prev {
                     prev = set.translator.reversed();
                     flips += 1;
@@ -2190,15 +2692,14 @@ mod tests {
     #[test]
     fn remove_and_reinsert() {
         let mut set = BlockSet::<u64, u8>::new();
-        let mut d = Deltas::new();
         for k in 0..50u64 {
-            set.insert(k, &mut d).unwrap();
-            d.clear();
+            set.insert(k).unwrap();
+            set.deltas().clear();
         }
         let a = set.find(&25).unwrap();
         assert_eq!(set.remove(a), Some(25));
         assert_eq!(set.remove(a), None);
-        set.insert(25, &mut d).unwrap();
+        set.insert(25).unwrap();
         let mut keys: Vec<u64> = set.iter().copied().collect();
         keys.sort();
         assert_eq!(keys, (0..50).collect::<Vec<_>>());
@@ -2257,12 +2758,11 @@ mod tests {
     #[test]
     fn cursor_matches_sorted_model() {
         let mut set = BlockSet::<u64, u16>::new();
-        let mut d = Deltas::new();
         //37 coprime 67 ⇒ distinct keys, 7 gaps for hole spots
         for i in 0..60u64 {
             let k = (i * 37 + 11) % 67;
-            set.insert(k, &mut d).unwrap();
-            d.clear();
+            set.insert(k).unwrap();
+            set.deltas().clear();
         }
         for k in [11u64, 48, 18, 59, 66] {
             if let Some(a) = set.find(&k) {
@@ -2297,9 +2797,7 @@ mod tests {
         assert_eq!(c.next(), None);
         assert_eq!(c.prev(), None);
         let mut set = set;
-        let mut d = Deltas::new();
-        set.insert(7, &mut d).unwrap();
-        d.clear();
+        set.insert(7).unwrap();
         let mut c = set.seek(&5);
         assert_eq!(c.next(), Some(&7));
         assert_eq!(c.next(), None);

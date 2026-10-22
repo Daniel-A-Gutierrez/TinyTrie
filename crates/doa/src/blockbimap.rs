@@ -1,13 +1,13 @@
 //!BlockBiMap: the bijective tier — two lockstep BlockMaps, each holding the
 //!other's names as its values, so both orders are native (no projection
 //!ordering) and every pair is one hop from either side. insert churns
-//!BOTH name spaces (one event each, carried by `BiDeltas`); the maps
-//!consume each other's events by the BACK-POINTER CHASE — a delta pair
-//!names the emitter's moved entry, and that entry's own value addresses
-//!the one partner slot whose held name went stale (O(1) per pair, no
-//!search; bijection guarantees a single partner per pair). the fresh
-//!entry's dummy value is never chased before its patch: only its own
-//!partner points at it, and a placed entry never moves.
+//!BOTH name spaces (one event each, in the maps' own `Deltas` slots); the
+//!maps consume each other's events by the BACK-POINTER CHASE — a delta
+//!pair names the emitter's moved entry, and that entry's own value
+//!addresses the one partner slot whose held name went stale (O(1) per
+//!pair, no search; bijection guarantees a single partner per pair). the
+//!fresh entry's dummy value is never chased before its patch: only its
+//!own partner points at it, and a placed entry never moves.
 //!cursors (`seek`/`seek_by_value`): blockmap cursors over either native
 //!order, the partner chased one hop per yield (like the iters).
 
@@ -16,46 +16,21 @@ use crate::blockmap::Cursor as MapCursor;
 use crate::blockset::Deltas;
 use crate::index::*;
 
-///two event streams, one per name space — apply + clear both like `Deltas`
-pub struct BiDeltas<A> {
-    ///K-side name swaps
-    pub keys:   Deltas<A>,
-    ///V-side name swaps
-    pub values: Deltas<A>,
-}
-
-impl<A: UnsignedNum> BiDeltas<A> {
-    pub fn new() -> Self {
-        BiDeltas { keys: Deltas::new(), values: Deltas::new() }
-    }
-
-    ///both streams empty
-    pub(crate) fn is_pending(&self) -> bool {
-        self.keys.is_pending() || self.values.is_pending()
-    }
-
-    pub fn clear(&mut self) {
-        self.keys.clear();
-        self.values.clear();
-    }
-}
-
 ///the back-pointer chase: apply `emitter`'s event to `target`'s value
 ///column, one write per moved entry. a delta pair names the emitter's
 ///moved entry, and that entry's own value addresses its partner slot in
 ///target — O(1) per pair, no search (bijection: one partner per entry).
 ///gather pairs carry the FULL hop (crossing count), so every pair is
 ///final — a single forward pass, no chained intermediate names. reads
-///run in POS space (`iter_pos`): the flip fires pre-record, so the
-///emitter's translator is unchanged from the record to this call; events
-///held across mutations must go through `iter`'s names instead
+///run in POS space (`next_pos` pulls): the flip fires pre-record, so
+///the emitter's translator is unchanged from the record to this call;
+///events held across mutations must go through `iter`'s names instead
 ///(era-stable — subtle_bugs §22)
 fn chase<EK: Ord, TK: Ord, A: UnsignedNum>(
-    emitter: &BlockMap<EK, A, A>,
-    event: &Deltas<A>,
+    emitter: &mut BlockMap<EK, A, A>,
     target: &mut BlockMap<TK, A, A>,
 ) {
-    for (from, to) in event.iter_pos() {
+    while let Some((from, to)) = emitter.deltas().next_chase() {
         let partner = *emitter.value_at_pos(to).expect("moved entry live");
         //the partner held the entry's ORIGINAL name before the event
         debug_assert_eq!(*target.get(partner).expect("partner live").1, emitter.name_at(from));
@@ -168,19 +143,26 @@ impl<K: Ord, V: Ord, A: UnsignedNum> BlockBiMap<K, V, A> {
     ///Err rolled the just-placed k back, so the slides it caused were
     ///real — key-side deltas may be PENDING: apply + clear on Err like
     ///on Ok
-    pub fn insert(&mut self, k: K, v: V, deltas: &mut BiDeltas<A>) -> Result<(A, A), (K, V)> {
-        assert!(!deltas.is_pending(), "pending deltas: apply + clear before reuse");
+    pub fn insert(&mut self, k: K, v: V) -> Result<(A, A), (K, V)> {
+        assert!(
+            !self.keys.deltas().is_pending(),
+            "pending deltas: apply + exhaust before reuse (keys)"
+        );
+        assert!(
+            !self.values.deltas().is_pending(),
+            "pending deltas: apply + exhaust before reuse (values)"
+        );
         //K first, dummy value — its only reader is the patch below. dup k
         //or a full name space ⇒ Err before any mutation
-        let k_addr = match self.keys.insert(k, A::ZERO, &mut deltas.keys) {
+        let k_addr = match self.keys.insert(k, A::ZERO) {
             Ok(a) => a,
             Err((k, _)) => return Err((k, v)),
         };
-        chase(&self.keys, &deltas.keys, &mut self.values);
+        chase(&mut self.keys, &mut self.values);
         //the one Err-after-mutation path: values' capacity can't differ
         //(lens always equal), so this is a value dup — roll the placed k
         //back; the slides it caused stay (kdeltas pending)
-        let val_addr = match self.values.insert(v, k_addr, &mut deltas.values) {
+        let val_addr = match self.values.insert(v, k_addr) {
             Ok(a) => a,
             Err((v, _)) => {
                 let k = match self.keys.remove(k_addr) {
@@ -190,9 +172,14 @@ impl<K: Ord, V: Ord, A: UnsignedNum> BlockBiMap<K, V, A> {
                 return Err((k, v));
             }
         };
-        chase(&self.values, &deltas.values, &mut self.keys);
+        chase(&mut self.values, &mut self.keys);
         self.keys.set_value(k_addr, val_addr);
         Ok((k_addr, val_addr))
+    }
+
+    ///both event slots, (K-side, V-side) — the two-stream deltas surface
+    pub fn deltas(&mut self) -> (&mut Deltas<A>, &mut Deltas<A>) {
+        (self.keys.deltas(), self.values.deltas())
     }
 
     pub fn remove_by_key(&mut self, k: &K) -> Option<(K, V)> {
@@ -382,8 +369,10 @@ mod tests {
     }
 
     ///apply both streams to the holder's two name columns, in order
-    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64, A)>, d: &BiDeltas<A>) {
-        for (from, to) in d.keys.iter() {
+    ///(pulling exhausts — the holder mirror IS the application)
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64, A)>, map: &mut BlockBiMap<u64, u64, A>) {
+        let (keys, values) = map.deltas();
+        for (from, to) in keys.iter() {
             for (a, _, _, _) in &mut *holder {
                 if *a == from {
                     *a = to;
@@ -391,7 +380,7 @@ mod tests {
                 }
             }
         }
-        for (from, to) in d.values.iter() {
+        for (from, to) in values.iter() {
             for (_, _, _, a) in &mut *holder {
                 if *a == from {
                     *a = to;
@@ -401,17 +390,23 @@ mod tests {
         }
     }
 
+    ///drain both event slots without applying (the no-op direct-place
+    ///events pend too — a fresh block's appends land in past-tail holes)
+    fn clear<A: UnsignedNum>(map: &mut BlockBiMap<u64, u64, A>) {
+        let (keys, values) = map.deltas();
+        keys.clear();
+        values.clear();
+    }
+
     fn insert_all(
         entries: impl IntoIterator<Item = (u64, u64)>,
     ) -> (BlockBiMap<u64, u64, u8>, Vec<(u8, u64, u64, u8)>) {
         let mut map = BlockBiMap::new();
         let mut holder = Vec::new();
-        let mut d = BiDeltas::new();
         for (k, v) in entries {
-            match map.insert(k, v, &mut d) {
+            match map.insert(k, v) {
                 Ok((ka, va)) => {
-                    apply(&mut holder, &d);
-                    d.clear();
+                    apply(&mut holder, &mut map);
                     holder.push((ka, k, v, va));
                 }
                 Err((k, v)) => panic!("insert ({k}, {v}) failed"),
@@ -472,7 +467,6 @@ mod tests {
     #[test]
     fn mixed_ops_torture() {
         let mut map = BlockBiMap::<u64, u64, u16>::new();
-        let mut d = BiDeltas::new();
         let mut holder = Vec::new();
         let mut s = 0x2545_F491_4F6C_DD1Du64;
         let mut rnd = move || {
@@ -489,17 +483,15 @@ mod tests {
                     (i / 40) * 700 + rnd() % 300
                 };
                 let v = k.wrapping_mul(3) + 7;
-                match map.insert(k, v, &mut d) {
+                match map.insert(k, v) {
                     Ok((ka, va)) => {
-                        apply(&mut holder, &d);
-                        d.clear();
+                        apply(&mut holder, &mut map);
                         holder.push((ka, k, v, va));
                     }
                     //a dup-v Err may carry real key-side slides — the
                     //holder applies them like an Ok
                     Err(_) => {
-                        apply(&mut holder, &d);
-                        d.clear();
+                        apply(&mut holder, &mut map);
                     }
                 }
             } else {
@@ -524,16 +516,14 @@ mod tests {
     #[test]
     fn dups_rejected() {
         let mut map = BlockBiMap::<u64, u64, u8>::new();
-        let mut d = BiDeltas::new();
-        map.insert(1, 11, &mut d).unwrap();
-        d.clear();
-        assert_eq!(map.insert(1, 99, &mut d), Err((1, 99)), "dup key");
+        map.insert(1, 11).unwrap();
+        clear(&mut map);
+        assert_eq!(map.insert(1, 99), Err((1, 99)), "dup key");
         //the k-placement records a no-op event even for a direct place
         //into a hole — pending, but nothing moved (the general dup-v case
         //is the rollback test below)
-        assert_eq!(map.insert(2, 11, &mut d), Err((2, 11)), "dup value");
-        assert_eq!(d.keys.iter().count(), 0, "nothing moved");
-        d.clear();
+        assert_eq!(map.insert(2, 11), Err((2, 11)), "dup value");
+        assert_eq!(map.deltas().0.iter().count(), 0, "nothing moved");
         assert_eq!(map.len(), 1);
         assert_eq!(map.get_by_key(&1), Some((&1, &11)), "rejected insert must not overwrite");
     }
@@ -544,14 +534,13 @@ mod tests {
     #[test]
     fn dup_value_rolls_back_with_pending_deltas() {
         let mut map = BlockBiMap::<u64, u64, u16>::new();
-        let mut d = BiDeltas::new();
         for i in 0..10u64 {
-            map.insert(i * 10, i * 10 + 100, &mut d).unwrap();
-            d.clear();
+            map.insert(i * 10, i * 10 + 100).unwrap();
+            clear(&mut map);
         }
         for k in 200..=214u64 {
-            map.insert(k, k + 100, &mut d).unwrap();
-            d.clear();
+            map.insert(k, k + 100).unwrap();
+            clear(&mut map);
         }
         //holes at pos 8, 9 (7 from the spot of key 5) and 10..19 (drops
         //density below the 3/4 turn line so the slide runs)
@@ -562,11 +551,11 @@ mod tests {
         }
         //key 5 lands at the occupied pos 1, hole 7 away ⇒ a 7-element
         //slide; value 110 already belongs to key 10 ⇒ dup v
-        assert_eq!(map.insert(5, 110, &mut d), Err((5, 110)));
-        assert!(d.keys.is_pending(), "the slide was real");
-        assert_eq!(d.keys.iter().count(), 7, "7 elements shifted one step");
-        assert!(!d.values.is_pending(), "the failing insert recorded nothing");
-        d.clear();
+        assert_eq!(map.insert(5, 110), Err((5, 110)));
+        assert!(map.deltas().0.is_pending(), "the slide was real");
+        assert_eq!(map.deltas().0.iter().count(), 7, "7 elements shifted one step");
+        assert!(!map.deltas().1.is_pending(), "the failing insert recorded nothing");
+        clear(&mut map);
         assert_eq!(map.len(), 13);
         assert_eq!(map.key_addr(&5), None, "rolled back");
         assert_eq!(map.get_by_value(&110), Some((&110, &10)));
@@ -583,10 +572,9 @@ mod tests {
     #[should_panic(expected = "pending deltas")]
     fn insert_panics_on_pending_deltas() {
         let mut map = BlockBiMap::<u64, u64, u8>::new();
-        let mut d = BiDeltas::new();
-        map.insert(1, 11, &mut d).unwrap();
-        map.insert(2, 12, &mut d).unwrap();
-        map.insert(3, 13, &mut d).unwrap();
+        map.insert(1, 11).unwrap();
+        map.insert(2, 12).unwrap();
+        map.insert(3, 13).unwrap();
     }
 
     ///u8 names: 256 pairs fill the space, the 257th fails clean, a
@@ -594,16 +582,15 @@ mod tests {
     #[test]
     fn name_space_exhaustion() {
         let mut map = BlockBiMap::<u64, u64, u8>::new();
-        let mut d = BiDeltas::new();
         for k in 0..256u64 {
-            map.insert(k, k * 1000, &mut d).unwrap();
-            d.clear();
+            map.insert(k, k * 1000).unwrap();
+            clear(&mut map);
         }
         assert_eq!(map.len(), 256);
-        assert_eq!(map.insert(1000, 5, &mut d), Err((1000, 5)), "name space full");
+        assert_eq!(map.insert(1000, 5), Err((1000, 5)), "name space full");
         map.remove_by_key(&0).unwrap();
-        map.insert(500, 500_000, &mut d).unwrap();
-        d.clear();
+        map.insert(500, 500_000).unwrap();
+        clear(&mut map);
         assert_eq!(map.len(), 256);
     }
 
@@ -642,9 +629,7 @@ mod tests {
         assert_eq!(c.next(), None);
         assert_eq!(c.prev(), None);
         let mut map = map;
-        let mut d = BiDeltas::new();
-        map.insert(7, 70, &mut d).unwrap();
-        d.clear();
+        map.insert(7, 70).unwrap();
         let mut c = map.seek(&5);
         assert_eq!(c.next(), Some((&7, &70)));
         assert_eq!(c.next(), None);

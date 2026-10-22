@@ -10,7 +10,7 @@
 //!turn/slide census twice — plain base, then the maintained skipset
 //!path (the deltas-consumer view).
 
-use doa::blockset::{BlockSet, Deltas};
+use doa::blockset::BlockSet;
 use doa::skipset::SkipSet;
 use std::collections::BTreeSet;
 use std::hint::black_box;
@@ -99,14 +99,13 @@ fn check_order(keys: impl Iterator<Item = u64>) {
 fn insert_block(keys: &[u64]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut set = BlockSet::<u64, u32>::new();
-        let mut deltas = Deltas::new();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for &k in keys {
-            set.insert(k, &mut deltas)
+            set.insert(k)
                 .unwrap_or_else(|k| panic!("insert failed at {k}"));
-            deltas.clear();
+            set.deltas().clear();
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;
@@ -127,14 +126,13 @@ fn insert_block(keys: &[u64]) -> Cell {
 fn insert_skip(keys: &[u64]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut set = SkipSet::<u64, u32>::new();
-        let mut deltas = Deltas::new();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for &k in keys {
-            set.insert(k, &mut deltas)
+            set.insert(k)
                 .unwrap_or_else(|k| panic!("insert failed at {k}"));
-            deltas.clear();
+            set.deltas().clear();
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;
@@ -155,20 +153,19 @@ fn insert_skip(keys: &[u64]) -> Cell {
 fn insert_skip_maintained(keys: &[u64]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut set = SkipSet::<u64, u32>::new();
-        let mut deltas = Deltas::new();
         let half = keys.len() / 2;
         for &k in &keys[..half] {
-            set.insert(k, &mut deltas).unwrap();
-            deltas.clear();
+            set.insert(k).unwrap();
+            set.deltas().clear();
         }
         set.rebuild();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for &k in &keys[half..] {
-            set.insert(k, &mut deltas)
+            set.insert(k)
                 .unwrap_or_else(|k| panic!("insert failed at {k}"));
-            deltas.clear();
+            set.deltas().clear();
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;
@@ -204,15 +201,14 @@ fn one_phased_rep(keys: &[u64], phase: Phase, deadline: Instant) -> (usize, bool
     match phase {
         Phase::Base2 => {
             let mut set = BlockSet::<u64, u32>::new();
-            let mut d = Deltas::new();
             for &k in &keys[..half] {
-                set.insert(k, &mut d).unwrap();
-                d.clear();
+                set.insert(k).unwrap();
+                set.deltas().clear();
             }
             let t = Instant::now();
             for &k in &keys[half..] {
-                set.insert(k, &mut d).unwrap();
-                d.clear();
+                set.insert(k).unwrap();
+                set.deltas().clear();
                 done += 1;
                 if done & 1023 == 0 && Instant::now() > deadline {
                     let ns = t.elapsed().as_nanos() as f64 / done as f64;
@@ -225,21 +221,20 @@ fn one_phased_rep(keys: &[u64], phase: Phase, deadline: Instant) -> (usize, bool
         }
         phase => {
             let mut set = SkipSet::<u64, u32>::new();
-            let mut d = Deltas::new();
             for &k in &keys[..half] {
-                set.insert(k, &mut d).unwrap();
-                d.clear();
+                set.insert(k).unwrap();
+                set.deltas().clear();
             }
             set.rebuild();
             let t = Instant::now();
             for &k in &keys[half..] {
                 let r = match phase {
-                    Phase::Maint => set.insert_maintain_only(k, &mut d),
-                    Phase::Descent => set.insert_descent_only(k, &mut d),
-                    _ => set.insert(k, &mut d),
+                    Phase::Maint => set.insert_maintain_only(k),
+                    Phase::Descent => set.insert_descent_only(k),
+                    _ => set.insert(k),
                 };
                 r.unwrap_or_else(|k| panic!("insert failed at {k}"));
-                d.clear();
+                set.deltas().clear();
                 done += 1;
                 if done & 1023 == 0 && Instant::now() > deadline {
                     let ns = t.elapsed().as_nanos() as f64 / done as f64;
@@ -309,13 +304,11 @@ fn insert_btree(keys: &[u64]) -> Cell {
 fn lookup_skip(keys: &[u64], probes: &[u64]) -> Cell {
     let mut block = BlockSet::<u64, u32>::new();
     let mut skip = SkipSet::<u64, u32>::new();
-    let mut db = Deltas::new();
-    let mut ds = Deltas::new();
     for &k in keys {
-        block.insert(k, &mut db).unwrap();
-        skip.insert(k, &mut ds).unwrap();
-        db.clear();
-        ds.clear();
+        block.insert(k).unwrap();
+        skip.insert(k).unwrap();
+        block.deltas().clear();
+        skip.deltas().clear();
     }
     skip.rebuild();
     for p in probes.iter().take(VERIFY) {
@@ -332,10 +325,9 @@ fn lookup_skip(keys: &[u64], probes: &[u64]) -> Cell {
 
 fn lookup_block(keys: &[u64], probes: &[u64]) -> Cell {
     let mut set = BlockSet::<u64, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        set.insert(k, &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(k).unwrap();
+        set.deltas().clear();
     }
     timed_probes(probes, |p| {
         black_box(set.contains(p));
@@ -373,10 +365,9 @@ fn timed_probes(probes: &[u64], mut probe: impl FnMut(&u64)) -> Cell {
 
 fn scan_block(keys: &[u64]) -> Cell {
     let mut set = BlockSet::<u64, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        set.insert(k, &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(k).unwrap();
+        set.deltas().clear();
     }
     assert_eq!(set.len(), keys.len());
     timed_scan(keys.len(), |seed| {
@@ -390,10 +381,9 @@ fn scan_block(keys: &[u64]) -> Cell {
 
 fn scan_skip(keys: &[u64]) -> Cell {
     let mut set = SkipSet::<u64, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        set.insert(k, &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(k).unwrap();
+        set.deltas().clear();
     }
     set.rebuild();
     assert_eq!(set.len(), keys.len());
@@ -443,7 +433,6 @@ fn turn_census(name: &str, keys: &[u64]) {
     TURN_MOVED.store(0, Ordering::Relaxed);
     TURN_TIME_NS.store(0, Ordering::Relaxed);
     let mut set = BlockSet::<u64, u32>::new();
-    let mut deltas = Deltas::new();
     let mut moved_elements = 0u64;
     let mut plain_inserts = 0u64;
     let mut plain_moved = 0u64;
@@ -451,8 +440,8 @@ fn turn_census(name: &str, keys: &[u64]) {
     let mut gather_moved = 0u64;
     let start = Instant::now();
     for &key in keys {
-        set.insert(key, &mut deltas).unwrap();
-        let moved = deltas.iter().filter(|(from, to)| from != to).count() as u64;
+        set.insert(key).unwrap();
+        let moved = set.deltas().iter().filter(|(from, to)| from != to).count() as u64;
         moved_elements += moved;
         //small vs large movement — a size-class split, not FREE_STRIDE:
         //word-scoped near/borrow slides legitimately reach ~62 elements
@@ -463,7 +452,6 @@ fn turn_census(name: &str, keys: &[u64]) {
             plain_inserts += 1;
             plain_moved += moved;
         }
-        deltas.clear();
     }
     let build_ns = start.elapsed().as_nanos() as u64;
     census_print(
@@ -541,10 +529,9 @@ fn skip_census(name: &str, keys: &[u64]) {
     use std::sync::atomic::Ordering;
     let half = keys.len() / 2;
     let mut set = SkipSet::<u64, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in &keys[..half] {
-        set.insert(k, &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(k).unwrap();
+        set.deltas().clear();
     }
     set.rebuild();
     TURN_COUNT.store(0, Ordering::Relaxed);
@@ -554,9 +541,9 @@ fn skip_census(name: &str, keys: &[u64]) {
     let (mut moved_elements, mut plain_inserts, mut plain_moved, mut gather_inserts, mut gather_moved) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
     for &k in &keys[half..] {
-        set.insert(k, &mut deltas).unwrap();
+        set.insert(k).unwrap();
         //same ≥8 split as turn_census: plain slides move < FREE_STRIDE (8)
-        let moved = deltas.iter().filter(|(from, to)| from != to).count() as u64;
+        let moved = set.deltas().iter().filter(|(from, to)| from != to).count() as u64;
         moved_elements += moved;
         if moved >= 8 {
             gather_inserts += 1;
@@ -565,7 +552,6 @@ fn skip_census(name: &str, keys: &[u64]) {
             plain_inserts += 1;
             plain_moved += moved;
         }
-        deltas.clear();
     }
     let build_ns = start.elapsed().as_nanos() as u64;
     assert_eq!(set.len(), keys.len());

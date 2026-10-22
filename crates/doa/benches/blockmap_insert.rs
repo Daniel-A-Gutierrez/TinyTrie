@@ -10,7 +10,7 @@
 //(best/avg over the reps that fit, slow cells one partial rep).
 
 use doa::blockmap::BlockMap;
-use doa::blockset::{BlockSet, Deltas};
+use doa::blockset::BlockSet;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -147,14 +147,13 @@ fn check_order(keys: impl Iterator<Item = u64>) {
 fn insert_map(keys: &[u64]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut map = BlockMap::<Item, u64, u32>::new();
-        let mut deltas = Deltas::new();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for &k in keys {
-            map.insert(Item::new(k), k, &mut deltas)
+            map.insert(Item::new(k), k)
                 .unwrap_or_else(|(i, _)| panic!("insert failed at {}", i.key));
-            deltas.clear();
+            map.deltas().clear();
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;
@@ -172,14 +171,13 @@ fn insert_map(keys: &[u64]) -> Cell {
 fn insert_set(keys: &[u64]) -> Cell {
     reps(Instant::now() + RUN_BUDGET, |deadline| {
         let mut set = BlockSet::<Item, u32>::new();
-        let mut deltas = Deltas::new();
         let t = Instant::now();
         let mut done = 0;
         let mut partial = false;
         for &k in keys {
-            set.insert(Item::new(k), &mut deltas)
+            set.insert(Item::new(k))
                 .unwrap_or_else(|k| panic!("insert failed at {}", k.key));
-            deltas.clear();
+            set.deltas().clear();
             done += 1;
             if done & 1023 == 0 && Instant::now() > deadline {
                 partial = true;
@@ -221,10 +219,9 @@ fn insert_btree(keys: &[u64]) -> Cell {
 fn lookup_map(keys: &[u64], probes: &[u64]) -> Cell {
     //workload-order build — the block's layout is the workload's
     let mut map = BlockMap::<Item, u64, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        map.insert(Item::new(k), k, &mut deltas).unwrap();
-        deltas.clear();
+        map.insert(Item::new(k), k).unwrap();
+        map.deltas().clear();
     }
     timed_probes(probes, |item| {
         black_box(map.value(item));
@@ -233,10 +230,9 @@ fn lookup_map(keys: &[u64], probes: &[u64]) -> Cell {
 
 fn lookup_set(keys: &[u64], probes: &[u64]) -> Cell {
     let mut set = BlockSet::<Item, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        set.insert(Item::new(k), &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(Item::new(k)).unwrap();
+        set.deltas().clear();
     }
     timed_probes(probes, |item| {
         black_box(set.contains(item));
@@ -274,10 +270,9 @@ fn timed_probes(probes: &[u64], mut probe: impl FnMut(&Item)) -> Cell {
 ///timing). BlockMap checksums key+value, the references checksum keys
 fn scan_map(keys: &[u64]) -> Cell {
     let mut map = BlockMap::<Item, u64, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        map.insert(Item::new(k), k, &mut deltas).unwrap();
-        deltas.clear();
+        map.insert(Item::new(k), k).unwrap();
+        map.deltas().clear();
     }
     assert_eq!(map.len(), keys.len());
     check_order(map.iter().map(|(i, _)| i.key));
@@ -292,10 +287,9 @@ fn scan_map(keys: &[u64]) -> Cell {
 
 fn scan_set(keys: &[u64]) -> Cell {
     let mut set = BlockSet::<Item, u32>::new();
-    let mut deltas = Deltas::new();
     for &k in keys {
-        set.insert(Item::new(k), &mut deltas).unwrap();
-        deltas.clear();
+        set.insert(Item::new(k)).unwrap();
+        set.deltas().clear();
     }
     assert_eq!(set.len(), keys.len());
     check_order(set.iter().map(|i| i.key));

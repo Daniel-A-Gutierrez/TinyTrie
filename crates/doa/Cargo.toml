@@ -54,3 +54,7 @@ harness = false
 name = "mask"
 harness = false
 
+[[bench]]
+name = "mid_band"
+harness = false
+
