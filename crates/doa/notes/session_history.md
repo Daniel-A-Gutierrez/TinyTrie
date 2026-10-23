@@ -1365,3 +1365,71 @@ removed.
   inserts re-dragging its own stranded holes); the streak/ladder retune
   sweep; (AA,BA) packing; arena bench; arena removal/merges; the above-max
   symmetric eager flip; skipset-tier-per-arena-block.
+
+## 2026-10-23 — the gather rewrite: subdivide, strided banks, the mean-rebalance, and the fork measured twice
+
+a full day on blockset's gather. the arc: subdivide → greedy banks → strided
+(sentinel) landings → want tuning (dist/6, log2) → run-preferring fetch → the
+block-mean water-level → the fork restored. every single-op config was built,
+measured, and most were deleted; the final ladder is the old topology with
+every rung upgraded.
+
+- landed: SUBDIVIDE (the clear run between k's live neighbors is order-legal;
+  interior gaps place k mid-gap, tail gaps at gap_lo — the append edge stays
+  solid; zero movement wherever the boundary gap has room); the reversal
+  trigger swap (`pos_sum < len·ilog2(len)` — one signal, pos_sq_sum/REVERSE_Z2
+  commented out at all six sites); the STRIDED bank (hole i lands at
+  `open ± (i + i/15)`, the run's head `drag = (w−1)/15` elements ride in as
+  sentinels so ≥1 live sits per 16 across the banked range; encoded in the
+  Gather buf's landings, no new event shape — blockmap's compact ported in
+  lockstep, pairs move via mem::replace); the RUN-PREFERRING fetch (once a run
+  member is taken the walk stops at the next singleton — singletons are the
+  floor of at-average regions at the ~1/2 cycle mean; leading singletons ride
+  along because compact's segment math needs a solid span); the MEAN
+  water-level (`rebalance_region` reborn: two scan arms — above_mean
+  (budget-capped, live·cap > len·span in u128) and unworkable (live·6 ≥ span·5,
+  uncapped); tail-grow serves the unworkable arm only; slack-0 and
+  ceiling-blocked stops slide from the nearest hole); the mint arm (solid mask
+  mints `1 + (cap−spot)/FREE_STRIDE`, clamped to the name ceiling).
+- died: the word-classified NEAR/BORROW/FORK ladder (HIGH/BORROW_MIN lines —
+  the run-preferring fetch + near-bank replace them); the ceiling valve
+  `rebalance_block` (commented out — the mint/bank ladder handles the refused
+  turn); want = log2(dist) (amortizes at dist/log2(dist) — unbounded; killed
+  the runs win at 1M 68→95 and blew the ceiling guard 1759); want = dist/6 as
+  the ONLY far arm (bank-only random 572-730); the bank-only and
+  rebalance-only ladders (each measured, each lost the other workload).
+- decided: the fork is load-bearing (hot = bank, cold = water-level — see
+  subtle_bugs §33, measured twice); NEAR holes (≤ 64) bank unconditionally
+  (gating them on the streak regressed random@10k 90→109); the rebalance stop
+  needs the workability FLOOR (a mean-only stop lets lattice stride exceed
+  the slide reach above 5/6 — subtle_bugs §32); the budget carries +64 (the
+  scan is word-granular); blockmap keeps the old reversal line (divergence
+  documented at should_reverse, port deferred).
+- measured (sorted_insert, medians, u32 addrs; machine-day noise ±5-10% on
+  1k rows — one append row read 14.2 with SortedSet shifted equally):
+
+  | config | random@1M | runs@1M | runs@10k |
+  |---|---|---|---|
+  | old ladder (10-22) | 274.6 complete | 92.4 | 53.3 |
+  | greedy bank dist/6 | 730 partial | 70.8 | 42.0 |
+  | + strided sentinels | 571.7 partial | 68.0 | ~42 |
+  | log2 want | 553 partial | 95.3 | 41.7 |
+  | mean-rebalance only | 292.8 partial | 5419 partial 557k | 160.4→241.9 |
+  | fork + near-bank (final) | **287.8 complete** | **71.3 complete** | 48.5 |
+
+  final ladder vs the old ladder: append 9.3/9.1/12.9 (was 9.7/9.5/13.4),
+  prepend 10.0/9.2/11.6 (11.1/9.6/12.2), random 45.9/89.7/287.8
+  (43.1/90.7/274.6 — parity), runs 40.1/48.5/71.3 (42.8/53.3/92.4 — −23% at
+  1M). vs BTreeSet at 1M: append 4.4× faster (12.9 vs 57.2), prepend 1.8×,
+  random 1.4× slower (287.8 vs 205.6), runs 1.8× slower (71.3 vs 40.4) —
+  the skip-list tier's mandate. miri clean on the blockset module (1098s);
+  fresh review agent: no correctness bugs, 8 findings applied (empty-fetch
+  fallbacks → §25 debug_asserts, blockmap near-gate off-by-one aligned,
+  z-gate test renamed to what it pins, §30 closure re-derived, left-sentinel
+  mirror test added).
+- deferred: blockmap's ilog2 trigger port + its ladder port to the new fork;
+  test gaps (slack-0 budget-short fallback, rebalance ceiling-bail, mint
+  clamped by room); subdivide's two extra mask scans at DRAM scale
+  (unbenched); the loosened trigger vs alternating front streams without
+  tail filler (ungated, untested); the skipset bench re-run under the new
+  ladder.

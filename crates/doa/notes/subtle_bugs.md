@@ -902,17 +902,21 @@ MONOTONICITY refusal, not a formula constraint.
 - forward turns are monotone for ANY offset (their correction is an
   additive band shift, not a ±1 ripple) — a shifted block that must
   keep turning reads Asc (cleave flips a Desc half for exactly this).
-- REACHABLE STATE (2026-10-22 review): a cleave-shifted half carries
-  offset ≥ its cap (any source offset < at wraps — most Asc blocks
-  hold offset 0, so the half is born at offset = cap; the Desc flip
-  RELOCATES the wrap to 255 − offset, never clears it). sound while
-  Asc; the live guard is grow_rotate's REFUSAL at reversed offset ≥
-  midpoint (routing the space need to the ceiling valve), because
-  reverse() on such a half would reborn the constraint and the next
-  turn would hit rotate_mask's always-on assert. the state's closure
-  today is partly arithmetic accident (the z-gate can't fire on a
-  seed-128 half) — do not loosen seed_uniform_signals or the turn
-  line without re-checking this chain.
+- REACHABLE STATE (2026-10-22 review; closure re-derived 2026-10-23
+  after the z-gate's death): a cleave-shifted half carries offset ≥
+  its cap (any source offset < at wraps — most Asc blocks hold offset
+  0, so the half is born at offset = cap; the Desc flip RELOCATES the
+  wrap to 255 − offset, never clears it). sound while Asc; the live
+  guard is grow_rotate's REFUSAL at reversed offset ≥ midpoint,
+  because reverse() on such a half would reborn the constraint and the
+  next turn would hit rotate_mask's always-on assert. the closure
+  under the ilog2 trigger (mean < log2(len)): a seeded half's uniform
+  mean ≈ len/2 clears log2(len) only past len ≳ 700, and even a
+  front-biased stream tipping it is harmless — reverse() is sound for
+  ANY offset (modular arithmetic), the refusal remains the structural
+  guard, and the space need routes to the mint/bank ladder (infallible
+  below the ceiling). do not loosen the trigger further without
+  re-checking this chain.
 - the "derotation" seen in small width examples is the mod-width
   identity (rl w = identity), not a mechanism to bank on.
 
@@ -936,6 +940,54 @@ cleave:
 **The rule.** any structure that relocates a block's signals without
 its history must seed neutral expectations, not zeros; any
 name-preserving position shift is an offset shift, never a re-mint.
+
+---
+
+## 32. A lattice the ladder plants must be slide-reachable; a scan budget must be word-granular (2026-10-23)
+
+**The nuance (2026-10-23, the gather rewrite's single-op sweep).** two
+coupled traps, both measured:
+- **stride-reach collision.** the rebalance's stop line and the slide
+  threshold (FREE_STRIDE) must agree: stop density < 5/6 ⟺ lattice
+  stride ≤ FREE_STRIDE ⟺ every planted hole is slide-reachable. a
+  block-MEAN stop (the 2026-10-23 target) breaks this above 5/6: at
+  len 226/256 the mean-lattice runs stride ~9-10, tail inserts can't
+  reach their own lattice's holes by slide, and every insert pays a
+  ~30-pair re-level (measured 2549 pairs over the descending ceiling
+  fill vs the guard's 1000). the fix is the workability FLOOR: extend
+  while density ≥ 5/6 regardless of the mean arm.
+- **budget granularity.** the scan extends word-by-word, so a budget
+  smaller than one word (budget = 2·dist with dist < 32) can never
+  extend past the spot's own word — a solid word stops slack-0 and the
+  §18 fallback pays a dist-long slide for a hole 7-31 away. measured
+  as 48-pair "slides" collapsing runs at 1k/10k. the budget carries
+  +64.
+
+**The rules.** every spacing decision must be checked against the
+ladder's other rungs (plant spacing ≤ walk reach), and every
+scan/budget bound must respect the scan's own granularity. also: the
+grow branch may serve the WORKABILITY arm only — `need − span`
+underflows against an already-workable span, and in release the wrap
+slips past the ceiling check and mints a garbage-sized allocation
+(measured as a 100%-CPU spin in the runs census).
+
+---
+
+## 33. The fork is load-bearing: clusters want concentration, random wants spread (measured twice) (2026-10-23)
+
+**The nuance.** hot-cluster and cold-random workloads want OPPOSITE
+hole placements, and each single-op gather config wins one workload by
+losing the other — first in the original ladder's 2026-10-20 sweep
+(banks vs rebalances), then across the 2026-10-23 single-op sweep at
+1M (bank-only: runs 68, random 572-730; rebalance-only: random 293,
+runs 5419). a chunk's ~100 inserts land in one ~100-slot range and
+burn any uniform spread in a few dozen subdivides; a random arrival
+lands once per gap and wants a hole within stride everywhere.
+
+**The rule.** the locality streak is the discriminator: hot banks
+(concentrate), cold water-levels (spread) — and NEAR holes (≤ 64) bank
+unconditionally (one memmove beats the rebalance's machinery; gating
+near-banks on the streak regressed random@10k 90→109 measured).
 
 ---
 

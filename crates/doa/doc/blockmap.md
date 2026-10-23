@@ -25,15 +25,15 @@ pub struct BlockMap<K, V, A> {
 impl<K, V, A> Drop for BlockMap<K, V, A> {}
 ///L0044
 impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {}
-///L0587
+///L0627
 ///`BlockMap::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K, V, A> {
     Asc { bits: SetBits<'a>, map: &'a BlockMap<K, V, A> },
     Desc { bits: SetBitsRev<'a>, map: &'a BlockMap<K, V, A> },
 }
-///L0592
+///L0632
 impl<'a, K: Ord, V, A: UnsignedNum> Iterator for Iter<'a, K, V, A> {}
-///L0608
+///L0648
 ///key-ordered bidirectional walk over live pairs — blockset::Cursor's
 ///machine (MaskCursor under a pairs-yielding wrapper; see
 ///blockset::Cursor). invalidated by any mutation — re-seek
@@ -42,11 +42,11 @@ pub struct Cursor<'a, K, V, A> {
     ///the slot-walk machine; dir = !reversed, baked at construction
     walk: MaskCursor<'a>,
 }
-///L0614
+///L0654
 impl<'a, K, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
-///L0621
+///L0661
 impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
-///L0678
+///L0718
 #[cfg(test)]
 mod tests {
     use super::*;

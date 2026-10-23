@@ -79,34 +79,34 @@ treeblock, each load-bearing:
   treeblock's translator). Offset turns (window moves) are the
   unimplemented third move; rotation turns work under ANY offset and
   either direction now.
-- **no walker, no `Fixable`, no anchor discipline.** `gather_slots` is
-  the WORD-CLASSIFIED ladder (2026-10-20): DIRECT (spot a hole) / NEAR (a
-  hole in k's own word — one plain slide, or a word-bounded bank of
-  `1+streak` holes when the locality streak is hot and the hole is past
-  FREE_STRIDE) / BORROW (a neighbor word under the HIGH line banks
-  `BORROW_MIN+streak` holes — the lendable surplus; a milked word lands at
-  High and stops lending) / the FORK — cold streak (< STREAK_BANK)
-  balances, hot banks; both arms end in `rebalance_region`, and a failed
-  bank (hole past len/2 — or HOWEVER FAR at the name ceiling, where
-  nothing is mintable and the declined fetch's fallback pays a
-  same-length slide per remaining hole) falls to the same
-  growth-rebalance (its tail arm). banks land k CENTERED in the
-  compacted hole range (`bank_landing` — order-legal anywhere in it,
-  slack-clamped against the anchor so a bank never breaks its own
-  streak; measured the winner over spot-adjacent and direction-led).
-  `rebalance_region` scans words outward (sparser side first) until
-  density < FREE_NUM/FREE_DEN strictly (= the stride-FREE_STRIDE lattice
-  capacity — the stop IS the stride cap), grows the tail via
-  `push_slots` when the scan hits the end, and past the name ceiling
-  (turn-refused, §18) slides from the nearest hole. open()'s APPEND
-  FASTPATH sits above the ladder: a solid tail run within FREE_STRIDE of
-  the edge extends the block and slides ≤ FREE_STRIDE elements. the
-  CEILING VALVE sits at the preemptive turn's refusal (2026-10-22):
-  when the turn line holds but doubling is impossible (past the name
-  midpoint, rotation budget spent), `rebalance_block` water-levels the
-  WHOLE block onto the minimal-stride lattice fitting len below the
-  name ceiling (200 live/256 → stride 5, tail extended to the tight
-  251) — interspersed space instead of O(n) slides per insert.
+- **no walker, no `Fixable`, no anchor discipline.** `gather_slots` is the
+  2026-10-23 ladder: SUBDIVIDE first (the clear run between k's live
+  neighbors is order-legal — interior gaps place k mid-gap, tail gaps at
+  gap_lo so the append edge stays solid; zero movement) / a nearest hole
+  within FREE_STRIDE slides / NEAR holes (≤ 64) bank unconditionally /
+  the FAR fork on the locality streak — hot (≥ STREAK_BANK) banks
+  `dist/FREE_STRIDE` holes, cold water-levels via `rebalance_region`
+  (the fork is load-bearing, measured twice — subtle_bugs §33). the
+  bank: RUN-PREFERRING fetch (once a run member is taken the walk
+  stops at the next singleton — singletons are the floor of at-average
+  regions at the ~1/2 cycle mean; leading singletons ride along, the
+  fetched list must stay consecutive for compact's solid-segment math),
+  STRIDED landings (hole i at `open ± (i + i/15)`, the run's head
+  `drag = (w−1)/15` elements ride in as SENTINELS so ≥1 live sits per 16
+  across the banked range — the skip list's stride window; encoded in
+  the Gather buf, blockmap's compact ported in lockstep), k CENTERED
+  (`bank_landing`, slack-clamped against the anchor).
+  `rebalance_region` scans words outward (sparser side first) under two
+  arms — above_mean (budget-capped: live·cap > len·span, u128 — average
+  the neighborhood to the block's mean; budget = 2·dist + 64, word-
+  granular) and unworkable (live·6 ≥ span·5, uncapped — the lattice
+  stride stays ≤ FREE_STRIDE so planted holes stay slide-reachable;
+  subtle_bugs §32); a tail-bounded unworkable region GROWS the tail
+  (the grow serves the unworkable arm only — `need−span` underflows
+  otherwise), and blocked-at-ceiling / slack-0 stops slide from the
+  nearest hole, however far. open()'s APPEND FASTPATH sits above the
+  ladder: a solid tail run within FREE_STRIDE of the edge extends the
+  block and slides ≤ FREE_STRIDE elements.
   the ladder is INFALLIBLE — no bails, no forced retries, no Option plumbing.
   No run-walk fixup
   choreography, no ancestry.
@@ -160,19 +160,22 @@ treeblock, each load-bearing:
   re-parameterizes (`p2a_new(p) = p2a_old(cap−1−p)` — exactly `offset →
   cap−1−offset` with the direction flipped), names follow the mirrored
   slots BY CONSTRUCTION — a pending deltas event survives the flip
-  untouched (it speaks names; names didn't change). trigger: mean insert
-  position (`pos_sum/len`, doubling at turns, reflecting at flips) below
-  len/8 past a 4·stride warmup, Z-GATED on the variance (`pos_sq_sum`,
-  reflected `len³−2·len·S+Q` at flips, quadrupled at turns): the low mean
-  must clear 2σ of the observed spread — alternating streams (front-landing
-  chunks from either direction) have huge variance and never look
-  front-biased, so the trigger can't thrash; a tight front cluster
-  (variance ≈ 0) flips as before. multiply-only hot path: the mean gate
-  runs first, the variance test only when it already says front-biased.
+  untouched (it speaks names; names didn't change). trigger (2026-10-23
+  swap): mean insert position (`pos_sum/len`, doubling at turns,
+  reflecting at flips) below log2(len) past a 4·stride warmup — an
+  O(len) flip costs one growth's worth of element copies (each element
+  pays log2(len) to doubling, amortized), so it pays exactly when the
+  stream is front-biased past that line. the z-gate/`pos_sq_sum`
+  variance machinery is DEAD (commented out at all sites) — alternating
+  front streams with no tail filler are now UNGATED (the renamed
+  `reversal_trigger_holds_on_alternating_chunks` test pins only the
+  mean side). blockmap keeps the OLD `pos_sum·8 < len²` line — an
+  intentional divergence, port deferred.
   SkipSet drives reversal MANUALLY (`should_reverse` + `reverse`) — its
   insert path never auto-flips; plain BlockSet inserts keep the auto
   trigger. see subtle_bugs §20 for the reversal turn's band + the
-  `offset < cap` rule offset turns must respect. the check runs at
+  `offset < cap` rule offset turns must respect, §30 for the re-derived
+  closure under the new trigger. the check runs at
   insert's TOP (pre-record, before `spot`) — the trigger sees the
   pre-insert signal, and no translator mutation follows the event record
   inside insert: pos-space deltas consumers (`iter_pos`, bimap's chase)
@@ -270,7 +273,9 @@ tiers:
 - `blockset.rs` — the set tier: `BlockSet<K: Archive, A>` (slots hold
   `K::Handle` copies over an append-only side heap; drop machinery gone —
   handles are POD, heap bytes leak on remove by design) + `Deltas` + the
-  fetch-gather ladder + the z-gated reversal trigger + the differential
+  subdivide/slide/near-bank/fork ladder (2026-10-23 — see the blockset
+  section) + the log2(len) reversal trigger (pos_sq_sum/REVERSE_Z2 dead,
+  commented out) + the differential
   `Iter` over SetBits/SetBitsRev; `find`/`contains` fast-path beyond
   either extreme (two compares, no bsearch — sequential probes land past
   the tail). the `insert_at`/`push_beyond` pair drives SkipSet's descent:
@@ -283,7 +288,7 @@ tiers:
   than pair expansion). the `Cursor` family: `seek`/`seek_after` →
   `next`/`prev`/`key`/`addr` over `MaskCursor`, invalidated by any
   mutation. the pos `epoch` (bumped by turn/flip — the skipset staleness
-  guard), `pos_sq_sum` (the z-gate's variance half), the always-on turn
+  guard), the always-on turn
   census statics, and `live_run_lengths` are SkipSet/bench-facing.
   `Deltas` is BLOCK-OWNED (2026-10-21 (b), phase 1): a `deltas()`
   accessor on every tier, PULL-based expansion (`seed_state`/`step_state`
@@ -301,11 +306,9 @@ tiers:
   compacted hole range (`bank_landing` — any slot in it is order-legal;
   slack-clamped so a bank cannot break its own streak; measured the
   winner over spot-adjacent and direction-led landings — the
-  direction-led machinery was built, measured worse, deleted). the
-  ceiling valve `rebalance_block`: the preemptive turn's replacement
-  when doubling is refused — a whole-block minimal-stride lattice
-  fitting len below the name ceiling, tail extended to the tight
-  extent (200 live/256 → stride 5, cap 251). `cleave` (raw slot/mask
+  direction-led machinery was built, measured worse, deleted); the
+  strided landings' sentinel expansion is exercised by two direct-drive
+  tests (right + left mirror). `cleave` (raw slot/mask
   copy + `Translator::shifted(at)` so moved NAMES SURVIVE — the split
   event is "position ≥ split_pos ⇒ new block id" via `Split::moved`;
   both halves' heaps
@@ -366,7 +369,8 @@ tiers:
   4 pays +27–34% insert; the root scan must stay ≤ stride — the s²
   misreading measured +165ns/insert at 1M from the linear root scan
   alone). `SkipSet::insert` NEVER lets the base auto-flip: it triggers
-  reversal itself (z-gate), then descends. removal unsupported (v0).
+  reversal itself (the base's should_reverse trigger), then descends.
+  removal unsupported (v0).
   bench-facing: the A/B phase hooks
   (`insert_maintain_only`/`insert_descent_only`) are `#[doc(hidden)]`.
   (the old blockset store copy — treeblock's store evolved toward pairs
@@ -376,7 +380,13 @@ tiers:
   substrate with a value riding beside every key: TWO parallel
   `MaybeUninit` vecs (keys/vals) under ONE shared mask, bit ⇔ the pair
   live; every slide/gather/turn/reversal relocates the pair in lockstep,
-  the mask half of turn/reversal runs once. borrows blockset's `Deltas`
+  the mask half of turn/reversal runs once. its compact/fetch are ported
+  copies of blockset's (sentinel-strided landings + run-preferring
+  walk, 2026-10-23 — kept in parity by review); its reversal keeps the
+  OLD `pos_sum·8 < len²` line (divergence documented at blockset's
+  `should_reverse`; port deferred) and its ladder is still the old
+  fetch-gather shape (port to the fork deferred). borrows blockset's
+  `Deltas`
   + the 2-knob translator unchanged — value slots are nameless, a name
   finds the pair. API beyond the set surface: `get(addr) -> (&K, &V)`,
   `value`/`value_mut` by key, `set_value` by addr (drop-safe overwrite),
@@ -424,8 +434,10 @@ tiers:
   a mid-gap k CLEAVES 50/50 — the raw copy (see blockset's `cleave`)
   with a one-field split event (`Split { from_aa, from_tr, to_aa,
   split_pos }`: position ≥ split_pos ⇒ retarget block id, SAME name).
-  the per-block z-gate is DEAD on split-born halves (a dense 128-prefill
-  needs len > 255), so the ARENA owns reversal: below-min into a
+  the per-block reversal trigger is DEAD on split-born halves (a
+  seed-128 half's uniform mean clears log2(len) only past ~700 —
+  unreachable in a 256 cap, subtle_bugs §30), so the ARENA owns
+  reversal: below-min into a
   non-reversed block past warmup flips it first. a dup into a FULL
   block Errs at capacity before the dup check — the arena discriminates
   by `contains` on full-block Errs (subtle_bugs §28), and after any
@@ -554,31 +566,37 @@ the past — run targeted tests.
   `inline(always)` walks — one potential outlined call per yield,
   unmeasured.
 - blockset: `try_insert`/`try_alloc` split + arena-level occupancy
-  decisions; threshold tuning (the z-gate's 2σ remains
-  unbenchmarked; the turn line `TURN_NUM/DEN`: 3/4 REJECTED twice
-  (2026-10-15/19 — the loss is the LAYOUT: doubled cap → sparser
-  probes + stretched deserts, random @1M lookup 347→1132), 7/8 the
-  settled value until 2026-10-20's 5/6 — the ceiling = the scan stop,
-  holding density under workability; 5/6 won random −45% insert/
+  decisions; threshold tuning (the new log2(len) reversal trigger is
+  unbenched against alternating front streams without tail filler —
+  ungated since the z-gate's death; the turn line `TURN_NUM/DEN`: 3/4
+  REJECTED twice (2026-10-15/19 — the loss is the LAYOUT: doubled cap →
+  sparser probes + stretched deserts, random @1M lookup 347→1132), 7/8
+  the settled value until 2026-10-20's 5/6 — the ceiling = the scan
+  stop, holding density under workability; 5/6 won random −45% insert/
   −73% movement at 1M but runs' reads sit on THRESHOLD LUCK at
   len 1M (between the 5/6 and 7/8 lines of cap 2^20, one extra
   doubling fires) — a size sweep across the boundary is the missing
-  measurement; BORROW_MIN/streak-boost also unbenched);
+  measurement); the 64 near-bank bound and the 2·dist+64 budget are
+  unbenched knobs (the +64 is granularity-mandatory — subtle_bugs
+  §32; the 64 is one word);
   holder-applying bench variant
   — the cascade savings (turns/flips are zero-churn) aren't measured by a
   deltas-clearing bench.
-- blockset: multi-word banking — the bank arms are word-bounded
-  (BORROW ~1 event per ~10 inserts per word), so runs still pays ~+9%
-  insert over the fetch baseline at 1M; widening banks re-digs the
-  deserts the rebalance arm levels — the fork trades them (see
-  session_history 2026-10-20 for both directions measured).
+- blockset: the ladder's test gaps (2026-10-23 review, report-only):
+  the slack-0 budget-short slide fallback, the rebalance's
+  blocked-at-ceiling bail, and the mint branch clamped by `room` have
+  no pinned tests.
+- blockset: subdivide's cost at DRAM scale — every open() pays
+  next_set + prev_set where the old code paid one mask.get (report-only
+  review finding, unbenched).
 - blockset: the preemptive turn (now the 5/6 line) fires before checking whether the
   spot is already open — delete-max + reinsert-max pays a full turn for a
   free slot (report-only finding; a nearest-hole-within-stride guard is
   the candidate, unbenched).
 - blockmap: ladder port — blockmap still runs the old fetch-gather
-  distance ladder (its own copy; FREE_STRIDE now 6 there too); a
-  Rebalance port would touch its slide/turn plumbing but not bimap
+  distance ladder (its own copy) + the OLD reversal line; the fork port
+  (subdivide/near-bank/mean-rebalance + the log2 trigger) would touch
+  its slide/turn plumbing but not bimap
   (its chase consumes blockmap events, which never include Rebalance).
 - blockset: offset turns (window moves — mask + data halves handle any
   offset now; the move op remains; under the corrected translator math
@@ -635,7 +653,7 @@ the past — run targeted tests.
   the above-max symmetric eager flip; per-block skipset tiers; the
   eager below-min flip is UNCONDITIONAL (one below-min key flips an
   append-heavy first block and the reflected gate stays off ~len
-  inserts — z-gating it is the unbenched candidate, report-only).
+  inserts — trigger-gating it is the unbenched candidate, report-only).
 - blockset: the streak/ladder retune sweep — anchor-follow made
   streaks honest (20–100 long where they broke at ~8) and the
   streak→want/routing coupling now costs runs 8.57 vs 6.46 moved/insert

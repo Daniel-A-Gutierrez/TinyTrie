@@ -431,12 +431,19 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
         let hole = self.mask.nearest_clear(spot.0)?;
         let right = hole > spot.0;
         let open = if right { spot.0 } else { spot.0 - 1 };
-        if hole.abs_diff(spot.0) < FREE_STRIDE {
+        if hole.abs_diff(spot.0) <= FREE_STRIDE {
             self.slide_hole(hole, open);
             self.deltas.record_none_slide(self.translator, Pos(hole), Pos(open));
             return Some(Pos(open));
         }
-        let holes = self.fetch_holes(spot, right, 1 + hole.abs_diff(spot.0) / FREE_STRIDE);
+        let mut holes = self.fetch_holes(spot, right, 1 + hole.abs_diff(spot.0) / FREE_STRIDE);
+        //an empty fetch is a bug, not a fallback (§25, see blockset) —
+        //holes[0] below panics loudly if this ever regresses
+        debug_assert!(!holes.is_empty());
+        //sentinel cap (see blockset): one run element per every-16 live
+        //sentinel, so at most 15·seg0+1 holes come along
+        let seg0 = if right { holes[0] - spot.0 } else { spot.0 - 1 - holes[0] };
+        holes.truncate(15 * seg0 + 1);
         self.compact_gather(spot, open, right, &holes);
         self.deltas.record_gather(self.translator, open, right, &holes);
         Some(Pos(open))
@@ -462,14 +469,24 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
     }
 
     ///the `want` nearest holes on one side of `spot`, nearest-first (see
-    ///blockset::fetch_holes)
+    ///blockset::fetch_holes — RUN-PREFERRING: once a run member is taken
+    ///the walk stops at the next singleton; leading singletons ride
+    ///along for the consecutive-list requirement)
     fn fetch_holes(&self, spot: Pos, right: bool, want: usize) -> Vec<usize> {
+        let run_member = |h: usize| {
+            (h > 0 && !self.mask.get(h - 1)) || (h + 1 < self.cap() && !self.mask.get(h + 1))
+        };
         let mut holes = Vec::with_capacity(want);
+        let mut seen_run = false;
         if right {
             let mut cursor = spot.0;
             while holes.len() < want
                 && let Some(h) = self.mask.next_clear(cursor)
             {
+                if seen_run && !run_member(h) {
+                    break;
+                }
+                seen_run |= run_member(h);
                 holes.push(h);
                 cursor = h + 1;
             }
@@ -477,6 +494,10 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
             let mut cursor = spot.0 - 1;
             while holes.len() < want {
                 let Some(h) = self.mask.prev_clear(cursor) else { break };
+                if seen_run && !run_member(h) {
+                    break;
+                }
+                seen_run |= run_member(h);
                 holes.push(h);
                 if h == 0 {
                     break;
@@ -488,9 +509,10 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
     }
 
     ///gather compaction, one pass, both vecs (see blockset::compact_gather
-    ///for the segment choreography)
+    ///for the segment choreography + the strided sentinel landings)
     fn compact_gather(&mut self, spot: Pos, open: usize, right: bool, holes: &[usize]) {
         let w = holes.len();
+        let drag = (w - 1) / 15;
         unsafe {
             let (kp, vp) = (self.keys.as_mut_ptr(), self.vals.as_mut_ptr());
             //segment j shifts by its crossing count; far segments copy
@@ -498,7 +520,7 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
             if right {
                 for j in (0..w).rev() {
                     let (lo, len) = if j == 0 {
-                        (spot.0, holes[0] - spot.0)
+                        (spot.0 + drag, holes[0] - spot.0 - drag)
                     } else {
                         (holes[j - 1] + 1, holes[j] - holes[j - 1] - 1)
                     };
@@ -509,7 +531,7 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
             } else {
                 for k in (0..w).rev() {
                     let (lo, len) = if k == 0 {
-                        (holes[0] + 1, spot.0 - 1 - holes[0])
+                        (holes[0] + 1, spot.0 - 1 - drag - holes[0])
                     } else {
                         (holes[k] + 1, holes[k - 1] - holes[k] - 1)
                     };
@@ -519,17 +541,35 @@ impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {
                 }
             }
         }
+        //sentinels land after the copies, descending (see blockset) —
+        //both halves of the pair
+        for i in (0..drag).rev() {
+            let (src, dst) = if right {
+                (open + i, open + 16 * i + 15)
+            } else {
+                (open - i, open - 16 * i - 15)
+            };
+            self.keys[dst] = std::mem::replace(&mut self.keys[src], MaybeUninit::uninit());
+            self.vals[dst] = std::mem::replace(&mut self.vals[src], MaybeUninit::uninit());
+        }
         for &h in holes {
             self.mask.set(h, true);
         }
-        //the vacated target range clears; sets first (see blockset)
+        //the vacated target range clears; sets first (see blockset);
+        //the sentinel slots re-set after the clear
         if right {
-            for t in open..open + w {
+            for t in open..open + w + drag {
                 self.mask.set(t, false);
             }
+            for i in 0..drag {
+                self.mask.set(open + 16 * i + 15, true);
+            }
         } else {
-            for t in open + 1 - w..=open {
+            for t in open + 1 - (w + drag)..=open {
                 self.mask.set(t, false);
+            }
+            for i in 0..drag {
+                self.mask.set(open - 16 * i - 15, true);
             }
         }
     }
