@@ -600,6 +600,117 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.translator.reversed()
     }
 
+    ///the block's translator snapshot (pub(crate): the arena's split
+    ///event carries from/to snapshots)
+    pub(crate) fn translator(&self) -> Translator<A> {
+        self.translator
+    }
+
+    ///the block's key-min materialized (Asc: first live, Desc: last
+    ///live) — rare calls only (min-changing inserts, splits); the
+    ///materialized value is a temporary clone (removal is the only
+    ///operation that leaks heap bytes, v1)
+    pub fn min_key(&self) -> Option<K> {
+        let p = if self.translator.reversed() {
+            self.mask.last_set()?
+        } else {
+            self.mask.next_set(0)?
+        };
+        // SAFETY: mask names a live slot
+        Some(K::materialize(unsafe { *self.data[p].assume_init_ref() }, &self.heap))
+    }
+
+    ///cleave at position `at`: the right half's slots copy AS-IS — data,
+    ///mask bits, and translator (the offset shift preserves every name;
+    ///only the block id changes, see arenaset's split event). no
+    ///laddering, no re-archiving of positions. live-or-not: holes copy
+    ///as holes. BOTH blocks rebuild their side heaps compact afterward
+    ///(handles are heap-RELATIVE, so halves can't share one; the old
+    ///heaps drop with the moved keys' bytes — nothing leaks) and BOTH
+    ///reset their z-gate signals to the uniform presumption over their
+    ///new lens (the moved half's insert history predicts nothing about
+    ///either half's future). the shifted offset can exceed the half's
+    ///cap (offset_src < at wraps — most Asc blocks carry offset 0, so
+    ///the half is born at offset = cap): sound while Asc — forward
+    ///turns are monotone for any offset — but REVERSED turns die there
+    ///(§30), so a Desc half flips to Asc at the end and grow_rotate
+    ///REFUSES the reversed turn at offset ≥ midpoint, routing the space
+    ///need to the ceiling valve instead. the halves' future shape —
+    ///rotate both, append, prepend — is an open parameter (v0: the
+    ///right half, as-is)
+    pub(crate) fn cleave(&mut self, at: usize) -> BlockSet<K, A> {
+        debug_assert!(at < self.cap(), "cleave boundary inside the block");
+        let half = self.cap() - at;
+        let mut right = BlockSet {
+            translator:  self.translator.shifted(at),
+            data:       (0..half).map(|_| MaybeUninit::uninit()).collect(),
+            heap:       Vec::new(),
+            mask:       self.mask.copy_region(at, self.cap()),
+            len:        0,
+            pos_sum:    0,
+            pos_sq_sum: 0,
+            epoch:      0,
+            last_insert: self.last_insert.saturating_sub(at),
+            streak:     0,
+            deltas:     Deltas::new(),
+        };
+        right.len = right.mask.count();
+        // SAFETY: the slots copy raw — the mask half governs validity,
+        // stale hole bytes stay masked-clear, never assume_init'd
+        unsafe {
+            std::ptr::copy(self.data.as_mut_ptr().add(at), right.data.as_mut_ptr(), half);
+        }
+        for p in at..self.cap() {
+            self.mask.set(p, false);
+        }
+        self.len -= right.len;
+        //both halves: fresh compact heaps (right reads the source's
+        //heap — the copied handles are its offsets), fresh gate signals
+        right.heap = BlockSet::<K, A>::rebuild_heap(&mut right.data, &right.mask, &self.heap);
+        self.heap = BlockSet::<K, A>::rebuild_heap(&mut self.data, &self.mask, &self.heap);
+        right.seed_uniform_signals();
+        self.seed_uniform_signals();
+        //the flipped half keeps offset ≥ cap (the wrap RELOCATES to the
+        //mirrored value, it doesn't clear) — sound while Asc; the
+        //reversed-turn refusal in grow_rotate is the live guard (§30)
+        if right.translator.reversed() {
+            right.reverse();
+        }
+        right
+    }
+
+    ///rebuild the side heap compact: every live slot re-archives into a
+    ///fresh heap (append-only); the old bytes drop with the old heap.
+    ///disjoint-field form — the source rebuilds while reading its own
+    ///heap
+    fn rebuild_heap(
+        data: &mut [MaybeUninit<K::Handle>],
+        mask: &Mask,
+        read: &[u8],
+    ) -> Vec<u8> {
+        let mut heap = Vec::new();
+        for p in 0..data.len() {
+            if mask.get(p) {
+                // SAFETY: mask names a live slot
+                let h = unsafe { *data[p].assume_init_ref() };
+                let k = K::materialize(h, read);
+                data[p] = MaybeUninit::new(K::archive(&k, &mut heap));
+            }
+        }
+        heap
+    }
+
+    ///the uniform presumption: a block whose insert history is unknown
+    ///seeds its z-gate with the mean/spread of uniform arrivals over
+    ///[0, len) — a pos_sum of 0 at a born-big len reads maximally
+    ///front-biased and flips on the first insert
+    fn seed_uniform_signals(&mut self) {
+        let n = self.len as u128;
+        self.pos_sum = (n * (n - 1) / 2) as u64;
+        self.pos_sq_sum = n * (n - 1) * (2 * n - 1) / 6;
+        self.streak = 0;
+    }
+
     ///k beyond the tail extreme — the end a sequential insert extends.
     ///SkipSet::insert routes these to push_beyond, skipping its descent
     pub fn beyond_tail(&self, k: &K) -> bool {
@@ -1678,9 +1789,14 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             return false;
         };
         //refusal guards: doubled positions would exceed the address
-        //space past the midpoint; the rotation knob would wrap
+        //space past the midpoint; the rotation knob would wrap; a
+        //REVERSED turn needs offset < midpoint (§30 — a cleave-shifted
+        //half can carry offset ≥ its cap, sound while Asc) — refuse and
+        //let open() route the space need to the ceiling valve
         if old_cap > A::MIDPOINT.as_usize()
             || self.translator.rotation() >= A::BIT_WIDTH as u32
+            || self.translator.reversed()
+                && self.translator.offset().as_usize() >= A::MIDPOINT.as_usize()
         {
             return false;
         }

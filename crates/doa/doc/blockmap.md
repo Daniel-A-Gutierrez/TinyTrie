@@ -8,7 +8,7 @@
 //!the translator carries the direction (see translator.rs).
 //!cursor (`seek`/`seek_after`): key-ordered walk over live pairs,
 //!blockset::Cursor's machine (see blockset).
-///L0021
+///L0020
 ///mask covers keys.len() slots; bit ⇔ slot initialized (key + value).
 pub struct BlockMap<K, V, A> {
     translator: Translator<A>,
@@ -18,20 +18,22 @@ pub struct BlockMap<K, V, A> {
     len:       usize,
     ///running sum of placed slot positions — the reversal tier's signal
     pos_sum:   u64,
+    ///the block's own event slot — the mutation feedback (see blockset)
+    deltas:    Deltas<A>,
 }
-///L0031
+///L0032
 impl<K, V, A> Drop for BlockMap<K, V, A> {}
-///L0043
+///L0044
 impl<K: Ord, V, A: UnsignedNum> BlockMap<K, V, A> {}
-///L0588
+///L0587
 ///`BlockMap::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K, V, A> {
     Asc { bits: SetBits<'a>, map: &'a BlockMap<K, V, A> },
     Desc { bits: SetBitsRev<'a>, map: &'a BlockMap<K, V, A> },
 }
-///L0593
+///L0592
 impl<'a, K: Ord, V, A: UnsignedNum> Iterator for Iter<'a, K, V, A> {}
-///L0609
+///L0608
 ///key-ordered bidirectional walk over live pairs — blockset::Cursor's
 ///machine (MaskCursor under a pairs-yielding wrapper; see
 ///blockset::Cursor). invalidated by any mutation — re-seek
@@ -40,16 +42,17 @@ pub struct Cursor<'a, K, V, A> {
     ///the slot-walk machine; dir = !reversed, baked at construction
     walk: MaskCursor<'a>,
 }
-///L0615
+///L0614
 impl<'a, K, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
-///L0622
+///L0621
 impl<'a, K: Ord, V, A: UnsignedNum> Cursor<'a, K, V, A> {}
-///L0679
+///L0678
 #[cfg(test)]
 mod tests {
     use super::*;
-    ///apply translated deltas as name swaps, in the given order
-    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64)>, deltas: &Deltas<A>);
+    ///apply translated deltas as name swaps, in the given order; returns
+    ///the pair count (assert-and-apply in one pull)
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64)>, deltas: &mut Deltas<A>) -> usize;
     fn insert_all(
         entries: impl IntoIterator<Item = (u64, u64)>,
     ) -> (BlockMap<u64, u64, u8>, Vec<(u8, u64, u64)>);

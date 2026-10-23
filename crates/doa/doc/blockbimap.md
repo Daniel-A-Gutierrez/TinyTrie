@@ -2,42 +2,31 @@
 //!BlockBiMap: the bijective tier — two lockstep BlockMaps, each holding the
 //!other's names as its values, so both orders are native (no projection
 //!ordering) and every pair is one hop from either side. insert churns
-//!BOTH name spaces (one event each, carried by `BiDeltas`); the maps
-//!consume each other's events by the BACK-POINTER CHASE — a delta pair
-//!names the emitter's moved entry, and that entry's own value addresses
-//!the one partner slot whose held name went stale (O(1) per pair, no
-//!search; bijection guarantees a single partner per pair). the fresh
-//!entry's dummy value is never chased before its patch: only its own
-//!partner points at it, and a placed entry never moves.
+//!BOTH name spaces (one event each, in the maps' own `Deltas` slots); the
+//!maps consume each other's events by the BACK-POINTER CHASE — a delta
+//!pair names the emitter's moved entry, and that entry's own value
+//!addresses the one partner slot whose held name went stale (O(1) per
+//!pair, no search; bijection guarantees a single partner per pair). the
+//!fresh entry's dummy value is never chased before its patch: only its
+//!own partner points at it, and a placed entry never moves.
 //!cursors (`seek`/`seek_by_value`): blockmap cursors over either native
 //!order, the partner chased one hop per yield (like the iters).
-///L0020
-///two event streams, one per name space — apply + clear both like `Deltas`
-pub struct BiDeltas<A> {
-    ///K-side name swaps
-    pub keys:   Deltas<A>,
-    ///V-side name swaps
-    pub values: Deltas<A>,
-}
-///L0027
-impl<A: UnsignedNum> BiDeltas<A> {}
-///L0053
+///L0029
 ///the back-pointer chase: apply `emitter`'s event to `target`'s value
 ///column, one write per moved entry. a delta pair names the emitter's
 ///moved entry, and that entry's own value addresses its partner slot in
 ///target — O(1) per pair, no search (bijection: one partner per entry).
 ///gather pairs carry the FULL hop (crossing count), so every pair is
 ///final — a single forward pass, no chained intermediate names. reads
-///run in POS space (`iter_pos`): the flip fires pre-record, so the
-///emitter's translator is unchanged from the record to this call; events
-///held across mutations must go through `iter`'s names instead
+///run in POS space (`next_pos` pulls): the flip fires pre-record, so
+///the emitter's translator is unchanged from the record to this call;
+///events held across mutations must go through `iter`'s names instead
 ///(era-stable — subtle_bugs §22)
 fn chase<EK: Ord, TK: Ord, A: UnsignedNum>(
-    emitter: &BlockMap<EK, A, A>,
-    event: &Deltas<A>,
+    emitter: &mut BlockMap<EK, A, A>,
     target: &mut BlockMap<TK, A, A>,
 );
-///L0069
+///L0044
 ///bijective map: K and V both unique, each entry reachable from either
 ///side in one hop. insert returns the pair's (K-side, V-side) names —
 ///both are ordinary `Deltas` names; removals move nothing (no deltas)
@@ -47,9 +36,9 @@ pub struct BlockBiMap<K, V, A> {
     ///V → the entry's K-side name
     values: BlockMap<V, A, A>,
 }
-///L0076
+///L0051
 impl<K: Ord, V: Ord, A: UnsignedNum> BlockBiMap<K, V, A> {}
-///L0224
+///L0211
 ///key-ordered bidirectional walk — a blockmap cursor over the keys side,
 ///the partner chased one hop per yield (see blockmap::Cursor; invalidated
 ///by any mutation — re-seek)
@@ -57,18 +46,18 @@ pub struct Cursor<'a, K, V, A> {
     bimap: &'a BlockBiMap<K, V, A>,
     walk:  MapCursor<'a, K, A, A>,
 }
-///L0231
+///L0218
 ///value-ordered bidirectional walk — Cursor's mirror over the values
 ///side, yields (&V, &K)
 pub struct ValueCursor<'a, K, V, A> {
     bimap: &'a BlockBiMap<K, V, A>,
     walk:  MapCursor<'a, V, A, A>,
 }
-///L0236
+///L0223
 impl<'a, K: Ord, V: Ord, A: UnsignedNum> Cursor<'a, K, V, A> {}
-///L0279
+///L0266
 impl<'a, K: Ord, V: Ord, A: UnsignedNum> ValueCursor<'a, K, V, A> {}
-///L0323
+///L0310
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,7 +67,11 @@ mod tests {
     ///$swap: the walk pairs are (value, key) — addrs orients them
     macro_rules! cursor_battery;
     ///apply both streams to the holder's two name columns, in order
-    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64, A)>, d: &BiDeltas<A>);
+    ///(pulling exhausts — the holder mirror IS the application)
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64, u64, A)>, map: &mut BlockBiMap<u64, u64, A>);
+    ///drain both event slots without applying (the no-op direct-place
+    ///events pend too — a fresh block's appends land in past-tail holes)
+    fn clear<A: UnsignedNum>(map: &mut BlockBiMap<u64, u64, A>);
     fn insert_all(
         entries: impl IntoIterator<Item = (u64, u64)>,
     ) -> (BlockBiMap<u64, u64, u8>, Vec<(u8, u64, u64, u8)>);

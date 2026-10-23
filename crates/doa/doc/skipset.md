@@ -105,7 +105,7 @@ pub struct SkipSet<K: Archive, A: UnsignedNum> {
 }
 ///L0197
 impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {}
-///L0663
+///L0668
 #[cfg(test)]
 mod tests {
     use super::*;

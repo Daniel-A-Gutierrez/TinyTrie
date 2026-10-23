@@ -9,6 +9,7 @@
 
 pub use treeblock::metadata::Fixup;
 
+pub mod arenaset;
 pub mod blockbimap;
 pub mod blockmap;
 pub mod blockset;

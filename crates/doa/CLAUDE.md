@@ -87,15 +87,27 @@ treeblock, each load-bearing:
   `BORROW_MIN+streak` holes — the lendable surplus; a milked word lands at
   High and stops lending) / the FORK — cold streak (< STREAK_BANK)
   balances, hot banks; both arms end in `rebalance_region`, and a failed
-  bank (hole past len/2) falls to the same growth-rebalance (its tail
-  arm). `rebalance_region` scans words outward (sparser side first) until
+  bank (hole past len/2 — or HOWEVER FAR at the name ceiling, where
+  nothing is mintable and the declined fetch's fallback pays a
+  same-length slide per remaining hole) falls to the same
+  growth-rebalance (its tail arm). banks land k CENTERED in the
+  compacted hole range (`bank_landing` — order-legal anywhere in it,
+  slack-clamped against the anchor so a bank never breaks its own
+  streak; measured the winner over spot-adjacent and direction-led).
+  `rebalance_region` scans words outward (sparser side first) until
   density < FREE_NUM/FREE_DEN strictly (= the stride-FREE_STRIDE lattice
   capacity — the stop IS the stride cap), grows the tail via
   `push_slots` when the scan hits the end, and past the name ceiling
   (turn-refused, §18) slides from the nearest hole. open()'s APPEND
   FASTPATH sits above the ladder: a solid tail run within FREE_STRIDE of
   the edge extends the block and slides ≤ FREE_STRIDE elements. the
-  ladder is INFALLIBLE — no bails, no forced retries, no Option plumbing.
+  CEILING VALVE sits at the preemptive turn's refusal (2026-10-22):
+  when the turn line holds but doubling is impossible (past the name
+  midpoint, rotation budget spent), `rebalance_block` water-levels the
+  WHOLE block onto the minimal-stride lattice fitting len below the
+  name ceiling (200 live/256 → stride 5, tail extended to the tight
+  251) — interspersed space instead of O(n) slides per insert.
+  the ladder is INFALLIBLE — no bails, no forced retries, no Option plumbing.
   No run-walk fixup
   choreography, no ancestry.
 - **Deltas = one compact event.** `enum Delta { NoneSlide{from,to},
@@ -236,8 +248,9 @@ substrate:
   cache) the set/map cursors wrap; walk-path methods `#[inline(always)]`
   end to end (subtle_bugs §23).
 - `translator.rs` — the set/map tier's 2-knob translator, fn-ptr per
-  direction + the reversal/turn maps; the one hard rule is position order
-  (pos 0 = min, pos len−1 = max).
+  direction + the reversal/turn/`shifted` maps (the cleave's offset − at,
+  name-preserving under both directions); the one hard rule is position
+  order (pos 0 = min, pos len−1 = max).
 - `serialize.rs` — the `Archive` trait: a stored K decomposes into a
   fixed-size POD `Handle` (slots hold handles; handles ARE the
   serialized form — heap-relative offsets, LE-canonical, so the
@@ -272,8 +285,37 @@ tiers:
   mutation. the pos `epoch` (bumped by turn/flip — the skipset staleness
   guard), `pos_sq_sum` (the z-gate's variance half), the always-on turn
   census statics, and `live_run_lengths` are SkipSet/bench-facing.
-  `Deltas`' event recording, `NoneSlide`, and `FREE_STRIDE`/`L2_BYTES`
-  are `pub(crate)` — blockmap shares them.
+  `Deltas` is BLOCK-OWNED (2026-10-21 (b), phase 1): a `deltas()`
+  accessor on every tier, PULL-based expansion (`seed_state`/`step_state`
+  over owned cursors — no borrow outlives a step), `iter` DRAINS
+  (exhaust = auto-clear; a half-consumed expansion still trips insert's
+  pending assert), the gather payload is reused scratch (no per-bank
+  alloc), `next_chase` is bimap's second non-consuming cursor, and
+  `insert` takes no deltas param anywhere. the streak anchor
+  (`last_insert`) FOLLOWS the previous element through every move site
+  (slide_hole/compact_gather/move_slot/grow_rotate/reverse — 0 stale,
+  verified by the honest-holder diagnostic that applies name swaps).
+  the hot-streak spot search `spot_near`: a bounded walk (2·FREE_STRIDE)
+  from the anchor returning bsearch's canonical boundary or a dup, any
+  miss falls back (runs insert −30% @10k). banks land k CENTERED in the
+  compacted hole range (`bank_landing` — any slot in it is order-legal;
+  slack-clamped so a bank cannot break its own streak; measured the
+  winner over spot-adjacent and direction-led landings — the
+  direction-led machinery was built, measured worse, deleted). the
+  ceiling valve `rebalance_block`: the preemptive turn's replacement
+  when doubling is refused — a whole-block minimal-stride lattice
+  fitting len below the name ceiling, tail extended to the tight
+  extent (200 live/256 → stride 5, cap 251). `cleave` (raw slot/mask
+  copy + `Translator::shifted(at)` so moved NAMES SURVIVE — the split
+  event is "position ≥ split_pos ⇒ new block id" via `Split::moved`;
+  both halves' heaps
+  rebuilt compact via `rebuild_heap`, signals re-seeded via
+  `seed_uniform_signals`; the shifted offset can exceed the half's cap
+  for ANY source orientation — sound while Asc, the Desc flip
+  RELOCATES the wrap rather than clearing it, and grow_rotate's
+  reversed-turn REFUSAL at offset ≥ midpoint is the live guard
+  (subtle_bugs §30/§31)) and `min_key`
+  are arena-facing.
 - `skipset.rs` — the skip-list index over BlockSet: `SkipSet` +
   `STRIDE`/`STRIDE_SHIFT`/`STRIDE_MASK` consts (power-of-2 — slot math is
   shift/mask; runtime divisors never compile to shifts). tier0
@@ -345,15 +387,18 @@ tiers:
 - `blockbimap.rs` — the bijective tier: `BlockBiMap<K, V, A>` — two lockstep
   BlockMaps, each holding the OTHER's names as its values (both orders native,
   no projection ordering; every pair one hop from either side). insert
-  churns BOTH name spaces — `BiDeltas` carries both `Deltas` streams; the
+  churns BOTH name spaces — each map's own block-owned `Deltas` slot
+  carries its stream (the old `BiDeltas` param died with phase 1); the
   maps consume each other's events by the BACK-POINTER CHASE (`chase`): a
   delta pair names the emitter's moved entry, and that entry's own value
   addresses the one partner slot whose held name went stale — O(1) per pair,
   no search. gather pairs carry the full hop, so every pair is final — the
-  chase is a single forward pass in POS space (`iter_pos` + reads at pos:
-  the flip fires pre-record, so the emitter's translator is unchanged from
-  record to chase; events held across mutations go through `iter`'s
-  era-stable names — subtle_bugs §22). the fresh entry's dummy value (A::ZERO) is never chased before
+  chase is a single forward pass pulling `next_chase` (a second expansion
+  cursor that does NOT consume the event — the holder's `iter` still sees
+  the full stream; the flip fires pre-record, so the emitter's translator
+  is unchanged from record to chase; events held across mutations go
+  through `iter`'s era-stable names — subtle_bugs §22). the fresh entry's
+  dummy value (A::ZERO) is never chased before
   its patch: only its own partner points at it, and a placed entry never
   moves. no value mutation API — V is a values-map KEY, mutation would
   break its order. dup detection lives IN the maps' inserts (no pre-check
@@ -361,13 +406,36 @@ tiers:
   orientation heuristic may still have flipped the block (names unaffected,
   invisible through the direction-aware API); a dup-V Err rolls the placed
   k back — the slides it caused are real, so key-side deltas may be
-  PENDING on Err (apply + clear like an Ok; a spot-as-hole placement
+  PENDING on Err (apply + exhaust like an Ok; a spot-as-hole placement
   records a no-op event, a push_back records nothing).
   cursors over both native orders: `seek`/`seek_after` → `Cursor` (key
   order, yields `(&K, &V)`) and `seek_by_value`/`seek_after_by_value` →
   `ValueCursor` (`(&V, &K)`) — blockmap cursors with the partner chased
   one hop per yield (like the iters); `addrs() -> (K-side, V-side)` on
   both.
+- `arenaset.rs` — the block-of-blocks tier (2026-10-22, phase 3): `ArenaSet` —
+  a `Vec` of u8-name BlockSets (cap 256 each) under a
+  `BTreeMap<min-clone, block-id>` index (K: Archive + Clone + Ord for v0;
+  the index's order IS the block order — no linked list). routing: the
+  floor entry (the greatest min ≤ k) owns k; k below every min routes to
+  the first block and its index entry is replaced (the only min-changing
+  insert). full blocks split: k at the tail extreme or below the min
+  SPAWNS a fresh block holding k alone (no renames — k never landed);
+  a mid-gap k CLEAVES 50/50 — the raw copy (see blockset's `cleave`)
+  with a one-field split event (`Split { from_aa, from_tr, to_aa,
+  split_pos }`: position ≥ split_pos ⇒ retarget block id, SAME name).
+  the per-block z-gate is DEAD on split-born halves (a dense 128-prefill
+  needs len > 255), so the ARENA owns reversal: below-min into a
+  non-reversed block past warmup flips it first. a dup into a FULL
+  block Errs at capacity before the dup check — the arena discriminates
+  by `contains` on full-block Errs (subtle_bugs §28), and after any
+  split EVERY index entry is recomputed from its half's current min
+  (§29). the consumer contract: drain `deltas()` (the touched block's
+  slot) and `take_split()` before the next insert. removal/merging: v0;
+  block ids and names are immortal. tests: the full holder-mirror
+  torture (every name verified after every insert through splits and
+  block deltas — asc/desc/random/scattered-runs) + a String-key
+  heap-rebuild test.
 
 consumer:
 - `treeblock/` — ALL the tree machinery: `blocks` (Block + BlockTrait/
@@ -406,7 +474,12 @@ consumer:
   inside grow_rotate — rare, O(cap), so clocks are free — + slide
   moved-elements from the deltas + the desert census via
   `live_run_lengths`; findings 2026-10-19: turns 1–3% of build, the
-  gather tail is count-bounded and quadratic in desert depth).
+  gather tail is count-bounded and quadratic in desert depth),
+  `mid_band.rs` (a dense 128-append prefill + descending/ascending
+  128-key bands landing inside it, nested and ISOLATED per band —
+  the isolated rows are the honest per-band measure, the nested rows
+  contaminate: band3 inherits band2's churn layout; findings
+  2026-10-22 in session_history).
 
 notes: `devlog.md` (design log), `session_history.md` (per-session record),
 `subtle_bugs.md` (solved nuances + their rules).
@@ -450,14 +523,23 @@ block, peek/addr checks, ghost round-trips; bimap's macro battery over
 both orders (descending keys force the flip, values ascend — mixed
 internal directions); mask `steps_match_naive` (single steps + full
 cache-riding walks vs naive at every start, the cache invariant asserted
-per hop). sized for miri — 60-key sets over a 67-wide key space (every
+per hop). arenaset (2026-10-22): the holder-mirror torture — every held
+name verified after EVERY insert through splits and block deltas
+(asc/desc/random-with-dups/scattered-runs; the model tracks accepted),
+boundary-spawn counts (sequential streams never cleave),
+`ceiling_rebalances_whole_block`, the String-key heap-rebuild test, the
+`streak_anchor_staleness` honest-holder anchor check (0 stale), and the
+`mid_band` streak/break diagnostics. sized for miri — 60-key sets over a
+67-wide key space (every
 boundary still swept; the flip still trips, gathers still bank), 70-bit
 mask: ~2 min.
 
 Run targeted: `cargo test -p doa --lib blockset` / `blockmap` / `mask` /
-`treeblock::walker`; uninit/leaks: `cargo +nightly miri test -p
-doa --lib <filter>` (slow — recompiles + interprets; blockset, blockmap
-and blockbimap are miri-CLEAN; miri runs are expensive — filter to small
+`treeblock::walker` / `arenaset`; uninit/leaks: `cargo +nightly miri test -p
+doa --lib <filter>` (slow — recompiles + interprets; blockset, blockmap,
+blockbimap and arenaset are miri-CLEAN — arenaset verified 2026-10-22,
+~67 min for the full suite: cleave's raw copy + handle rebasing are
+the jurisdiction; miri runs are expensive — filter to small
 subsets, the torture tests dominate).
 ⚠ Running the full `cargo test` in this crate has crashed the IDE out of memory in
 the past — run targeted tests.
@@ -499,8 +581,10 @@ the past — run targeted tests.
   Rebalance port would touch its slide/turn plumbing but not bimap
   (its chase consumes blockmap events, which never include Rebalance).
 - blockset: offset turns (window moves — mask + data halves handle any
-  offset now; the move op remains, and it must respect `offset < cap` or
-  generalize the reversed band — subtle_bugs §20),
+  offset now; the move op remains; under the corrected translator math
+  (the NEXT TASK above) the offset restrictions dissolve into
+  recalculation — §20/§30 document the monotonicity constraint the
+  old band math encoded),
   mixed-side/multi-event deltas (`Delta::Pairs` awaits bulk),
   `from_vec`, convenience getters.
 - blockset: find-bench density sweep (90–97%) — the bench now runs the
@@ -530,8 +614,43 @@ the past — run targeted tests.
 - extend the btree consumer (deletes with leaf removal, underfull merges).
 - `keys()` iter hook + ordered iteration (`IntoIterator` on the walker).
 - sparse-ChildPos nav — children()-based sibling walks for one-kid/sparse nodes.
-- arena tier — subtrees & forwarding (block_id roots), ordering across splits;
-  graduation — pluripotent → concrete strategy at len == the `Half` cap.
+- NEXT TASK — block splitting with the corrected translator math (the
+  user's, notes/devlog.md "Reversed translator math", 2026-10-22): offset
+  is ALWAYS recalculated on rotate/split via the complete formula
+  `new.a2p(old.p2a(at)) = 0 ⇒ new_offset = −((old_offset + at) rl
+  old_rot rr new_rot)` — valid for arbitrary split points and both
+  halves (the at=0 case simplifies to "preserve the address of phys
+  0"), making `len < MIDPOINT` the ONLY in-place rotation constraint
+  and replacing every offset restriction (the reversed-band assert
+  included — its real content is the monotonicity refusal, subtle_bugs
+  §30). the midpoint-split-then-rotate runs in one step (the
+  would-be-wrapped region lives in the empty half); the "derotation"
+  in small-width examples is the mod-width identity, not a mechanism.
+  this is the ceiling graduation — it supersedes the
+  `rebalance_block` lattice valve (which leaves a block capped
+  forever) and likely replaces `cleave`'s Desc-flip guard; a rename
+  event (the natural-position derotate) returns for this path.
+- arenaset: (AA,BA) packing representation; an `arena.rs` bench (vs
+  BTreeSet/SkipSet); removal + block merges (v0 has immortal ids);
+  the above-max symmetric eager flip; per-block skipset tiers; the
+  eager below-min flip is UNCONDITIONAL (one below-min key flips an
+  append-heavy first block and the reflected gate stays off ~len
+  inserts — z-gating it is the unbenched candidate, report-only).
+- blockset: the streak/ladder retune sweep — anchor-follow made
+  streaks honest (20–100 long where they broke at ~8) and the
+  streak→want/routing coupling now costs runs 8.57 vs 6.46 moved/insert
+  (accepted 2026-10-22: the mid-run is the adversarial case); the
+  word-bounded bank arms re-bank every ~7 inserts re-dragging their
+  own stranded holes — multi-word banking (below) and the want
+  scaling deserve one clean knob sweep, not end-of-session flailing.
+- blockset: multi-word banking — ELEVATED (2026-10-22): with honest
+  streaks the one-word borrow bound is the binding constraint (a
+  streak's want outruns what one word holds; the fork pays the
+  difference as drag). the old warning stands: widening re-digs the
+  deserts the rebalance arm levels.
+- treeblock arena — subtrees & forwarding (block_id roots), ordering
+  across splits; the SET arena tier (arenaset) landed 2026-10-22 —
+  this remains the tree consumer's version.
 - `Fixup` relevance-check optimization (elide unnecessary runtime checks).
 - known latent flaws (all unexercised): reparent_run's `set_position` jumps,
   the unary-internal-riser panic, packed-ChildPos nav breaking on

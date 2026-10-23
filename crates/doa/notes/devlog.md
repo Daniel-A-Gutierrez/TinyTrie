@@ -2,6 +2,254 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+
+# A simpler heuristic? 
+
+Consider the cost of an operation as number of items moved + number of deltas generated. 
+A reversal is equal cost to moving a single space from len to 0 if we update offset via prepend, otherwise the latter is twice the cost. 
+if we're already moving an item, we may as well correct any dense regions on the way. 
+if we bank (distance/2) , then next time theres a big bank itll only look half as far and bank half as much. 
+
+if we factor in 'complexity' as the number of individual slides (regardless of the slide length)
+items moved + num slides + num deltas
+so for an item say 10 away from the back...lemme draw this 
+oxoxoxoxoxxxxxvxxxxxxxxxx
+say we're looking at v. 
+say our threshold for banking is 0.
+once we've looked 5 away, we find a slot to the left, but we want 2 spots at least. 
+keep looking, 7 away, 2 spots but we want 3
+9 away , 3 spots but we want 4, etc. 
+
+## Front banking
+say we have a block with len 192, we bank 32 free slots from the tail to pos 32. 
+whats the cheaper delta? 
+offset increases by 1 and 0..32 addresses shift left 32
+or leave offset as is and 32..192 addresses shift right 1
+
+## Free space cheaper than distributed space
+1 delta to move adjacent free slots,  n deltas to move n strided free slots. 
+maybe we shouldnt be gathering. 
+maybe we just set a threshold for finding a single free slot and once we cant, we both bank and redistribute. 
+maybe we can use our skip list to find free space. 
+
+its tricky that
+xoxoxoxov is twice as hard to gather as
+ooooxxxxv
+
+both of those would read as the same - 4 empty and 4 taken
+maybe a quick mask op to check adjacency - (word & word>>1).count_ones() ? 
+gather could be wired to prefer cheaper space. 
+if our 'near' threshold is say, 32, and once its exhausted we gather for a bank_rebalance
+we're looking for the cheapest way we can get (distance/2) slots + dense-region/2. 
+once cost exceeds len, its cheaper to grow_rotate. 
+
+so cost can roughly be calculated as 
+let cost = 65; //min cost to rebalance a 32 region is 32 updates + 32 moves + 1 delta (recording dense -> strided fill is trivial)
+let want = 32; //min dense region size / 2 or * 1-(target-density) + distance/2, im saying 1/2 density for now, grows until the first found free space, or maybe till region density falls below 'high' (5/6 rn). 
+let distance = 16;
+let grow_cost = self.len();
+loop {
+    let rword = mask.word[ (pos+distance) >> 6 ]
+    let lword = mask.word[ (pos-distance) >> 6 ]
+    rword_free = rword.count_zeroes();
+    rword_slides = rword^(rword>>1);
+    //same for lword
+} 
+
+
+so within the near bounds - find slot and slide 1 at a time .
+past that (meaning everything in near bounds was dense) - look outward for the minimum cost set of words to take space from.
+a words cost is how many live elements live between spot and it, plus the number of 'edges' or crossings in it.
+'want' increases at 1x the word's one count until we hit the edge of the dense region, then it increases by half - thats the bank half distance + enough to rebalance the dense region.
+
+im imagining it could go like this :
+many inserts in a region near the head cause a dense region 32 wide. 
+its want is 32 to rebalance, plus 1/2 of the number of slots scanned from slot (so min 16).  
+
+if the block is uniformly 50% full, itll search for... well , all the way to the end. 
+it cant find more than 32 slots a word and thats what want increases by so itll make it all the way to the tail,
+then move len/2 + 32 slots from the tail to the head. 
+its important that it doesnt stop taking from the tail after just 32 slots - thatd end up being a whole block gather just for a 32 wide rebalance, when otherwise it can be a single O(len) move + translator offset.
+so i guess we stop when cost exceeds 2*len? 
+actually the cost of grow_rotate is only O(occupied). 
+strictly less than len, so prepend is always more expensive if it has to search all the way to the tail.
+if we have a resevoir at the midpoint, moving half of it would be O(occupancy/2) moves plus occupancy/2 updates. The slide is just (distance,from,to). 
+reversal though - thats O(occupied) and 1 translator bit as well. 
+What if in reversal, we just pad the back first with 32 free slots before reversing? 
+That way if they all get used up its a indicator we shouldnt have. 
+
+the size of the dense region hints that we need more consecutive free space
+we insert in the middle of that banked free block and that helps with our append/prepend - only middle insert on a bank tho, otherwise its adjacent to prev/next.
+the free region should be furthest-hole/2 wide.  
+we also rebalance the region - requiring dense-region free slots. 
+
+we preferentially take from words which have few live elements.
+the cost of a word is the number of live elements between it and slot, plus the number of crossings within it. 
+we scan until either cost grows past len - at which point we reverse or grow depending on spot - 
+or we reach a point where even if the next word were empty its cost would still be higher to move than what we've found so far, or want is met. 
+or we could keep it simple, track the distance till want is met and scan till the prior conditions or twice that .
+
+yk what fuck it, 
+dense region = bank and rebalance.
+forget borrowing.
+bank discovers the width of the dense region centered on spot, gathers space, then distributes it within that region, placing k in the middle of the sparse area. 
+the bigger the dense region the sparser we make it. 
+we take from neighbors even if theyre fairly dense already. 
+
+id like a rebalancing algorithm that doesnt put items at an even stride, but instead does something gaussian-like. 
+
+maybe we always insert by subdividing a gap. thats how random can reclaim free-chunks. 
+then we also always bank, proportional to the distance to the first found free slot. 
+set our bank factor to free stride perhaps, so want = dist_to_first_hole / FREE_STRIDE
+they dont rebalance, we just drop em between prev and next, then put the new item in the middle of the gap.
+
+reversal? 
+how about this : if in the search for a free space its cheaper to reverse the array and pull from the front than to gather the spaces or grow, do that. 
+costs : 
+ 
+reversal = 
+ok how about this
+each element has been copied log2(len) times for growing
+so for a O(n) reversal to be worth it, the average position has to be in the first log2(len) positions. 
+or just pos_sum < occ*log2(len)
+gather = 2 * live_moved * occupied
+
+
+# Reversed translator math
+
+i think a previous agent that wrote those just got confused, the math isnt too tricky, just have to keep in mind that if len > midpoint then we cant preserve any ordering while
+rotating because the high addresses get mixed in with the low. its still useful though if we can just split the block at midpoint then rotate - all the 'mixed in' other half's items are empty. for
+efficiency's sake we do it in one step.
+
+work through it in 3 bits , 0,1,2,3,4,5,6,7 rotated left becomes 0,2,4,6,1,3,5,7 right? 
+offset by 4 and its 1,3,5,7,0,2,4,6 . 
+rotate again and its 2,6,3,7,0,4,1,5 . relative ordering not preserved !
+
+however 1,3,5,7 can actually derotate and map into their natural positions, and offset goes to 0. new left block is 0,1,2,3,4,5,6,7
+same for the right block.
+
+if the translator's reversed then we have 0,7,6,5,4,3,2,1
+
+ordinarily translator formulas are 
+p2a : (offset+pos) rl rot
+a2p : addr rr rot + offset
+
+reversed is
+p2a : (offset-pos) rl rot
+a2p : offset - (addr rr rot)
+
+reversed with 1 rot is 
+addrs = [0,7,5,3,1,6,4,2]
+with 1 rot and 4 offset 
+addrs = [1,6,4,2,0,7,5,3]
+seems to still work fine. 
+
+2 rot and 4 offset : 
+[2,6,3,7,0,4,1,5]  - ordering from rot 1 not maintained. 
+or rather, when our prime sequence 0..8 rotated, we had a wrap point every 4
+when we rotate again, we wrap every 2. 
+at rotation 3, its identity. 
+
+a twice rotated unoffset sequence is [0,4,1,5,2,6,3,7] 
+
+what if offset is 6 instead of 4? 
+[3,7,0,4,1,5,2,6] 
+doesnt really matter .
+
+so just to get them in one place our sequences are 
+rl0 [0,1,2,3,4,5,6,7]
+rl1 [0,2,4,6,1,3,5,7]
+rl2 [0,4,1,5,2,6,3,7]
+rl3 [0,1,2,3,4,5,6,7]
+
+and reversed 
+rl0 [0,7,6,5,4,3,2,1]
+rl1 [0,7,5,3,1,6,4,2]
+rl2 [0,7,3,6,2,5,1,4]
+rl3 [0,7,6,5,4,3,2,1]
+
+from that its pretty plain to see that a rotation right puts space between elements that were adjacent previously by borrowing space from the top half of the addresses. 
+meanwhile a left rotation takes elements that were 1 apart and makes them adjacent, evens in the left odds in the right. 
+
+consider though rl 0 off 2 to rl 2 
+r0 [6,5,4,3,2,1,0,7]
+r2 [3,6,2,5,1,4,0,7]
+
+normally a rotation right puts elements between but preserves ordering, but in this case 3 went from the rightmost to the leftmost.
+even if we assume [2,1,0,7] were empty space, the rotation doesnt work.
+a fix would be to offset such that 3 ends up back on the right - we'd want 6 to be the first element so offset becomes (off-0) rl 2 = 6 , off-0 = 5 , off=5
+so thats one approach - recalculate offset for the new left half and right half. 
+
+i guess for the left half the ideal is 'preserve address of phys 0 by recalculating offset'. 
+of course with that, len must be <= midpoint, otherwise its impossible. 
+for a reversed block the math is 
+p2a(0) = addr of 0
+new_off - (addr rr new_rot) = 0
+new off = addr rr new_rot
+
+applying that to the case from earlier : 
+p2a(0) = 6, new_rot = 2
+6 rr 2 = 5
+ez
+
+lemme see if the trick words regardless of rev
+
+r0 off2 [2,3,4,5,6,7,0,1]
+to
+r2 off? [2,6,3,7,0,4,1,5]
+
+p2a(0) = 2
+2 rr 2 = 4
+p2a : (offset+pos) rl rot
+p2a(0) = 4 + 0 rl 2 = 2. 
+nice!
+
+so in practice, i think this should be done whenever we rotate. 
+idk exactly when its necessary, but it certainly never hurts. 
+
+when splitting, if we split exactly at the midpoint we should never have a problem. 
+actually does this work for the right half? 
+and does it work if we're splitting at arbitrary locations?
+
+
+r0 off2 [2,3,4,5,6,7,0,1]
+lets say we're splitting at 3, so [5,6,7,0,1] are going to the new right half.
+instead of using 0 for p2a we use the split point 3
+p2a(3) = 5
+5 rr 2 = 6 rr 1 = 3
+so new offset is 3
+a2p(5) = 5 rr 2 + 3 = 6? no good. 
+p2a(0) = 5 + 3 rl 2 = 0, no good. 
+
+ok we rederive it i guess
+a2p(5) = 
+0 = addr rr rot + offset = 
+5 rr 2 + off = 0 =>
+3 + off = 0 => 
+off = 5 
+
+p2a(0) with r2 off2 = (3+pos) rl 2 = 3 rl 2 = 5
+ok cool . 
+
+so why didnt the first formula work? 
+i think the simplication with pos=0 threw things off
+the correct complete formula is 
+
+new.a2p(old.p2a(at)) = 0 
+
+p2a : (offset+pos) rl rot
+a2p : addr rr rot + offset
+
+%8 : 0 = (old.offset + at) rl old.rot rr new.rot + new.offset
+new.offset = - ((old.offset + at) rl old.rot rr new.rot)
+= - ((2 + 3) rl 0 rr 2) = -3 = 5
+
+also since i presume we're growing, not shrinking, new_rot = old_rot - 1 % 3 ( in 8 bit at least). 
+
+that formula should work for both the right and left halves its just simplified in the left halves case. 
+rather than restricting when a block can rotate without altering offset, offset should always be recalculated, the only limitation for an in-place rotation is that len < MIDPOINT. 
+the 'derotation' i observed before also was just that %3 coming into play - its not something we should normally bank on. 
+
 # Deltas
 up till now deltas has been something supplied by the consumer - but its a necessary part of the block's state. 
 i think we make it a part of the block, and provide it by a call to fn deltas(&mut self) -> &mut Deltas. 

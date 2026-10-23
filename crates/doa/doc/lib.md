@@ -10,30 +10,32 @@
 ///L0010
 pub use treeblock::metadata::Fixup;
 ///L0012
-pub mod blockbimap;
+pub mod arenaset;
 ///L0013
-pub mod blockmap;
+pub mod blockbimap;
 ///L0014
-pub mod blockset;
+pub mod blockmap;
 ///L0015
-pub mod index;
+pub mod blockset;
 ///L0016
-pub mod mask;
+pub mod index;
 ///L0017
-pub mod serialize;
+pub mod mask;
 ///L0018
-pub mod skipset;
+pub mod serialize;
 ///L0019
-pub mod translator;
+pub mod skipset;
 ///L0020
+pub mod translator;
+///L0021
 pub mod treeblock;
-///L0022
-pub struct InOrder;
 ///L0023
-pub struct PreOrder;
+pub struct InOrder;
 ///L0024
+pub struct PreOrder;
+///L0025
 pub struct PostOrder;
-///L0028
+///L0029
 ///where the tree root lives in a fresh block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootPos {
@@ -41,7 +43,7 @@ pub enum RootPos {
     Middle,
     End,
 }
-///L0038
+///L0039
 ///which ordering a block uses. a const so tree ops can `match` on it and
 ///monomorphize into a per-ordering flow that differs in *steps* (splits), not just
 ///values (`suggest_*` methods cover those).
@@ -51,24 +53,24 @@ pub enum Order {
     In,
     Post,
 }
-///L0046
+///L0047
 ///which side of an anchor a slot opens on (or a suggestion names).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rel {
     Before,
     After,
 }
-///L0052
+///L0053
 ///impl'd by `InOrder` (Middle/In), `PreOrder` (Beginning/Pre), `PostOrder` (End/Post).
 pub trait Ordering: 'static {
     const ROOT_POS: RootPos;
     const ORDER: Order;
 }
-///L0058
+///L0059
 ///easiest to split, iteration OK
 impl Ordering for InOrder {}
-///L0062
+///L0063
 impl Ordering for PreOrder {}
-///L0066
+///L0067
 impl Ordering for PostOrder {}
 ```

@@ -840,6 +840,105 @@ gated its 2-word occupancy read at ≤ 64 and fell to next_set).
 
 ---
 
+## 28. A dup into a FULL block reads as capacity (2026-10-22)
+
+**The bug (2026-10-22, arenaset routing — caught by the holder torture).**
+`BlockSet::insert` checks `len >= max_capacity()` BEFORE the dup
+search, so a duplicate key inserted into a full block returns Err with
+no way to tell it apart from a capacity miss. the arena's first split
+logic read every full-block Err as "split" — it CLEAVED a 256-element
+block for a key the block already had, then the re-route insert into a
+half hit the real dup and hit an "impossible" arm.
+
+**The rule.** capacity-vs-dup is only decidable by content when the
+block is not full. the arena discriminates on the Err path:
+`len == ceiling && !contains(k)` ⇒ split, everything else ⇒ dup.
+never infer "capacity" from len alone on an Err.
+
+---
+
+## 29. A split moves the source block's MIN — both index entries update (2026-10-22)
+
+**The bug (2026-10-22, arenaset's BTreeMap index — caught by the model
+torture).** after a cleave, inserting only the right half's min entry
+leaves the source's index key naming a min that now lives in the right
+half. worse: when both halves' mins collide (possible after the source
+kept the old entry), `BTreeMap::insert` SILENTLY REPLACES — the source
+block vanishes from routing entirely, every later key routes to the
+wrong block, and order corrupts across block boundaries.
+
+**The rules.**
+- after any split, EVERY affected block's index entry is recomputed
+  from its current min (`min_key`), not patched incrementally.
+- a keyed index over blocks is a name⇒id map with insert-replace
+  semantics: a collision is an invariant break, not a merge. rebuild
+  both entries or assert distinctness.
+
+---
+
+## 30. The reversed turn dies at offset ≥ midpoint: the band wraps to a PREFIX and position 0's image leaves the block (2026-10-22)
+
+**The nuance (2026-10-22, grow_rotate/rotate_mask — the corrected math
+is the user's, notes/devlog.md "Reversed translator math").** the
+reversed turn map is `q = 2p − [(offset − p) mod 2^w ≥ 2^(w−1)]` —
+valid arithmetic for ANY offset. for offset < midpoint the band
+condition collapses to `p > offset` (a contiguous position suffix, the
+mask ripple's down-band) and the map is monotone. for offset ≥ midpoint
+the comparison wraps: the band becomes a position PREFIX
+`p ≤ offset − 2^(w−1)` and position 0's image `2·0 − 1` goes NEGATIVE,
+wrapping to `2^w − 1` — the bottom element lands at the TOP and
+position order breaks (offset 188, u8: q(0) = 255, q(1) = 1). the
+translator formulas were never confused; rotate_mask's assert is a
+MONOTONICITY refusal, not a formula constraint.
+
+**The rules.**
+- a turn's images must stay inside `[0, 2·cap)` in order: the broken
+  positions are exactly the ones whose doubled image falls into the
+  wrapped region — harmless IFF those positions are holes. this is the
+  midpoint-split insight: split first and the collision region lives
+  in the empty half, so `len < MIDPOINT` is the only in-place
+  rotation constraint once offset is always recalculated
+  (next task — see session_history 2026-10-22).
+- forward turns are monotone for ANY offset (their correction is an
+  additive band shift, not a ±1 ripple) — a shifted block that must
+  keep turning reads Asc (cleave flips a Desc half for exactly this).
+- REACHABLE STATE (2026-10-22 review): a cleave-shifted half carries
+  offset ≥ its cap (any source offset < at wraps — most Asc blocks
+  hold offset 0, so the half is born at offset = cap; the Desc flip
+  RELOCATES the wrap to 255 − offset, never clears it). sound while
+  Asc; the live guard is grow_rotate's REFUSAL at reversed offset ≥
+  midpoint (routing the space need to the ceiling valve), because
+  reverse() on such a half would reborn the constraint and the next
+  turn would hit rotate_mask's always-on assert. the state's closure
+  today is partly arithmetic accident (the z-gate can't fire on a
+  seed-128 half) — do not loosen seed_uniform_signals or the turn
+  line without re-checking this chain.
+- the "derotation" seen in small width examples is the mod-width
+  identity (rl w = identity), not a mechanism to bank on.
+
+---
+
+## 31. A born-big block must seed its z-gate; a name-preserving split is `offset − at` (2026-10-22)
+
+**The nuance (2026-10-22, cleave).** two coupled traps in the raw-copy
+cleave:
+- a block BORN at len (the copied half) with pos_sum 0 reads
+  maximally front-biased to the reversal gate — it flips on its first
+  insert. `seed_uniform_signals` (both halves: the moved half's insert
+  history predicts neither side's future) plants the uniform
+  mean/spread over [0, len).
+- the halves keep their names iff the new translator is the source's
+  with `offset − at` — the same shift under BOTH directions (fwd
+  `(p − offset)` → `(q − (offset − at))`, rev `(offset − p)` →
+  `((offset − at) − q)`), so the split event is "position ≥ split_pos
+  ⇒ new block id, SAME name" and holders do no name math.
+
+**The rule.** any structure that relocates a block's signals without
+its history must seed neutral expectations, not zeros; any
+name-preserving position shift is an offset shift, never a re-mint.
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on

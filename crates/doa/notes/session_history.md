@@ -1297,3 +1297,71 @@ records the landed pieces AND the multi-session plan; later sessions append belo
 - deferred: the (AA,BA) packing representation; cap-ceiling split trigger (vs len ==
   256 — the ceiling fix removed the worst of the turn-refused grind, re-measure
   first); blockmap's ladder port inherits the ceiling escape when it happens.
+
+## 2026-10-22 — runs banking, the ceiling valve, and the arena lands
+
+phase 2 (runs) and phase 3 (the arena) landed on the 10-21 plan. the session's
+verdicts are mostly deletion records — three mechanisms built, measured, and
+removed.
+
+- landed (blockset): the centered bank landing (`bank_landing` — any slot in
+  the compacted hole range is order-legal; k takes the center, slack-clamped);
+  the anchor-follow (`last_insert` tracks the previous element through
+  slide_hole/compact_gather/move_slot/grow_rotate/reverse — 0 stale, verified
+  by an honest-holder diagnostic that APPLIES name swaps, the old one measured
+  name-staleness artifacts); the ceiling valve (`rebalance_block` — the
+  preemptive turn's replacement when doubling is refused: whole-block
+  minimal-stride lattice fitting len below the name ceiling, tail extended to
+  the tight extent; the mid-run O(n)-per-insert grind is gone); `cleave` (raw
+  slot/mask copy, `Translator::shifted(at)` = offset − at so MOVED NAMES
+  SURVIVE and the split event is "position ≥ split_pos ⇒ new block id", heap
+  rebuilt compact on both halves, signals re-seeded, Desc halves flipped Asc
+  — see subtle_bugs §30/§31); `min_key`, `rebuild_heap`, `seed_uniform_signals`.
+- landed (arenaset — the block-of-blocks tier): `ArenaSet` — Vec of u8-name
+  BlockSets under `BTreeMap<min-clone, id>` (the index order IS the block
+  order); floor-entry routing; boundary spawns (fresh block takes k alone —
+  no renames ever for sequential streams); 50/50 cleaves with the one-field
+  split event; arena-owned below-min flips (split-born halves have a dead
+  z-gate); dup-vs-capacity discrimination by lookup (§28); 8 tests incl. a
+  full holder-mirror torture (every name verified after every insert) and a
+  String-key heap-rebuild test.
+- died: the run-direction signal (raw Σ(pos−prev) is stale across a
+  streak-continuing direction change AND self-reinforces through its own
+  landing; EMA-damped still lost to plain centering — do not revive without a
+  new workload); the len/8 hot-bank gate and the want-decoupling (measured
+  worse, reverted — the mid-run is the adversarial case, not the tuning
+  target); the ladder-insert cleave (z-gate flips the newborn mid-cleave,
+  re-archiving churns the heap — replaced by the raw copy).
+- decided: keep anchor-follow (correct invariant; costs runs movement via
+  the streak→want coupling — the ladder's streak tuning is a sweep-worthy
+  task of its own); centering over direction-led (three-arm A/B, both bands);
+  raw-copy cleave over insert-cleave (names survive, event collapses);
+  `from_tr` snapshots stay in Deltas (era stability for held events).
+- measured (moved/ins, deterministic, this machine):
+  | cell | pre-phase-2 | landed |
+  |---|---|---|
+  | runs @10k | 7.19 | 8.57 (the anchor-follow cost, accepted) |
+  | desc band iso | 5.97 | 5.78 |
+  | asc band iso | 6.66 | 5.31 |
+  | runs time @10k | 59.6 | 52.1 (−13%) |
+  | random @10k | — | bit-identical movement across all phases |
+  bank-landing three-arm (bands, spot-adjacent / centered / direction-led):
+  5.97/5.23/6.02 desc, 6.66/5.73/5.83 asc. ceiling valve: 200 live/256 →
+  stride 5, cap 251, follow-ups amortize (1,4,15,1 moved). anchor-follow
+  streak census: 5 resets/256 band (transition + ceiling-jumps structural;
+  the Δ7 slack off-by-one fixed by budgeting from `open`).
+- NEXT TASK (the user's, notes/devlog.md "Reversed translator math"): block
+  splitting with the corrected translator math — offset is ALWAYS recalculated
+  on rotate/split via the complete formula
+  `new.a2p(old.p2a(at)) = 0 ⇒ new_offset = −((old_offset + at) rl old_rot rr new_rot)`
+  (valid for arbitrary split points and both halves; `len < MIDPOINT` becomes
+  the only in-place rotation constraint, replacing every offset restriction);
+  the midpoint-split-then-rotate (the would-be-wrapped region lives in the
+  empty half); the derotation in small-width examples is the mod-width
+  identity, not a mechanism. this supersedes the rebalance-block valve as the
+  ceiling graduation and likely replaces cleave's Desc-flip guard.
+- deferred: multi-word banking (elevated: with honest streaks the one-word
+  borrow bound is the binding constraint — the fork re-banks every ~7
+  inserts re-dragging its own stranded holes); the streak/ladder retune
+  sweep; (AA,BA) packing; arena bench; arena removal/merges; the above-max
+  symmetric eager flip; skipset-tier-per-arena-block.

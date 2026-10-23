@@ -72,6 +72,17 @@ impl<A: UnsignedNum> Translator<A> {
         Translator { rotation, offset, ..Translator::new() }
     }
 
+    ///the cleave shift: positions slide down by `at` with names intact —
+    ///`p2a_new(p) = p2a_old(p + at)` under BOTH directions (offset − at,
+    ///wrapping). the cleaved half's elements keep their names; only
+    ///their block changes
+    pub(crate) fn shifted(&self, at: usize) -> Self {
+        Translator {
+            offset: self.offset.wrapping_sub(A::from_usize(at)),
+            ..*self
+        }
+    }
+
     ///the rotation turn: rotation + 1, offset doubled — names preserved by
     ///construction under both directions
     pub(crate) fn rotate(&self) -> Self {

@@ -35,7 +35,7 @@ pub struct Translator<A> {
 }
 ///L0045
 impl<A: UnsignedNum> Translator<A> {}
-///L0113
+///L0124
 #[cfg(test)]
 mod tests {
     use super::*;
