@@ -1,27 +1,16 @@
 ```rust
-//!the set/map tier's 2-knob translator — fn-ptr-specialized per direction so
-//!translation carries no negate/branch: forward `p2a(p) = (p − offset) ror
-//!rotation`, reversed `p2a(p) = (offset − p) ror rotation`. the indirect
-//!call is BTB-predicted (~1 cycle, see treeblock translator's bench
-//!notes), re-dispatched only on rotate/reverse — `reversed` selects the
-//!fns, never touches the math.
+//!the set/map tier's 2-knob translator — one inline path per op, a branch
+//!on `reversed` picking the operand order, rotation+offset applied
+//!unconditionally: forward `p2a(p) = (p − offset) ror rotation`, reversed
+//!`p2a(p) = (offset − p) ror rotation`. deliberately fn-ptr-free: a
+//!memmapped block would serialize the translator verbatim, and a stored
+//!code address is a hijack primitive — the branch shape measured ~4
+//!cycles/call faster anyway (benches/translator.rs).
 //!invariant: a2p is p2a's exact inverse (round-trip exact on canonical
 //!slots); names survive the rotation turn (`pos → 2·pos` under BOTH
 //!directions — offset doubling cancels the negation) and the reversal
 //!(`p2a_rev_new(p) = p2a_old(cap−1−p)`, names follow the mirrored slots).
-///L0014
-type A2p<A> = fn(A, u32, A) -> A;
-///L0015
-type P2a<A> = fn(Pos, u32, A) -> A;
-///L0017
-fn a2p_fwd<A: UnsignedNum>(a: A, rotation: u32, offset: A) -> A;
-///L0021
-fn a2p_rev<A: UnsignedNum>(a: A, rotation: u32, offset: A) -> A;
-///L0025
-fn p2a_fwd<A: UnsignedNum>(p: Pos, rotation: u32, offset: A) -> A;
-///L0029
-fn p2a_rev<A: UnsignedNum>(p: Pos, rotation: u32, offset: A) -> A;
-///L0037
+///L0019
 ///the set tier's 2-knob translator — rotation turn = growth (doubling
 ///rule unchanged either direction), reversal re-parameterizes so names
 ///follow the mirrored slots
@@ -30,12 +19,10 @@ pub struct Translator<A> {
     rotation: u32,
     offset:   A,
     reversed: bool,
-    a2p:      A2p<A>,
-    p2a:      P2a<A>,
 }
-///L0045
+///L0025
 impl<A: UnsignedNum> Translator<A> {}
-///L0124
+///L0107
 #[cfg(test)]
 mod tests {
     use super::*;

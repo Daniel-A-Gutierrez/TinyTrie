@@ -35,20 +35,34 @@
 //!- creep: widths track the base cap (extend); past the epoch reservation
 //!  (turn refused / pathological growth) → full re-derive.
 //!the top tier is rootless (skip-list shape, not a bounded-arity B-tree
-//!node). removal unsupported (v0).
-///L0047
+//!node). standalone removal unsupported (v0); `update` removes
+//!internally — its window-chain re-read is the removal's tier fix.
+///L0048
 ///the settled skip stride — power of two (compile-time assert) so slot
 ///math is shift/mask; the div-vs-shift cost story lives in the header
 pub(crate) const STRIDE: usize = 16;
-///L0049
+///L0050
 ///log2(STRIDE)
 const STRIDE_SHIFT: u32 = STRIDE.trailing_zeros();
-///L0051
+///L0052
 ///the grid mask, STRIDE − 1
 const STRIDE_MASK: usize = STRIDE - 1;
-///L0052
+///L0053
 const _: () = assert!(STRIDE >= 2 && STRIDE.is_power_of_two(), "STRIDE must be a power of 2 ≥ 2");
-///L0058
+///L0057
+///update's hint-walk radius each side of the removed slot; a miss falls
+///back to the full tier descent
+const HINT_RADIUS: usize = 2 * STRIDE;
+///L0061
+///`SkipSet::update`'s Err — the set is unchanged in both cases
+#[derive(Debug, PartialEq)]
+pub enum UpdateErr<K> {
+    ///`addr` names no live element
+    Absent,
+    ///`new` already lives at another addr — returned untouched
+    Dup(K),
+}
+///L0072
 ///one tier's footprint in the shared store: slots [start, start+width)
 ///used, [start+width, start+capacity) reserved — capacity is 2× the
 ///width chain at 2·cap, covering one turn doubling AND the grid
@@ -58,7 +72,7 @@ struct Region {
     width:    usize,
     capacity: usize,
 }
-///L0068
+///L0082
 ///the single-allocation tier store: [top … tier0] regions, handle slots
 ///only — plain Vec (no MaybeUninit: set writes Some-or-borrow, so every
 ///in-width slot is initialized; reservation slots hold K::MIN and are
@@ -72,9 +86,9 @@ struct Store<K: Archive> {
     ///the fast path); true ⇒ repeats mark holes and must be skipped
     holes: bool,
 }
-///L0078
+///L0092
 impl<K: Archive> Store<K> {}
-///L0171
+///L0185
 ///maintenance-path counters — diagnostic tests only, zero release cost
 #[cfg(test)]
 #[derive(Default)]
@@ -91,7 +105,7 @@ struct Ops {
     ///tail-push inserts routed to push_beyond
     tail_pushes:  usize,
 }
-///L0187
+///L0201
 ///deterministic skip-list index over a `BlockSet` base: tiers built by
 ///`rebuild()`, maintained incrementally thereafter. removal unsupported
 pub struct SkipSet<K: Archive, A: UnsignedNum> {
@@ -103,9 +117,9 @@ pub struct SkipSet<K: Archive, A: UnsignedNum> {
     #[cfg(test)]
     ops: Ops,
 }
-///L0197
+///L0211
 impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {}
-///L0674
+///L0835
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +146,48 @@ mod tests {
     fn matches_model_descending();
     #[test]
     fn matches_model_stride();
+    ///apply name swaps to a held (addr, key) mirror — the deltas protocol
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64)>, deltas: &mut Deltas<A>);
+    ///full parity check: model sweep, iter order, holder names
+    fn verify_model(
+        set: &SkipSet<u64, u16>,
+        holder: &[(u16, u64)],
+        model: &BTreeSet<u64>,
+        space: u64,
+    );
+    ///one update op's model/holder bookkeeping, model as the oracle.
+    ///vacated names may be re-minted by later inserts — no dead-addr
+    ///tracking
+    fn update_op(
+        set: &mut SkipSet<u64, u16>,
+        holder: &mut Vec<(u16, u64)>,
+        model: &mut BTreeSet<u64>,
+        idx: usize,
+        new: u64,
+    );
+    ///update torture: near hints (the bracket walk), far misses (descent
+    ///fallback), both Err paths, the same-key no-op, the no-tiers phase,
+    ///plain inserts interleaved — holder names verified after EVERY op.
+    ///removal decrements pos_sum, so a front-biased update stream can
+    ///fire the flip mid-run — the Desc mirror lives in update_descending
+    ///either way
+    #[test]
+    fn update_torture();
+    ///update under Desc: a descending build flips the base mid-stream, so
+    ///every op exercises the mirrored hint walk, the Desc descent and
+    ///the Desc tier re-reads
+    #[test]
+    fn update_descending();
+    ///the bracket fast path's contract: in-place swap keeps the name,
+    ///records no event, returns the old key; a bracket miss degrades to
+    ///remove+insert
+    #[test]
+    fn update_in_place();
+    ///no-tiers far update: the descent fallback must not need tiers —
+    ///the full block IS the window (review repro: this used to hit
+    ///window_of's "tiers built" unreachable)
+    #[test]
+    fn update_no_tiers_far();
     ///tier structure: tier0 slot j = the handle of the FIRST live item
     ///in window j·STRIDE (None iff the window is empty); each upper tier
     ///lifts every stride-th grid slot of the tier below; regions hold

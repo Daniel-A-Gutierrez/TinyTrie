@@ -2,6 +2,61 @@
 The most recent top level entries are towards the top.
 This file used to be notes/doa.md
 
+# Array Block
+the composition piece for arenaset (blockblock?)
+split construction : 
+colname.index
+colname.data
+
+correspond to 
+Arena
+Vec<BlockData>
+
+struct ArenaDeltas ; //can express that a key moved across blocks, shared between blocks. 
+
+struct Arena { 
+    skip : SkipMap<T,BlockHeader<T>,u32>
+    deltas : ArenaDeltas //shared reusable memory for updates between all blocks, blocks get a bool dirty guard instead. 
+}
+
+struct BlockHeader<T,BA,SIZE> {
+    data_addr : u32,
+    len : BA, //num bytes occupied in block
+    rev : bool,
+    block : Option<*mut BlockData<T,SIZE>> 
+}
+
+struct BlockData<T,BA,SIZE> {
+    translator : Translator<BA> 
+    prev_pos :  BA
+    streak :    BA
+    avg_pos :   BA
+    epoch : u8
+    dirty : bool //in place of deltas 
+    mask : [u64; SIZE/64]
+
+    stack_len : BA
+    heap_len :  BA
+    data : [u8 ; SIZE]
+}
+
+we need a vec alternative - a miniaturized program memory space with a fixed size
+stack and heap grow until heap_len + stack_len*sizeof(T::Handle) >= SIZE
+the heap grows downwards from the top of the memory space, the stack grows up from the bottom
+
+the contents of data is heap and data from blockset both sharing the same memory space. 
+
+i think we need a unifying store trait that supports 
+alloc(len) -> &mut [u8]
+grow_stack(amt)
+free(BA,BA)
+
+actually thats just an allocator, maybe we can get one and plug it into both the heap and stack vecs we already use. 
+only slight complication is that the heap needs to grow backwards. 
+
+also block needs to be sensitive to errors from the vec too now, it will refuse once the block is full which isnt at a fixed number of items 
+but depends on the size of the heap allocations of those items too. 
+so we have to check their size before even trying to insert them. 
 
 # A simpler heuristic? 
 

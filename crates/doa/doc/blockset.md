@@ -262,15 +262,15 @@ pub struct BlockSet<K: Archive, A> {
 }
 ///L0566
 impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {}
-///L1899
+///L1921
 ///`BlockSet::iter`'s return type — direction picked at construction
 pub enum Iter<'a, K: Archive, A> {
     Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
     Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
 }
-///L1904
+///L1926
 impl<'a, K: Archive, A: UnsignedNum> Iterator for Iter<'a, K, A> {}
-///L1922
+///L1944
 ///key-ordered bidirectional walk — `seek`/`seek_after` position, `next`
 ///walks key-ascending (yield current, then step), `prev` walks back (step,
 ///then yield). stepping runs on `MaskCursor` (the cached-word walk, see
@@ -281,11 +281,11 @@ pub struct Cursor<'a, K: Archive, A> {
     ///the slot-walk machine; dir = !reversed, baked at construction
     walk: MaskCursor<'a>,
 }
-///L1928
+///L1950
 impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {}
-///L1935
+///L1957
 impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {}
-///L1996
+///L2018
 #[cfg(test)]
 mod tests {
     use super::*;

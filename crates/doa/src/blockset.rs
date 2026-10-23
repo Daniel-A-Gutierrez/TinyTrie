@@ -788,6 +788,12 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.mask.next_set(from)
     }
 
+    ///first live position < below — None at the head. skipset's update
+    ///hint walk (the prev-mirror of first_live_pos)
+    pub fn prev_live_pos(&self, below: usize) -> Option<usize> {
+        self.mask.prev_set(below)
+    }
+
     ///live-run lengths between holes (position order) — the desert
     ///census: banking clusters holes and the solid runs it leaves
     ///behind are what the fetch walks. NOT API
@@ -1190,11 +1196,27 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         if pos.0 < self.data.len() && self.mask.get(pos.0) {
             self.mask.set(pos.0, false);
             self.len -= 1;
+            //the signal tracks CURRENT elements — removal subtracts its
+            //slot (post-move position, not what the insert added; a
+            //heuristic, wrapping keeps it total)
+            self.pos_sum = self.pos_sum.wrapping_sub(pos.0 as u64);
             let h = unsafe { *self.data[pos.0].assume_init_ref() };
             Some(K::materialize(h, &self.heap))
         } else {
             None
         }
+    }
+
+    ///in-place key swap at a live slot: archives `k`, overwrites the
+    ///handle, returns the previous key materialized (its heap bytes leak,
+    ///v1). no mask/name/signal/position changes — ORDER is the caller's
+    ///contract: `k`'s key must sit inside the slot's immediate bracket
+    pub(crate) fn replace_key(&mut self, p: usize, k: K) -> K {
+        let h = K::archive(&k, &mut self.heap);
+        // SAFETY: p names a live slot (caller-checked)
+        let old = K::materialize(unsafe { *self.key(p) }, &self.heap);
+        self.data[p] = MaybeUninit::new(h);
+        old
     }
 
     ///bsearch over live slots — the raw boundary. Ok(p) = the

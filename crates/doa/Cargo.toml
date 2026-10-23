@@ -58,3 +58,11 @@ harness = false
 name = "mid_band"
 harness = false
 
+[[bench]]
+name = "translator"
+harness = false
+
+[[bench]]
+name = "update"
+harness = false
+

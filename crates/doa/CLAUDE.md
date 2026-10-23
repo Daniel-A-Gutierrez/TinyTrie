@@ -66,7 +66,7 @@ treeblock, each load-bearing:
   do this: its consumers hold addrs across arbitrary mutations inside a
   tree it can't see, so names are assigned at birth and slides report
   pos-space fixups for the consumer's own structures to apply.
-- **2-knob translator, fn-ptr per direction (`src/translator.rs`).**
+- **2-knob translator, inline direction branch (`src/translator.rs`).**
   treeblock's shift knob exists to keep spreads fixup-free while address
   width grows; (offset, rotation) alone provably can't survive width growth
   + post-rotation adjustment (carries break the rotation) — but blockset's
@@ -74,9 +74,12 @@ treeblock, each load-bearing:
   A; the new slots mint the idle names rotation leaves between the
   spaced-out old ones). The 4-knob closure degenerates and 2 knobs close.
   direction is a translator knob now: reversed negates the position term
-  (`p2a(p) = (offset − p) ror rotation`), the fn-ptr specialization keeps
-  the negate off the translation path (BTB-predicted indirect call, as in
-  treeblock's translator). Offset turns (window moves) are the
+  (`p2a(p) = (offset − p) ror rotation`); the fn-ptr-per-direction dispatch
+  DIED 2026-10-23 — a serialized translator carrying a code address is a
+  hijack primitive under memmapping, and the branch measured ~4 cycles/call
+  faster anyway (`benches/translator.rs`; the BTB-prediction claim was
+  wrong — the indirect call costs load+call+ret). Offset turns (window
+  moves) are the
   unimplemented third move; rotation turns work under ANY offset and
   either direction now.
 - **no walker, no `Fixable`, no anchor discipline.** `gather_slots` is the
@@ -162,8 +165,9 @@ treeblock, each load-bearing:
   slots BY CONSTRUCTION — a pending deltas event survives the flip
   untouched (it speaks names; names didn't change). trigger (2026-10-23
   swap): mean insert position (`pos_sum/len`, doubling at turns,
-  reflecting at flips) below log2(len) past a 4·stride warmup — an
-  O(len) flip costs one growth's worth of element copies (each element
+  reflecting at flips, DECREMENTING at removals — the signal tracks
+  current elements, 2026-10-23) below log2(len) past a 4·stride warmup —
+  an O(len) flip costs one growth's worth of element copies (each element
   pays log2(len) to doubling, amortized), so it pays exactly when the
   stream is front-biased past that line. the z-gate/`pos_sq_sum`
   variance machinery is DEAD (commented out at all sites) — alternating
@@ -250,8 +254,10 @@ substrate:
   + `MaskCursor` — the slot-walk state machine (slot/ghost/dir/word
   cache) the set/map cursors wrap; walk-path methods `#[inline(always)]`
   end to end (subtle_bugs §23).
-- `translator.rs` — the set/map tier's 2-knob translator, fn-ptr per
-  direction + the reversal/turn/`shifted` maps (the cleave's offset − at,
+- `translator.rs` — the set/map tier's 2-knob translator, an inline
+  branch on `reversed` (fn-ptr-free — serializable, and ~4 cycles/call
+  faster; `benches/translator.rs` keeps the record) + the
+  reversal/turn/`shifted` maps (the cleave's offset − at,
   name-preserving under both directions); the one hard rule is position
   order (pos 0 = min, pos len−1 = max).
 - `serialize.rs` — the `Archive` trait: a stored K decomposes into a
@@ -283,9 +289,14 @@ tiers:
   `bsearch_bounds` inside), NEVER auto-reverses — SkipSet owns the flip
   (`should_reverse`/`reverse`); push_beyond takes a caller-guaranteed
   beyond-tail key. tier/diagnostic accessors: `slot`/`first_live_pos`/
+  `prev_live_pos` (the update hint walk's down-side stepper)/
   `cmp_key`/`pos_of` (pos_of unchecked — live addrs only) + `slides()`
   (the raw NoneSlide chain — SkipSet coalesces intervals from it, cheaper
-  than pair expansion). the `Cursor` family: `seek`/`seek_after` →
+  than pair expansion) + `replace_key` (pub(crate): in-place handle swap
+  at a live slot, old key materialized back, order = the CALLER's
+  bracket contract — update's fast path). `remove` decrements pos_sum
+  (the reversal signal tracks current elements). the `Cursor` family:
+  `seek`/`seek_after` →
   `next`/`prev`/`key`/`addr` over `MaskCursor`, invalidated by any
   mutation. the pos `epoch` (bumped by turn/flip — the skipset staleness
   guard), the always-on turn
@@ -375,7 +386,20 @@ tiers:
   misreading measured +165ns/insert at 1M from the linear root scan
   alone). `SkipSet::insert` NEVER lets the base auto-flip: it triggers
   reversal itself (the base's should_reverse trigger), then descends.
-  removal unsupported (v0).
+  `SkipSet::update(addr, new) -> Result<(A, K), UpdateErr<K>>` (2026-10-23):
+  Ok = (new addr, the OLD key). FAST PATH: `new` strictly inside `addr`'s
+  immediate key bracket (direction-aware; the neighbors are the only
+  possible dups and Equal fails both sides) — `replace_key` swaps the
+  handle in place, name preserved, no deltas event, one
+  apply_slide(p, p) window-chain re-read. SLOW PATH: dup PRE-CHECK first
+  (what makes Err atomic — capacity cannot fail, the removal reserved
+  room), then remove (pos_sum decrements — the signal tracks current
+  elements), apply_slide(p, p), `hint_window` bracket walk (±2·STRIDE
+  from the vacated slot, monotone-sound under both directions, head/tail
+  exhaustion = valid bounds) bounding insert_at, descent/beyond_tail
+  fallback as insert. the flip fires at update's TOP, before any event
+  record (§22 holds); same-key update = Ok((addr, new)) no-op.
+  standalone removal stays unsupported (v0).
   bench-facing: the A/B phase hooks
   (`insert_maintain_only`/`insert_descent_only`) are `#[doc(hidden)]`.
   (the old blockset store copy — treeblock's store evolved toward pairs
@@ -496,7 +520,19 @@ consumer:
   128-key bands landing inside it, nested and ISOLATED per band —
   the isolated rows are the honest per-band measure, the nested rows
   contaminate: band3 inherits band2's churn layout; findings
-  2026-10-22 in session_history).
+  2026-10-22 in session_history),
+  `translator.rs` (the dispatch A/B that killed the fn-ptr: old fn-ptr
+  shape vs the library's inline branch, p2a/a2p × fwd/rev × rot 0/13,
+  shapes asserted equal per cell — fn-ptr ~0.99–1.58ns vs branch
+  ~0.15–0.25ns/call),
+  `update.rs` (SkipSet::update vs BTreeSet remove+insert over an even-key
+  append prefill, tiers built: near = 2i→2i+1, the in-bracket fast path
+  (names stable, asserted per op); far = shuffled slots → shuffled odd
+  keys, the slow path with the holder-protocol HashMap retarget of
+  deltas included in the timing; "diag" arg runs the ADVERSARIAL cross
+  pattern — an insert edge marching away from a one-sided desert slides
+  a linearly growing run (the ladder's known desert pathology, see
+  Future Work's multi-word banking), NOT update's).
 
 notes: `devlog.md` (design log), `session_history.md` (per-session record),
 `subtle_bugs.md` (solved nuances + their rules).
@@ -679,8 +715,14 @@ the past — run targeted tests.
   the unary-internal-riser panic, packed-ChildPos nav breaking on
   sparse-addressed nodes, the STORES_PARENTS walker hazard class +
   `set_parent`'s Some-return, children()-sortedness unchecked.
-- skipset: removal (v0 — a mask clear + the window's first re-read;
-  the deltas protocol already reports the slide class). auto-stride +
+- skipset: standalone removal (v0 — a mask clear + the window's first
+  re-read; the deltas protocol already reports the slide class; update's
+  slow path already does the remove + tier-fix choreography to copy).
+  update's slow path pays a FULL-DESCENT find for the dup pre-check even
+  when the hint walk bounds a nearby window — a window-bounded dup check
+  is the unbenched candidate (report-only review finding, 2026-10-23);
+  the update-top flip branch (should_reverse mid-update-stream) has no
+  deterministic test. auto-stride +
   an L2 build gate — tiers lose ~35% on lookups at 10k (cache-resident
   base); the stride should derive from L2_BYTES/handle size, likely as
   a const-generic once it un-defers. skipset removal of the epoch's

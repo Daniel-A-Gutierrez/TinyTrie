@@ -34,7 +34,8 @@
 //!- creep: widths track the base cap (extend); past the epoch reservation
 //!  (turn refused / pathological growth) → full re-derive.
 //!the top tier is rootless (skip-list shape, not a bounded-arity B-tree
-//!node). removal unsupported (v0).
+//!node). standalone removal unsupported (v0); `update` removes
+//!internally — its window-chain re-read is the removal's tier fix.
 
 use std::cmp::Ordering;
 
@@ -50,6 +51,19 @@ const STRIDE_SHIFT: u32 = STRIDE.trailing_zeros();
 ///the grid mask, STRIDE − 1
 const STRIDE_MASK: usize = STRIDE - 1;
 const _: () = assert!(STRIDE >= 2 && STRIDE.is_power_of_two(), "STRIDE must be a power of 2 ≥ 2");
+
+///update's hint-walk radius each side of the removed slot; a miss falls
+///back to the full tier descent
+const HINT_RADIUS: usize = 2 * STRIDE;
+
+///`SkipSet::update`'s Err — the set is unchanged in both cases
+#[derive(Debug, PartialEq)]
+pub enum UpdateErr<K> {
+    ///`addr` names no live element
+    Absent,
+    ///`new` already lives at another addr — returned untouched
+    Dup(K),
+}
 
 ///one tier's footprint in the shared store: slots [start, start+width)
 ///used, [start+width, start+capacity) reserved — capacity is 2× the
@@ -255,6 +269,109 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
             self.maintain(placed.0);
             addr
         })
+    }
+
+    ///replace the key at `addr` with `new`, hinting that `new` belongs at
+    ///or near `addr`'s slot. Ok = (`new`'s addr, the old key); the addr
+    ///equals `addr` on the fast path but may differ on the slow one (the
+    ///removal vacated the name, the insert mints fresh, a turn spreads
+    ///names). Err leaves the set unchanged: `Absent` (`addr` names
+    ///nothing live) or `Dup` (`new` already lives elsewhere —
+    ///pre-checked, which is what makes Err atomic; capacity cannot fail,
+    ///the removal reserved room).
+    ///
+    ///FAST PATH: `new` sits strictly inside `addr`'s immediate key
+    ///bracket (both inequalities direction-aware; the neighbors are the
+    ///only possible dups and Equal fails both sides) — the slot itself is
+    ///order-legal, so the swap is in place: no move, no deltas event,
+    ///the NAME survives, holders keep `addr`. the only tier obligation
+    ///is the window-first chain re-read (the slot's handle changed; a
+    ///stale window-first would mislead the descent). SLOW PATH
+    ///otherwise: remove, bracket-walk hint (`hint_window`) bounding
+    ///insert_at, descent fallback — the dup pre-check makes Err atomic,
+    ///the removal's window chain re-reads (removal moves nothing — no
+    ///event — but a window-first can go stale), the insert rides the
+    ///normal maintain path, its deltas left pending like insert's. the
+    ///old key's heap bytes leak (v1 removal). the flip fires at update's
+    ///top (pre-record, §22) — but NOT in the tier-less phase (insert
+    ///auto-flips via base.insert there; update's insert_at never does —
+    ///a divergence, heuristic-only)
+    pub fn update(&mut self, addr: A, new: K) -> Result<(A, K), UpdateErr<K>> {
+        if self.base.get(addr).is_none() {
+            return Err(UpdateErr::Absent);
+        }
+        if self.store.is_some() && self.base.should_reverse() {
+            self.base.reverse();
+            self.sync_move();
+        }
+        //the hint names a live slot — read after any flip (names survive,
+        //positions mirror)
+        let p = self.base.pos_of(addr);
+        let old_h = self.base.slot(p).expect("checked live");
+        if self.base.cmp_key(&old_h, &new) == Ordering::Equal {
+            return Ok((addr, new)); //same key — no-op, `new` is the old value
+        }
+        //old's immediate key bracket, direction-aware: `lower` names the
+        //pos-below side (Asc ⇔ key < new, Desc ⇔ key > new)
+        let rev = self.base.reversed();
+        let side = |h: &K::Handle, lower: bool| {
+            let ord = self.base.cmp_key(h, &new);
+            match (rev, lower) {
+                (false, true) | (true, false) => ord == Ordering::Less,
+                (false, false) | (true, true) => ord == Ordering::Greater,
+            }
+        };
+        let prev_ok = self
+            .base
+            .prev_live_pos(p)
+            .map_or(true, |q| side(&self.base.slot(q).expect("walk names live slots"), true));
+        let next_ok = self
+            .base
+            .first_live_pos(p + 1)
+            .map_or(true, |q| side(&self.base.slot(q).expect("walk names live slots"), false));
+        if prev_ok && next_ok {
+            let old = self.base.replace_key(p, new);
+            if self.store.is_some() {
+                self.apply_slide(p, p);
+            }
+            return Ok((addr, old));
+        }
+        //SLOW PATH — dup pre-check: makes Err atomic — with no dup the
+        //insert cannot fail (capacity was reserved by the removal)
+        if self.find(&new).is_some() {
+            return Err(UpdateErr::Dup(new));
+        }
+        let old = self.base.remove(addr).expect("checked live");
+        if self.store.is_some() {
+            //removal moves nothing, but the removed element may have been
+            //a window-first / a lifted head — re-read its chain
+            self.apply_slide(p, p);
+        }
+        let result = match self.hint_window(&new, p) {
+            // SAFETY: the walk verified the window contract — every live
+            // pos < lo / ≥ hi sits on k's correct key side, and the
+            // pre-check ruled out dups
+            Some((lo, hi)) => unsafe { self.base.insert_at(new, lo, hi) },
+            None if self.base.beyond_tail(&new) => self.base.push_beyond(new),
+            None => {
+                //no tiers: the full block IS the window — window_of
+                //requires built tiers
+                let (blo, bhi) = if self.store.is_some() {
+                    self.window_of(&new)
+                } else {
+                    (0, self.base.cap())
+                };
+                // SAFETY: window_of's descent bounds — as insert
+                unsafe { self.base.insert_at(new, blo, bhi) }
+            }
+        };
+        //cannot Err: no dup exists (pre-check) and capacity was reserved
+        let (new_addr, placed) =
+            match result { Ok(r) => r, Err(_) => unreachable!("update's insert cannot fail") };
+        if self.store.is_some() {
+            self.maintain(placed.0);
+        }
+        Ok((new_addr, old))
     }
 
     ///the base's event slot — the deltas protocol surface
@@ -575,6 +692,50 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
         }
     }
 
+    ///bracket walk from the removed slot `hint`: Some((lo, hi)) bounds
+    ///insert_at when `new` lands within HINT_RADIUS of it, None falls
+    ///back to the descent. the first live element on k's pos-below side
+    ///bounds lo (everything further below is the same side by
+    ///monotonicity), the first on the pos-above side bounds hi;
+    ///far-side elements walked past sit INSIDE the window —
+    ///unconstrained, the windowed bsearch resolves them. head/tail
+    ///exhaustion is a valid bound (lo 0 / hi cap). Desc runs key order
+    ///against pos order — the sides mirror
+    fn hint_window(&self, new: &K, hint: usize) -> Option<(usize, usize)> {
+        //pos-below side of k: Asc ⇔ key < k, Desc ⇔ key > k. dups are
+        //pre-checked — every compare lands strictly on one side
+        let rev = self.base.reversed();
+        let below = |h: &K::Handle| {
+            let ord = self.base.cmp_key(h, new);
+            if rev { ord == Ordering::Greater } else { ord == Ordering::Less }
+        };
+        let mut lo = 0;
+        let mut q = self.base.prev_live_pos(hint);
+        while let Some(pos) = q {
+            if pos + HINT_RADIUS < hint {
+                return None;
+            }
+            if below(&self.base.slot(pos).expect("walk names live slots")) {
+                lo = pos + 1;
+                break;
+            }
+            q = self.base.prev_live_pos(pos);
+        }
+        let mut hi = self.base.cap();
+        let mut q = self.base.first_live_pos(hint + 1);
+        while let Some(pos) = q {
+            if pos > hint + HINT_RADIUS {
+                return None;
+            }
+            if !below(&self.base.slot(pos).expect("walk names live slots")) {
+                hi = pos;
+                break;
+            }
+            q = self.base.first_live_pos(pos + 1);
+        }
+        Some((lo, hi))
+    }
+
     ///tier descent → the base position window [blo, bhi) that must
     ///contain k's answer; find_window / insert_at resolve inside it.
     ///each level scans its slot RANGE for the last ≤ k and first > k
@@ -801,6 +962,246 @@ mod tests {
             state
         };
         torture((0..300u64).map(|_| rnd() % 500));
+    }
+
+    ///apply name swaps to a held (addr, key) mirror — the deltas protocol
+    fn apply<A: UnsignedNum>(holder: &mut Vec<(A, u64)>, deltas: &mut Deltas<A>) {
+        for (from, to) in deltas.iter() {
+            for (a, _) in holder.iter_mut() {
+                if *a == from {
+                    *a = to;
+                    break;
+                }
+            }
+        }
+    }
+
+    ///full parity check: model sweep, iter order, holder names
+    fn verify_model(
+        set: &SkipSet<u64, u16>,
+        holder: &[(u16, u64)],
+        model: &BTreeSet<u64>,
+        space: u64,
+    ) {
+        assert_eq!(set.len(), model.len());
+        let mut prev = None;
+        for k in set.iter().copied() {
+            if let Some(p) = prev {
+                assert!(k > p, "order {p} !< {k}");
+            }
+            prev = Some(k);
+        }
+        for &(a, k) in holder {
+            assert_eq!(set.get(a), Some(&k), "holder {a}");
+        }
+        for key in 0..=space {
+            assert_eq!(set.contains(&key), model.contains(&key), "k={key}");
+        }
+    }
+
+    ///one update op's model/holder bookkeeping, model as the oracle.
+    ///vacated names may be re-minted by later inserts — no dead-addr
+    ///tracking
+    fn update_op(
+        set: &mut SkipSet<u64, u16>,
+        holder: &mut Vec<(u16, u64)>,
+        model: &mut BTreeSet<u64>,
+        idx: usize,
+        new: u64,
+    ) {
+        let (addr, old) = holder[idx];
+        if new == old {
+            assert_eq!(set.update(addr, new), Ok((addr, new)), "same key keeps its name");
+            set.deltas().clear();
+        } else if model.contains(&new) {
+            assert_eq!(
+                set.update(addr, new),
+                Err(UpdateErr::Dup(new)),
+                "dup must Err, set unchanged"
+            );
+            set.deltas().clear();
+        } else {
+            let (a, ret_old) = set.update(addr, new).expect("free key must place");
+            assert_eq!(ret_old, old, "Ok returns the old key");
+            apply(holder, set.deltas());
+            model.remove(&old);
+            model.insert(new);
+            holder[idx] = (a, new);
+        }
+    }
+
+    ///update torture: near hints (the bracket walk), far misses (descent
+    ///fallback), both Err paths, the same-key no-op, the no-tiers phase,
+    ///plain inserts interleaved — holder names verified after EVERY op.
+    ///removal decrements pos_sum, so a front-biased update stream can
+    ///fire the flip mid-run — the Desc mirror lives in update_descending
+    ///either way
+    #[test]
+    fn update_torture() {
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut rnd = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let space = 100u64;
+        let mut set = SkipSet::<u64, u16>::new();
+        let mut holder: Vec<(u16, u64)> = Vec::new();
+        let mut model = BTreeSet::new();
+        let mut live = 0;
+        while live < 25 {
+            let k = rnd() % space;
+            match set.insert(k) {
+                Ok(a) => {
+                    apply(&mut holder, set.deltas());
+                    holder.push((a, k));
+                    model.insert(k);
+                    live += 1;
+                }
+                Err(_) => set.deltas().clear(),
+            }
+        }
+        //one update before any tiers exist; its vacated name — if not
+        //re-minted by the landing — must probe Absent, set unchanged
+        let old0 = holder[0].0;
+        let probe_k = (holder[0].1 + 1) % space;
+        update_op(&mut set, &mut holder, &mut model, 0, probe_k);
+        if set.get(old0).is_none() {
+            assert_eq!(set.update(old0, rnd() % space), Err(UpdateErr::Absent));
+        }
+        //far + far-dup updates in the no-tiers phase — the full-block
+        //window fallback (review: the descent used to panic here)
+        update_op(&mut set, &mut holder, &mut model, 7, space / 2 + 37);
+        let dup_k = holder[3].1;
+        update_op(&mut set, &mut holder, &mut model, 8, dup_k);
+        verify_model(&set, &holder, &model, space);
+        set.rebuild();
+        for i in 0..200u64 {
+            //plain inserts keep the insert/descent/maintain paths exercised
+            if i % 9 == 0 {
+                let k = rnd() % space;
+                match set.insert(k) {
+                    Ok(a) => {
+                        apply(&mut holder, set.deltas());
+                        holder.push((a, k));
+                        model.insert(k);
+                    }
+                    Err(_) => set.deltas().clear(),
+                }
+                verify_model(&set, &holder, &model, space);
+                continue;
+            }
+            let idx = (rnd() % holder.len() as u64) as usize;
+            let new = if rnd() % 2 == 0 {
+                (holder[idx].1 + rnd() % 8 + 1) % space //near — the hint's claim
+            } else {
+                rnd() % space //far — half the hint's claims are lies
+            };
+            update_op(&mut set, &mut holder, &mut model, idx, new);
+            verify_model(&set, &holder, &model, space);
+        }
+        //a fresh rebuild must agree with the incrementally-maintained tiers
+        set.rebuild();
+        verify_model(&set, &holder, &model, space);
+    }
+
+    ///update under Desc: a descending build flips the base mid-stream, so
+    ///every op exercises the mirrored hint walk, the Desc descent and
+    ///the Desc tier re-reads
+    #[test]
+    fn update_descending() {
+        let space = 100u64;
+        let mut set = SkipSet::<u64, u16>::new();
+        let mut holder: Vec<(u16, u64)> = Vec::new();
+        let mut model = BTreeSet::new();
+        for k in (0..40u64).rev() {
+            let a = set.insert(k).unwrap();
+            apply(&mut holder, set.deltas());
+            holder.push((a, k));
+            model.insert(k);
+        }
+        set.rebuild();
+        assert!(set.base().reversed(), "descending build must flip");
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut rnd = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..120 {
+            let idx = (rnd() % holder.len() as u64) as usize;
+            let new = if rnd() % 2 == 0 {
+                (holder[idx].1 + rnd() % 8 + 1) % space
+            } else {
+                rnd() % space
+            };
+            update_op(&mut set, &mut holder, &mut model, idx, new);
+            verify_model(&set, &holder, &model, space);
+        }
+        //updates never re-flip — the base stays Desc throughout
+        assert!(set.base().reversed());
+    }
+
+    ///the bracket fast path's contract: in-place swap keeps the name,
+    ///records no event, returns the old key; a bracket miss degrades to
+    ///remove+insert
+    #[test]
+    fn update_in_place() {
+        let mut set = SkipSet::<u64, u16>::new();
+        for k in (0..40u64).step_by(2) {
+            set.insert(k).unwrap();
+            set.deltas().clear();
+        }
+        set.rebuild();
+        let addr = set.find(&20).unwrap();
+        //21 ∈ (18, 22) — old's exact bracket
+        assert_eq!(set.update(addr, 21), Ok((addr, 20)));
+        assert_eq!(set.get(addr), Some(&21), "in-place: name survives");
+        assert!(!set.deltas().is_pending(), "in-place: no event recorded");
+        assert!(set.contains(&21) && !set.contains(&20));
+        assert_eq!(set.len(), 20);
+        //7 ∉ (18, 22) — slow path: remove+insert, the name mints fresh
+        let (a2, ret_old) = set.update(addr, 7).unwrap();
+        assert_eq!(ret_old, 21);
+        assert_eq!(set.get(a2), Some(&7));
+        assert!(set.contains(&7) && !set.contains(&21));
+        assert_eq!(set.len(), 20);
+        let mut prev = None;
+        for k in set.iter().copied() {
+            if let Some(p) = prev {
+                assert!(k > p);
+            }
+            prev = Some(k);
+        }
+    }
+
+    ///no-tiers far update: the descent fallback must not need tiers —
+    ///the full block IS the window (review repro: this used to hit
+    ///window_of's "tiers built" unreachable)
+    #[test]
+    fn update_no_tiers_far() {
+        let mut set = SkipSet::<u64, u32>::new();
+        let mut addrs = Vec::new();
+        for i in 0..90u64 {
+            let a = set.insert(2 * i).unwrap();
+            set.deltas().clear();
+            addrs.push(a);
+        }
+        //key 0 → 181: the boundary sits ≫ HINT_RADIUS positions away, in
+        //range (not beyond-tail) — the fallback arm
+        let (a2, old) = set.update(addrs[0], 181).unwrap();
+        assert_eq!(old, 0);
+        assert_eq!(set.get(a2), Some(&181));
+        assert!(set.contains(&181) && !set.contains(&0));
+        let mut prev = None;
+        for k in set.iter().copied() {
+            if let Some(p) = prev {
+                assert!(k > p);
+            }
+            prev = Some(k);
+        }
     }
 
     ///tier structure: tier0 slot j = the handle of the FIRST live item

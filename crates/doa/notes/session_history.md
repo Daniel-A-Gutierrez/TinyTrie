@@ -1448,3 +1448,65 @@ every rung upgraded.
   (unbenched); the loosened trigger vs alternating front streams without
   tail filler (ungated, untested); the skipset bench re-run under the new
   ladder.
+
+## 2026-10-23 (b) — the fn-ptr dies for serialization, and SkipSet::update lands
+
+two deliverables: a serializable translator and the addr-keyed replace. the
+fn-ptr question started as a microbench curiosity and died on a security
+argument — a memmapped block would serialize its translator verbatim, and a
+stored code address is a hijack primitive. the branch shape measured faster
+anyway, so the dispatch cost nothing to kill.
+
+- landed: the translator's inline `reversed` branch (rotation+offset
+  unconditional, `#[inline(always)]` — fn-ptr fields + their four fns
+  deleted); `SkipSet::update(addr, new) -> Result<(A, K), UpdateErr<K>>` —
+  Ok = (new addr, the OLD key); FAST PATH: `new` strictly inside `addr`'s
+  immediate key bracket (direction-aware) ⇒ `BlockSet::replace_key` swaps
+  the handle in place (name preserved, no deltas event, one
+  apply_slide(p, p) window-chain re-read); SLOW PATH: dup pre-check (makes
+  Err atomic) → remove → tier fix → `hint_window` bracket walk (±2·STRIDE
+  from the vacated slot, monotone-sound, head/tail exhaustion = valid
+  bounds) bounding insert_at, descent/beyond_tail fallback; same-key
+  update = Ok((addr, new)) no-op; `BlockSet::prev_live_pos` (the hint
+  walk's down-side stepper); `remove` now DECREMENTS pos_sum (the signal
+  tracks current elements — makes the flip trigger reachable in
+  update-heavy streams); benches `translator.rs` + `update.rs`; tests
+  update_torture / update_descending / update_in_place /
+  update_no_tiers_far (miri-clean, ~5 min the update pair).
+- died: the fn-ptr dispatch (serialization hazard + measured slower — the
+  header's BTB-prediction "~1 cycle" claim was wrong: the indirect call
+  costs load+call+ret ≈ 4 cycles); the bench's cross-pattern far workload
+  (moved to `diag` — it measures the base ladder's one-sided-desert
+  pathology, not update).
+- decided: the strict bracket IS the dup check (only the immediate
+  neighbors can equal `new`, Equal fails both sides — no separate find;
+  subtle_bugs §35); Err atomicity via pre-check, never rollback (a
+  rollback re-enters the hazard it escapes — §35); "nothing moved" still
+  owes the window-chain re-read (copied-value staleness ≠ position
+  staleness — §35); Ok carries (addr, old key) — the slow path can change
+  the name, so the addr must return.
+- measured (update.rs, ns/op best-of-10, even-key append prefill, tiers
+  built; vs BTreeSet remove+insert; machine-day noise ±5-10%):
+
+  | workload | 1k | 10k | 100k |
+  |---|---|---|---|
+  | near (fast path) | 15.6 vs 35.1 | 17.6 vs 69.6 | 19.7 vs 74.9 |
+  | far (slow path + holder retarget) | 32.5 vs 28.6 | 39.9 vs 97.8 | 60.9 vs 128.5 |
+
+  the fast path holds ~4× at DRAM scale; BTreeSet edges far at 1k
+  (cache-resident). translator dispatch (benches/translator.rs, shapes
+  asserted equal per cell): fn-ptr 0.99–1.58 ns/call vs branch 0.15–0.25
+  — the microbench flatters the branch (unrolled ILP), true gap in situ
+  ~3-4 cycles; both uniform across rot 0/13 × fwd/rev.
+- deferred: window-bounded dup pre-check (slow path pays a full descent
+  even when the hint bounds a nearby window — report-only, unbenched, in
+  CLAUDE.md Future Work); the update-top flip branch has no deterministic
+  test (pos_sum decrements make it reachable but not provably); the
+  tier-less update never flips (insert auto-flips there — divergence
+  documented at update's doc). fresh review agent: one confirmed panic
+  (the no-tiers far fallback hit window_of's "tiers built" unreachable —
+  fixed to the full-block window, repro test update_no_tiers_far pinned)
+  + the test gap that let it through (no-tiers far/far-dup ops added to
+  update_torture); everything else checked out guarded (hint_window Desc
+  mirroring, bracket dup detection, Err atomicity, §22 flip/record
+  ordering, pos_sum wrap analysis, the bench's holder retarget).

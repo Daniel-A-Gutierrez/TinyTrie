@@ -1021,6 +1021,37 @@ stale-low/borrow repeats are safe-direction.
 
 ---
 
+## 35. The strict bracket IS the dup check; Err atomicity is a pre-check, not a rollback (2026-10-23)
+
+**The nuance (2026-10-23, `SkipSet::update`'s fast path).** replacing a
+key at a known addr in place — no search at all — looks like it needs a
+dup guard on top of the bracket test. it doesn't: the only elements that
+can equal `new` are old's immediate key-order neighbors (a set admits no
+third equal key between them), and the bracket test is STRICT on both
+sides (Equal fails the pos-below test AND the pos-above test, under
+either direction), so a dup fails the bracket by construction. the
+mirrored trap: making Err atomic by rolling back a half-done
+remove+insert is wrong-shaped — re-inserting the old key can itself
+slide and re-record, re-entering the hazard the rollback was built to
+escape. instead pre-check the ONLY failure mode that survives the
+removal's reserved capacity (the dup) BEFORE the first mutation; after
+that the mutation path cannot fail and no rollback exists. same family:
+a removal or in-place swap moves NOTHING, so no deltas event fires — but
+the tiers hold COPIES of window-first handles, and the swapped-out
+element may have been one; the op still owes `apply_slide(p, p)` even
+though positions never changed (§26's safe-direction rule covers how a
+stale first narrows; this is the obligation to re-read at all).
+
+**The rule.** when a fast path replaces the search, derive its validity
+guarantee from the comparisons it already pays for — don't bolt a
+redundant guard on. for multi-step mutations with an Err contract:
+enumerate the failure modes, pre-check them all before touching state,
+and let the mutation run fallible-free. and "nothing moved" never means
+"no re-read owed" — copied-value staleness is independent of position
+staleness.
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on
