@@ -105,7 +105,7 @@ pub struct SkipSet<K: Archive, A: UnsignedNum> {
 }
 ///L0197
 impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {}
-///L0668
+///L0674
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +144,13 @@ mod tests {
     ///without any explicit rebuild
     #[test]
     fn incremental_maintenance();
+    ///REGRESSION (apply_slide's mid-window miss): the bench's runs shape
+    ///at 10k, maintained phase — a subdivide's point event (mid, mid)
+    ///starting mid-window left tier0's window-first stale-high; the
+    ///descent narrowed the next insert's range EXCLUDING its true
+    ///boundary, insert_at placed k into a wrong gap, and order broke at
+    ///i=12. full order check after every insert, both phases
+    #[test]
+    fn maintained_runs_order();
 }
 ```

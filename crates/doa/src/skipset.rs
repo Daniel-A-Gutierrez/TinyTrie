@@ -547,12 +547,18 @@ impl<K: Archive, A: UnsignedNum> SkipSet<K, A> {
     ///idempotent
     fn apply_slide(&mut self, from: usize, to: usize) {
         let shift = STRIDE_SHIFT;
-        let mask = STRIDE_MASK;
         let Some(store) = self.store.as_mut() else { return };
         let tier_count = store.regions.len();
         let (mut lo, mut hi) = (from.min(to), from.max(to));
         for tier in (0..tier_count).rev() {
-            let first_slot = (lo + mask) >> shift;
+            //FLOOR: position lo lives in window lo>>shift — the old
+            //ceil skipped lo's own window whenever the interval started
+            //mid-window (a subdivide's point event (mid, mid) then
+            //concluded "nothing changed", leaving the window's first
+            //stale-high — the descent narrowed the next insert's range
+            //EXCLUDING its true boundary, and insert_at placed k into
+            //a wrong-gap order break; repro: skipset runs@10k i=12)
+            let first_slot = lo >> shift;
             let last_slot = hi >> shift;
             if first_slot > last_slot {
                 break; //no slot on this tier's grid changed — none above
@@ -877,5 +883,49 @@ mod tests {
         assert_matches_model(&set, keys.iter().copied(), 1);
         set.rebuild();
         assert_matches_model(&set, keys, 2);
+    }
+
+    ///REGRESSION (apply_slide's mid-window miss): the bench's runs shape
+    ///at 10k, maintained phase — a subdivide's point event (mid, mid)
+    ///starting mid-window left tier0's window-first stale-high; the
+    ///descent narrowed the next insert's range EXCLUDING its true
+    ///boundary, insert_at placed k into a wrong gap, and order broke at
+    ///i=12. full order check after every insert, both phases
+    #[test]
+    fn maintained_runs_order() {
+        let n = 10000usize;
+        let mut chunks: Vec<Vec<u64>> = (0..n / 100)
+            .map(|c| ((c * 100) as u64..((c * 100) as u64 + 100)).collect())
+            .collect();
+        for c in chunks.iter_mut().step_by(2) {
+            c.reverse();
+        }
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for i in (1..chunks.len()).rev() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            chunks.swap(i, (s % (i as u64 + 1)) as usize);
+        }
+        let keys: Vec<u64> = chunks.into_iter().flatten().collect();
+        let mut set = SkipSet::<u64, u32>::new();
+        let half = keys.len() / 2;
+        for &k in &keys[..half] {
+            set.insert(k).unwrap_or_else(|k| panic!("dup {k}"));
+            set.deltas().clear();
+        }
+        set.rebuild();
+        for (i, &k) in keys[half..].iter().enumerate() {
+            set.insert(k).unwrap_or_else(|k| panic!("dup {k}"));
+            set.deltas().clear();
+            let mut prev = None;
+            for x in set.iter().copied() {
+                if let Some(p) = prev {
+                    assert!(x > p, "maint i={i} k={k}: order {p} !< {x}");
+                }
+                prev = Some(x);
+            }
+            assert_eq!(set.len(), half + i + 1);
+        }
     }
 }

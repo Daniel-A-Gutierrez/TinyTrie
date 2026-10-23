@@ -336,15 +336,20 @@ tiers:
   slots never read), ONE allocation, regions [top…tier0] front-to-back,
   reservations sized 2× the width chain at 2·cap (covers one turn and
   the cap-creep ceiling). STALENESS IS THE SCHEME'S SHARP EDGE
-  (subtle_bugs §26) — two sites are correctness-load-bearing, one is
-  tightness: the descent HEAD must seed its hole-check (prev from slot
+  (subtle_bugs §26, §34) — three sites are correctness-load-bearing:
+  the descent HEAD must seed its hole-check (prev from slot
   lo−1 — an inherited lo can name a borrowed grid origin — and K::MIN
   at lo==0, where a Desc head borrow once compared Greater and pinned
   bhi to 0, every probe dead); maintenance writes must go through
   `set_cascade` (rewrite the run of holes to the right that copied the
   old value — a hole's content depends on its left neighbor's VALUE,
-  which apply_slide's position intervals don't cover); the tail-push
-  empty→real at a gridline re-lifts the upper gridline chain as
+  which apply_slide's position intervals don't cover); and
+  apply_slide's changed-window range is the FLOOR cover
+  floor(lo/stride)..=floor(hi/stride) at every cascade tier (§34: the
+  old ceil skipped the interval's own window whenever it started
+  mid-window — a stale-high window-first NARROWS the descent's range
+  excluding an insert's true boundary, the unsafe direction); the
+  tail-push empty→real at a gridline re-lifts the upper gridline chain as
   TIGHTNESS only (a stale borrow still equals its left neighbor and
   repeat-detects; a stale lift is widening-only; `tier0 > 0` guard).
   `Store::holes`

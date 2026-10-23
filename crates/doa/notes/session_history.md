@@ -1426,7 +1426,22 @@ every rung upgraded.
   fresh review agent: no correctness bugs, 8 findings applied (empty-fetch
   fallbacks → §25 debug_asserts, blockmap near-gate off-by-one aligned,
   z-gate test renamed to what it pins, §30 closure re-derived, left-sentinel
-  mirror test added).
+  mirror test added). POST-REVIEW, the skipset bench's own order assert
+  caught a LATENT skipset bug older than the session: apply_slide's
+  changed-window range used ceil(lo/stride), skipping any interval's
+  own window when it starts mid-window — a subdivide point event then
+  left a tier0 window-first stale-high, the descent excluded an
+  insert's true boundary, and insert_at broke order (maintained
+  runs@10k, insert 13; subtle_bugs §34, fixed to floor,
+  regression-pinned).
+  regression-pinned). the skipset bench re-run (1M, medians): the
+  tiers flip the lookup story — random lookup SkipSet 119.8 vs
+  BTreeSet 179.9 (1.5× faster) and flat BlockSet 169.3 (−29%);
+  append lookup 117.8 vs 194.3; inserts stay BTree's (random 114.4
+  vs 170.3 base / 182.2 maintained); the wrapper costs ~0.8ns over
+  the base, upkeep+descent ~12ns on random. at 10k (cache-resident)
+  the tiers still lose lookups to BTree (51.3 vs 38.2) — the tier
+  win is DRAM-scale, as the L2 build gate always predicted.
 - deferred: blockmap's ilog2 trigger port + its ladder port to the new fork;
   test gaps (slack-0 budget-short fallback, rebalance ceiling-bail, mint
   clamped by room); subdivide's two extra mask scans at DRAM scale

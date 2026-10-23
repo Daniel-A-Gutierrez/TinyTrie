@@ -991,6 +991,36 @@ near-banks on the streak regressed random@10k 90→109 measured).
 
 ---
 
+## 34. apply_slide's changed-window range starts at FLOOR(lo/stride) — ceil skips the interval's own window (2026-10-23)
+
+**The nuance (2026-10-23, skipset's apply_slide — latent since the
+2026-10-21 maskless store, exposed by the blockset gather rewrite).**
+the changed-window range for an event interval [lo, hi] is
+`floor(lo/stride) ..= floor(hi/stride)` — position lo LIVES in window
+`lo >> shift`. the old code computed `ceil(lo/stride)` = `(lo + mask)
+>> shift`, so any interval starting mid-window skipped re-reading its
+own window; for a POINT event (`(mid, mid)`, the subdivide's no-op)
+with mid % 16 ≠ 0 the range came back EMPTY (`first_slot > last_slot`
+→ "no slot changed") and the window's first went stale-high. a
+stale-high first is the UNSAFE direction (§26's safe-direction rule
+covers borrows and stale lifts, not firsts): the descent narrows the
+next insert's range EXCLUDING its true boundary, insert_at's window
+contract ("all live at/after `to` have key > k") is violated, and the
+windowed bsearch — blind to the live element just past `bhi` — hands
+the boundary to the ladder, which places k into a wrong gap. repro:
+skipset maintained runs@10k, insert 13 (k=1112 placed before 1111;
+both then unfindable — bsearch assumes order). the old ladder carried
+the same exposure for its `(spot, spot)` direct-place events and
+survived on workload luck.
+
+**The rule.** a staleness-repair range must be the FLOOR cover of the
+changed positions at every tier of the cascade — never ceil, and a
+point interval at a grid edge is the case to test first. any stored
+value that can read stale-HIGH is a narrowing hazard; only
+stale-low/borrow repeats are safe-direction.
+
+---
+
 ## Appendix — API-level traps, closed earlier
 
 - **`'walker`-tied ref returns.** Returning `&'walker` from `&self` methods on
