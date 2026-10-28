@@ -1,10 +1,11 @@
-# session history — doa
+# session history
 
-the crate's working history: the problem a session worked on, the approaches tried, what
+the WORKSPACE's working history (crate sections pre-2026-10-28 are doa; newer
+entries may cover any crate): the problem a session worked on, the approaches tried, what
 worked and what didn't, and why — plus the numbers that chose between them.
-CLAUDE.md carries the living map (concepts, contracts, current state, future work); anything
+each crate's CLAUDE.md carries its living map (concepts, contracts, current state, future work); anything
 temporal belongs here, not there.
-the devlog is the user's own writing — sessions never write to it or point readers there.
+devlogs are the user's own writing — sessions never write to them or point readers there.
 one entry per session, appended by the session-end routine, newest last; the format contract
 is the section below.
 
@@ -1510,3 +1511,46 @@ anyway, so the dispatch cost nothing to kill.
   update_torture); everything else checked out guarded (hint_window Desc
   mirroring, bracket dup detection, Err atomicity, §22 flip/record
   ordering, pos_sum wrap analysis, the bench's holder retarget).
+
+## 2026-10-27 — block substrate: crate + archive v2 + Stacks + blockset port + freelist
+manager-mode session: tasks delegated to fresh agents, each diff reviewed before the next launched.
+
+- landed: new `block` crate — `Block<P>` dual-front allocator (relptr'd
+dynamical trailing data, no const generics; zero-record invariant), `Archive<P>`/`RelOrd<P>`
++ `Allocator` (write seam, snapshot/rewind) + `Heap` (read seam), `Stack` (snapshot-unit
+LIFO full erase) + threaded `Stacks` over kanal (owner actor, leases, LRU eviction),
+heap freelist (in-hole stamps), overhead bench w/ channel A/B; new `block-derive`
+crate (mirror handle structs, layout canaries); doa `BlockSet` ported onto the block
+substrate, old blockset frozen as `blockset_v1` for skipset/arenaset; workspace
+CLAUDE/notes restructure (workflow+style up a level, session history workspace-wide,
+block devlog split, block/notes/subtle_bugs seeded).
+- died: doa's `legacy-v1` feature gate (didn't compile — replaced by the frozen `blockset_v1` copy).
+`Archive::drop` (renamed `release`, clippy trait-name + write-seam symmetry). Heap-as-`&mut`
+(on the cmp path — poisons lookups; read view won). Stacks single-threaded v0 (user call:
+no point).
+- decided: relptr dynamic data over fixed-only+const generics; zero-record invariant over
+uninit bytes (user call: serialized stale bytes are a leak); RelOrd FIELD-WISE over view
+construction (user call: inlining + wasted field builds); kanal over std mpsc (8.6×);
+Stacks full actor thread design from day one; skipset/arenaset stay v1 via frozen copy
+(porting blocked on v2 MIN + materialize); blockset cleave = verbatim tail heap copy
+(no materialize to rebase nested handles); T7 agent output-cap deaths → task sliced into
+5 sub-delegations.
+- measured:
+| cell (ns)                      | std mpsc | kanal  |
+|--------------------------------|----------|--------|
+| channel RTT floor (echo)       | ~5600    | ~650   |
+| Stacks::push                   | ~5800    | ~700   |
+| read-closure 1-item            | ~5600    | ~710   |
+| lease grant                    | ~5800    | ~800   |
+| lease amortized (held view)    | —        | 39     |
+| eviction alternating (b=1)     | ~7100    | ~1750  |
+| flush amortized /push          | 7–8      | ~4.4   |
+| 4-thread push aggregate/item   | ~1190    | ~310   |
+| bounded(1) vs unbounded replies|          | noise  |
+conditions: this box, 3s wall cells, med-of-5 reps; raw storage
+(archive/push_borrowed) 3–6ns/item either way. suites final: block 65+9, block-derive 8,
+doa 135, all-targets clean, miri clean (stacks integration needs -Zmiri-disable-isolation).
+- deferred: Archive view/materialize + MIN const + LE policy; block compaction
+(handle-fixup protocol); Stacks persistent-reply/fire-and-forget then per-block-latch
+redesign; blockset remove-release wiring + with_byte_cap + DEFAULT_SLOTS retune; doa doc/
+stale session_history comment refs (rid a code session + skeletonize refresh).

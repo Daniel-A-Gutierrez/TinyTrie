@@ -19,18 +19,42 @@
 //!slide. the translator carries the direction (see translator.rs).
 //!cursor (`seek`/`seek_after`): bidirectional key-ordered walk over raw
 //!slots — invalidated by any mutation, re-seek.
-//!keys live archived (serialize.rs): `K: Archive`, slots hold `K::Handle`
-//!over an append-only side heap, reads yield `K::View`.
+//!keys live archived (v2, crates/block): slots hold `K::Handle` copies
+//!over the set's OWN `Block<P>` — the whole tier is ONE serialized
+//!allocation. the block's stack carries the occupancy words (fixed region,
+//!preallocated for the slot ceiling, pushed first — it can never grow) and
+//!the Handle slots (the stack's LAST item, growing by `extend_buf`); the
+//!heap bytes hang off K::archive through the block's Allocator. reads use
+//!`RelOrd::rel_cmp` over `Heap::new(&self)` — a `&Block` view, so find/
+//!bsearch stay `&self` throughout. capacity feedback is try-then-rewind:
+//!`Allocator::snapshot` → `K::archive` returns Ok (committed) or Err →
+//!`rewind` (heap wiped to the snapshot — the block's zero-record
+//!invariant), and the insert fails atomically with both fronts unchanged.
+//!removal/replace still leak heap bytes (v0 — release wiring is deferred
+//!with the freelist; the deltas/holder protocols don't model freed
+//!regions yet).
 
 use std::cmp::Ordering;
-use std::mem::MaybeUninit;
+use std::marker::PhantomData;
+use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
+use block::{Archive, Block, H, Heap, MAX_ALIGN, Ptr, RelOrd, S};
+
+///the byte ceiling one block can hold — aligned DOWN, since block.grow
+///rounds its target UP to MAX_ALIGN before the width check
+fn pmax<P: Ptr>() -> usize {
+    P::MAX.as_usize().min(u32::MAX as usize) & !(MAX_ALIGN - 1)
+}
+
 use crate::index::*;
-use crate::mask::{Mask, MaskCursor, SetBits, SetBitsRev};
-use crate::serialize::Archive;
+use crate::mask::Mask;
 use crate::translator::Translator;
+
+///default slot ceiling of `new()`: a cache-resident-ish block (~1 MB of
+///u64-key data + its mask). with_capacity names it explicitly
+const DEFAULT_SLOTS: usize = 1 << 17;
 
 ///one fetch-gather slide-chain link: the hole moves `from → to`. Gather
 ///events speak these in post-prior-slides coordinates (see `Delta::Gather`)
@@ -133,6 +157,7 @@ fn run_of(from: usize, to: usize) -> (usize, i64, usize) {
 }
 
 ///the raw slide chain (see `Deltas::slides`)
+#[allow(dead_code)] //skipset's consumer is legacy-gated; blockset's tests exercise it
 pub(crate) enum Slides<'a> {
     Empty,
     One(NoneSlide),
@@ -367,6 +392,7 @@ impl<A: UnsignedNum> Deltas<A> {
     ///the raw slide chain — compact hole moves; the changed positions of
     ///each slide are [min(from, to), max(from, to)] inclusive. skipset's
     ///incremental upkeep reads these instead of the pair expansion
+    #[allow(dead_code)]
     pub(crate) fn slides(&self) -> Slides<'_> {
         match &self.event {
             Delta::Empty => Slides::Empty,
@@ -533,21 +559,555 @@ pub static TURN_MOVED: AtomicU64 = AtomicU64::new(0);
 pub static TURN_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
 
+///block-backed occupancy words — the set's fixed mask region. `Mask`'s
+///algorithm suite over the block bytes (mask.rs keeps the v1 Vec form for
+///the untouched tiers; this port cannot reshape it, so the suite is
+///mirrored here and blockset's tests exercise it in place). bit p ⇔ slot
+///p live, bits past `bits` clear. the physical word array is preallocated
+///for `covered` slots and NEVER grows — `covered` is the block-gained
+///invariant the //! header documents. words past the tracked range stay
+///zero (the block's zero-record invariant keeps unwritten claims zero)
+struct SlotMask<P> {
+    s:       S<P>,
+    bits:    usize,
+    covered: usize,
+}
+
+impl<P: Ptr> SlotMask<P> {
+    ///the region as u64 words. SAFETY: every claimed word is initialized —
+    ///the region is written (live words) or zeroed by the block (zero-
+    ///record invariant covers unwritten claims)
+    fn words<'a>(&self, b: &'a Block<P>) -> &'a [u64] {
+        let buf = b.stack_buf::<u64>(self.s);
+        unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len()) }
+    }
+
+    fn words_mut<'a>(&self, b: &'a mut Block<P>) -> &'a mut [u64] {
+        let buf = b.stack_buf_mut::<u64>(self.s);
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len()) }
+    }
+
+    ///word count of the TRACKED range (the scans' bound — the physical
+    ///array is longer)
+    #[inline]
+    fn words_for(&self) -> usize {
+        (self.bits + 63) / 64
+    }
+
+    ///retrack to `bits` ≤ covered — set bits preserved, words preexist
+    fn resize(&mut self, bits: usize) {
+        assert!(bits <= self.covered, "mask resize past the fixed region");
+        self.bits = bits;
+    }
+
+    #[inline]
+    fn get(&self, b: &Block<P>, p: usize) -> bool {
+        assert!(p < self.bits, "mask index {p} ≥ {}", self.bits);
+        self.words(b)[p >> 6] & 1 << (p & 63) != 0
+    }
+
+    #[inline]
+    fn set(&self, b: &mut Block<P>, p: usize, live: bool) {
+        assert!(p < self.bits, "mask index {p} ≥ {}", self.bits);
+        let word = &mut self.words_mut(b)[p >> 6];
+        if live {
+            *word |= 1 << (p & 63);
+        } else {
+            *word &= !(1 << (p & 63));
+        }
+    }
+
+    ///first set bit ≥ from, or None
+    #[inline]
+    fn next_set(&self, b: &Block<P>, from: usize) -> Option<usize> {
+        let words = self.words(b);
+        //dense fast path: the bit at `from` is usually set — `from` is the
+        //answer, no scan and no position rebuild
+        let mut w = from >> 6;
+        let mut off = from & 63;
+        if w < self.words_for() && words[w] & 1 << off != 0 {
+            return Some(from);
+        }
+        while w < self.words_for() {
+            let word = words[w] >> off;
+            if word != 0 {
+                return Some((w << 6) + off + word.trailing_zeros() as usize);
+            }
+            w += 1;
+            off = 0;
+        }
+        None
+    }
+
+    ///highest set bit < from, or None
+    #[inline]
+    fn prev_set(&self, b: &Block<P>, from: usize) -> Option<usize> {
+        let from = from.min(self.bits);
+        if from == 0 {
+            return None;
+        }
+        let words = self.words(b);
+        //dense fast path: the bit just below is usually set
+        let p = from - 1;
+        if words[p >> 6] & 1 << (p & 63) != 0 {
+            return Some(p);
+        }
+        let mut w = p >> 6;
+        let mut keep = (p & 63) + 1;
+        loop {
+            let word = words[w] & if keep == 64 { u64::MAX } else { (1 << keep) - 1 };
+            if word != 0 {
+                return Some((w << 6) + 63 - word.leading_zeros() as usize);
+            }
+            if w == 0 {
+                return None;
+            }
+            w -= 1;
+            keep = 64;
+        }
+    }
+
+    ///highest set bit, or None
+    fn last_set(&self, b: &Block<P>) -> Option<usize> {
+        let words = self.words(b);
+        let mut w = self.words_for();
+        while w > 0 {
+            w -= 1;
+            let word = words[w];
+            if word != 0 {
+                return Some((w << 6) + 63 - word.leading_zeros() as usize);
+            }
+        }
+        None
+    }
+
+    ///the word containing p — 0 past the tracked range. the cursor
+    ///steppers' cache load
+    #[inline]
+    fn word_at(&self, b: &Block<P>, p: usize) -> u64 {
+        self.words(b).get(p >> 6).copied().unwrap_or(0)
+    }
+
+    ///first set bit strictly above p — the cursor's cache-bearing step
+    ///(VALUE-passed word; see mask.rs step_up)
+    #[inline]
+    fn step_up(&self, b: &Block<P>, p: usize, word: u64) -> Option<(usize, u64)> {
+        let hi = p & 63;
+        if hi < 63 {
+            if word & 1 << (hi + 1) != 0 {
+                return Some((p + 1, word));
+            }
+            let rest = word >> (hi + 1);
+            if rest != 0 {
+                return Some(((p & !63) + (hi + 1) + rest.trailing_zeros() as usize, word));
+            }
+        }
+        let q = self.next_set(b, p + 1)?;
+        Some((q, self.word_at(b, q)))
+    }
+
+    ///first set bit strictly below p — the mirrored step (cache contract
+    ///as step_up)
+    #[inline]
+    fn step_down(&self, b: &Block<P>, p: usize, word: u64) -> Option<(usize, u64)> {
+        let lo = p & 63;
+        if lo > 0 {
+            if word & 1 << (lo - 1) != 0 {
+                return Some((p - 1, word));
+            }
+            let below = word & ((1 << (lo - 1)) - 1);
+            if below != 0 {
+                return Some(((p & !63) + 63 - below.leading_zeros() as usize, word));
+            }
+        }
+        let q = self.prev_set(b, p)?;
+        Some((q, self.word_at(b, q)))
+    }
+
+    ///first clear bit ≥ from and < bits, or None
+    #[inline]
+    fn next_clear(&self, b: &Block<P>, from: usize) -> Option<usize> {
+        if from >= self.bits {
+            return None;
+        }
+        let words = self.words(b);
+        //fast path: `from` itself clear — it's the answer
+        if words[from >> 6] & 1 << (from & 63) == 0 {
+            return Some(from);
+        }
+        let mut w = from >> 6;
+        let mut off = from & 63;
+        while w < self.words_for() {
+            let end = (self.bits - (w << 6)).min(64);
+            let mut word = !words[w] >> off;
+            if end < 64 {
+                //shift already dropped `off` low bits of a partial word
+                word &= (1 << (end - off)) - 1;
+            }
+            if word != 0 {
+                return Some((w << 6) + off + word.trailing_zeros() as usize);
+            }
+            w += 1;
+            off = 0;
+        }
+        None
+    }
+
+    ///last clear bit ≤ from (clamped to bits−1), or None
+    #[inline]
+    fn prev_clear(&self, b: &Block<P>, from: usize) -> Option<usize> {
+        if self.bits == 0 {
+            return None;
+        }
+        let from = from.min(self.bits - 1);
+        let words = self.words(b);
+        //fast path: `from` itself clear — it's the answer
+        if words[from >> 6] & 1 << (from & 63) == 0 {
+            return Some(from);
+        }
+        let mut w = from >> 6;
+        let mut keep = from & 63;
+        loop {
+            let end = (self.bits - (w << 6)).min(64);
+            let mut word = !words[w];
+            word &= if keep == 63 { u64::MAX } else { (1 << (keep + 1)) - 1 };
+            if end < 64 {
+                word &= (1 << end) - 1;
+            }
+            if word != 0 {
+                return Some((w << 6) + 63 - word.leading_zeros() as usize);
+            }
+            if w == 0 {
+                return None;
+            }
+            w -= 1;
+            keep = 63;
+        }
+    }
+
+    ///nearest clear bit to `center`, ties to the after side. `center`
+    ///itself is excluded — callers pass a position they occupy
+    #[inline]
+    fn nearest_clear(&self, b: &Block<P>, center: usize) -> Option<usize> {
+        let after = if center < self.bits {
+            self.next_clear(b, center + 1)
+        } else {
+            None
+        };
+        let before = center.checked_sub(1).and_then(|p| self.prev_clear(b, p));
+        match (after, before) {
+            (Some(a), Some(x)) => Some(if a - center <= center - x { a } else { x }),
+            (a, x) => a.or(x),
+        }
+    }
+
+    ///set bits in ascending order / descending order — the exhaustion
+    ///zeroing of mask.rs's engines is preserved (subtle_bugs §21)
+    fn iter_set<'a>(&self, b: &'a Block<P>) -> SetBitsW<'a> {
+        let mut words = self.words(b).iter();
+        SetBitsW { word: words.next().copied().unwrap_or(0), words, pos: 0 }
+    }
+
+    fn iter_set_rev<'a>(&self, b: &'a Block<P>) -> SetBitsRevW<'a> {
+        let mut words = self.words(b).iter().rev();
+        SetBitsRevW { word: words.next().copied().unwrap_or(0), words, pos: self.bits.wrapping_sub(1) }
+    }
+
+    ///number of set bits (tracked range)
+    #[allow(dead_code)]
+    fn count(&self, b: &Block<P>) -> usize {
+        self.words(b)[..self.words_for()].iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    ///region occupancy [from, to) → the v1 delta payload Mask (rare-path,
+    ///per-bit — the record sites only)
+    fn region_mask(&self, b: &Block<P>, from: usize, to: usize) -> Mask {
+        assert!(from <= to && to <= self.bits, "region [{from}, {to}) out of range");
+        let mut region = Mask::with_bits(to - from);
+        for p in from..to {
+            if self.words(b)[p >> 6] & 1 << (p & 63) != 0 {
+                region.set(p - from, true);
+            }
+        }
+        region
+    }
+
+    ///the rotation turn's mask half: bit p → 2·p ± the band ripple (see
+    ///mask.rs rotate_mask — the doubled range must fit the fixed region,
+    ///grow_rotate's `new_cap ≤ slot_max` guard). panics if bits > midpoint
+    ///(or, reversed, offset ≥ midpoint)
+    fn rotate_mask(&mut self, b: &mut Block<P>, offset: usize, midpoint: usize, reversed: bool) {
+        assert!(self.bits <= midpoint, "bits {} > midpoint {midpoint}", self.bits);
+        let new_words = (self.bits * 2 + 63) / 64;
+        assert!(new_words <= self.words(b).len(), "doubled range past the fixed mask region");
+        let old_words = self.words_for();
+        let cap = self.bits;
+        self.bits = cap * 2;
+        {
+            let words = self.words_mut(b);
+            for i in (0..old_words).rev() {
+                let w = words[i];
+                words[i * 2] = spread(w as u32);
+                //word 2i+1 only when the doubled tracked range covers it —
+                //its spread names bits ≥ the old cap, zero by the
+                //no-bit-past-bits invariant (word-multiple caps lose the
+                //scratch word the resize-then-truncate form allocated)
+                if i * 2 + 1 < new_words {
+                    words[i * 2 + 1] = spread((w >> 32) as u32);
+                }
+            }
+        }
+        //band target range + shift direction (mask.rs's mapping)
+        let (lo, hi, down) = if reversed {
+            assert!(offset < midpoint, "reversed offset {offset} ≥ midpoint {midpoint}");
+            (offset * 2 + 1, cap * 2, true)
+        } else if offset <= midpoint {
+            (0, offset.min(cap) * 2, false)
+        } else {
+            match offset - midpoint {
+                s if s < cap => (s * 2, cap * 2, false),
+                _ => (1, 0, false),
+            }
+        };
+        if lo >= hi {
+            return;
+        }
+        let wlo = lo >> 6;
+        let whi = (hi - 1) >> 6;
+        //down: the word above's bit-0 element falls onto this word's bit 63
+        let mut fall = 0u64;
+        let words = self.words_mut(b);
+        for wi in (wlo..=whi).rev() {
+            let low = if wi == wlo { lo & 63 } else { 0 };
+            let high = if wi == whi { ((hi - 1) & 63) + 1 } else { 64 };
+            let rmask = if high == 64 {
+                if low == 0 { u64::MAX } else { u64::MAX << low }
+            } else {
+                ((1u64 << (high - low)) - 1) << low
+            };
+            let w = words[wi];
+            let ripple = if down {
+                (w & rmask) >> 1 & rmask
+            } else {
+                (w & rmask) << 1 & rmask
+            };
+            let mut nw = ripple | w & !rmask;
+            if fall != 0 {
+                nw |= 1 << 63;
+            }
+            words[wi] = nw;
+            fall = if down { w & rmask & 1 } else { 0 };
+        }
+    }
+
+    ///bit p ⇔ old bit bits−1−p (the array-reversal half of a flip; the
+    ///trailing zero slack shifts down — mask.rs reverse)
+    fn reverse(&self, b: &mut Block<P>) {
+        let n = self.words_for();
+        let words = self.words_mut(b);
+        for i in 0..n / 2 {
+            words.swap(i, n - 1 - i);
+        }
+        for w in words[..n].iter_mut() {
+            *w = w.reverse_bits();
+        }
+        let slack = (64 - self.bits % 64) % 64;
+        if slack != 0 {
+            let mut below = 0;
+            for w in words[..n].iter_mut().rev() {
+                let cur = *w;
+                *w = (cur >> slack) | (below << (64 - slack));
+                below = cur & ((1 << slack) - 1);
+            }
+        }
+    }
+}
+
+///`SlotMask::iter_set`'s engine (mask.rs's SetBits — exhaustion zeroes the
+///cache, §21). pub only for Iter's field visibility; not API
+pub struct SetBitsW<'a> {
+    words: std::slice::Iter<'a, u64>,
+    word:  u64,
+    pos:   usize,
+}
+
+impl Iterator for SetBitsW<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            //dense common case: `pos` is the state, the yield is free
+            if self.word & 1 << (self.pos & 63) != 0 {
+                let p = self.pos;
+                self.pos += 1;
+                if self.pos & 63 == 0 {
+                    self.word = self.words.next().copied().unwrap_or(0);
+                }
+                return Some(p);
+            }
+            //hole: advance one bit (tz-jumping measured slower — mask.rs)
+            if self.word >> (self.pos & 63) == 0 {
+                self.pos = (self.pos | 63) + 1;
+                match self.words.next() {
+                    Some(&w) => self.word = w,
+                    None => {
+                        self.word = 0;
+                        return None;
+                    }
+                }
+            } else {
+                self.pos += 1;
+            }
+        }
+    }
+}
+
+///the descending mirror (mask.rs's SetBitsRev). pub only for Iter's field
+///visibility; not API
+pub struct SetBitsRevW<'a> {
+    words: std::iter::Rev<std::slice::Iter<'a, u64>>,
+    word:  u64,
+    pos:   usize,
+}
+
+impl Iterator for SetBitsRevW<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            let bit = 1u64 << (self.pos & 63);
+            if self.word & bit != 0 {
+                let p = self.pos;
+                self.pos = self.pos.wrapping_sub(1);
+                if self.pos & 63 == 63 {
+                    self.word = self.words.next().copied().unwrap_or(0);
+                }
+                return Some(p);
+            }
+            let below = self.word & (bit | bit.wrapping_sub(1));
+            if below == 0 {
+                self.pos = (self.pos & !63).wrapping_sub(1);
+                match self.words.next() {
+                    Some(&w) => self.word = w,
+                    None => {
+                        self.word = 0;
+                        return None;
+                    }
+                }
+            } else {
+                self.pos = self.pos.wrapping_sub(1);
+            }
+        }
+    }
+}
+
+///slots — 2i; mask.rs's (v1-shared) spread is private to that module
+fn spread(x: u32) -> u64 {
+    let mut x = x as u64;
+    x = (x | (x << 16)) & 0x0000_FFFF_0000_FFFF;
+    x = (x | (x << 8)) & 0x00FF_00FF_00FF_00FF;
+    x = (x | (x << 4)) & 0x0F0F_0F0F_0F0F_0F0F;
+    x = (x | (x << 2)) & 0x3333_3333_3333_3333;
+    x = (x | (x << 1)) & 0x5555_5555_5555_5555;
+    x
+}
+
+///slot-walk state machine — mask.rs's MaskCursor shape over the block
+///words (dir/slot/ghost/word cache; the set/map cursors wrap it)
+struct SlotCursor {
+    dir:  bool,
+    ///the current slot, or the forward ghost
+    slot: Option<usize>,
+    word: u64,
+}
+
+impl SlotCursor {
+    fn start(dir: bool) -> Self {
+        SlotCursor { dir, slot: None, word: 0 }
+    }
+
+    fn dir(&self) -> bool {
+        self.dir
+    }
+
+    ///land at a live slot — the cache load
+    #[inline]
+    fn at<P: Ptr>(&mut self, m: &SlotMask<P>, b: &Block<P>, q: usize) {
+        self.word = m.word_at(b, q);
+        self.slot = Some(q);
+    }
+
+    ///the forward ghost
+    fn end(&mut self) {
+        self.slot = None;
+    }
+
+    #[inline]
+    fn slot(&self) -> Option<usize> {
+        self.slot
+    }
+
+    ///step past slot `p` (yield-then-step, `next`'s half — the caller
+    ///holds p from slot()); past the last slot ghosts
+    #[inline]
+    fn advance<P: Ptr>(&mut self, m: &SlotMask<P>, b: &Block<P>, p: usize) {
+        let q = if self.dir {
+            m.step_up(b, p, self.word)
+        } else {
+            m.step_down(b, p, self.word)
+        };
+        match q {
+            Some((q, w)) => {
+                self.word = w;
+                self.slot = Some(q);
+            }
+            None => self.slot = None,
+        }
+    }
+
+    ///step back (step-then-yield, `prev`'s half): the slot now current, or
+    ///None at the walk's start (state stays put; from the ghost, resumes
+    ///at the far end)
+    #[inline]
+    fn retreat<P: Ptr>(&mut self, m: &SlotMask<P>, b: &Block<P>) -> Option<usize> {
+        let p = match self.slot {
+            None => {
+                let q = if self.dir { m.last_set(b)? } else { m.next_set(b, 0)? };
+                self.at(m, b, q);
+                return Some(q);
+            }
+            Some(p) => p,
+        };
+        let q = if self.dir { m.step_down(b, p, self.word) } else { m.step_up(b, p, self.word) };
+        let (r, w) = q?;
+        self.word = w;
+        self.slot = Some(r);
+        Some(r)
+    }
+}
+
 ///dense ordered set over archived keys: pos-ordered slot array holding
-///`K::Handle` copies + a side heap of archived bytes.
-///mask covers data.len() slots; bit ⇔ slot initialized.
-pub struct BlockSet<K: Archive, A> {
+///`K::Handle` copies over the set's OWN `Block<P>` — stack carries the
+///fixed occupancy words (first item, sized for the slot ceiling) then the
+///growing Handle slots (last item); K's archive hangs heap bytes off the
+///same block. mask bit p ⇔ slot p live.
+pub struct BlockSet<K: Archive<P> + RelOrd<P>, A: UnsignedNum, P: Ptr = u32> {
     translator: Translator<A>,
-    data:       Vec<MaybeUninit<K::Handle>>,
-    ///K's archived heap bytes — append-only, unordered (see serialize.rs)
-    heap:       Vec<u8>,
-    mask:       Mask,
+    ///the whole tier — stack [mask words | slots], heap = K's archived keys
+    block:      Block<P>,
+    ///fixed occupancy words (first stack item — never moves, never grows)
+    mask:       SlotMask<P>,
+    ///the slot region (LAST stack item — grows by extend_buf)
+    data_s:     S<P>,
+    ///the slot ceiling — the fixed mask's coverage and every ladder
+    ///ceiling's ceiling (min of the constructor's ask and the name space)
+    slot_max:   usize,
     len:        usize,
     ///running sum of placed slot positions — the mean-insert-position
     ///signal for the reversal tier
     pos_sum:    u64,
-    //pos_sq_sum: u128 — the z-gate's variance half, dead with the
-    //2026-10-22 trigger swap
     ///bumped by every position-relocating silent move (turns, flips) —
     ///slides/gathers don't bump (they record deltas). position holders
     ///(skipset tiers) use it as a staleness guard
@@ -561,21 +1121,132 @@ pub struct BlockSet<K: Archive, A> {
     streak:     usize,
     ///the block's own event slot — the mutation feedback (see Deltas)
     deltas:     Deltas<A>,
+    ///K's defining site — the storage never names it (reads are through
+    ///RelOrd over K::Handle)
+    _k:         PhantomData<fn() -> K>,
 }
 
-impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
+impl<K: Archive<P> + RelOrd<P>, A: UnsignedNum, P: Ptr> BlockSet<K, A, P> {
+    ///slot ceiling = min(name space, DEFAULT_SLOTS), the pointer-width
+    ///clamp applied — growth-by-turn matches the old Vec doubling inside
+    ///the fixed mask's coverage
     pub fn new() -> Self {
+        Self::construct(Self::default_slots())
+    }
+
+    ///explicit slot ceiling (≤ the name space) — the fixed mask's coverage
+    pub fn with_capacity(slots: usize) -> Self {
+        Self::construct(slots)
+    }
+
+    fn default_slots() -> usize {
+        A::MAX.as_usize().saturating_add(1).min(DEFAULT_SLOTS)
+    }
+
+    fn construct(slots: usize) -> Self {
+        let name_space = A::MAX.as_usize().saturating_add(1);
+        let handle = size_of::<K::Handle>();
+        //clamp: the fixed mask + the full data region must fit one block.
+        //closed-form width floor (8·⌈s/64⌉ ≤ 8 → per-slot cost ≥ handle +
+        //1/8), then trim — never an underflow, even for a mask that alone
+        //exceeds the pointer width
+        let mut smax = slots
+            .min(name_space)
+            .min(8 * pmax::<P>().saturating_sub(8) / (8 * handle + 1));
+        while 8 * smax.div_ceil(64) + smax * handle > pmax::<P>() {
+            smax = smax.saturating_sub(1);
+        }
+        let mask_bytes = 8 * smax.div_ceil(64);
+        //born at the mask + the first 4 slots — data growth beyond that
+        //takes the block's own growth (fit)
+        let mut block = Block::new(mask_bytes + 4 * handle);
+        let mask_s = block.push_buf::<u64>(smax.div_ceil(64)).expect("mask region");
+        //0-len slot item — the stack's LAST, extends from here on
+        let data_s = block.push_buf::<K::Handle>(0).expect("slot region");
         BlockSet {
             translator: Translator::new(),
-            data:      Vec::new(),
-            heap:      Vec::new(),
-            mask:      Mask::new(),
-            len:       0,
-            pos_sum:   0,
-            epoch:     0,
+            block,
+            mask: SlotMask { s: mask_s, bits: 0, covered: smax },
+            data_s,
+            slot_max: smax,
+            len: 0,
+            pos_sum: 0,
+            epoch: 0,
             last_insert: 0,
-            streak:     0,
-            deltas:     Deltas::new(),
+            streak: 0,
+            deltas: Deltas::new(),
+            _k: PhantomData,
+        }
+    }
+
+    ///the handle slots as a raw view — mask-governed liveness (mask ⇔ init)
+    fn data(&self) -> &[MaybeUninit<K::Handle>] {
+        self.block.stack_buf::<K::Handle>(self.data_s)
+    }
+
+    fn data_mut(&mut self) -> &mut [MaybeUninit<K::Handle>] {
+        self.block.stack_buf_mut::<K::Handle>(self.data_s)
+    }
+
+    ///slots allocated (mask bit range — the old `data.len()`)
+    pub fn cap(&self) -> usize {
+        self.data_s.1.as_usize() / size_of::<K::Handle>()
+    }
+
+    ///the block-level capacity feedback: grow to fit `extra` stack-or-heap
+    ///bytes — doubling, clamped to the pointer width. Err at the width
+    ///ceiling (data growth panics from there: the constructor asserts the
+    ///data budget inside it; only heap pressure can starve a data grow,
+    ///the arena tier's escape — no new ladder bail-outs)
+    fn fit(&mut self, extra: usize) -> Result<(), ()> {
+        let pmax = pmax::<P>();
+        let need = self.block.stack_len() + self.block.heap_len() + extra;
+        if need > pmax {
+            return Err(());
+        }
+        self.block.grow(need.max(self.block.cap() * 2).min(pmax)).map_err(|_| ())
+    }
+
+    ///extend the slot region (LAST stack item) by `add` slots; grows the
+    ///block on CapErr. the mask's tracked range belongs to the CALLER —
+    ///plain extensions resize it (push_slot), the turn's rotate_mask
+    ///doubles it across this very extension (a resize here would
+    ///double-count)
+    fn grow_data(&mut self, add: usize) {
+        loop {
+            if let Ok(s) = self.block.extend_buf::<K::Handle>(self.data_s, add) {
+                self.data_s = s;
+                return;
+            }
+            self.fit(add * size_of::<K::Handle>())
+                .expect("block byte capacity exhausted");
+        }
+    }
+
+    ///archive k into the block's heap — try-then-rewind: CapErr rolls the
+    ///heap front back (the block wipes it) and Err(k) is the only silent-
+    ///failure path in this tier, so fronts stay untouched on Err. heap
+    ///pressure gets ONE block-grow retry (the fronts share one gap — the
+    ///same doubling budget the data rung pays) before the rewind is final
+    fn archive_once(&mut self, k: &K) -> Result<K::Handle, ()> {
+        let mut al = self.block.allocator();
+        K::archive(k, &mut al).map_err(|_| ())
+    }
+
+    fn archive_key(&mut self, k: K) -> Result<K::Handle, K> {
+        let snap = self.block.allocator().snapshot();
+        match self.archive_once(&k) {
+            Ok(h) => Ok(h),
+            Err(()) => {
+                self.block.allocator().rewind(snap.clone());
+                if self.fit(0).is_ok() {
+                    if let Ok(h) = self.archive_once(&k) {
+                        return Ok(h);
+                    }
+                    self.block.allocator().rewind(snap);
+                }
+                Err(k)
+            }
         }
     }
 
@@ -589,10 +1260,8 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.len
     }
 
-    pub fn cap(&self) -> usize {
-        self.data.len()
-    }
-
+    ///the slot ceiling in NAMES — the old static bound (the legacy-gated
+    ///tiers read it); the ladder's live ceiling is `slot_max` per instance
     pub fn max_capacity() -> usize {
         A::MAX.as_usize().saturating_add(1)
     }
@@ -605,16 +1274,23 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
 
     ///None if addr names no live element (never-minted names can't alias a
     ///live slot — a2p is injective; STALE pre-delta names can, see
-    ///subtle_bugs §17)
-    pub fn get<'s>(&'s self, addr: A) -> Option<K::View<'s>> {
+    ///subtle_bugs §17). the raw slot handle — no heap read
+    pub fn get<'s>(&'s self, addr: A) -> Option<&'s K::Handle> {
         let p = self.translator.a2p(addr);
-        (p.0 < self.data.len() && self.mask.get(p.0))
-            .then(|| unsafe { K::view(self.data[p.0].assume_init_ref(), &self.heap) })
+        (p.0 < self.cap() && self.mask.get(&self.block, p.0))
+            .then(|| unsafe { self.key(p.0) })
     }
 
     ///compare a stored handle against a query key — the tiers' compare
+    ///(RelOrd over the block's heap read view; &self throughout)
     pub fn cmp_key(&self, h: &K::Handle, k: &K) -> Ordering {
-        K::cmp_key(h, k, &self.heap)
+        K::rel_cmp(h, k, &Heap::new(&self.block))
+    }
+
+    ///the block's heap read seam — handle→bytes lookups (v2 handles carry
+    ///no view; readers derive their bytes through this)
+    pub fn heap(&self) -> Heap<'_, P> {
+        Heap::new(&self.block)
     }
 
     ///base position of a live addr — unchecked: a stale/dead addr still
@@ -630,71 +1306,81 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
 
     ///the block's translator snapshot (pub(crate): the arena's split
     ///event carries from/to snapshots)
+    #[allow(dead_code)] //arena split event
     pub(crate) fn translator(&self) -> Translator<A> {
         self.translator
     }
 
-    ///the block's key-min materialized (Asc: first live, Desc: last
-    ///live) — rare calls only (min-changing inserts, splits); the
-    ///materialized value is a temporary clone (removal is the only
-    ///operation that leaks heap bytes, v1)
-    pub fn min_key(&self) -> Option<K> {
+    ///the block's key-min handle (Asc: first live, Desc: last live) —
+    ///rare calls only (min-changing inserts, splits). the handle, not a
+    ///materialized key: v2 orders through RelOrd
+    pub fn min_key(&self) -> Option<K::Handle> {
         let p = if self.translator.reversed() {
-            self.mask.last_set()?
+            self.mask.last_set(&self.block)?
         } else {
-            self.mask.next_set(0)?
+            self.mask.next_set(&self.block, 0)?
         };
         // SAFETY: mask names a live slot
-        Some(K::materialize(unsafe { *self.data[p].assume_init_ref() }, &self.heap))
+        Some(unsafe { *self.key(p) })
     }
 
     ///cleave at position `at`: the right half's slots copy AS-IS — data,
     ///mask bits, and translator (the offset shift preserves every name;
     ///only the block id changes, see arenaset's split event). no
     ///laddering, no re-archiving of positions. live-or-not: holes copy
-    ///as holes. BOTH blocks rebuild their side heaps compact afterward
-    ///(handles are heap-RELATIVE, so halves can't share one; the old
-    ///heaps drop with the moved keys' bytes — nothing leaks) and BOTH
-    ///reset their z-gate signals to the uniform presumption over their
-    ///new lens (the moved half's insert history predicts nothing about
-    ///either half's future). the shifted offset can exceed the half's
-    ///cap (offset_src < at wraps — most Asc blocks carry offset 0, so
-    ///the half is born at offset = cap): sound while Asc — forward
-    ///turns are monotone for any offset — but REVERSED turns die there
-    ///(§30), so a Desc half flips to Asc at the end and grow_rotate
-    ///REFUSES the reversed turn at offset ≥ midpoint, routing the space
-    ///need to the ceiling valve instead. the halves' future shape —
-    ///rotate both, append, prepend — is an open parameter (v0: the
-    ///right half, as-is)
-    pub(crate) fn cleave(&mut self, at: usize) -> BlockSet<K, A> {
+    ///as holes. the right half's heap is a VERBATIM tail copy of this
+    ///block's whole heap — handles resolve through it unchanged (H is
+    ///end-relative: the same heap length at the tail reproduces every
+    ///offset, nested regions included). the v1 compact rebuild + handle
+    ///recompute is deferred: it needs a handle-rebase contract on K
+    ///(v2 has no materialize). the left half keeps its own heap — its
+    ///handles never moved; the right half's leaked dead bytes ride the
+    ///removal-leak rule. BOTH halves reset their signals to the uniform
+    ///presumption over their new lens (the moved half's insert history
+    ///predicts nothing about either half's future). the shifted offset
+    ///can exceed the half's cap (offset_src < at wraps — most Asc blocks
+    ///carry offset 0, so the half is born at offset = cap): sound while
+    ///Asc — forward turns are monotone for any offset — but REVERSED
+    ///turns die there (§30), so a Desc half flips to Asc at the end and
+    ///grow_rotate REFUSES the reversed turn at offset ≥ midpoint,
+    ///routing the space need to the ceiling valve instead
+    #[allow(dead_code)] //arena-facing (tests drive it)
+    pub(crate) fn cleave(&mut self, at: usize) -> BlockSet<K, A, P> {
         debug_assert!(at < self.cap(), "cleave boundary inside the block");
         let half = self.cap() - at;
-        let mut right = BlockSet {
-            translator:  self.translator.shifted(at),
-            data:       (0..half).map(|_| MaybeUninit::uninit()).collect(),
-            heap:       Vec::new(),
-            mask:       self.mask.copy_region(at, self.cap()),
-            len:        0,
-            pos_sum:    0,
-            epoch:      0,
-            last_insert: self.last_insert.saturating_sub(at),
-            streak:     0,
-            deltas:     Deltas::new(),
-        };
-        right.len = right.mask.count();
-        // SAFETY: the slots copy raw — the mask half governs validity,
-        // stale hole bytes stay masked-clear, never assume_init'd
-        unsafe {
-            std::ptr::copy(self.data.as_mut_ptr().add(at), right.data.as_mut_ptr(), half);
+        let heap_len = self.block.heap_len();
+        //the half's ceiling: the source's remaining coverage (the fixed
+        //mask must cover future turns), never above the name space
+        let smax = (self.slot_max - at).min(A::MAX.as_usize().saturating_add(1)).max(half);
+        let mut right = BlockSet::<K, A, P>::construct(smax);
+        //the shift is the split event: position ≥ split_pos ⇒ new block
+        //id, SAME name (§31)
+        right.translator = self.translator.shifted(at);
+        right.last_insert = self.last_insert.saturating_sub(at);
+        //slot region first (the fit accounts heap after it), then the
+        //verbatim heap copy fits its own budget
+        right.grow_data(half);
+        right.mask.resize(half);
+        if heap_len > 0 {
+            right.fit(heap_len).expect("heap copy fits the half");
+            let whole = self.block.heap(H(P::from_usize(heap_len), P::from_usize(heap_len)));
+            let mut al = right.block.allocator();
+            al.copy_from::<u8>(whole).expect("heap copy fits the half");
         }
+        //slots copy raw — the mask half governs validity; stale hole
+        //bytes stay masked-out, never read
         for p in at..self.cap() {
-            self.mask.set(p, false);
+            let live = self.mask.get(&self.block, p);
+            if live {
+                right.data_mut()[p - at] = self.data()[p];
+                right.mask.set(&mut right.block, p - at, true);
+            }
+        }
+        right.len = right.mask.count(&right.block);
+        for p in at..self.cap() {
+            self.mask.set(&mut self.block, p, false);
         }
         self.len -= right.len;
-        //both halves: fresh compact heaps (right reads the source's
-        //heap — the copied handles are its offsets), fresh gate signals
-        right.heap = BlockSet::<K, A>::rebuild_heap(&mut right.data, &right.mask, &self.heap);
-        self.heap = BlockSet::<K, A>::rebuild_heap(&mut self.data, &self.mask, &self.heap);
         right.seed_uniform_signals();
         self.seed_uniform_signals();
         //the flipped half keeps offset ≥ cap (the wrap RELOCATES to the
@@ -706,31 +1392,11 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         right
     }
 
-    ///rebuild the side heap compact: every live slot re-archives into a
-    ///fresh heap (append-only); the old bytes drop with the old heap.
-    ///disjoint-field form — the source rebuilds while reading its own
-    ///heap
-    fn rebuild_heap(
-        data: &mut [MaybeUninit<K::Handle>],
-        mask: &Mask,
-        read: &[u8],
-    ) -> Vec<u8> {
-        let mut heap = Vec::new();
-        for p in 0..data.len() {
-            if mask.get(p) {
-                // SAFETY: mask names a live slot
-                let h = unsafe { *data[p].assume_init_ref() };
-                let k = K::materialize(h, read);
-                data[p] = MaybeUninit::new(K::archive(&k, &mut heap));
-            }
-        }
-        heap
-    }
-
     ///the uniform presumption: a block whose insert history is unknown
     ///seeds its z-gate with the mean/spread of uniform arrivals over
     ///[0, len) — a pos_sum of 0 at a born-big len reads maximally
     ///front-biased and flips on the first insert
+    #[allow(dead_code)]
     fn seed_uniform_signals(&mut self) {
         let n = self.len as u128;
         self.pos_sum = (n * (n - 1) / 2) as u64;
@@ -745,7 +1411,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             return true;
         }
         let tail = self.key_tail();
-        let ord = K::cmp_key(tail, k, &self.heap);
+        let ord = self.cmp_key(tail, k);
         if self.translator.reversed() {
             ord == Ordering::Greater
         } else {
@@ -778,20 +1444,21 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///live handle at a base position — None if out of range or a hole.
     ///the tiers' incremental re-read
     pub fn slot(&self, pos: usize) -> Option<K::Handle> {
-        (pos < self.data.len() && self.mask.get(pos)).then(|| unsafe { *self.key(pos) })
+        (pos < self.cap() && self.mask.get(&self.block, pos))
+            .then(|| unsafe { *self.key(pos) })
     }
 
     ///first live position ≥ from — None past the tail. the tiers'
     ///window-first sampling (tier0 slot j = the first item in window j,
     ///so banking/turns/bands can never empty a sample)
     pub fn first_live_pos(&self, from: usize) -> Option<usize> {
-        self.mask.next_set(from)
+        self.mask.next_set(&self.block, from)
     }
 
     ///first live position < below — None at the head. skipset's update
     ///hint walk (the prev-mirror of first_live_pos)
     pub fn prev_live_pos(&self, below: usize) -> Option<usize> {
-        self.mask.prev_set(below)
+        self.mask.prev_set(&self.block, below)
     }
 
     ///live-run lengths between holes (position order) — the desert
@@ -802,7 +1469,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         let mut runs = Vec::new();
         let mut run_start: Option<usize> = None;
         let mut prev = 0usize;
-        for pos in self.mask.iter_set() {
+        for pos in self.mask.iter_set(&self.block) {
             match run_start {
                 None => run_start = Some(pos),
                 Some(_) if pos == prev + 1 => {}
@@ -832,25 +1499,25 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             if to == 0 {
                 return None;
             }
-            self.mask.prev_set(to)?
+            self.mask.prev_set(&self.block, to)?
         } else {
-            self.mask.next_set(from).filter(|probe| *probe < to)?
+            self.mask.next_set(&self.block, from).filter(|probe| *probe < to)?
         };
         loop {
             // SAFETY: every step lands on a mask-named slot
-            match unsafe { K::cmp_key(self.key(p), k, &self.heap) } {
+            match self.cmp_key(unsafe { self.key(p) }, k) {
                 Ordering::Less => {}
                 Ordering::Equal => return Some(self.translator.p2a(Pos(p))),
                 Ordering::Greater => return None,
             }
             let q = if rev {
-                let q = self.mask.prev_set(p)?;
+                let q = self.mask.prev_set(&self.block, p)?;
                 if q < from {
                     return None;
                 }
                 q
             } else {
-                let q = self.mask.next_set(p + 1)?;
+                let q = self.mask.next_set(&self.block, p + 1)?;
                 if q >= to {
                     return None;
                 }
@@ -865,14 +1532,14 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //beyond either extreme → absent, no bsearch (see blockmap::find)
         if self.len > 0 {
             let tail = self.key_tail();
-            let ord = K::cmp_key(tail, k, &self.heap);
+            let ord = self.cmp_key(tail, k);
             let beyond = if self.translator.reversed() { ord == Ordering::Greater } else { ord == Ordering::Less };
             if beyond {
                 return None;
             }
             //len > 0 ⇒ a first live slot exists
-            let head = unsafe { self.key(self.mask.next_set(0).unwrap()) };
-            let ord = K::cmp_key(head, k, &self.heap);
+            let head = unsafe { self.key(self.mask.next_set(&self.block, 0).unwrap()) };
+            let ord = self.cmp_key(head, k);
             let before = if self.translator.reversed() { ord == Ordering::Less } else { ord == Ordering::Greater };
             if before {
                 return None;
@@ -889,26 +1556,26 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.find(k).is_some()
     }
 
-    ///first→last over live keys
-    pub fn iter(&self) -> Iter<'_, K, A> {
+    ///first→last over live keys (raw handles — order via RelOrd)
+    pub fn iter(&self) -> Iter<'_, K, A, P> {
         //direction picked once, never per element; Desc blocks: key order
         //ascends against pos order, so they walk positions down
         if self.translator.reversed() {
-            Iter::Desc { bits: self.mask.iter_set_rev(), set: self }
+            Iter::Desc { bits: self.mask.iter_set_rev(&self.block), set: self }
         } else {
-            Iter::Asc { bits: self.mask.iter_set(), set: self }
+            Iter::Asc { bits: self.mask.iter_set(&self.block), set: self }
         }
     }
 
     ///cursor at the first key ≥ k, or the walk's end if none
-    pub fn seek(&self, k: &K) -> Cursor<'_, K, A> {
+    pub fn seek(&self, k: &K) -> Cursor<'_, K, A, P> {
         let mut cursor = Cursor::new(self);
         cursor.seek(k);
         cursor
     }
 
     ///cursor at the first key > k — k itself lands in a downward walk
-    pub fn seek_after(&self, k: &K) -> Cursor<'_, K, A> {
+    pub fn seek_after(&self, k: &K) -> Cursor<'_, K, A, P> {
         let mut cursor = Cursor::new(self);
         cursor.seek_after(k);
         cursor
@@ -918,20 +1585,20 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///Desc runs key order against pos order, so its mirror is prev_set
     fn key_bound(&self, from: usize) -> Option<usize> {
         if self.translator.reversed() {
-            self.mask.prev_set(from)
+            self.mask.prev_set(&self.block, from)
         } else {
-            self.mask.next_set(from)
+            self.mask.next_set(&self.block, from)
         }
     }
 
-    ///Err returns k (dup, or out of names)
+    ///Err returns k (dup, or out of names). heap-capacity failures ride
+    ///the same Err — try-then-rewind leaves both fronts untouched
     pub fn insert(&mut self, k: K) -> Result<A, K> {
         assert!(!self.deltas.is_pending(), "pending deltas: apply + exhaust before reuse");
-        if self.data.is_empty() {
-            let h = K::archive(&k, &mut self.heap);
-            return Ok(self.insert_first(h));
+        if self.cap() == 0 {
+            return self.insert_first(k);
         }
-        if self.len >= Self::max_capacity() {
+        if self.len >= self.slot_max {
             return Err(k);
         }
         //flip check BEFORE the record — no translator mutation happens
@@ -942,7 +1609,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             return Err(k);
         };
         //archive after the dup check — a rejected key leaves no heap bytes
-        let h = K::archive(&k, &mut self.heap);
+        let h = self.archive_key(k)?;
         Ok(self.place_from(h, spot).0)
     }
 
@@ -952,7 +1619,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///next silent move)
     fn place_from(&mut self, h: K::Handle, spot: Pos) -> (A, Pos) {
         //sequential at the back: extend instead of sliding
-        if spot.0 == self.data.len() && self.data.len() < Self::max_capacity() {
+        if spot.0 == self.cap() && self.cap() < self.slot_max {
             (self.push_back(h, spot), spot)
         } else {
             let p = self.open(spot);
@@ -971,6 +1638,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     /// boundary or a dup lies inside [from, to). the bsearch trusts the
     /// window; a wrong one corrupts the ordering. panics on pending
     /// deltas, like insert
+    #[allow(dead_code)] //skipset's consumer is legacy-gated
     pub(crate) unsafe fn insert_at(
         &mut self,
         k: K,
@@ -978,17 +1646,17 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         to: usize,
     ) -> Result<(A, Pos), K> {
         assert!(!self.deltas.is_pending(), "pending deltas: apply + exhaust before reuse");
-        if self.data.is_empty() {
-            let h = K::archive(&k, &mut self.heap);
-            return Ok((self.insert_first(h), Pos(0)));
+        if self.cap() == 0 {
+            let a = self.insert_first(k)?;
+            return Ok((a, Pos(0)));
         }
-        if self.len >= Self::max_capacity() {
+        if self.len >= self.slot_max {
             return Err(k);
         }
         match self.bsearch_bounds(&k, from, to) {
             Ok(_) => return Err(k), //dup
             Err(spot) => {
-                let h = K::archive(&k, &mut self.heap);
+                let h = self.archive_key(k)?;
                 Ok(self.place_from(h, spot))
             }
         }
@@ -999,17 +1667,18 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///(max Asc, min Desc — the end a sequential insert extends). no
     ///scan, no dup possible. SkipSet's beyond_tail pre-check routes
     ///appends here — one tail scan total instead of three
+    #[allow(dead_code)]
     pub(crate) fn push_beyond(&mut self, k: K) -> Result<(A, Pos), K> {
         assert!(!self.deltas.is_pending(), "pending deltas: apply + exhaust before reuse");
-        if self.data.is_empty() {
-            let h = K::archive(&k, &mut self.heap);
-            return Ok((self.insert_first(h), Pos(0)));
+        if self.cap() == 0 {
+            let a = self.insert_first(k)?;
+            return Ok((a, Pos(0)));
         }
-        if self.len >= Self::max_capacity() {
+        if self.len >= self.slot_max {
             return Err(k);
         }
-        let spot = Pos(self.mask.last_set().unwrap() + 1);
-        let h = K::archive(&k, &mut self.heap);
+        let spot = Pos(self.mask.last_set(&self.block).unwrap() + 1);
+        let h = self.archive_key(k)?;
         Ok(self.place_from(h, spot))
     }
 
@@ -1018,9 +1687,9 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///SkipSet calls this manually — plain insert auto-flips via
     ///maybe_reverse, insert_at never does
     pub(crate) fn reverse(&mut self) {
-        self.data.reverse();
-        self.mask.reverse();
-        self.translator = self.translator.reverse(self.data.len());
+        self.data_mut().reverse();
+        self.mask.reverse(&mut self.block);
+        self.translator = self.translator.reverse(self.cap());
         let len = self.len as u64;
         //reflect the bias signal around len — the trigger's own scale —
         // NOT the physical mirror (cap−1−p): cap imports density noise.
@@ -1031,8 +1700,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //cap−1−p — anything else misreads the next streak compare);
         //the trigger sums keep the len-reflection above
         self.last_insert = self
-            .data
-            .len()
+            .cap()
             .saturating_sub(1)
             .saturating_sub(self.last_insert);
         self.epoch += 1;
@@ -1056,9 +1724,9 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             //beyond the tail extreme (max Asc, min Desc — the end a
             //sequential insert extends) the spot is known without bsearch
             //— one last_set serves both the compare and the spot
-            let p = self.mask.last_set().unwrap();
+            let p = self.mask.last_set(&self.block).unwrap();
             // SAFETY: last_set names a live slot — mask ⇔ init
-            let ord = K::cmp_key(unsafe { self.key(p) }, k, &self.heap);
+            let ord = self.cmp_key(unsafe { self.key(p) }, k);
             let beyond = if self.translator.reversed() { ord == Ordering::Greater } else { ord == Ordering::Less };
             if beyond {
                 return Some(Pos(p + 1));
@@ -1084,7 +1752,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///back
     fn spot_near(&self, k: &K) -> Option<Result<Pos, ()>> {
         let anchor = self.last_insert;
-        if !self.mask.get(anchor) {
+        if !self.mask.get(&self.block, anchor) {
             return None; //removed since the streak landed
         }
         // SAFETY: mask names the anchor live
@@ -1100,7 +1768,11 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         let mut prev = anchor;
         let mut cursor = anchor;
         loop {
-            let q = if up { self.mask.next_set(cursor + 1) } else { self.mask.prev_set(cursor) };
+            let q = if up {
+                self.mask.next_set(&self.block, cursor + 1)
+            } else {
+                self.mask.prev_set(&self.block, cursor)
+            };
             let Some(q) = q else { return None };
             if q + bound < anchor || q > anchor + bound {
                 return None; //past the streak's reach
@@ -1119,15 +1791,25 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         }
     }
 
-    ///vec-like first allocation: 4 slots, no translator turn until it fills
-    fn insert_first(&mut self, h: K::Handle) -> A {
-        self.data = (0..4).map(|_| MaybeUninit::uninit()).collect();
-        self.mask = Mask::with_bits(4);
-        self.place(h, Pos(0))
+    ///vec-like first allocation: 4 slots, no translator turn until it
+    ///fills. archive failure rolls the stack front back too — both
+    ///fronts untouched on Err (the region wipes with the shrink)
+    fn insert_first(&mut self, k: K) -> Result<A, K> {
+        self.grow_data(4);
+        self.mask.resize(self.cap());
+        match self.archive_key(k) {
+            Ok(h) => Ok(self.place(h, Pos(0))),
+            Err(k) => {
+                self.block.stack_shrink(self.data_s.0.as_usize());
+                self.data_s = S(self.data_s.0, P::from_usize(0));
+                self.mask.resize(0);
+                Err(k)
+            }
+        }
     }
 
     ///extend the allocation and place k at the edge — dense, holes never
-    ///minted here. caller guarantees spot == cap < max_capacity
+    ///minted here. caller guarantees spot == cap < the slot ceiling
     fn push_back(&mut self, h: K::Handle, spot: Pos) -> A {
         self.push_slot();
         self.place(h, spot)
@@ -1144,9 +1826,9 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //nothing), as does the spot-hole case (direct place)
         if spot.0 < self.cap()
             && self.cap() - spot.0 <= FREE_STRIDE
-            && self.cap() < Self::max_capacity()
-            && self.mask.get(spot.0)
-            && (spot.0..self.cap()).all(|p| self.mask.get(p))
+            && self.cap() < self.slot_max
+            && self.mask.get(&self.block, spot.0)
+            && (spot.0..self.cap()).all(|p| self.mask.get(&self.block, p))
         {
             let from = self.cap();
             self.push_slot();
@@ -1156,8 +1838,8 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //turn beats the long scans (mid-block inserts only). refused ⇒
         //the gather banks from however far — a hole always exists
         //below the ceiling (len < ceiling, mask not solid)
-        if self.len.wrapping_mul(TURN_DEN) > self.data.len().wrapping_mul(TURN_NUM)
-            && self.data.len() - spot.0 > FREE_STRIDE
+        if self.len.wrapping_mul(TURN_DEN) > self.cap().wrapping_mul(TURN_NUM)
+            && self.cap() - spot.0 > FREE_STRIDE
         {
             let old = self.translator;
             if self.grow_rotate() {
@@ -1178,8 +1860,8 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///write k at an open slot, mark live, mint its name; the slot position
     ///joins the running insert-position sum
     fn place(&mut self, h: K::Handle, p: Pos) -> A {
-        self.data[p.0] = MaybeUninit::new(h);
-        self.mask.set(p.0, true);
+        self.data_mut()[p.0] = MaybeUninit::new(h);
+        self.mask.set(&mut self.block, p.0, true);
         self.len += 1;
         self.pos_sum = self.pos_sum.wrapping_add(p.0 as u64);
         //locality streak: this insert within a stride of the previous
@@ -1189,34 +1871,36 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         self.translator.p2a(p)
     }
 
-    ///None if addr names no live element. the key is materialized back from
-    ///the heap; its heap bytes leak (v1: no reclamation — see serialize.rs)
-    pub fn remove(&mut self, addr: A) -> Option<K> {
+    ///None if addr names no live element. the handle is dead after this —
+    ///its heap bytes leak (v0: release wiring is deferred with the
+    ///freelist; the deltas/holder protocols don't model freed regions)
+    pub fn remove(&mut self, addr: A) -> Option<K::Handle> {
         let pos = self.translator.a2p(addr);
-        if pos.0 < self.data.len() && self.mask.get(pos.0) {
-            self.mask.set(pos.0, false);
+        if pos.0 < self.cap() && self.mask.get(&self.block, pos.0) {
+            self.mask.set(&mut self.block, pos.0, false);
             self.len -= 1;
             //the signal tracks CURRENT elements — removal subtracts its
             //slot (post-move position, not what the insert added; a
             //heuristic, wrapping keeps it total)
             self.pos_sum = self.pos_sum.wrapping_sub(pos.0 as u64);
-            let h = unsafe { *self.data[pos.0].assume_init_ref() };
-            Some(K::materialize(h, &self.heap))
+            Some(unsafe { *self.key(pos.0) })
         } else {
             None
         }
     }
 
     ///in-place key swap at a live slot: archives `k`, overwrites the
-    ///handle, returns the previous key materialized (its heap bytes leak,
-    ///v1). no mask/name/signal/position changes — ORDER is the caller's
-    ///contract: `k`'s key must sit inside the slot's immediate bracket
-    pub(crate) fn replace_key(&mut self, p: usize, k: K) -> K {
-        let h = K::archive(&k, &mut self.heap);
+    ///handle, returns the previous handle (its heap bytes leak, v0). no
+    ///mask/name/signal/position changes — ORDER is the caller's
+    ///contract: `k`'s key must sit inside the slot's immediate bracket.
+    ///Err(k) = the archive didn't fit (try-then-rewind; state untouched)
+    #[allow(dead_code)]
+    pub(crate) fn replace_key(&mut self, p: usize, k: K) -> Result<K::Handle, K> {
+        let h = self.archive_key(k)?;
         // SAFETY: p names a live slot (caller-checked)
-        let old = K::materialize(unsafe { *self.key(p) }, &self.heap);
-        self.data[p] = MaybeUninit::new(h);
-        old
+        let old = unsafe { *self.key(p) };
+        self.data_mut()[p] = MaybeUninit::new(h);
+        Ok(old)
     }
 
     ///bsearch over live slots — the raw boundary. Ok(p) = the
@@ -1229,7 +1913,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //DRAM-resident); the cmov bound has no mispredict (wins
         //cache-resident, where compares are cheap and a branch
         //mispredicts every probe)
-        self.bsearch_bounds(k, 0, self.data.len())
+        self.bsearch_bounds(k, 0, self.cap())
     }
 
     ///bsearch over a position window [lo0, hi0) — insert_at's bounded
@@ -1237,7 +1921,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///log2(window) probes instead of a linear walk (or the full-block
     ///log2(cap))
     fn bsearch_bounds(&self, k: &K, lo0: usize, hi0: usize) -> Result<Pos, Pos> {
-        let big = self.data.len().wrapping_mul(std::mem::size_of::<K::Handle>()) > L2_BYTES;
+        let big = self.cap() * size_of::<K::Handle>() > L2_BYTES;
         match (self.translator.reversed(), big) {
             (true, true) => self.search_spec::<true>(k, lo0, hi0),
             (true, false) => self.search_cmov::<true>(k, lo0, hi0),
@@ -1263,7 +1947,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                     let probe = unsafe { self.key(p) };
                     //Desc: key order ascends against pos order — the
                     //compare flips (folded per instantiation)
-                    let ord = K::cmp_key(probe, k, &self.heap);
+                    let ord = self.cmp_key(probe, k);
                     let ord = if REV { ord.reverse() } else { ord };
                     match ord {
                         Ordering::Less => lo = p + 1,
@@ -1287,7 +1971,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
                 None => hi = mid,
                 Some(p) => {
                     let probe = unsafe { self.key(p) };
-                    let ord = K::cmp_key(probe, k, &self.heap);
+                    let ord = self.cmp_key(probe, k);
                     let ord = if REV { ord.reverse() } else { ord };
                     if ord == Ordering::Less {
                         lo = p + 1;
@@ -1301,7 +1985,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //if the narrowing ended on or below it. equality is
         //direction-free
         if let Some(p) = self.next_live(lo, hi0) {
-            if K::cmp_key(unsafe { self.key(p) }, k, &self.heap) == Ordering::Equal {
+            if self.cmp_key(unsafe { self.key(p) }, k) == Ordering::Equal {
                 return Ok(Pos(p));
             }
         }
@@ -1314,13 +1998,13 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     fn position(&self, k: &K) -> Result<Pos, Pos> {
         match self.bsearch(k) {
             Ok(p) => Ok(p),
-            Err(spot) => Err(self.next_live(spot.0, self.data.len()).map(Pos).unwrap_or(spot)),
+            Err(spot) => Err(self.next_live(spot.0, self.cap()).map(Pos).unwrap_or(spot)),
         }
     }
 
     #[inline]
     fn next_live(&self, from: usize, bound: usize) -> Option<usize> {
-        self.mask.next_set(from).filter(|p| *p < bound)
+        self.mask.next_set(&self.block, from).filter(|p| *p < bound)
     }
 
     ///raw live-slot read
@@ -1329,21 +2013,12 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///
     /// p must name a live slot — mask ⇔ init
     unsafe fn key(&self, p: usize) -> &K::Handle {
-        unsafe { self.data[p].assume_init_ref() }
-    }
-
-    ///live-slot view through the heap
-    ///
-    /// # Safety
-    ///
-    /// p must name a live slot — mask ⇔ init
-    unsafe fn view_key(&self, p: usize) -> K::View<'_> {
-        K::view(unsafe { self.key(p) }, &self.heap)
+        unsafe { self.data()[p].assume_init_ref() }
     }
 
     ///key at the physical tail (max Asc, min Desc); panics if len == 0
     fn key_tail(&self) -> &K::Handle {
-        unsafe { self.key(self.mask.last_set().expect("live")) }
+        unsafe { self.key(self.mask.last_set(&self.block).expect("live")) }
     }
 
     ///open a slot at/near `spot` — SUBDIVIDE first (the clear run
@@ -1359,8 +2034,8 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //movement. interior gaps split at the middle (either side serves
         //the next insert); a tail gap fills at its head — the append
         //edge stays solid (push_back's premise)
-        let next = self.mask.next_set(spot.0);
-        let prev = self.mask.prev_set(spot.0);
+        let next = self.mask.next_set(&self.block, spot.0);
+        let prev = self.mask.prev_set(&self.block, spot.0);
         let gap_lo = prev.map_or(0, |p| p + 1);
         let gap_hi = next.map_or(self.cap(), |n| n);
         if gap_hi > gap_lo {
@@ -1368,15 +2043,15 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
             self.deltas.record_none_slide(self.translator, Pos(land), Pos(land));
             return Pos(land);
         }
-        let up = self.mask.next_clear(spot.0 + 1);
-        let down = spot.0.checked_sub(1).and_then(|b| self.mask.prev_clear(b));
+        let up = self.mask.next_clear(&self.block, spot.0 + 1);
+        let down = spot.0.checked_sub(1).and_then(|b| self.mask.prev_clear(&self.block, b));
         let hole = match (up, down) {
             (Some(u), Some(d)) if u - spot.0 <= spot.0 - d => u,
             (_, Some(d)) => d,
             (Some(u), _) => u,
             //mask solid: mint tail slots — len < ceiling guarantees room
             _ => {
-                let room = Self::max_capacity() - self.cap();
+                let room = self.slot_max - self.cap();
                 let want = (1 + (self.cap() - spot.0) / FREE_STRIDE).min(room);
                 self.push_slots(want);
                 self.cap() - 1
@@ -1451,19 +2126,23 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
 
     ///one plain slide: hole `from` → `to`
     fn slide_hole(&mut self, from: usize, to: usize) {
-        unsafe {
-            let ptr = self.data.as_mut_ptr();
-            if from > to {
-                std::ptr::copy(ptr.add(to), ptr.add(to + 1), from - to);
-            } else {
-                std::ptr::copy(ptr.add(from + 1), ptr.add(from), to - from);
+        {
+            let data = self.data_mut();
+            // SAFETY: within the slot region; the run between is live
+            unsafe {
+                let ptr = data.as_mut_ptr();
+                if from > to {
+                    std::ptr::copy(ptr.add(to), ptr.add(to + 1), from - to);
+                } else {
+                    std::ptr::copy(ptr.add(from + 1), ptr.add(from), to - from);
+                }
             }
         }
         //the run between is fully live (nearest hole) — two-bit mask
         //update; the stale duplicate bytes ptr::copy leaves behind are
         //masked clear, never assume_init'd
-        self.mask.set(from, true);
-        self.mask.set(to, false);
+        self.mask.set(&mut self.block, from, true);
+        self.mask.set(&mut self.block, to, false);
         //the previous k may ride the run — the anchor follows its element
         //(a stale anchor misreads the next streak compare)
         if from > to {
@@ -1479,9 +2158,10 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     ///make every target vacant when written (see rebalance_region); the
     ///stale source bytes are masked clear, never assume_init'd
     fn move_slot(&mut self, from: usize, to: usize) {
-        self.data[to] = std::mem::replace(&mut self.data[from], MaybeUninit::uninit());
-        self.mask.set(from, false);
-        self.mask.set(to, true);
+        let data = self.data_mut();
+        data[to] = std::mem::replace(&mut data[from], MaybeUninit::uninit());
+        self.mask.set(&mut self.block, from, false);
+        self.mask.set(&mut self.block, to, true);
         if from == self.last_insert {
             self.last_insert = to;
         }
@@ -1500,14 +2180,15 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     fn fetch_holes(&self, spot: Pos, right: bool, want: usize, bound: usize) -> Vec<usize> {
         //adjacent hole ⇔ the neighbor slot is clear
         let run_member = |h: usize| {
-            (h > 0 && !self.mask.get(h - 1)) || (h + 1 < self.cap() && !self.mask.get(h + 1))
+            (h > 0 && !self.mask.get(&self.block, h - 1))
+                || (h + 1 < self.cap() && !self.mask.get(&self.block, h + 1))
         };
         let mut holes = Vec::with_capacity(want);
         let mut seen_run = false;
         if right {
             let mut cursor = spot.0;
             while holes.len() < want
-                && let Some(h) = self.mask.next_clear(cursor)
+                && let Some(h) = self.mask.next_clear(&self.block, cursor)
             {
                 if h >= bound || seen_run && !run_member(h) {
                     break;
@@ -1519,7 +2200,7 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         } else {
             let mut cursor = spot.0 - 1;
             while holes.len() < want {
-                let Some(h) = self.mask.prev_clear(cursor) else { break };
+                let Some(h) = self.mask.prev_clear(&self.block, cursor) else { break };
                 if h < bound || seen_run && !run_member(h) {
                     break;
                 }
@@ -1544,35 +2225,40 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
     fn compact_gather(&mut self, spot: Pos, open: usize, right: bool, holes: &[usize]) {
         let w = holes.len();
         let drag = (w - 1) / 15;
-        unsafe {
-            let ptr = self.data.as_mut_ptr();
-            //segment j (between consecutive holes) shifts by its crossing
-            //count; far segments copy first so no live source is read
-            //after being overwritten
-            if right {
-                //holes ascend; segment 0 spans [spot+drag, h_0) — its
-                //head `drag` elements are the sentinels, landing later
-                for j in (0..w).rev() {
-                    let (lo, len) = if j == 0 {
-                        (spot.0 + drag, holes[0] - spot.0 - drag)
-                    } else {
-                        (holes[j - 1] + 1, holes[j] - holes[j - 1] - 1)
-                    };
-                    let shift = w - j;
-                    std::ptr::copy(ptr.add(lo), ptr.add(lo + shift), len);
-                }
-            } else {
-                //holes descend; the top segment ends at spot − 1 − drag
-                //(the element at spot never moves — k lands below it;
-                //its head `drag` elements are the sentinels)
-                for k in (0..w).rev() {
-                    let (lo, len) = if k == 0 {
-                        (holes[0] + 1, spot.0 - 1 - drag - holes[0])
-                    } else {
-                        (holes[k] + 1, holes[k - 1] - holes[k] - 1)
-                    };
-                    let shift = w - k;
-                    std::ptr::copy(ptr.add(lo), ptr.add(lo - shift), len);
+        {
+            let data = self.data_mut();
+            // SAFETY: segment copies stay inside the live slot range; the
+            //vacated stale sources are masked clear below, never read
+            unsafe {
+                let ptr = data.as_mut_ptr();
+                //segment j (between consecutive holes) shifts by its crossing
+                //count; far segments copy first so no live source is read
+                //after being overwritten
+                if right {
+                    //holes ascend; segment 0 spans [spot+drag, h_0) — its
+                    //head `drag` elements are the sentinels, landing later
+                    for j in (0..w).rev() {
+                        let (lo, len) = if j == 0 {
+                            (spot.0 + drag, holes[0] - spot.0 - drag)
+                        } else {
+                            (holes[j - 1] + 1, holes[j] - holes[j - 1] - 1)
+                        };
+                        let shift = w - j;
+                        std::ptr::copy(ptr.add(lo), ptr.add(lo + shift), len);
+                    }
+                } else {
+                    //holes descend; the top segment ends at spot − 1 − drag
+                    //(the element at spot never moves — k lands below it;
+                    //its head `drag` elements are the sentinels)
+                    for k in (0..w).rev() {
+                        let (lo, len) = if k == 0 {
+                            (holes[0] + 1, spot.0 - 1 - drag - holes[0])
+                        } else {
+                            (holes[k] + 1, holes[k - 1] - holes[k] - 1)
+                        };
+                        let shift = w - k;
+                        std::ptr::copy(ptr.add(lo), ptr.add(lo - shift), len);
+                    }
                 }
             }
         }
@@ -1580,33 +2266,36 @@ impl<K: Archive, A: UnsignedNum> BlockSet<K, A> {
         //copies' source span), DESCENDING — every target above the
         //remaining sentinel sources, and below the shifted block's
         //targets, so both data and pair-emission order stay safe
-        for i in (0..drag).rev() {
-            let (src, dst) = if right {
-                (open + i, open + 16 * i + 15)
-            } else {
-                (open - i, open - 16 * i - 15)
-            };
-            self.data[dst] = self.data[src];
+        {
+            let data = self.data_mut();
+            for i in (0..drag).rev() {
+                let (src, dst) = if right {
+                    (open + i, open + 16 * i + 15)
+                } else {
+                    (open - i, open - 16 * i - 15)
+                };
+                data[dst] = data[src];
+            }
         }
         for &h in holes {
-            self.mask.set(h, true);
+            self.mask.set(&mut self.block, h, true);
         }
         //the vacated target range clears; sets first — a hole compacted
         //onto its own old position ends clear. the sentinel slots re-set
         //after the clear
         if right {
             for t in open..open + w + drag {
-                self.mask.set(t, false);
+                self.mask.set(&mut self.block, t, false);
             }
             for i in 0..drag {
-                self.mask.set(open + 16 * i + 15, true);
+                self.mask.set(&mut self.block, open + 16 * i + 15, true);
             }
         } else {
             for t in open + 1 - (w + drag)..=open {
-                self.mask.set(t, false);
+                self.mask.set(&mut self.block, t, false);
             }
             for i in 0..drag {
-                self.mask.set(open - 16 * i - 15, true);
+                self.mask.set(&mut self.block, open - 16 * i - 15, true);
             }
         }
         //the previous k rides its segment by its crossing count — the
@@ -1706,11 +2395,11 @@ for the blockmap port + quick revert
     ///everything. a slack-0 stop (solid scan, budget short of any hole)
     ///falls to the nearest-hole slide, however far
     fn rebalance_region(&mut self, spot: Pos, budget: usize) -> Pos {
-        let mut cap = self.data.len();
+        let mut cap = self.cap();
         //spot's word, clamped: spot == cap scans the last word, not past it
         let mut wlo = spot.0.min(cap - 1) >> 6;
         let mut whi = wlo;
-        let mut live = self.mask.word_at(wlo << 6).count_ones() as usize;
+        let mut live = self.mask.word_at(&self.block, wlo << 6).count_ones() as usize;
         let mut span = ((whi + 1) << 6).min(cap) - (wlo << 6);
         //the scan arms, split: the MEAN arm (budget-capped — a denser
         //neighborhood implies a sparser one elsewhere, the average says
@@ -1734,11 +2423,13 @@ for the blockmap port + quick revert
             //cheapest space (nothing relocates, names mint on demand);
             //blocked at the name ceiling (§18): the nearest hole slides,
             //however far
-            if unworkable && !right && (!left || self.mask.word_at((wlo - 1) << 6).count_ones() > 0) {
+            if unworkable && !right
+                && (!left || self.mask.word_at(&self.block, (wlo - 1) << 6).count_ones() > 0)
+            {
                 let need = live * FREE_DEN / FREE_NUM + 1;
                 let grow = need - span;
-                if cap + grow > Self::max_capacity() {
-                    let hole = match self.mask.nearest_clear(spot.0) {
+                if cap + grow > self.slot_max {
+                    let hole = match self.mask.nearest_clear(&self.block, spot.0) {
                         Some(hole) => hole,
                         None => {
                             self.push_slot();
@@ -1748,7 +2439,7 @@ for the blockmap port + quick revert
                     return self.slide_open(hole, spot.0);
                 }
                 self.push_slots(grow);
-                cap = self.data.len();
+                cap = self.cap();
                 whi = (cap - 1) >> 6;
                 span = cap - (wlo << 6);
                 continue;
@@ -1758,8 +2449,8 @@ for the blockmap port + quick revert
             }
             let take_left = match (left, right) {
                 (true, true) => {
-                    let lw = self.mask.word_at((wlo - 1) << 6).count_ones();
-                    let rw = self.mask.word_at((whi + 1) << 6).count_ones();
+                    let lw = self.mask.word_at(&self.block, (wlo - 1) << 6).count_ones();
+                    let rw = self.mask.word_at(&self.block, (whi + 1) << 6).count_ones();
                     lw <= rw
                 }
                 (true, false) => true,
@@ -1767,9 +2458,9 @@ for the blockmap port + quick revert
             };
             if take_left {
                 wlo -= 1;
-                live += self.mask.word_at(wlo << 6).count_ones() as usize;
+                live += self.mask.word_at(&self.block, wlo << 6).count_ones() as usize;
             } else {
-                live += self.mask.word_at((whi + 1) << 6).count_ones() as usize;
+                live += self.mask.word_at(&self.block, (whi + 1) << 6).count_ones() as usize;
                 whi += 1;
             }
             span = ((whi + 1) << 6).min(cap) - (wlo << 6);
@@ -1782,7 +2473,7 @@ for the blockmap port + quick revert
             //slack 0 — the scan stopped solid (budget short of any
             //hole): the nearest hole slides, however far; a globally
             //solid mask mints first (len < ceiling leaves room)
-            let hole = match self.mask.nearest_clear(spot.0) {
+            let hole = match self.mask.nearest_clear(&self.block, spot.0) {
                 Some(hole) => hole,
                 None => {
                     self.push_slot();
@@ -1796,7 +2487,7 @@ for the blockmap port + quick revert
             self.deltas.record_none_slide(self.translator, Pos(base), Pos(base));
             return Pos(base);
         }
-        let region = self.mask.copy_region(base, end);
+        let region = self.mask.region_mask(&self.block, base, end);
         //k's rank among the region's live — the boundary is count-below
         //in the pre-move mask (order is preserved)
         let r = region.count_below((spot.0.min(end) - base).min(region.bits()));
@@ -1833,19 +2524,24 @@ for the blockmap port + quick revert
     }
 
     ///rotation turn (in-place): cap doubles, every live element relocates
-    ///to `a2p_new(name)` — names preserved by construction. false ⇒
-    ///refused (name-space midpoint passed, or rotation budget spent)
+    ///to `a2p_new(name)` — names preserved by construction. the doubled
+    ///range must fit the FIXED mask region (slot_max) — refusal there
+    ///escalates to open()'s ceiling valves like the other guards. false ⇒
+    ///refused (slot ceiling, name-space midpoint passed, or rotation
+    ///budget spent)
     fn grow_rotate(&mut self) -> bool {
-        let old_cap = self.data.len();
+        let old_cap = self.cap();
         let Some(new_cap) = old_cap.checked_mul(2) else {
             return false;
         };
-        //refusal guards: doubled positions would exceed the address
-        //space past the midpoint; the rotation knob would wrap; a
-        //REVERSED turn needs offset < midpoint (§30 — a cleave-shifted
-        //half can carry offset ≥ its cap, sound while Asc) — refuse and
-        //let open() route the space need to the ceiling valve
-        if old_cap > A::MIDPOINT.as_usize()
+        //refusal guards: doubled slots past the fixed mask's coverage;
+        //doubled positions would exceed the address space past the
+        //midpoint; the rotation knob would wrap; a REVERSED turn needs
+        //offset < midpoint (§30 — a cleave-shifted half can carry offset
+        //≥ its cap, sound while Asc) — refuse and let open() route the
+        //space need to the ceiling valve
+        if new_cap > self.slot_max
+            || old_cap > A::MIDPOINT.as_usize()
             || self.translator.rotation() >= A::BIT_WIDTH as u32
             || self.translator.reversed()
                 && self.translator.offset().as_usize() >= A::MIDPOINT.as_usize()
@@ -1855,25 +2551,26 @@ for the blockmap port + quick revert
         let old_tr = self.translator;
         let turn_start = Instant::now();
         let new_tr = old_tr.rotate();
-        self.data.reserve(old_cap);
-        self.data.extend((old_cap..new_cap).map(|_| MaybeUninit::uninit()));
+        self.grow_data(old_cap);
         //the map is monotone with each target ≥ its source — the
         //descending pass writes every target before its source is read.
         //any offset, either direction: the band (upper-half names land
         //odd) is rotate_mask's job
         let mut anchor_moved = false;
         for p in (0..old_cap).rev() {
-            if self.mask.get(p) {
-                let q = new_tr.a2p(self.translator.p2a(Pos(p)));
+            if self.mask.get(&self.block, p) {
+                let q = new_tr.a2p(old_tr.p2a(Pos(p)));
                 debug_assert!(q.0 >= p, "turn must not move an element down");
                 if p == self.last_insert {
                     self.last_insert = q.0;
                     anchor_moved = true;
                 }
-                self.data[q.0] = std::mem::replace(&mut self.data[p], MaybeUninit::uninit());
+                let data = self.data_mut();
+                data[q.0] = std::mem::replace(&mut data[p], MaybeUninit::uninit());
             }
         }
         self.mask.rotate_mask(
+            &mut self.block,
             self.translator.offset().as_usize(),
             A::MIDPOINT.as_usize(),
             self.translator.reversed(),
@@ -1894,20 +2591,20 @@ for the blockmap port + quick revert
         true
     }
 
-    ///extend by one uninit slot (mask clear) — the Vec's own doubling
-    ///carries reallocation. panics at the name-space ceiling.
+    ///extend by one uninit slot (mask clear) — the block grows if the
+    ///free gap can't hold it. panics past the slot ceiling
     fn push_slot(&mut self) {
-        assert!(self.data.len() < Self::max_capacity(), "name space exhausted");
-        self.data.push(MaybeUninit::uninit());
-        self.mask.resize(self.data.len());
+        assert!(self.cap() < self.slot_max, "slot ceiling exhausted");
+        self.grow_data(1);
+        self.mask.resize(self.cap());
     }
 
-    ///extend by `n` uninit slots (mask clear) in one resize — the
-    ///rebalance's tail-growth valve. caller checks the name ceiling
+    ///extend by `n` uninit slots (mask clear) in one extend — the
+    ///rebalance's tail-growth valve. caller checks the ceiling
     fn push_slots(&mut self, n: usize) {
-        assert!(self.data.len() + n <= Self::max_capacity(), "name space exhausted");
-        self.data.extend((0..n).map(|_| MaybeUninit::uninit()));
-        self.mask.resize(self.data.len());
+        assert!(self.cap() + n <= self.slot_max, "slot ceiling exhausted");
+        self.grow_data(n);
+        self.mask.resize(self.cap());
     }
 
     ///deferred — see CLAUDE.md Future Work; panics
@@ -1918,49 +2615,49 @@ for the blockmap port + quick revert
 }
 
 ///`BlockSet::iter`'s return type — direction picked at construction
-pub enum Iter<'a, K: Archive, A> {
-    Asc { bits: SetBits<'a>, set: &'a BlockSet<K, A> },
-    Desc { bits: SetBitsRev<'a>, set: &'a BlockSet<K, A> },
+pub enum Iter<'a, K: Archive<P> + RelOrd<P>, A: UnsignedNum, P: Ptr = u32> {
+    Asc { bits: SetBitsW<'a>, set: &'a BlockSet<K, A, P> },
+    Desc { bits: SetBitsRevW<'a>, set: &'a BlockSet<K, A, P> },
 }
 
-impl<'a, K: Archive, A: UnsignedNum> Iterator for Iter<'a, K, A> {
-    type Item = K::View<'a>;
+impl<'a, K: Archive<P> + RelOrd<P>, A: UnsignedNum, P: Ptr> Iterator for Iter<'a, K, A, P> {
+    type Item = &'a K::Handle;
 
     #[inline]
-    fn next(&mut self) -> Option<K::View<'a>> {
+    fn next(&mut self) -> Option<&'a K::Handle> {
         match self {
             //mask ⇔ init invariant upholds the read
-            Iter::Asc { bits, set } => bits.next().map(|p| unsafe { set.view_key(p) }),
-            Iter::Desc { bits, set } => bits.next().map(|p| unsafe { set.view_key(p) }),
+            Iter::Asc { bits, set } => bits.next().map(|p| unsafe { set.key(p) }),
+            Iter::Desc { bits, set } => bits.next().map(|p| unsafe { set.key(p) }),
         }
     }
 }
 
 ///key-ordered bidirectional walk — `seek`/`seek_after` position, `next`
 ///walks key-ascending (yield current, then step), `prev` walks back (step,
-///then yield). stepping runs on `MaskCursor` (the cached-word walk, see
-///mask.rs). holds raw slots: any mutation (slides, turns, flips)
+///then yield). stepping runs on `SlotCursor` (the cached-word walk over the
+///block-backed mask). holds raw slots: any mutation (slides, turns, flips)
 ///invalidates it — re-seek
-pub struct Cursor<'a, K: Archive, A> {
-    set:  &'a BlockSet<K, A>,
+pub struct Cursor<'a, K: Archive<P> + RelOrd<P>, A: UnsignedNum, P: Ptr = u32> {
+    set:  &'a BlockSet<K, A, P>,
     ///the slot-walk machine; dir = !reversed, baked at construction
-    walk: MaskCursor<'a>,
+    walk: SlotCursor,
 }
 
-impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
-    fn new(set: &'a BlockSet<K, A>) -> Self {
+impl<'a, K: Archive<P> + RelOrd<P>, A: UnsignedNum, P: Ptr> Cursor<'a, K, A, P> {
+    fn new(set: &'a BlockSet<K, A, P>) -> Self {
         //dir: positions ascend — unless the block is flipped
-        Cursor { set, walk: MaskCursor::start(&set.mask, !set.translator.reversed()) }
+        Cursor { set, walk: SlotCursor::start(!set.translator.reversed()) }
     }
 }
 
-impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
+impl<'a, K: Archive<P> + RelOrd<P>, A: UnsignedNum, P: Ptr> Cursor<'a, K, A, P> {
     ///reposition at the first key ≥ k
     pub fn seek(&mut self, k: &K) {
         match self.set.bsearch(k) {
-            Ok(p) => self.walk.at(p.0),
+            Ok(p) => self.walk.at(&self.set.mask, &self.set.block, p.0),
             Err(spot) => match self.set.key_bound(spot.0) {
-                Some(q) => self.walk.at(q),
+                Some(q) => self.walk.at(&self.set.mask, &self.set.block, q),
                 None => self.walk.end(),
             },
         }
@@ -1971,12 +2668,19 @@ impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
         let q = match self.set.bsearch(k) {
             //past the dup in key order — dir = Asc: forward skip
             Ok(p) => {
-                if self.walk.dir() { self.set.mask.next_set(p.0 + 1) }
-                else { self.set.mask.prev_set(p.0) }
+                if self.walk.dir() {
+                    self.set.mask.next_set(&self.set.block, p.0 + 1)
+                } else {
+                    self.set.mask.prev_set(&self.set.block, p.0)
+                }
             }
             Err(spot) => self.set.key_bound(spot.0),
         };
-        if let Some(q) = q { self.walk.at(q) } else { self.walk.end() }
+        if let Some(q) = q {
+            self.walk.at(&self.set.mask, &self.set.block, q)
+        } else {
+            self.walk.end()
+        }
     }
 
     ///yield the current element, step forward (key-ascending). None at
@@ -1986,11 +2690,10 @@ impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
     //budget) and walk loops paid a call + cursor spill per step —
     ///measured 2× @10k fwd
     #[inline(always)]
-    pub fn next(&mut self) -> Option<K::View<'a>> {
+    pub fn next(&mut self) -> Option<&'a K::Handle> {
         let p = self.walk.slot()?;
-        let set = self.set;
-        let v = unsafe { set.view_key(p) };
-        self.walk.advance(p);
+        let v = unsafe { self.set.key(p) };
+        self.walk.advance(&self.set.mask, &self.set.block, p);
         Some(v)
     }
 
@@ -1998,14 +2701,14 @@ impl<'a, K: Archive, A: UnsignedNum> Cursor<'a, K, A> {
     ///the walk's start (the state stays at the first element — next
     ///re-yields it); from the forward ghost, resumes at the last element
     #[inline(always)]
-    pub fn prev(&mut self) -> Option<K::View<'a>> {
-        let q = self.walk.retreat()?;
-        Some(unsafe { self.set.view_key(q) })
+    pub fn prev(&mut self) -> Option<&'a K::Handle> {
+        let q = self.walk.retreat(&self.set.mask, &self.set.block)?;
+        Some(unsafe { self.set.key(q) })
     }
 
     ///the element next() would yield, without moving
-    pub fn key(&self) -> Option<K::View<'a>> {
-        self.walk.slot().map(|p| unsafe { self.set.view_key(p) })
+    pub fn key(&self) -> Option<&'a K::Handle> {
+        self.walk.slot().map(|p| unsafe { self.set.key(p) })
     }
 
     ///the current element's name
@@ -3054,5 +3757,151 @@ mod tests {
         let mut c = set.seek_after(&7);
         assert_eq!(c.next(), None);
         assert_eq!(c.prev(), Some(&7));
+    }
+
+    ///NARROW POINTER: P = u16 (64 KB block ceiling) with an explicit slot
+    ///ceiling — turns double inside the fixed mask's coverage, the fixture
+    ///mirror + key order hold, and the mask region never grows past its
+    ///init words (the port's mask-fixed invariant)
+    #[test]
+    fn narrow_pointer_width_fixed_mask() {
+        let mut set = BlockSet::<u64, u16, u16>::with_capacity(64);
+        let words0 = set.block.stack_buf::<u64>(set.mask.s).len();
+        //u16-P — the u32-P check()/apply helpers don't fit; the mirror runs inline
+        let mut holder = Vec::new();
+        for i in 0..64u64 {
+            let k = i * 45 % 199; //45 invertible mod 199 — 64 distinct keys
+            let a = set.insert(k).unwrap();
+            for (from, to) in set.deltas().iter() {
+                for (a, _) in &mut *holder {
+                    if *a == from {
+                        *a = to;
+                        break;
+                    }
+                }
+            }
+            holder.push((a, k));
+        }
+        assert_eq!(holder.len(), 64);
+        let mut prev = None;
+        for k in set.iter() {
+            if let Some(p) = prev {
+                assert!(*k > p, "order broken");
+            }
+            prev = Some(*k);
+        }
+        for (a, k) in &holder {
+            assert_eq!(set.get(*a), Some(k), "holder name {a:?} -> key {k} broken");
+        }
+        assert!(set.cap() <= set.slot_max);
+        assert_eq!(set.mask.bits, set.cap(), "mask range tracks cap");
+        assert_eq!(
+            set.block.stack_buf::<u64>(set.mask.s).len(),
+            words0,
+            "the mask region never grows after init"
+        );
+    }
+
+    ///FAILED ARCHIVE: a heap key past the block's byte width leaves BOTH
+    ///fronts untouched (stack front + occupied byte sum identical, the
+    ///heap front rewound) and the holder mirror survives the Err intact
+    #[test]
+    fn failed_insert_leaves_fronts_unchanged() {
+        let mut set = BlockSet::<String, u16, u16>::with_capacity(64);
+        let mut holder: Vec<(u16, u64)> = Vec::new();
+        let key = |i: usize| format!("k{i:0>1999}"); //2000 bytes — heap keys
+        //lexicographic ascending → appends; the block grows for both fronts
+        //until the 64 KB pointer ceiling bites the heap
+        for i in 0..62usize {
+            match set.insert(key(i)) {
+                Ok(a) => {
+                    apply(&mut holder, set.deltas());
+                    holder.push((a, i as u64));
+                }
+                Err(_) => set.deltas().clear(),
+            }
+        }
+        assert!(!holder.is_empty(), "the successes must precede the ceiling");
+        //fronts before the failing insert
+        let stack0 = set.block.stack_len();
+        let used0 = stack0 + set.block.heap_len();
+        let big = key(999);
+        match set.insert(big.clone()) {
+            Ok(_) => panic!("the width ceiling should have refused key {big}"),
+            Err(k) => assert_eq!(k, big),
+        }
+        assert_eq!(set.block.stack_len(), stack0, "stack front untouched");
+        assert_eq!(
+            set.block.stack_len() + set.block.heap_len(),
+            used0,
+            "occupancy unchanged (heap front rewound)"
+        );
+        assert!(!set.deltas().is_pending(), "no event for a failed archive");
+        //every earlier key still resolves under its name
+        let heap = Heap::new(&set.block);
+        for &(a, i) in &holder {
+            let expect = key(i as usize);
+            let h = match set.get(a) {
+                Some(h) => h,
+                None => panic!("name {a} lost"),
+            };
+            assert_eq!(
+                String::rel_cmp(h, &expect, &heap),
+                Ordering::Equal,
+                "key {i} broken"
+            );
+        }
+    }
+
+    ///CLEAVE HEAP REBASE: heap keys (14 bytes — past the inline cutoff)
+    ///across a split — every right-half handle resolves through the NEW
+    ///half's Heap (the verbatim tail copy reproduces each end-relative
+    ///offset) and keeps key order; the left half resolves through its own
+    ///untouched heap, and split names survive (position ≥ split_pos ⇒ new
+    ///block id, same name)
+    #[test]
+    fn cleave_rebases_heap_handles() {
+        let mut set = BlockSet::<String, u16, u32>::with_capacity(64);
+        let mut names: Vec<(u16, String)> = Vec::new();
+        for i in 0..30u16 {
+            let k = format!("key-{i:0>10}"); //14 bytes — heap-stored
+            let a = set.insert(k.clone()).unwrap();
+            set.deltas().clear();
+            names.push((a, k));
+        }
+        //ascending stream — names == positions (offset 0, rotation 0)
+        let right = set.cleave(15);
+        let heap_l = Heap::new(&set.block);
+        let heap_r = Heap::new(&right.block);
+        assert_eq!(right.block.heap_len(), set.block.heap_len(), "verbatim heap copy");
+        for (name, k) in &names {
+            let side = if *name >= 15 { &right } else { &set };
+            let heap = if *name >= 15 { &heap_r } else { &heap_l };
+            let h = side
+                .get(*name)
+                .unwrap_or_else(|| panic!("split name {name} lost"));
+            assert_eq!(String::rel_cmp(h, k, heap), Ordering::Equal, "key {k}");
+        }
+        //each half's stored keys still ascend under ITS OWN heap
+        for w in names.windows(2) {
+            let (n0, _) = w[0];
+            let (n1, _) = w[1];
+            if (n0 >= 15) != (n1 >= 15) {
+                continue; //across the split — per-half order only
+            }
+            let (h0, h1, heap) = if n0 >= 15 {
+                (right.get(n0).unwrap(), right.get(n1).unwrap(), &heap_r)
+            } else {
+                (set.get(n0).unwrap(), set.get(n1).unwrap(), &heap_l)
+            };
+            assert_eq!(
+                String::rel_cmp_h(h0, h1, heap),
+                Ordering::Less,
+                "half order {n0} {n1}"
+            );
+        }
+        //the source (left) half dropped the moved slots — its cap/len shrank
+        assert_eq!(set.len(), 15);
+        assert_eq!(right.len(), 15);
     }
 }

@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::blockset::{BlockSet, Deltas, FREE_STRIDE};
+use crate::blockset_v1::{BlockSet, Deltas, FREE_STRIDE};
 use crate::serialize::Archive;
 use crate::translator::Translator;
 

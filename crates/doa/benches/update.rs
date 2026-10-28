@@ -14,7 +14,7 @@
 //!cell budget + partial reps (see sorted_insert.rs). size via first CLI
 //!arg, default 10k.
 
-use doa::blockset::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
+use doa::blockset_v1::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
 use doa::skipset::SkipSet;
 use std::collections::{BTreeSet, HashMap};
 use std::hint::black_box;

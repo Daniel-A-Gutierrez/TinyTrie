@@ -189,7 +189,7 @@ Deferred: the `try_alloc`/`try_insert` split + arena-level occupancy
 decisions (`insert`'s ladder owns the in-block heuristics now), offset
 turns (window moves — mask + data halves both handle any offset; the move
 op itself remains), `from_vec`, convenience getters. Benchmarks
-and phase breakdown in `notes/session_history.md`.
+and phase breakdown in `../../notes/session_history.md`.
 
 
 ## Style
@@ -198,41 +198,7 @@ and phase breakdown in `notes/session_history.md`.
   the post-slide state restores) — say what the walker names afterward. flows
   read as choreography; silent repositioning is where the bugs hide.
 
-## Workflow
-
-- sessions start from a clean tree: the previous session ends with a commit. remind the user before making code edits if the git diff is dirty. 
-- session-end routine, in order: run `skeletonize.py` (regenerates the doc/
-  outlines), spawn a **fresh** review agent (not a fork) on the session's diff —
-  it reads this file and subtle_bugs.md first so it doesn't re-flag intentional
-  choices — apply findings, append the session's entry to
-  notes/session_history.md (format contract at the file's top), update this
-  file + subtle_bugs.md (merge in place, prune stale entries), re-run
-  `skeletonize.py` if src changed, and leave the tree ready for commit — the
-  user commits.
-- review priority: correctness (bugs, invariant breaks, do-not-revive violations) >
-  cheap cleanups > doc-record > perf. unbenchmarked perf suggestions are reported,
-  never auto-applied.
-- "defer" means written into this file's Future Work or into subtle_bugs.md — never
-  "remembered".
-- do not update the claude.toml until the session is ending. 
-
-# Style
-- doc comments are the single source of truth for item outlines - keep them
-  minimal: 1-2 lines, what the item is FOR plus anything non-obvious about
-  its contract (assumptions, guarantees, panics, None/return semantics).
-  they never describe HOW the function works - mechanism lives as
-  single-line annotations at the site doing it (rationale at the branch
-  that needs it, safety notes at the loop that depends on them). variant
-  and field docs carry their own semantics. SAFETY blocks and `//!` module
-  headers are exempt - they hold the full contract.
-- single line comments may be introduced in long functions to concisely explain what a block of code does
-- a comment must never be longer than the source it applies to. 
-- function names and variables should be concise but explanatory - avoid arbitrary letters and abbreviations.
-- module item order: `use` → `mod` → structs → types → traits → impls → macro
-  invocations. a macro is defined where its output class lives — one generating
-  structs sits with the structs, one generating impls with the impls.
-- each file's `//!` header carries its purpose + invariants. this file keeps the conceptual
-  map only — item inventories live in doc/ and are generated, never hand-edited.
+(style and session workflow are workspace-level — root CLAUDE.md.)
 
 ## Files (lowest level → highest)
 
@@ -492,7 +458,7 @@ consumer:
   vs sorted-vec + BTreeSet, 32-byte items, size via CLI arg — default
   10k, u32 addrs — with a 3s wall budget per structure×workload cell and
   partial-rep reporting; findings + phase breakdown in
-  `notes/session_history.md`), `blockmap_insert.rs` (same harness/workloads,
+  `../../notes/session_history.md`), `blockmap_insert.rs` (same harness/workloads,
   BlockMap vs BTreeMap + the BlockSet same-run reference — u64 values),
   `bimap.rs` (same harness, BlockBiMap vs a two-BTreeMap bidirectional
   control — insert/lookup-both-sides/remove/iter_pairs; findings in
@@ -534,8 +500,8 @@ consumer:
   a linearly growing run (the ladder's known desert pathology, see
   Future Work's multi-word banking), NOT update's).
 
-notes: `devlog.md` (design log), `session_history.md` (per-session record),
-`subtle_bugs.md` (solved nuances + their rules).
+notes: `devlog.md` (design log), `subtle_bugs.md` (solved nuances + their rules);
+the per-session record moved up to the workspace (`../../notes/session_history.md`).
 
 archive: `src/archive/` + `examples/old_btree/` (the live tree consumer is
 `examples/btree.rs`).

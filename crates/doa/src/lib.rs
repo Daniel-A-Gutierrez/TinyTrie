@@ -13,6 +13,7 @@ pub mod arenaset;
 pub mod blockbimap;
 pub mod blockmap;
 pub mod blockset;
+pub mod blockset_v1;
 pub mod index;
 pub mod mask;
 pub mod serialize;

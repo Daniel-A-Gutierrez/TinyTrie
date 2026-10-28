@@ -39,7 +39,7 @@
 
 use std::cmp::Ordering;
 
-use crate::blockset::{BlockSet, Deltas, Iter};
+use crate::blockset_v1::{BlockSet, Deltas, Iter};
 use crate::index::UnsignedNum;
 use crate::serialize::Archive;
 

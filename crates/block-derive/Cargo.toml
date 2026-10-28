@@ -1,0 +1,20 @@
+[package]
+name = "block-derive"
+authors = ["Daniel A Gutierrez"]
+version = "0.0.1"
+edition = "2024"
+description = "Archive/RelOrd proc-macro derives for the block crate."
+license = "Apache-2.0"
+repository = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+homepage = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["derive"] }
+
+[dev-dependencies]
+block = { path = "../block" }

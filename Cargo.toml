@@ -4,6 +4,8 @@ members = [
     "crates/btrees",
     "crates/poly-trie",
     "crates/benches", "crates/arrays", "crates/doa", "crates/block_splitting",
+    "crates/block",
+    "crates/block-derive",
 ]
 resolver = "2"
 
@@ -12,4 +14,3 @@ resolver = "2"
 tiny-trie = { path = "crates/tiny-trie" }
 btrees = { path = "crates/btrees" }
 poly-trie = { path = "crates/poly-trie" }
-bencher = { path = "crates/benches" }

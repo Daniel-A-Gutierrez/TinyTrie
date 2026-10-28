@@ -8,7 +8,9 @@
 //!100). each structure × workload cell capped at RUN_BUDGET (partial reps
 //!reported over the completed prefix).
 
+use block::{RelOrd, StrHandle};
 use doa::blockset::BlockSet;
+use std::cmp::Ordering;
 use sorted_vec::SortedSet;
 use std::collections::BTreeSet;
 use std::hint::black_box;
@@ -19,6 +21,41 @@ const CHUNK_LEN: usize = 100;
 const RUNS: usize = 10;
 ///wall clock per structure × workload cell
 const RUN_BUDGET: Duration = Duration::from_secs(3);
+
+///v2 handles carry no view — order via RelOrd over the block's heap seam
+///(zero-copy, the same cost shape the v1 &str view had)
+fn check_order_set(set: &BlockSet<String, u32>) {
+    let heap = set.heap();
+    let mut prev: Option<&StrHandle<u32>> = None;
+    for h in set.iter() {
+        if let Some(p) = prev {
+            assert_eq!(
+                String::rel_cmp_h(p, h, &heap),
+                Ordering::Less,
+                "order broken"
+            );
+        }
+        prev = Some(h);
+    }
+}
+
+///the v1 checksum (len ^ seed + first byte) over stored keys: heap-backed
+///keys pay the heap chase, inline keys read the prefix word — no alloc
+fn checksum_set(set: &BlockSet<String, u32>, seed: u64) -> u64 {
+    let heap = set.heap();
+    let mut c = 0u64;
+    for h in set.iter() {
+        let (len, first) = if h.h.0 == 0 {
+            let be = h.pfx.to_be_bytes();
+            (h.h.1 as usize, be.first().copied().unwrap_or(0))
+        } else {
+            let b = heap.bytes(h.h);
+            (b.len(), b.first().copied().unwrap_or(0))
+        };
+        c = c.wrapping_add(len as u64 ^ seed).wrapping_add(first as u64);
+    }
+    c
+}
 
 ///best/avg ns per op over the reps that fit the cell budget
 struct Cell {
@@ -128,7 +165,7 @@ fn insert_block(keys: &[String]) -> Cell {
         }
         let ns = t.elapsed().as_nanos() as f64 / done as f64;
         assert_eq!(set.len(), done);
-        check_order(set.iter());
+        check_order_set(&set);
         black_box(&set);
         (done, partial, ns)
     })
@@ -242,8 +279,8 @@ fn scan_block(keys: &[String]) -> Cell {
         set.deltas().clear();
     }
     assert_eq!(set.len(), keys.len());
-    check_order(set.iter());
-    timed_scan(keys.len(), |seed| checksum(set.iter(), seed))
+    check_order_set(&set);
+    timed_scan(keys.len(), |seed| checksum_set(&set, seed))
 }
 
 fn scan_sortedvec(keys: &[String]) -> Cell {

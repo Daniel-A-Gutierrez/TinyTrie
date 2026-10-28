@@ -1,0 +1,16 @@
+[package]
+name = "block"
+authors = ["Daniel A Gutierrez"]
+version = "0.0.1"
+edition = "2024"
+description = "Fixed-storage dual-front allocator."
+license = "Apache-2.0"
+repository = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+homepage = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
+
+[[bench]]
+name = "stacks"
+harness = false
+
+[dependencies]
+kanal = "0.1.1"

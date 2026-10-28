@@ -10,7 +10,7 @@
 //!turn/slide census twice — plain base, then the maintained skipset
 //!path (the deltas-consumer view).
 
-use doa::blockset::BlockSet;
+use doa::blockset_v1::BlockSet;
 use doa::skipset::SkipSet;
 use std::collections::BTreeSet;
 use std::hint::black_box;
@@ -427,7 +427,7 @@ fn timed_scan(count: usize, mut pass: impl FnMut(u64) -> u64) -> Cell {
 ///streams. decomposes the plain BlockSet insert: turns vs slides vs the
 ///rest (bsearch, banking, ladder)
 fn turn_census(name: &str, keys: &[u64]) {
-    use doa::blockset::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
+    use doa::blockset_v1::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
     use std::sync::atomic::Ordering;
     TURN_COUNT.store(0, Ordering::Relaxed);
     TURN_MOVED.store(0, Ordering::Relaxed);
@@ -483,7 +483,7 @@ fn census_print(
     gather_inserts: u64,
     gather_moved: u64,
 ) {
-    use doa::blockset::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
+    use doa::blockset_v1::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
     use std::sync::atomic::Ordering;
     let turns = TURN_COUNT.load(Ordering::Relaxed);
     let turn_moved = TURN_MOVED.load(Ordering::Relaxed);
@@ -525,7 +525,7 @@ fn census_print(
 ///inserts (upkeep included), so the deltas stats are exactly what the
 ///tier upkeep had to absorb
 fn skip_census(name: &str, keys: &[u64]) {
-    use doa::blockset::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
+    use doa::blockset_v1::{TURN_COUNT, TURN_MOVED, TURN_TIME_NS};
     use std::sync::atomic::Ordering;
     let half = keys.len() / 2;
     let mut set = SkipSet::<u64, u32>::new();

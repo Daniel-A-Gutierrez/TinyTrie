@@ -404,3 +404,21 @@ fn main() {
         );
     }
 }
+///v2 storage seam (block::Archive) — the v1 impl above stays for the
+///legacy tiers; same handle = the value (inline 32-byte POD)
+impl<P: block::Ptr> block::Archive<P> for Item {
+    type Handle = Item;
+    const HEAP: bool = false;
+    fn archive(k: &Self, _al: &mut block::Allocator<P>) -> Result<Self::Handle, block::CapErr> {
+        Ok(*k)
+    }
+    fn release(_h: &Self::Handle, _al: &mut block::Allocator<P>) {}
+}
+impl<P: block::Ptr> block::RelOrd<P> for Item {
+    fn rel_cmp(h: &Self::Handle, k: &Self, _heap: &block::Heap<P>) -> Ordering {
+        h.key.cmp(&k.key)
+    }
+    fn rel_cmp_h(a: &Self::Handle, b: &Self::Handle, _heap: &block::Heap<P>) -> Ordering {
+        a.key.cmp(&b.key)
+    }
+}
