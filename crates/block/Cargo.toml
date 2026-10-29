@@ -12,5 +12,5 @@ homepage = "https://github.com/Daniel-A-Gutierrez/TinyTrie"
 name = "stacks"
 harness = false
 
-[dependencies]
+[dev-dependencies]
 kanal = "0.1.1"

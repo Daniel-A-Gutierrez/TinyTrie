@@ -1,110 +1,21 @@
 //!`Archive`/`RelOrd` derives for the block crate's archive traits. a derived
-//!named-field struct `X` gets `XHandle<P>` (declaration order = comparison
-//!order), a field-zipping `Archive<P>` impl (entry snapshot, rewind on Err)
-//!and, under `derive(RelOrd)`, a short-circuiting `RelOrd<P>` impl.
+//!named-field struct `X` gets `XHandle` (declaration order = comparison
+//!order), a field-zipping `Archive` impl (unwind-based atomicity: a failure
+//!at field k releases fields k−1..0 and rolls the front back) and, under
+//!`derive(RelOrd)`, a short-circuiting `RelOrd` impl.
 //!v0: non-generic named-field structs whose field types implement the traits.
-//!HANDLE RECORD LAW: handles are POD with EXPLICIT padding only — the derive
-//!inserts `_pad_k: [u8; N]` wherever a P-INDEPENDENT gap exists and, for
-//!fully-classified structs, pins layout with a monomorphized `const {}`
-//!canary (boundary alignment + exact size); a violated canary is a COMPILE
-//!error at the offending P width — a shape that cannot express zero padding
-//!must not be used at that width. projection const-eval is dead on this
-//!toolchain (unconstrained generic constants even under generic_const_exprs),
-//!so known layouts are a closed table and unknown layouts disable the check.
+//!HANDLE RECORD LAW: handles are POD with EXPLICIT padding only — the layout
+//!is fully concrete (no pointer-width generics), so the derive computes each
+//!pad as a CONST EXPRESSION over the real `size_of`/`align_of` of the
+//!projected handles and pins the result with a const canary: any implicit
+//!padding the compiler would insert is a COMPILE error, not a dirty record.
+//!the same proof backs the emitted `ZeroPad`/`ReprC` impls `Block::push`
+//!gates on — every byte of the handle is a field or a computed pad.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as T2;
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Ident, Type, Visibility, parse_macro_input};
-
-///handle layout class of a field type. known layouts are the closed table:
-///inline primitives (Handle = Self) + StrHandle (align 8, size 16/24) + VecH
-///(align P::BYTES, size 8/8/16/24); anything else is unknown.
-enum Klass {
-    ///inline primitive: Handle = Self
-    Prim(u64, u64),
-    StrH,
-    VecH,
-    Unk,
-}
-
-fn classify(ty: &Type) -> Klass {
-    let Type::Path(tp) = ty else { return Klass::Unk };
-    let Some(seg) = tp.path.segments.last() else { return Klass::Unk };
-    match seg.ident.to_string().as_str() {
-        "u8" | "i8" => Klass::Prim(1, 1),
-        "u16" | "i16" => Klass::Prim(2, 2),
-        "u32" | "i32" | "char" => Klass::Prim(4, 4),
-        "u64" | "i64" | "usize" | "isize" => Klass::Prim(8, 8),
-        "u128" | "i128" => Klass::Prim(16, 16),
-        "String" => Klass::StrH,
-        //genuine Vec<..> — a path-scoped Vec<T> without angle args is not ours
-        "Vec" if matches!(seg.arguments, syn::PathArguments::AngleBracketed(_)) => Klass::VecH,
-        _ => Klass::Unk,
-    }
-}
-
-///static-offset tracker for pad planning: Exact = numeric offset known;
-///Mult8 = offset is an unknown multiple of 8 (StrH/VecH tails align every
-///≤8 boundary for free); Dead = no more static reasoning.
-enum Off {
-    Exact(u64),
-    Mult8,
-    Dead,
-}
-
-///per-field pads (before field k) + optional trailing pad, when every field
-///layout is table-known; None when unknown fields disable planning.
-fn plan(klasses: &[Klass]) -> Option<(Vec<Option<usize>>, Option<usize>)> {
-    let mut pads: Vec<Option<usize>> = vec![None; klasses.len()];
-    let mut amax = 1u64;
-    let mut st = Off::Exact(0);
-    for (i, k) in klasses.iter().enumerate() {
-        match (k, &st) {
-            (Klass::Unk, _) => return None,
-            (Klass::Prim(sz, al), Off::Exact(o)) => {
-                let gap = (al - o % al) % al;
-                if gap > 0 {
-                    pads[i] = Some(gap as usize);
-                }
-                amax = amax.max(*al);
-                st = Off::Exact(o + gap + sz);
-            }
-            (Klass::Prim(sz, al), Off::Mult8) => {
-                if *al > 8 {
-                    //u128's gap depends on the unknown multiple — stops static
-                    //reasoning; the canary still verifies per width
-                    st = Off::Dead;
-                } else {
-                    //8-mult offsets are aligned for every align ≤ 8
-                    st = if *sz % 8 == 0 { Off::Mult8 } else { Off::Dead };
-                }
-            }
-            (Klass::Prim(_, _), Off::Dead) => {}
-            (Klass::StrH, Off::Exact(o)) => {
-                let gap = (8 - o % 8) % 8;
-                if gap > 0 {
-                    pads[i] = Some(gap as usize);
-                }
-                st = Off::Mult8;
-            }
-            (Klass::StrH, _) => {}
-            (Klass::VecH, Off::Exact(o)) if o % 8 == 0 => st = Off::Mult8,
-            (Klass::VecH, Off::Exact(_)) => st = Off::Dead, //align = P::BYTES
-            (Klass::VecH, _) => {}
-        }
-    }
-    //trailing pad only when the struct alignment is fully static ≥ 8 (the
-    //zero-sized marker contributes align P::BYTES ≤ 8 at every width)
-    let tail = match st {
-        Off::Exact(o) if amax >= 8 => {
-            let n = (amax - o % amax) % amax;
-            (n > 0).then_some(n as usize)
-        }
-        _ => None,
-    };
-    Some((pads, tail))
-}
 
 struct Spec {
     vis: Visibility,
@@ -151,11 +62,11 @@ fn spec(input: DeriveInput) -> Result<Spec, syn::Error> {
     })
 }
 
-///shared impl header: `P: Ptr` + per-field trait bounds.
+///shared impl header: per-field trait bounds.
 fn impl_header(name: &Ident, types: &[Type], tr: &str) -> T2 {
     let path: syn::Path = syn::parse_str(&format!("::block::{tr}")).unwrap();
-    let bounds = types.iter().map(|t| quote!(#t: #path<P>));
-    quote!(impl<P: ::block::Ptr> #path<P> for #name where #(#bounds,)*)
+    let bounds = types.iter().map(|t| quote!(#t: #path));
+    quote!(impl #path for #name where #(#bounds,)*)
 }
 
 fn archive_expansion(input: DeriveInput) -> T2 {
@@ -167,97 +78,102 @@ fn archive_expansion(input: DeriveInput) -> T2 {
 
     let header = impl_header(&name, &types, "Archive");
     //HEAP = any field heaps: `f0::HEAP || f1::HEAP || false` (empty → false)
-    let heap = types.iter().map(|t| quote!(<#t as ::block::Archive<P>>::HEAP ||));
+    let heap = types.iter().map(|t| quote!(<#t as ::block::Archive>::HEAP ||));
 
-    //layout plan: explicit pads + the canary's walk
-    let klasses: Vec<Klass> = types.iter().map(classify).collect();
-    let (pads, tail) = match plan(&klasses) {
-        Some(p) => p,
-        //unknown layouts: no reasoning possible — zero pads, zero checks
-        None => (vec![None; fields.len()], None),
-    };
-    let classified = plan(&klasses).is_some();
+    //const-expressions layout: the running byte offset and each pad are
+    //computed from the REAL size_of/align_of of the projected handles — no
+    //macro-side layout table, works for any (nested, derived, manual) handle
+    let mut off = quote!(0usize);
+    let mut amax = quote!(1usize);
+    let mut pad_exprs: Vec<T2> = Vec::new();
+    for t in &types {
+        let h = quote!(<#t as ::block::Archive>::Handle);
+        let align = quote!(::core::mem::align_of::<#h>());
+        let pad = quote!((#align - #off % #align) % #align);
+        pad_exprs.push(pad.clone());
+        //const-callable max (Ord::max is not const on this toolchain)
+        amax = quote!(if #amax > #align { #amax } else { #align });
+        off = quote!(#off + #pad + ::core::mem::size_of::<#h>());
+    }
+    //tail pad to the struct alignment
+    let tail_pad = quote!((#amax - #off % #amax) % #amax);
+    let total = quote!(#off + #tail_pad);
 
-    //declaration order; every Err rewinds to the entry snapshot (atomic)
-    let archive_fields = fields.iter().zip(&types).map(|(f, t)| {
-        let v = format_ident!("h_{}", f);
+    //const canary: the compiler's layout must equal the computed one — any
+    //implicit padding is a COMPILE error here, which is also the proof
+    //behind the ZeroPad/ReprC claims below (the align max rides in through
+    //the tail pad, so the size check alone proves the layout)
+    let canary = {
+        let msg = format!("{}: implicit padding in the handle layout", handle);
         quote! {
-            let #v = match <#t as ::block::Archive<P>>::archive(&k.#f, al) {
-                Ok(v) => v,
-                Err(e) => { al.rewind(snap); return Err(e); }
-            };
+            const _: () = assert!(
+                ::core::mem::size_of::<#handle>() == #total,
+                #msg
+            );
         }
-    }).collect::<Vec<_>>();
-    let snapshot = (!fields.is_empty()).then(|| quote!(let snap = al.snapshot();));
-    //field init + the explicit pads before/after them, zero-written
+    };
+
+    //declaration order; each field archives into a local, and a failure at
+    //field k unwinds everything before it: releases of fields k−1..0 in
+    //reverse (children first), then the front rolls back to the entry
+    //position — unwind-based atomicity, no snapshot
+    let heap0 = (!fields.is_empty()).then(|| quote!(let heap0 = al.heap_len();));
+    let mut archive_fields: Vec<T2> = Vec::new();
+    for (k, (f, t)) in fields.iter().zip(&types).enumerate() {
+        let v = format_ident!("h_{}", f);
+        let undo: Vec<T2> = fields[..k]
+            .iter()
+            .zip(&types[..k])
+            .rev()
+            .map(|(u, ut)| {
+                let h = format_ident!("h_{}", u);
+                quote!(<#ut as ::block::Archive>::release(&#h, al);)
+            })
+            .collect();
+        archive_fields.push(quote! {
+            let #v = match <#t as ::block::Archive>::archive(&k.#f, al) {
+                Ok(v) => v,
+                Err(e) => {
+                    #(#undo)*
+                    al.rollback(heap0);
+                    return Err(e);
+                }
+            };
+        });
+    }
+    //field init + the computed pads before them, zero-written
     let mut inits: Vec<T2> = Vec::new();
     for (i, (f, _)) in fields.iter().zip(&types).enumerate() {
         let v = format_ident!("h_{}", f);
-        if let Some(n) = pads[i] {
-            let pad = format_ident!("_pad_{}", i);
-            inits.push(quote!(#pad: [0u8; #n]));
-        }
+        let pad = format_ident!("_pad_{}", i);
+        let n = &pad_exprs[i];
+        inits.push(quote!(#pad: [0u8; #n]));
         inits.push(quote!(#f: #v));
     }
-    if let Some(n) = tail {
-        inits.push(quote!(_tail: [0u8; #n]));
-    }
+    inits.push(quote!(_tail: [0u8; #tail_pad]));
 
-    //monomorphized layout canary: walks the handle with REAL projected
-    //handle sizes/aligns (inline consts evaluate per P) and fails the
-    //compilation of any width whose layout leaves implicit padding
-    let canary = classified.then(|| {
-        let mut walk: Vec<T2> = Vec::new();
-        let mut prev = format_ident!("off_start");
-        let mut next = 0u32;
-        walk.push(quote!(let #prev = 0usize;));
-        for (i, (f, t)) in fields.iter().zip(&types).enumerate() {
-            let off = format_ident!("off_{}", next);
-            next += 1;
-            let mut rhs = quote!(#prev);
-            if let Some(n) = pads[i] {
-                rhs = quote!(#rhs + #n);
-            }
-            let msg = format!("{}: implicit padding before field '{}'", handle, f);
-            walk.push(quote!(let #off = #rhs;));
-            walk.push(quote!(assert!(
-                #off % ::core::mem::align_of::<<#t as ::block::Archive<P>>::Handle>() == 0,
-                #msg
-            );));
-            prev = format_ident!("off_{}", next);
-            walk.push(quote!(let #prev = #off
-                + ::core::mem::size_of::<<#t as ::block::Archive<P>>::Handle>();));
-        }
-        let mut end = quote!(#prev);
-        if let Some(n) = tail {
-            end = quote!(#end + #n);
-        }
-        let msg = format!("{}: implicit trailing padding", handle);
-        quote! {
-            const {
-                #(#walk)*
-                assert!(#end == ::core::mem::size_of::<#handle<P>>(), #msg);
-            }
-        }
-    });
+    //the canary proves every byte is a field or a computed pad — the marker
+    //claims are exactly what it proves
+    let markers = quote! {
+        // SAFETY: the canary above proves the layout holds no implicit padding.
+        unsafe impl ::block::ZeroPad for #handle {}
+        // SAFETY: declared #[repr(C)] below.
+        unsafe impl ::block::ReprC for #handle {}
+    };
 
-    //declaration-order handle fields + explicit pads + the zero-sized marker
-    //(`PhantomData<[P; 0]>` names P at zero size/width-free cost at the tail)
+    //declaration-order handle fields + computed pads
     let mut handle_fields: Vec<T2> = Vec::new();
     for (i, (f, t)) in fields.iter().zip(&types).enumerate() {
-        if let Some(n) = pads[i] {
-            let pad = format_ident!("_pad_{}", i);
-            handle_fields.push(quote!(#pad: [u8; #n],));
-        }
-        handle_fields.push(quote!(pub #f: <#t as ::block::Archive<P>>::Handle,));
+        let pad = format_ident!("_pad_{}", i);
+        let n = &pad_exprs[i];
+        handle_fields.push(quote!(#pad: [u8; #n],));
+        handle_fields.push(quote!(pub #f: <#t as ::block::Archive>::Handle,));
     }
-    if let Some(n) = tail {
-        handle_fields.push(quote!(_tail: [u8; #n],));
-    }
+    handle_fields.push(quote!(_tail: [u8; #tail_pad],));
 
     //children first: release in reverse declaration order
     let release_fields = fields.iter().zip(&types).rev().map(|(f, t)| {
-        quote!(<#t as ::block::Archive<P>>::release(&h.#f, al);)
+        quote!(<#t as ::block::Archive>::release(&h.#f, al);)
     });
     //hand-written: derive(Debug) emits projection bounds rustc cannot solve
     //(`H: Debug` where H is a generic impl's assoc type)
@@ -265,20 +181,16 @@ fn archive_expansion(input: DeriveInput) -> T2 {
         quote!(.field(stringify!(#f), &self.#f))
     });
 
-    let marker_init = quote!(_p: ::core::marker::PhantomData);
     quote! {
         #[automatically_derived]
         #[derive(Clone, Copy, PartialEq, Eq)]
         #[repr(C)]
-        #vis struct #handle<P>
-        where P: ::block::Ptr, #(#types: ::block::Archive<P>,)*
-        {
+        #vis struct #handle {
             #(#handle_fields)*
-            _p: ::core::marker::PhantomData<[P; 0]>,
         }
 
         #[automatically_derived]
-        impl<P: ::block::Ptr> ::core::fmt::Debug for #handle<P> {
+        impl ::core::fmt::Debug for #handle {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 f.debug_struct(stringify!(#handle))
                     #(#dbg_fields)*
@@ -286,20 +198,22 @@ fn archive_expansion(input: DeriveInput) -> T2 {
             }
         }
 
+        #markers
+
         #[automatically_derived]
         #header {
-            type Handle = #handle<P>;
+            type Handle = #handle;
             const HEAP: bool = #(#heap)* false;
 
-            fn archive(k: &Self, al: &mut ::block::Allocator<'_, P>)
+            fn archive(k: &Self, al: &mut ::block::Allocator<'_>)
                 -> Result<Self::Handle, ::block::CapErr> {
                 #canary
-                #snapshot
+                #heap0
                 #(#archive_fields)*
-                Ok(#handle { #(#inits,)* #marker_init })
+                Ok(#handle { #(#inits,)* })
             }
 
-            fn release(h: &Self::Handle, al: &mut ::block::Allocator<'_, P>) {
+            fn release(h: &Self::Handle, al: &mut ::block::Allocator<'_>) {
                 #(#release_fields)*
             }
         }
@@ -313,7 +227,7 @@ fn cmp_body(fields: &[Ident], types: &[Type], meth: &str) -> T2 {
     let steps = fields.iter().zip(types).map(|(f, t)| {
         let m = format_ident!("{}", meth);
         quote! {
-            let ord = <#t as ::block::RelOrd<P>>::#m(&a.#f, &b.#f, heap);
+            let ord = <#t as ::block::RelOrd>::#m(&a.#f, &b.#f, heap);
             if ord != #ord::Equal { return ord; }
         }
     });
@@ -324,7 +238,7 @@ fn rel_cmp_body(fields: &[Ident], types: &[Type]) -> T2 {
     let ord: syn::Path = syn::parse_quote!(::core::cmp::Ordering);
     let steps = fields.iter().zip(types).map(|(f, t)| {
         quote! {
-            let ord = <#t as ::block::RelOrd<P>>::rel_cmp(&h.#f, &k.#f, heap);
+            let ord = <#t as ::block::RelOrd>::rel_cmp(&h.#f, &k.#f, heap);
             if ord != #ord::Equal { return ord; }
         }
     });
@@ -343,12 +257,12 @@ fn rel_ord_expansion(input: DeriveInput) -> T2 {
     quote! {
         #[automatically_derived]
         #header {
-            fn rel_cmp(h: &Self::Handle, k: &Self, heap: &::block::Heap<P>)
+            fn rel_cmp(h: &Self::Handle, k: &Self, heap: &::block::Heap<'_>)
                 -> ::core::cmp::Ordering {
                 #cmp
             }
 
-            fn rel_cmp_h(a: &Self::Handle, b: &Self::Handle, heap: &::block::Heap<P>)
+            fn rel_cmp_h(a: &Self::Handle, b: &Self::Handle, heap: &::block::Heap<'_>)
                 -> ::core::cmp::Ordering {
                 #cmp_h
             }

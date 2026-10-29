@@ -5,10 +5,10 @@
 //!append). every rep builds a fresh file in temp_dir; cells are capped at
 //!RUN_BUDGET with partial reps over the completed prefix (doa bench style).
 //!decomposition the harness leans on:
-//!- `Stacks::push` has no fire-and-forget form (send_req always awaits a
-//!  oneshot), so the channel round-trip floor is measured separately as an
-//!  mpsc echo with the same per-request shape (fresh channel pair + keyed
-//!  message per op) — `stacks − echo` ≈ owner-side work, `echo` = RTT floor.
+//!- Stacks is per-block-RwLock since the 2026-10-27 rewrite (the owner thread
+//!  is gone); the echo cells pin the OLD channel transport's RTT floor (std
+//!  mpsc vs kanal, the same per-op shape the actor paid) — the lock-based
+//!  push should sit near `stack-direct`, where the actor sat at echo+work.
 //!- `archive-only` preallocates one big Block outside the timing (no spill
 //!  churn) to isolate `String::archive`; `stack-direct` uses real 4080-byte
 //!  records and spills to a fresh Stack when full, mirroring Stacks' append.
@@ -17,11 +17,11 @@
 //!  fresh record (with an immediate 4096-byte birth write) every 72 items —
 //!  that file churn is honest cost.
 
-use block::{Archive, Heap, Ptr, Stacks, Stack};
+use block::{Archive, Heap, Stack, Stacks};
 use std::hint::black_box;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 const RUNS: usize = 5;
@@ -61,9 +61,9 @@ fn temp_path(name: &str) -> PathBuf {
 
 ///best/med/avg ns per op over the reps that fit the cell budget
 struct Cell {
-    best: f64,
-    med: f64,
-    avg: f64,
+    best:    f64,
+    med:     f64,
+    avg:     f64,
     partial: Option<usize>,
 }
 
@@ -75,7 +75,9 @@ impl Cell {
         };
         format!(
             "{name:<32} {best:>w$.1} {med:>w$.1} {avg:>w$.1}{partial}",
-            best = self.best, med = self.med, avg = self.avg
+            best = self.best,
+            med = self.med,
+            avg = self.avg
         )
     }
 }
@@ -119,11 +121,11 @@ fn timed_cell(name: &str, w: usize, rep: impl FnMut(&Instant) -> (usize, bool, f
 }
 
 ///checksum of every stack item (inline keys ride the prefix, heap keys chase)
-fn scan_items(s: &Stack<String, u32>, hp: &Heap<u32>) -> usize {
+fn scan_items(s: &Stack<String>, hp: &Heap<'_>) -> usize {
     let mut c = 0usize;
     for (_, sh) in s.items() {
-        c = c.wrapping_add(if sh.h.0.as_usize() == 0 {
-            sh.h.1.as_usize() ^ sh.pfx as usize
+        c = c.wrapping_add(if sh.h.off() == 0 {
+            sh.h.len() as usize ^ sh.pfx as usize
         } else {
             let b = hp.bytes(sh.h);
             b.len() ^ b.first().map_or(0, |&x| x as usize)
@@ -134,21 +136,31 @@ fn scan_items(s: &Stack<String, u32>, hp: &Heap<u32>) -> usize {
 
 fn main() {
     let w = 10;
-    println!("block::Stacks overhead bench — ns/item or ns/access, columns best/med/avg, cell budget {RUN_BUDGET:?}");
+    println!(
+        "block::Stacks overhead bench — ns/item or ns/access, columns best/med/avg, cell budget {RUN_BUDGET:?}"
+    );
     println!();
 
     // 1. push (ns/item)
-    println!("== push (ns/item): Stacks::push vs Stack::push_borrowed vs String::archive vs channel RTT ==");
+    println!(
+        "== push (ns/item): Stacks::push vs Stack::push_borrowed vs String::archive vs channel RTT (the old transport) =="
+    );
     for (shape, klen) in [("short8", 8usize), ("long32", 32usize)] {
         let path = temp_path(&format!("push-{shape}"));
         timed_cell(&format!("push/{shape}/archive-only"), w, |deadline| {
-            let cap = (PUSHS * 32).next_multiple_of(16);
-            let mut b = block::Block::<u32>::new(cap);
+            //u16-pointer world: caps ≤ 65520, so the stream chains blocks
+            let mut b = block::Block::new(65280);
             let ks = Lcg(0xDEAD_BEEF_CAFE_F00D).keys(klen, PUSHS);
             let t = Instant::now();
             let mut done = 0;
             for k in &ks {
-                let h = { let mut al = b.allocator(); String::archive(k, &mut al).unwrap() };
+                if b.free_bytes() < 64 {
+                    b = block::Block::new(65280);
+                }
+                let h = {
+                    let mut al = b.allocator();
+                    String::archive(k, &mut al).unwrap()
+                };
                 black_box(&h);
                 done += 1;
                 if past(deadline, done, 256) {
@@ -269,7 +281,9 @@ fn main() {
     // 2. read vs lease (per-access ns): block 0 preloaded with {FILL_ITEMS}
     // long32 items (~4KB of stack+heap content), no eviction under the
     // default budget
-    println!("== read pattern (per-access ns) — block 0 = {FILL_ITEMS} long32 items; scan = all-items checksum ==");
+    println!(
+        "== read pattern (per-access ns) — block 0 = {FILL_ITEMS} long32 items; scan = all-items checksum =="
+    );
     let path = temp_path("read");
     {
         let s = Stacks::<String>::create(&path).unwrap();
@@ -375,7 +389,9 @@ fn main() {
 
     // 3. eviction (per-access ns): light read (top item's prefix) alternating
     // b0/b1 — budget 1 evicts + reloads every access
-    println!("== eviction (per-access ns) — 2 blocks (300 inline keys), light read, alternate b0/b1 ==");
+    println!(
+        "== eviction (per-access ns) — 2 blocks (300 inline keys), light read, alternate b0/b1 =="
+    );
     let ks = Lcg(0x9E37_79B9_7F4A_7C15).keys(8, 300);
     let cells = [
         ("evict/budget1/alternating", 1usize, 0),
@@ -428,15 +444,17 @@ fn main() {
         let clean = t2.elapsed();
         println!(
             "rep {i}: push {pushes:.1} ns/op | flush {} µs ({} ns/push amortized) | clean flush {} µs",
-            flush.as_micros(), flush.as_nanos() as f64 / FLUSH_N as f64, clean.as_micros()
+            flush.as_micros(),
+            flush.as_nanos() as f64 / FLUSH_N as f64,
+            clean.as_micros()
         );
     }
     println!();
 
-    // 5. concurrency: T cloned handles pushing through one owner; aggregate
-    // ns/item = the slowest thread's wall / total items (all run concurrently)
-    println!("== concurrency (ns/item through one owner) — {THREAD_ITEMS} long32 items per thread ==");
-    for threads in [1usize, 2, 4] {
+    // 5. concurrency: T cloned handles pushing through the shared state;
+    // aggregate ns/item = the slowest thread's wall / total items
+    println!("== concurrency (ns/item, aggregate) — {THREAD_ITEMS} long32 items per thread ==");
+    for threads in [1usize, 2, 4, 8] {
         let path = temp_path(&format!("conc-{threads}"));
         timed_cell(&format!("conc/threads{threads}"), w, |deadline| {
             let s = Stacks::<String>::create(&path).unwrap();
@@ -465,7 +483,11 @@ fn main() {
             assert_eq!(s.len().unwrap(), threads * THREAD_ITEMS);
             black_box(max_wall);
             if Instant::now() > *deadline {
-                return (threads * THREAD_ITEMS, true, max_wall as f64 / (threads * THREAD_ITEMS) as f64);
+                return (
+                    threads * THREAD_ITEMS,
+                    true,
+                    max_wall as f64 / (threads * THREAD_ITEMS) as f64,
+                );
             }
             (threads * THREAD_ITEMS, false, max_wall as f64 / (threads * THREAD_ITEMS) as f64)
         });

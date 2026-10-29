@@ -1,45 +1,40 @@
-//!append-ordered storage over `Block<P>`: push archives `T` through the
-//!Allocator and stores the unit (heap_len snapshot, Handle) on the stack
-//!front; pop shrinks to the unit's start and `pop_heap`s to its snapshot —
-//!both wipes now, so a LIFO pop ERASES the item's stack bytes and heap
+//!append-ordered storage over `Block`: push archives `T` through the
+//!Allocator and stores the unit — (heap_len snapshot u32, Handle) — on the
+//!stack front; pop shrinks to the unit's start and `pop_heap`s to its
+//!snapshot — both wipes, so a LIFO pop ERASES the item's stack bytes and heap
 //!regions completely (no freelist machinery; `T::release` stays available
 //!for non-LIFO consumers, Stack never calls it). unordered storage —
 //!ordering/search stays the consumer's job (`RelOrd`/`Heap` are reads, not
 //!duties). v0 is ONE block, no growth: full ⇒ `CapErr` (multi-block files
-//!are Stacks, task 6).
-//!serialized record = [Header 16B | cap data]; `Stack::new` picks
-//!cap = RECORD − 16 so the record is exactly 4096 bytes. the dead gap writes
-//!as zeros and the zero-record invariant covers everything else — a record
-//!is live data or zero, byte-for-byte round-tripped (no field decode). the
-//!snapshot rides the record, so `from_record` needs no extra state.
+//!are Stacks).
+//!unit layout = [snap u32][align gap (block-zeroed)][handle], pushed as two
+//!items — `Block::push` zeroes the gap and the ZeroPad handles carry no
+//!undefined bytes, so no unit-level pad wipe exists. the gap widths are
+//!per-T constants, so a unit's stride is too: `layout()` derives
+//!(unit0, stride) and every walk is arithmetic.
+//!serialized record = [Header 16B | stack | zero gap | heap incl. freelist
+//!head]; `Stack::new` picks cap = RECORD − 16 so the record is exactly 4096
+//!bytes. the dead gap writes as zeros and the zero-record invariant covers
+//!everything else — a record is live data or zero, byte-for-byte round-tripped
+//!(no field decode). the snapshot rides the record, so `from_record` needs
+//!no extra state.
 
 use std::fmt;
 use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::mem::{align_of, size_of};
 use std::path::Path;
-use std::slice;
 
 use crate::archive::{Archive, Heap};
-use crate::block::{Block, CapErr};
-use crate::handle::{H, Ptr, S};
+use crate::block::{Block, CapErr, NODE};
+use crate::handle::S;
 
 ///default record size — devlog §5b's 4096-byte block. cap = RECORD − 16.
 pub const RECORD: usize = 4096;
 
-///stack unit: the heap_len taken BEFORE the item's archive, plus the handle.
-///the snapshot is u32 (P-independent — cap never exceeds u32). repr(C) keeps
-///`h` at a fixed offset `max(4, align_of::<H>())`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-struct Unit<H> {
-    snap: u32,
-    h: H,
-}
-
-pub struct Stack<T, P = u32> {
-    block: Block<P>,
-    _t: PhantomData<T>,
+pub struct Stack<T> {
+    block: Block,
+    _t:    PhantomData<T>,
 }
 
 ///record validation failure; `Io` comes only from file loads.
@@ -59,12 +54,17 @@ impl fmt::Display for LoadErr {
         match self {
             Self::Io(e) => write!(f, "{e}"),
             Self::TooShort => write!(f, "record shorter than a header"),
-            Self::BadCap { cap } => write!(f, "bad cap {cap} (below 16 or not 16-multiple)"),
+            Self::BadCap { cap } => write!(
+                f,
+                "bad cap {cap} (below 16, not 16-multiple, or past the pointer width)"
+            ),
             Self::BadPtr { ptr } => write!(f, "bad ptr {ptr} (must be 16)"),
             Self::StrideMismatch { file, stride } => {
                 write!(f, "file length {file} is not a multiple of record stride {stride}")
             }
-            Self::NotSingleRecord { records } => write!(f, "{records} records — Stack is single-block"),
+            Self::NotSingleRecord { records } => {
+                write!(f, "{records} records — Stack is single-block")
+            }
             Self::Overflow { stack, heap, cap } => {
                 write!(f, "stack {stack} + heap {heap} exceed cap {cap}")
             }
@@ -80,7 +80,7 @@ impl From<io::Error> for LoadErr {
     }
 }
 
-impl<T: Archive<P>, P: Ptr> Stack<T, P> {
+impl<T: Archive> Stack<T> {
     ///cap chosen so the serialized record is exactly `RECORD` bytes.
     pub fn new() -> Self {
         Self::with_cap(RECORD - 16)
@@ -91,82 +91,164 @@ impl<T: Archive<P>, P: Ptr> Stack<T, P> {
         Stack { block: Block::new(cap), _t: PhantomData }
     }
 
+    ///per-T unit geometry: `(unit0, stride, gap0, gap1)`. unit =
+    /// [snap u32][gap1][handle]; the next unit's snap lands 4-aligned after
+    /// the handle, so units ≥ 1 carry a LEADING gap0 (nonzero only for
+    /// sub-4-aligned handles). every gap is a per-T CONSTANT: unit_start ≡ 0
+    /// mod align_h inductively (handle ends stay aligned), so snap_end ≡
+    /// 4 mod align_h always — the fact `unit_parts_back` leans on.
+    fn layout() -> (usize, usize, usize, usize) {
+        let (sh, ah) = (size_of::<T::Handle>(), align_of::<T::Handle>().max(1));
+        let gap1 = ah.max(4) - 4;
+        let gap0 = (4 - sh % 4) % 4;
+        (4 + gap1 + sh, 4 + gap1 + sh + gap0, gap0, gap1)
+    }
+
+    ///(snap offset, handle offset) of unit `i`, absolute stack-region bytes —
+    ///unit 0 has no leading gap0.
+    fn unit_geo(i: usize) -> (usize, usize) {
+        let (unit0, stride, gap0, gap1) = Self::layout();
+        let (snap, handle) = (gap0, gap0 + 4 + gap1);
+        if i == 0 {
+            (0, 4 + gap1)
+        } else {
+            let u = unit0 + (i - 1) * stride;
+            (u + snap, u + handle)
+        }
+    }
+
     ///archives `k`, then pushes the unit (pre-archive heap_len, handle) onto
-    ///the stack. on Err both ends are unchanged: archive's own Err leaves the
-    ///heap untouched, a stack-side Err rewinds (wipes) the archived regions.
-    pub fn push(&mut self, k: T) -> Result<S<P>, CapErr> {
+    ///the stack. on Err both ends are unchanged: a failing `T::archive`
+    ///unwinds itself (children-first release + front rollback — the archive
+    ///contract), and a stack-side Err unwinds the landed archive the same
+    ///way before shrinking the snap back.
+    pub fn push(&mut self, k: T) -> Result<S<T::Handle>, CapErr> {
         self.push_borrowed(&k)
     }
 
     ///push that borrows k — on CapErr the value is intact, so a caller can
     ///retry the item into a fresh block without a Clone bound (Stacks' spill).
-    pub fn push_borrowed(&mut self, k: &T) -> Result<S<P>, CapErr> {
-        let (h, snap) = {
+    pub fn push_borrowed(&mut self, k: &T) -> Result<S<T::Handle>, CapErr> {
+        let heap0 = self.block.heap_len();
+        let front0 = self.block.stack_len();
+        let h = {
             let mut al = self.block.allocator();
-            let snap = al.snapshot();
-            (T::archive(k, &mut al)?, snap)
-        };
-        let s = match self.block.push(Unit { snap: snap.heap as u32, h }) {
-            Ok(s) => s,
-            Err(e) => {
-                //stack front met the heap bottom — rewind (wipe) the archive
-                let mut al = self.block.allocator();
-                al.rewind(snap);
-                return Err(e);
+            match T::archive(k, &mut al) {
+                Ok(h) => h,
+                //the impl unwound itself — the heap is already unchanged
+                Err(e) => return Err(e),
             }
         };
-        //the unit's own struct padding carries uninit bytes — wipe for the
-        //zero-record invariant (h's internal padding is the handle type's duty)
-        let (hs, ha) = (size_of::<T::Handle>(), align_of::<T::Handle>());
-        let h_off = ha.max(4);
-        let u0 = s.0.as_usize();
-        let bytes = self.block.stack_bytes_mut();
-        bytes[u0 + 4..u0 + h_off].fill(0);
-        bytes[u0 + h_off + hs..u0 + s.1.as_usize()].fill(0);
-        Ok(s)
+        match self.block.push(heap0 as u32) {
+            Ok(_) => {}
+            Err(e) => {
+                //unwind the landed archive, then give the space back
+                let mut al = self.block.allocator();
+                T::release(&h, &mut al);
+                al.rollback(heap0);
+                return Err(e);
+            }
+        }
+        match self.block.push(h) {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                //pull the snap back to the PRE-PUSH front — s_snap.off() is
+                //the snap's aligned start, so it would strand the snap's
+                //alignment gap on the stack front (sub-4-aligned handles)
+                self.block.stack_shrink(front0);
+                let mut al = self.block.allocator();
+                T::release(&h, &mut al);
+                al.rollback(heap0);
+                Err(e)
+            }
+        }
     }
 
     ///pops the LAST unit: shrinks (wipes) its stack bytes and `pop_heap`s to
     ///its snapshot (wiping every heap byte above it — that is the item's own
     ///regions under strict LIFO; any unit pushed after it is already gone, or
-    ///its push failed and rewound). returns the handle — its bytes are wiped
+    ///its push failed and unwound). returns the handle — its bytes are wiped
     ///and its regions erased, bookkeeping only. no owned-T materialization.
     pub fn pop(&mut self) -> Option<T::Handle> {
-        let u = *self.units().last()?;
-        self.block.stack_shrink(self.block.stack_len() - size_of::<Unit<T::Handle>>());
-        self.block.pop_heap(self.block.heap_len() - u.snap as usize);
-        Some(u.h)
+        //copy out before mutating — last() borrows the stack bytes
+        let (snap, h) = self.last()?;
+        let h = *h;
+        self.block.stack_shrink(self.unit_start_back());
+        self.block.pop_heap(self.block.heap_len() - snap as usize);
+        Some(h)
     }
 
-    ///the stored units in push order — one consecutive stride. `snap` names
+    ///the stored units in push order — (snapshot, handle) pairs. `snap` names
     ///the heap extent the unit's pop will erase to.
-    fn units(&self) -> &[Unit<T::Handle>] {
-        let size = size_of::<Unit<T::Handle>>();
-        let bytes = self.item_bytes();
-        let raw = self.block.stack_bytes();
-        assert!(
-            (raw.as_ptr() as usize).is_multiple_of(align_of::<Unit<T::Handle>>()),
-            "unit misaligned"
-        );
-        // SAFETY: Stack owns its block and only ever pushes one unit type —
-        // Block::push places every unit at a multiple of its own size
-        // (size_of is a multiple of align_of), so the stack IS [Unit; n]
-        unsafe { slice::from_raw_parts(raw.as_ptr().cast(), bytes / size) }
+    pub fn items(&self) -> impl Iterator<Item = (u32, &T::Handle)> + '_ {
+        let n = self.len();
+        let bytes = self.block.stack_bytes();
+        (0..n).map(move |i| {
+            let (s, h) = Self::unit_geo(i);
+            let snap = u32::from_le_bytes(bytes[s..s + 4].try_into().unwrap());
+            // SAFETY: units push (snap, handle) with the handle at its
+            // unit-geo offset, handle-aligned by Block::push
+            let h = unsafe { &*bytes.as_ptr().add(h).cast::<T::Handle>() };
+            (snap, h)
+        })
     }
 
-    ///(snapshot, handle) pairs in push order, borrowing the stack.
-    pub fn items(&self) -> impl Iterator<Item = (u32, &T::Handle)> {
-        self.units().iter().map(|u| (u.snap, &u.h))
-    }
-
-    ///the last unit's (snapshot, handle), without popping.
+    ///the last unit's (snapshot, handle), without popping — DIVISION-FREE:
+    ///the unit geometry is constant per T, so the last unit's position
+    ///derives backward from stack_len (a runtime stride division here is a
+    ///~20-cycle stall on every read; see layout()'s proof for why snap_end
+    ///sits exactly gap1 before the handle).
     pub fn last(&self) -> Option<(u32, &T::Handle)> {
-        self.units().last().map(|u| (u.snap, &u.h))
+        let bytes = self.block.stack_len();
+        if bytes == 0 {
+            return None;
+        }
+        let (snap_end, handle_start) = self.unit_parts_back(bytes);
+        let stack_bytes = self.block.stack_bytes();
+        let snap = u32::from_le_bytes(stack_bytes[snap_end - 4..snap_end].try_into().unwrap());
+        // SAFETY: the last pushed item is the handle, ending at stack_len;
+        // Block::push placed it handle-aligned
+        let h = unsafe { &*stack_bytes.as_ptr().add(handle_start).cast::<T::Handle>() };
+        Some((snap, h))
     }
 
-    ///item count = stack bytes / unit size.
+    ///backward geometry of the last unit, given `bytes = stack_len ≥ its
+    ///unit`: handle = [bytes − size_h, bytes); snap ends gap1 before the
+    ///handle starts (gap1 is the per-T constant — snap_end ≡ 0 mod 4 and
+    ///snap_end mod align_h is the constant 4 mod align_h). the assert is the
+    ///misuse canary: any stack_len that cannot be a unit's end is broken.
+    fn unit_parts_back(&self, bytes: usize) -> (usize, usize) {
+        let (sh, gap1) = (size_of::<T::Handle>(), Self::layout().3);
+        let handle_start = bytes - sh;
+        let snap_end = handle_start - gap1;
+        assert!(snap_end >= 4, "stack/unit stride broken");
+        (snap_end, handle_start)
+    }
+
+    ///the last unit's start byte (pop's shrink target) — backward, without
+    ///the count: unit0 has no leading gap0, steady units do; one comparison
+    ///replaces the runtime-stride division.
+    fn unit_start_back(&self) -> usize {
+        let bytes = self.block.stack_len();
+        let (unit0, stride, gap0, _) = Self::layout();
+        debug_assert!(
+            bytes == 0 || bytes == unit0 || (bytes - unit0) % stride == 0,
+            "stack/unit stride broken"
+        );
+        let snap_end = self.unit_parts_back(bytes).0;
+        if bytes == unit0 { snap_end - 4 } else { snap_end - 4 - gap0 }
+    }
+
+    ///item count = stack bytes / unit stride. NOT the hot path — last()/pop()
+    ///derive positions backward without the count (the stride is a runtime
+    ///divisor; the division is real and stays out of reads).
     pub fn len(&self) -> usize {
-        self.item_bytes() / size_of::<Unit<T::Handle>>()
+        let bytes = self.block.stack_len();
+        if bytes == 0 {
+            return 0;
+        }
+        let (unit0, stride, _, _) = Self::layout();
+        1 + (bytes - unit0) / stride
     }
 
     pub fn is_empty(&self) -> bool {
@@ -174,31 +256,34 @@ impl<T: Archive<P>, P: Ptr> Stack<T, P> {
     }
 
     ///read seam over the block's heap regions.
-    pub fn heap(&self) -> Heap<'_, P> {
+    pub fn heap(&self) -> Heap<'_> {
         Heap::new(&self.block)
     }
 
-    pub fn block(&self) -> &Block<P> {
+    pub fn block(&self) -> &Block {
         &self.block
     }
 
-    ///the serialized record: [Header | stack | zero gap | heap]. two records
-    ///of equal stacks are byte-identical (zero-record invariant + zeroed gap).
+    ///the serialized record: [Header | stack | zero gap | heap + freelist
+    ///head]. two records of equal stacks are byte-identical (zero-record
+    ///invariant + zeroed gap).
     pub fn to_record(&self) -> Vec<u8> {
-        let (stack, heap, cap) = (self.block.stack_len(), self.block.heap_len(), self.block.cap());
+        let (stack, heap, cap) =
+            (self.block.stack_len(), self.block.heap_len(), self.block.cap());
         let mut v = Vec::with_capacity(16 + cap);
         v.extend_from_slice(&(stack as u32).to_le_bytes());
         v.extend_from_slice(&(heap as u32).to_le_bytes());
         v.extend_from_slice(&(cap as u32).to_le_bytes());
         v.extend_from_slice(&16u32.to_le_bytes());
         v.extend_from_slice(self.block.stack_bytes());
-        v.resize(16 + cap - heap, 0);
-        //whole heap span: zero-record invariant keeps even alignment pads defined
-        v.extend_from_slice(self.block.heap(H(P::from_usize(heap), P::from_usize(heap))));
+        v.resize(16 + cap - NODE - heap, 0);
+        //whole heap span including the freelist head: the zero-record
+        //invariant keeps even alignment pads defined
+        v.extend_from_slice(self.block.heap_span());
         v
     }
 
-    ///writes one record to `path` (multi-record files are Stacks, task 6).
+    ///writes one record to `path` (multi-record files are Stacks).
     pub fn save(&self, path: &Path) -> io::Result<()> {
         std::fs::File::create(path)?.write_all(&self.to_record())
     }
@@ -222,9 +307,11 @@ impl<T: Archive<P>, P: Ptr> Stack<T, P> {
         if record.len() < 16 {
             return Err(LoadErr::TooShort);
         }
-        let f4 = |i: usize| u32::from_le_bytes([record[i], record[i + 1], record[i + 2], record[i + 3]]);
+        let f4 = |i: usize| {
+            u32::from_le_bytes([record[i], record[i + 1], record[i + 2], record[i + 3]])
+        };
         let (stack, heap, cap, ptr) = (f4(0), f4(4), f4(8), f4(12));
-        if cap < 16 || !cap.is_multiple_of(16) {
+        if cap < 16 || !cap.is_multiple_of(16) || cap as usize > u16::MAX as usize {
             return Err(LoadErr::BadCap { cap: cap as usize });
         }
         let stride = 16 + cap as usize;
@@ -237,23 +324,15 @@ impl<T: Archive<P>, P: Ptr> Stack<T, P> {
         if ptr != 16 {
             return Err(LoadErr::BadPtr { ptr });
         }
-        if stack as usize + heap as usize > cap as usize {
+        //the freelist head occupies the last NODE bytes — not front space
+        if stack as usize + heap as usize > cap as usize - NODE {
             return Err(LoadErr::Overflow { stack, heap, cap });
         }
         Ok(())
     }
-
-    ///stack bytes, all of them units, no gaps. panics on stride violation
-    ///(misuse through the escaping `block()` view).
-    fn item_bytes(&self) -> usize {
-        let size = size_of::<Unit<T::Handle>>();
-        let len = self.block.stack_len();
-        assert!(len.is_multiple_of(size), "stack/unit stride broken");
-        len
-    }
 }
 
-impl<T: Archive<P>, P: Ptr> Default for Stack<T, P> {
+impl<T: Archive> Default for Stack<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -282,8 +361,8 @@ mod tests {
             assert_eq!(String::rel_cmp(h, &s.to_string(), &heap), Ordering::Equal);
         }
         //structural: handles equal a fresh archive of the same values
-        let expected: Vec<StrHandle<u32>> = {
-            let mut b = crate::Block::<u32>::new(4080);
+        let expected: Vec<StrHandle> = {
+            let mut b = crate::Block::new(4080);
             let mut al = b.allocator();
             strings.iter().map(|s| String::archive(&s.to_string(), &mut al).unwrap()).collect()
         };
@@ -302,11 +381,11 @@ mod tests {
     ///LIFO pops erase to each unit's snapshot — heap shrinks back per pop and
     ///the record carries nothing of the popped items (no freelist machinery)
     #[test]
-    fn pop_erases_to_snapshot() {
+    fn pop_erases_to_front() {
         let mut st = Stack::<Vec<String>>::new();
         st.push(vec!["short".to_string(), LONG.to_string(), "abcdefgh".to_string()]).unwrap();
         let heap0 = st.block().heap_len();
-        assert!(heap0 >= LONG.len());
+        assert!(heap0 >= LONG.len() as usize);
         st.push(vec![LONG.to_string(), "abcdefghi".to_string()]).unwrap();
         let heap1 = st.block().heap_len();
         assert!(heap1 > heap0);
@@ -316,11 +395,11 @@ mod tests {
         assert_eq!(st.len(), 1);
         //unit0's pop erases the rest: heap 0, stack empty, record all-zero data
         let h0 = st.pop().unwrap();
-        assert_eq!(h0.len.as_usize(), 3);
+        assert_eq!(h0.len as usize, 3);
         assert_eq!(st.block().heap_len(), 0);
         assert!(st.is_empty());
         let rec = st.to_record();
-        assert!(rec[16..].iter().all(|&b| b == 0));
+        assert!(rec[16..rec.len() - NODE].iter().all(|&b| b == 0));
     }
 
     ///security pin: after a pop, the record holds NO bytes of the popped item
@@ -345,7 +424,10 @@ mod tests {
         //archive-side: heap bytes exceed the block
         let mut st = Stack::<String>::with_cap(64);
         let (heap0, len0, free0) = (st.block().heap_len(), st.len(), st.block().free_bytes());
-        assert!(st.push("way beyond the whole block capacity ______________________".to_string()).is_err());
+        assert!(
+            st.push("way beyond the whole block capacity ______________________".to_string())
+                .is_err()
+        );
         assert_eq!(st.block().heap_len(), heap0);
         assert_eq!(st.len(), len0);
         assert_eq!(st.block().free_bytes(), free0);
@@ -353,19 +435,37 @@ mod tests {
         //stack-side: empty Vec handles cost no heap — the failure is
         //exclusively the stack front meeting the heap bottom
         let mut st2 = Stack::<Vec<u32>>::with_cap(64);
-        while st2.block().free_bytes() >= 16 {
+        //unit = snap 4 + VecHandle 8 = 12 bytes (align 2 — no gaps)
+        while st2.block().free_bytes() >= 12 {
             st2.push(vec![]).unwrap();
         }
-        assert!(st2.block().free_bytes() < 16);
+        assert!(st2.block().free_bytes() < 12);
         let (heap1, len1) = (st2.block().heap_len(), st2.len());
         assert!(st2.push(vec![]).is_err());
         assert_eq!(st2.block().heap_len(), heap1);
         assert_eq!(st2.len(), len1);
-        //the failed push left no residue (its archive was rewound); a pop
+        //the failed push left no residue (its archive was unwound); a pop
         //reopens the slot
         st2.pop().unwrap();
         st2.push(vec![]).expect("pop freed the stack slot");
         assert_eq!(st2.len(), len1);
+    }
+
+    ///a failed push near-full leaves the stack front EXACTLY where it was —
+    ///the landed snap's alignment gap is reclaimed too (sub-4-aligned
+    ///handles), and pop keeps answering (the stride canary stays honest).
+    ///regression: shrinking to the snap's aligned start stranded the gap,
+    ///broke the canary on the next pop
+    #[test]
+    fn failed_push_leaves_no_stack_residue() {
+        let mut st = Stack::<u16>::with_cap(64);
+        while st.push(0xABu16).is_ok() {}
+        let (front, len) = (st.block().stack_len(), st.len());
+        assert!(st.push(0xCD).is_err(), "the block is full");
+        assert_eq!(st.block().stack_len(), front, "gap residue reclaimed");
+        assert_eq!(st.len(), len);
+        assert_eq!(st.pop().unwrap(), 0xAB);
+        assert!(st.push(0xCD).is_ok());
     }
 
     #[test]
@@ -381,9 +481,9 @@ mod tests {
         assert_eq!(&rec[4..8], &(st.block().heap_len() as u32).to_le_bytes());
         assert_eq!(&rec[8..12], &4080u32.to_le_bytes());
         assert_eq!(&rec[12..16], &16u32.to_le_bytes());
-        //dead gap reads as zeros
+        //dead gap reads as zeros (the head's last 4 bytes are the heap span)
         let (s0, h0) = (st.block().stack_len(), st.block().heap_len());
-        assert!(rec[16 + s0..16 + 4080 - h0].iter().all(|&b| b == 0));
+        assert!(rec[16 + s0..16 + 4080 - NODE - h0].iter().all(|&b| b == 0));
         //record seam round-trip, re-serialization identical
         let loaded = Stack::<String>::from_record(&rec).unwrap();
         assert_eq!(loaded.items().collect::<Vec<_>>(), st.items().collect::<Vec<_>>());
@@ -410,6 +510,16 @@ mod tests {
             v
         };
         assert!(matches!(Stack::<String>::from_record(&bad), Err(LoadErr::BadCap { cap: 0 })));
+        //cap past the pointer width
+        let bad: Vec<u8> = {
+            let mut v = rec.clone();
+            v[8..12].copy_from_slice(&65536u32.to_le_bytes());
+            v
+        };
+        assert!(matches!(
+            Stack::<String>::from_record(&bad),
+            Err(LoadErr::BadCap { cap: 65536 })
+        ));
         //two records in one file
         let mut two = rec.clone();
         two.extend_from_slice(&rec);
@@ -448,65 +558,34 @@ mod tests {
         st.pop().unwrap();
         st.push(vec![7]).unwrap();
         assert_eq!(st.len(), pushed);
-        assert_eq!(st.last().unwrap().1.len.as_usize(), 1);
+        assert_eq!(st.last().unwrap().1.len as usize, 1);
     }
 
-    ///u16-width record round-trip over VecH<u16>, whose explicit pad
-    ///(P::TailPad3) reads zero in the record; the String twin below pins
-    ///StrHandle's pad at this width.
+    ///the two-push unit layout: u64 units are [snap 4][gap 4][handle 8] =
+    ///16 bytes — byte-identical to the old Unit struct, and every byte of a
+    ///pushed unit is defined (gap block-zeroed, handle ZeroPad)
     #[test]
-    fn narrow_pointer_width_record() {
-        let mut st = Stack::<Vec<u32>, u16>::with_cap(256);
-        st.push(vec![1, 2, 3]).unwrap();
-        st.push(vec![]).unwrap();
+    fn unit_layout_pads_zero() {
+        let mut st = Stack::<u64>::new();
+        st.push(0xDEAD_BEEF_0123_4567).unwrap();
+        st.push(1).unwrap();
+        assert_eq!(st.block().stack_len(), 32, "two 16-byte units");
         let rec = st.to_record();
-        assert_eq!(rec.len(), 16 + 256);
-        let loaded = Stack::<Vec<u32>, u16>::from_record(&rec).unwrap();
-        assert_eq!(loaded.len(), 2);
+        //unit0: snap@0..4, gap@4..8 (zero), handle@8..16
+        assert_eq!(&rec[16 + 4..16 + 8], &[0; 4], "unit gap zero");
+        assert_eq!(&rec[16 + 8..16 + 16], &0xDEAD_BEEF_0123_4567u64.to_le_bytes());
+        //round-trip byte-exact
+        let loaded = Stack::<u64>::from_record(&rec).unwrap();
         assert_eq!(loaded.items().collect::<Vec<_>>(), st.items().collect::<Vec<_>>());
         assert_eq!(loaded.to_record(), rec);
-        //order survives the round-trip
-        let its: Vec<_> = st.items().collect();
-        assert_eq!(Vec::<u32>::rel_cmp_h(its[0].1, its[1].1, &loaded.heap()), Ordering::Greater);
-        let mut l2 = loaded;
-        assert_eq!(l2.pop().unwrap().len.as_usize(), 0);
-    }
-
-    ///T2's pad fix closed the invariant exception: StrHandle<u16> carries an
-    ///explicit zero pad — pinned byte-level in the record, round-tripped at
-    ///this width, ordering intact, pop erasure to snapshot holding.
-    #[test]
-    fn narrow_string_record_pads_zero() {
-        let mut st = Stack::<String, u16>::with_cap(256);
-        for s in ["abcdefghi", LONG, "abc"] {
-            st.push(s.to_string()).unwrap();
-        }
-        assert_eq!(st.block().stack_len(), 3 * 24, "unit = snap 4 + handle 16, align 8");
-        let rec = st.to_record();
-        assert_eq!(rec.len(), 16 + 256);
-        //each unit's StrHandle pad bytes (handle offsets [12..16] at unit
-        //offset 8) read zero — no uninit struct padding reaches the record
-        for i in 0..3 {
-            let u = 16 + i * 24;
-            assert!(rec[u + 8 + 12..u + 8 + 16].iter().all(|&b| b == 0), "unit {i} pad");
-        }
-        //round-trip + re-serialization identical
-        let loaded = Stack::<String, u16>::from_record(&rec).unwrap();
-        assert_eq!(loaded.items().collect::<Vec<_>>(), st.items().collect::<Vec<_>>());
-        assert_eq!(loaded.to_record(), rec);
-        //order survives and matches Ord
-        let hs: Vec<_> = loaded.items().map(|(_, h)| h).collect();
-        assert_eq!(String::rel_cmp_h(hs[0], hs[1], &loaded.heap()), "abcdefghi".cmp(LONG));
-        //pop erases to each unit's snapshot at this width too
-        while !st.is_empty() {
-            let (snap, _) = st.last().unwrap();
-            st.pop().unwrap();
-            assert_eq!(st.block().heap_len(), snap as usize);
-        }
-        assert_eq!(st.block().heap_len(), 0);
-        let rec2 = st.to_record();
-        assert!(rec2[16..].iter().all(|&b| b == 0));
-        assert!(!rec2.windows(LONG.len()).any(|w| w == LONG.as_bytes()));
+        //sub-4-aligned handles take the gap0 stride (u16: unit 6, stride 8)
+        let mut st2 = Stack::<u16>::new();
+        st2.push(0xAB).unwrap();
+        st2.push(0xCD).unwrap();
+        assert_eq!(st2.block().stack_len(), 6 + 8, "irregular unit0 then steady stride");
+        assert_eq!(st2.pop().unwrap(), 0xCD);
+        assert_eq!(st2.pop().unwrap(), 0xAB);
+        assert!(st2.pop().is_none());
     }
 
     #[cfg(not(miri))]
@@ -526,7 +605,7 @@ mod tests {
         assert_eq!(loaded.len(), st.len());
         assert_eq!(loaded.items().collect::<Vec<_>>(), st.items().collect::<Vec<_>>());
         //rel_cmp_h ordering matches across both heaps, all pairs
-        let hs: Vec<_> = st.items().map(|(_, h)| h).collect();
+        let hs: Vec<_> = st.items().map(|(_, h)| *h).collect();
         for a in &hs {
             for b in &hs {
                 assert_eq!(

@@ -7,12 +7,12 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 
-use block::{Allocator, Archive, Block, CapErr, Heap, Ptr, RelOrd, StrHandle};
+use block::{Allocator, Archive, Block, CapErr, Heap, RelOrd, ReprC, StrHandle, ZeroPad};
 use block_derive::{Archive, RelOrd};
 
 ///archive every k into one block; both cmp forms match Ord over all pairs
-fn assert_cmp<K: RelOrd<u32> + Ord>(ks: &[K]) {
-    let mut b = Block::<u32>::new(1 << 16);
+fn assert_cmp<K: RelOrd + Ord>(ks: &[K]) {
+    let mut b = Block::new(65280);
     let hs = {
         let mut al = b.allocator();
         ks.iter().map(|k| K::archive(k, &mut al).unwrap()).collect::<Vec<_>>()
@@ -30,11 +30,17 @@ fn assert_cmp<K: RelOrd<u32> + Ord>(ks: &[K]) {
 // EXPLICIT pad (manual impls follow the same record law: every byte defined):
 // i64's alignment over i32 leaves 4 implicit bytes otherwise
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(C)]
 struct PairHandle {
     lo: i32,
     _pad_lo: [u8; 4],
     hi: i64,
 }
+
+// SAFETY: explicit pad field; every byte is a field.
+unsafe impl ZeroPad for PairHandle {}
+// SAFETY: declared #[repr(C)] above.
+unsafe impl ReprC for PairHandle {}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Pair {
@@ -42,21 +48,21 @@ struct Pair {
     hi: i64,
 }
 
-impl<P: Ptr> Archive<P> for Pair {
-    //inline fields: the handle is P-free — no marker field needed here
+impl Archive for Pair {
+    //inline fields: the handle carries no marker field
     type Handle = PairHandle;
     const HEAP: bool = false;
-    fn archive(k: &Self, _al: &mut Allocator<'_, P>) -> Result<Self::Handle, CapErr> {
+    fn archive(k: &Self, _al: &mut Allocator<'_>) -> Result<Self::Handle, CapErr> {
         Ok(PairHandle { lo: k.lo, _pad_lo: [0; 4], hi: k.hi })
     }
-    fn release(_h: &Self::Handle, _al: &mut Allocator<'_, P>) {}
+    fn release(_h: &Self::Handle, _al: &mut Allocator<'_>) {}
 }
 
-impl<P: Ptr> RelOrd<P> for Pair {
-    fn rel_cmp(h: &Self::Handle, k: &Self, _heap: &Heap<P>) -> Ordering {
+impl RelOrd for Pair {
+    fn rel_cmp(h: &Self::Handle, k: &Self, _heap: &Heap<'_>) -> Ordering {
         h.lo.cmp(&k.lo).then(h.hi.cmp(&k.hi))
     }
-    fn rel_cmp_h(a: &Self::Handle, b: &Self::Handle, _heap: &Heap<P>) -> Ordering {
+    fn rel_cmp_h(a: &Self::Handle, b: &Self::Handle, _heap: &Heap<'_>) -> Ordering {
         a.lo.cmp(&b.lo).then(a.hi.cmp(&b.hi))
     }
 }
@@ -94,11 +100,10 @@ struct D {
 #[derive(Archive, RelOrd)]
 struct Empty {}
 
-//the mixed-width record shape: a u32-ish field ordered BEFORE the String —
-//the cross-field pad ([0; 4] after num) is P-independent and the trailing
-//StrHandle lands on a multiple of 8 at EVERY width, so the canary passes for
-//all P. the reverse order (String first) leaves a P-independent-4-byte tail
-//only at width 4 — the narrow-width record hole, refused there by the canary
+//the mixed layout shape: a u32 field ordered BEFORE the String — the
+//cross-field pad ([0; 4] after num) and StrHandle's own tail pad are both
+//computed by the derive's const expressions, and the canary pins the exact
+//24-byte handle
 #[derive(Archive, RelOrd)]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct G {
@@ -112,22 +117,22 @@ thread_local! {
 
 struct Tag<const N: u8>;
 
-impl<P: Ptr, const N: u8> Archive<P> for Tag<N> {
+impl<const N: u8> Archive for Tag<N> {
     type Handle = u8;
     const HEAP: bool = false;
-    fn archive(_k: &Self, _al: &mut Allocator<'_, P>) -> Result<Self::Handle, CapErr> {
+    fn archive(_k: &Self, _al: &mut Allocator<'_>) -> Result<Self::Handle, CapErr> {
         Ok(N)
     }
-    fn release(_h: &Self::Handle, _al: &mut Allocator<'_, P>) {
+    fn release(_h: &Self::Handle, _al: &mut Allocator<'_>) {
         LOG.with(|l| l.borrow_mut().push(N));
     }
 }
 
-impl<P: Ptr, const N: u8> RelOrd<P> for Tag<N> {
-    fn rel_cmp(_h: &Self::Handle, _k: &Self, _heap: &Heap<P>) -> Ordering {
+impl<const N: u8> RelOrd for Tag<N> {
+    fn rel_cmp(_h: &Self::Handle, _k: &Self, _heap: &Heap<'_>) -> Ordering {
         Ordering::Equal
     }
-    fn rel_cmp_h(_a: &Self::Handle, _b: &Self::Handle, _heap: &Heap<P>) -> Ordering {
+    fn rel_cmp_h(_a: &Self::Handle, _b: &Self::Handle, _heap: &Heap<'_>) -> Ordering {
         Ordering::Equal
     }
 }
@@ -152,23 +157,23 @@ fn log() -> Vec<u8> {
 
 #[test]
 fn heap_consts_fold_from_fields() {
-    assert!(!<A as Archive<u32>>::HEAP, "all fields inline");
-    assert!(<B as Archive<u32>>::HEAP);
-    assert!(<C as Archive<u32>>::HEAP);
-    assert!(<D as Archive<u32>>::HEAP);
-    assert!(!<Empty as Archive<u32>>::HEAP);
+    assert!(!<A as Archive>::HEAP, "all fields inline");
+    assert!(<B as Archive>::HEAP);
+    assert!(<C as Archive>::HEAP);
+    assert!(<D as Archive>::HEAP);
+    assert!(!<Empty as Archive>::HEAP);
     //A archives without touching the heap
-    let mut b = Block::<u32>::new(64);
+    let mut b = Block::new(64);
     {
         let mut al = b.allocator();
-        <A as Archive<u32>>::archive(&A { a: 1, b: 2, c: Pair { lo: 3, hi: 4 } }, &mut al).unwrap();
+        <A as Archive>::archive(&A { a: 1, b: 2, c: Pair { lo: 3, hi: 4 } }, &mut al).unwrap();
     }
     assert_eq!(b.heap_len(), 0);
 }
 
 #[test]
 fn empty_struct_edges() {
-    let mut b = Block::<u32>::new(64);
+    let mut b = Block::new(64);
     let h = { let mut al = b.allocator(); Empty::archive(&Empty {}, &mut al).unwrap() };
     assert_eq!(b.heap_len(), 0);
     let heap = Heap::new(&b);
@@ -179,16 +184,16 @@ fn empty_struct_edges() {
 ///§5c shape B: the flat-vec and string layouts through the derived handle
 #[test]
 fn b_handle_shape_roundtrip() {
-    let mut b = Block::<u32>::new(256);
+    let mut b = Block::new(256);
     let k = B { a: vec![1, 2, 3], b: "abcdefghi".to_string() };
     let h = { let mut al = b.allocator(); B::archive(&k, &mut al).unwrap() };
     let heap = Heap::new(&b);
     //Vec<i32> flat: one region of raw u32s
-    assert_eq!(h.a.len.as_usize(), 3);
-    for (i, v) in [1u32, 2, 3].iter().enumerate() {
-        assert_eq!(heap.handle::<u32>(h.a.h, i), v);
+    assert_eq!(h.a.len as usize, 3);
+    for (i, v) in [1i32, 2, 3].iter().enumerate() {
+        assert_eq!(heap.slot::<i32>(h.a.h, i), v);
     }
-    assert_eq!(h.a.h.1.as_usize(), 12);
+    assert_eq!(h.a.h.len() as usize, 12);
     //string: 9 bytes rides the heap, pfx the first 8
     assert_eq!(heap.bytes(h.b.h), b"abcdefghi");
     assert_eq!(h.b.pfx, u64::from_be_bytes(*b"abcdefgh"));
@@ -198,7 +203,7 @@ fn b_handle_shape_roundtrip() {
 ///inline fields read back as values, string/vec regions resolve through Heap
 #[test]
 fn d_handle_shape_roundtrip() {
-    let mut b = Block::<u32>::new(256);
+    let mut b = Block::new(256);
     let k = D {
         a: A { a: 1, b: 2, c: Pair { lo: 3, hi: 4 } },
         c: C { s: vec!["abcdefghi".to_string(), "z".to_string()], h: 5 },
@@ -212,13 +217,13 @@ fn d_handle_shape_roundtrip() {
     assert_eq!(h.a.c.hi, 4);
     //C's vec handles region holds StrHandles; "z" is inline, "abcdefghi" heap
     assert_eq!(h.c.h, 5);
-    assert_eq!(h.c.s.len.as_usize(), 2);
-    let s0 = heap.handle::<StrHandle<u32>>(h.c.s.h, 0);
+    assert_eq!(h.c.s.len as usize, 2);
+    let s0 = heap.slot::<StrHandle>(h.c.s.h, 0);
     assert_eq!(heap.bytes(s0.h), b"abcdefghi");
-    let s1 = heap.handle::<StrHandle<u32>>(h.c.s.h, 1);
-    assert_eq!(s1.h.0.as_usize(), 0, "inline element");
-    //layout: 2 × StrHandle<u32> (32 bytes) + 9 string bytes
-    assert_eq!(b.heap_len(), 41);
+    let s1 = heap.slot::<StrHandle>(h.c.s.h, 1);
+    assert_eq!(s1.h.off(), 0, "inline element");
+    //layout: 4-byte align pad + 2 × StrHandle (32 bytes) + 9 string bytes
+    assert_eq!(b.heap_len(), 45);
 }
 
 #[test]
@@ -273,7 +278,7 @@ fn cmp_matches_ord() {
 ///whole composite — heap_len and free unchanged, space reusable
 #[test]
 fn failed_archive_atomic() {
-    let mut b = Block::<u32>::new(128);
+    let mut b = Block::new(128);
     let ks: Vec<String> = (0..6).map(|i| format!("string-{i}-padding")).collect();
     let k = C { s: ks, h: 0 };
     let (heap0, free0) = (b.heap_len(), b.free_bytes());
@@ -285,7 +290,7 @@ fn failed_archive_atomic() {
         let mut al = b.allocator();
         C::archive(&C { s: vec!["twelve_bytes".into()], h: 0 }, &mut al).unwrap();
     }
-    assert_eq!(b.heap_len(), 16 + 12, "rewound space is reusable");
+    assert_eq!(b.heap_len(), 4 + 16 + 12, "rewound space is reusable");
 }
 
 ///derived release = per-field releases in REVERSE declaration order, each
@@ -293,7 +298,7 @@ fn failed_archive_atomic() {
 ///y(2) then x(1)
 #[test]
 fn release_order_children_first() {
-    let mut b = Block::<u32>::new(64);
+    let mut b = Block::new(64);
     let k = Outer {
         lead: Inner { x: Tag::<1>, y: Tag::<2> },
         tail: vec![Tag::<3>, Tag::<3>],
@@ -305,7 +310,7 @@ fn release_order_children_first() {
     }
     assert_eq!(log(), vec![3u8, 3, 2, 1]);
     //inline-only composite: release touches nothing
-    let mut b = Block::<u32>::new(64);
+    let mut b = Block::new(64);
     let ah = {
         let mut al = b.allocator();
         A::archive(&A { a: 1, b: 2, c: Pair { lo: 3, hi: 4 } }, &mut al).unwrap()
@@ -323,11 +328,11 @@ fn release_order_children_first() {
 ///internal tail 20..24) is DEFINED and reads zero; rel_cmp agrees with Ord
 #[test]
 fn narrow_record_zero_pads() {
-    let mut b = Block::<u16>::new(256);
+    let mut b = Block::new(256);
     let k = G { num: 0x0102_0304, name: "abcdefghij".to_string() };
     let h = { let mut al = b.allocator(); G::archive(&k, &mut al).unwrap() };
-    assert_eq!(std::mem::size_of::<GHandle<u16>>(), 24);
-    let s = b.push::<GHandle<u16>>(h).unwrap();
+    assert_eq!(std::mem::size_of::<GHandle>(), 24);
+    let s = b.push::<GHandle>(h).unwrap();
     let rec = b.stack_bytes();
     assert_eq!(rec.len(), 24);
     assert_eq!(&rec[4..8], &[0; 4], "cross-field pad");

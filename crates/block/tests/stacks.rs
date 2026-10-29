@@ -6,16 +6,16 @@ use std::cmp::Ordering;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 
-use block::{LoadErr, Ptr, RelOrd, Stacks, StacksErr};
+use block::{LoadErr, RelOrd, Stacks, StacksErr};
 
-///u64 unit = snap 4 + pad 4 + handle 8 = 16 bytes; 255 per record
-const PER_BLOCK: usize = 255;
+///u64 unit = snap 4 + gap 4 + handle 8 = 16 bytes; 254 per record (the
+///freelist head owns the last 4 bytes of front space)
+const PER_BLOCK: usize = 254;
 
 fn tmp_path(name: &str) -> PathBuf {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir()
-        .join(format!("block-stacks-{name}-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!("block-stacks-{name}-{}-{n}", std::process::id()))
 }
 
 fn u64_items(s: &Stacks<u64>, block: u32) -> Vec<u64> {
@@ -30,7 +30,7 @@ fn push_pop_lifo_across_blocks() {
         s.push(i).unwrap();
     }
     assert_eq!(s.len().unwrap(), 600);
-    assert_eq!(s.blocks().unwrap(), 3, "255 x 2 + 90");
+    assert_eq!(s.blocks().unwrap(), 3, "254 x 2 + 92");
     assert_eq!(s.top().unwrap(), 2);
     //strict LIFO order across the block boundary
     for i in (0..600u64).rev() {
@@ -68,7 +68,7 @@ fn concurrent_push_integrity() {
             })
         })
         .collect();
-    drop(s); //owner exits (flushes) once the threads' clones drop too
+    drop(s); //the exit flush runs when the last clone drops (threads' clones included)
     for h in handles {
         h.join().unwrap();
     }
@@ -126,9 +126,9 @@ fn reload_transparent_after_eviction() {
         s.push(i).unwrap();
     }
     let a0 = u64_items(&s, 0);
-    assert_eq!(a0, (0..255).collect::<Vec<u64>>());
+    assert_eq!(a0, (0..254).collect::<Vec<u64>>());
     let a2 = u64_items(&s, 2);
-    assert_eq!(a2, (510..600).collect::<Vec<u64>>());
+    assert_eq!(a2, (508..600).collect::<Vec<u64>>());
     //block 0 was evicted by the block-2 read — reload returns identical items
     assert_eq!(u64_items(&s, 0), a0);
     assert_eq!(u64_items(&s, 2), a2);
@@ -136,7 +136,7 @@ fn reload_transparent_after_eviction() {
     let _ = std::fs::remove_file(&path);
 }
 
-///drop → owner flushes on exit → reopen → contents identical, including the
+///drop → exit flush → reopen → contents identical, including the
 ///pop-erasure state (a popped item leaves no bytes in any record).
 #[test]
 fn reopen_roundtrip_with_pop_erasure() {
@@ -149,8 +149,8 @@ fn reopen_roundtrip_with_pop_erasure() {
     //push the secret LAST, then pop it — its erasure must leave no bytes
     let (seclen, slen) = (secret.len(), "string-item-299____paddingpadding".len());
     assert_eq!(s.push(secret.to_string()).unwrap().0, s.top().unwrap());
-    assert_eq!(s.pop().unwrap().unwrap().h.1.as_usize(), seclen);
-    assert_eq!(s.pop().unwrap().unwrap().h.1.as_usize(), slen);
+    assert_eq!(s.pop().unwrap().unwrap().h.len() as usize, seclen);
+    assert_eq!(s.pop().unwrap().unwrap().h.len() as usize, slen);
     let snap: Vec<Vec<u8>> =
         (0..s.blocks().unwrap()).map(|b| s.lease(b).unwrap().bytes().to_vec()).collect();
     drop(s);
@@ -179,8 +179,9 @@ fn reopen_roundtrip_with_pop_erasure() {
     let _ = std::fs::remove_file(&path);
 }
 
-///a read closure that panics: the payload resumes on the caller thread and
-///the owner keeps serving afterwards.
+///a read closure that panics: the unwind resumes on the caller thread; the
+///cell lock poisons and later access recovers (read closures cannot mutate,
+///so poison carries no corruption).
 #[test]
 fn closure_panic_isolation() {
     let path = tmp_path("panic");
@@ -188,7 +189,7 @@ fn closure_panic_isolation() {
     s.push(11).unwrap();
     let r = panic::catch_unwind(AssertUnwindSafe(|| s.read(0, |_, _| panic!("boom"))));
     assert_eq!(r.unwrap_err().downcast_ref::<&str>(), Some(&"boom"));
-    //owner unharmed
+    //poisoned lock recovered — access still serves
     assert_eq!(u64_items(&s, 0), vec![11]);
     s.push(12).unwrap();
     assert_eq!(s.len().unwrap(), 2);
@@ -209,7 +210,7 @@ fn budget_zero_degenerate() {
     //only the MRU (block 0) survives eviction at budget 0
     assert_eq!(s.resident_ids().unwrap(), vec![0]);
     assert_eq!(u64_items(&s, 0), (0..10).collect::<Vec<u64>>());
-    drop(s); //write-back happens at owner exit
+    drop(s); //write-back happens at the exit flush
     let s2 = Stacks::<u64>::load(&path).unwrap();
     assert_eq!(s2.len().unwrap(), 10);
     drop(s2);
@@ -234,6 +235,45 @@ fn oversize_item_is_cap_err() {
     assert_eq!(s.len().unwrap(), 2);
     assert_eq!(s.read(0, |st, _| st.len()).unwrap(), 1);
     assert_eq!(s.read(1, |st, _| st.len()).unwrap(), 1);
+    drop(s);
+    let _ = std::fs::remove_file(&path);
+}
+
+///concurrent spills: many small records (72 long32 items each) fill from
+///several threads at once — every push must land or Err honestly (a spurious
+///Cap here was the fresh-record race the bench caught 2026-10-27), and every
+///value present exactly once.
+#[test]
+#[cfg(not(miri))]
+fn concurrent_spill_no_false_cap() {
+    const THREADS: usize = 4;
+    const PER: usize = 300;
+    let path = tmp_path("spill-race");
+    let s = Stacks::<String>::create(&path).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let s = s.clone();
+            let b = barrier.clone();
+            std::thread::spawn(move || {
+                b.wait();
+                for i in 0..PER {
+                    //32 bytes — past the inline cutoff, 72/record: ~17 records
+                    let key = format!("{t:04}-{i:04}-xxxxxxxxxxxxxxxxxxxxxxxxx");
+                    s.push(key).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(s.len().unwrap(), THREADS * PER);
+    let mut counted = 0;
+    for b in 0..s.blocks().unwrap() {
+        counted += s.read(b, |st, _| st.len()).unwrap();
+    }
+    assert_eq!(counted, THREADS * PER, "every record counted");
     drop(s);
     let _ = std::fs::remove_file(&path);
 }
@@ -276,7 +316,7 @@ fn load_rejects_corrupt_files() {
     let mut rec = vec![0u8; 8192];
     rec[8..12].copy_from_slice(&65552u32.to_le_bytes());
     std::fs::write(&path, rec).unwrap();
-    let e = Stacks::<u64, u16>::load(&path).err().unwrap();
+    let e = Stacks::<u64>::load(&path).err().unwrap();
     assert!(matches!(e, StacksErr::Load(LoadErr::BadCap { cap: 65552 })), "{e:?}");
     let _ = std::fs::remove_file(&path);
 

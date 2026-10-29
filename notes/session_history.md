@@ -1512,7 +1512,7 @@ anyway, so the dispatch cost nothing to kill.
   mirroring, bracket dup detection, Err atomicity, §22 flip/record
   ordering, pos_sum wrap analysis, the bench's holder retarget).
 
-## 2026-10-27 — block substrate: crate + archive v2 + Stacks + blockset port + freelist
+## 2026-10-27 (a) — block substrate: crate + archive v2 + Stacks + blockset port + freelist
 manager-mode session: tasks delegated to fresh agents, each diff reviewed before the next launched.
 
 - landed: new `block` crate — `Block<P>` dual-front allocator (relptr'd
@@ -1554,3 +1554,253 @@ doa 135, all-targets clean, miri clean (stacks integration needs -Zmiri-disable-
 (handle-fixup protocol); Stacks persistent-reply/fire-and-forget then per-block-latch
 redesign; blockset remove-release wiring + with_byte_cap + DEFAULT_SLOTS retune; doa doc/
 stale session_history comment refs (rid a code session + skeletonize refresh).
+
+## 2026-10-27 (b) — block: Stacks channel actor → per-block RwLocks
+
+- landed: `Stacks` rewritten lock-based — per-record `Cell` (`RwLock<Slot>` +
+  atomic lease counter), one structural `Mutex<Shared>` (top/cell table/LRU/
+  file_len), `Inner`'s Drop = the synchronous exit flush; `read` closures run
+  locally under read guards (no Box/Send/'static; panics unwind naturally,
+  poison recovered via into_inner); lease = `Arc` snapshot + the cell counter
+  (the lease owns its cell, so releases are always accounted); evict gated
+  by an atomic resident-count mirror, skips readers/MRU/try_write-busy;
+  spill + pop-retreat re-check `top` under the shared lock.
+- died: the owner thread + kanal request protocol (its ~650ns RTT floor was
+  ~90% of every op); `StacksErr::Closed`/`Panicked`; the read-closure
+  `Send + 'static` and `T::Handle: Send` bounds; kanal as a lib dep (dev-deps
+  now — the bench echo cells keep the transport A/B record).
+- decided: per-block RwLock cells over a persistent-reply/fire-and-forget
+  channel retrofit (Future Work listed both; locks delete the transport
+  instead of batching around it). Block-state Cap rule — Err on an EMPTY
+  block under the write lock = oversize — over "Err in my own appended
+  record" (subtle_bugs §11: the ownership form misfired under concurrent
+  spills; the bench's threads2 cell caught `Cap(free:16)` on pushable
+  32-byte strings). Lease-owns-cell over best-effort release (exact
+  accounting beats the old channel drop; the exit flush runs at the last
+  clone's drop — deterministic without waiting on leases). Two-phase read (write-lock ensure → read
+  lock, MRU touch at entry, retry on the rare evicted window) over blocking
+  shared→cell edges (the only cell→shared edge is the residency register,
+  safe because the evictor only try_writes cells).
+- measured:
+| cell (ns, med)          | actor | locks | notes |
+|-------------------------|-------|-------|-------|
+| push short8 / long32    | 664 / 720 | 44 / 78 | stack-direct 5 / 9.4 |
+| read closure 1-item     | 721   | 17.5  | same-block readers now parallel |
+| lease grant             | 800   | 65    | |
+| lease full-per-access   | 1924  | 1131  | ~1000 of it is the view build |
+| evict b1 alternating    | 1813  | 893   | |
+| evict b16 alternating   | 666   | 13    | |
+| 4-thread push aggregate | 345   | 164   | 8-thread 189 |
+conditions: same box/cells as entry (a); push ≈ stack-direct + ~3 mutex
+cycles. suites: block 65 lib + 10 integration green; miri clean (stacks
+integration, -Zmiri-disable-isolation); new concurrent_spill_no_false_cap
+pins §11 (3× native).
+- deferred: read try_read fast path (resident blocks still pay the write-lock
+  ensure); multi-producer ceiling (top-cell serialization + entry mutex;
+  len()'s O(blocks) with_slot scan) — unbenched, in CLAUDE.md Future Work.
+  fresh review agent: one confirmed contract break (the evictor's readers
+  load can precede a concurrent lease grant's fetch_add, dropping a leased
+  block's stack — fixed with a post-try_write recheck under the lock) and
+  the triplicated ensure/register extracted; everything else checked out
+  guarded (deadlock order walked schedule by schedule, resident_count
+  pairing, read retry termination, Cap/spill races, §6 invariants, the new
+  Block Sync impl).
+
+## 2026-10-28 (a) — block v3: u16 pinning, in-band freelist, typed handles, markers
+
+user-review-driven redesign (devlog "Review instructions after feedback", up
+to line 45); block + block-derive migrated, doa's blockset port PENDING.
+
+- landed: `Ptr`/width generics DEAD — crate is u16-only (cap ≤ 65520; the
+  growable u64 sibling will be a hand-copied crate, no macro by user call).
+  `S<T>`/`H<T>`: typed, crate-private fields, Block-only construction —
+  typed reads carry no alignment check and expose no unsafe. In-band
+  freelist v2: `(len, next)` head node owns the data region's last NODE=4
+  bytes, off-sorted links, next=0 sentinel, min-alloc NODE (spans round to ≥
+  4 and a size multiple — H::len may exceed the request), the list IS the
+  serialized form (from_record walks, truncates corrupt links) — MAGIC,
+  stamps, discover_holes, the holes Vec all died; Block is one pointer.
+  `ZeroPad`/`ReprC` markers gate `push<T: Copy + ZeroPad + ReprC>` (Rust
+  moves copy padding too — the manual unit wipe died; Block zeroes push
+  gaps). Stack's Unit died: units push as (snap u32, handle) pairs with
+  per-T const geometry (leading gap0 in units ≥ 1 — layout byte-identical
+  for align-8 handles). Allocator: `alloc_slice` (was copy_from),
+  `archive_slice` (the recursive region-then-elements primitive — Vec's
+  archive body collapsed into it; write_slot left the public API), Heap
+  reads are slices (bytes/slots/slot — `handle`/`region` names died);
+  `VecH`→`VecHandle`, `prefix64`→`str_prefix_64`. block-derive: the Klass
+  table died — pads/canary are const expressions over real size_of/align_of
+  (works for derive-on-derive + manual handles), canary proves the emitted
+  ZeroPad/ReprC impls.
+- died: kanal-era leftovers n/a; this pass: `Ptr`, `TailPad2/3`, `HOLE_MAGIC`/
+  stamps/scan, `Block::holes` runtime state, `Unit`, `copy_from`, `region`/
+  `handle` names, `heap_as`/`heap_mut` public forms, the per-width canary.
+- decided: in-band list over a serialized hole table (redundant state every
+  wipe would maintain; stamps already live in the bytes — the table's only
+  win was sub-8 persistence, killed by min-alloc NODE anyway). Absolute
+  back-offset links over relative distances (same walk, simpler coalesce
+  math). Snap stored on the stack top (was: does it even need storing —
+  yes: pop's erase extent rides the record). [snap][handle] order +
+  forward-computed geometry over [handle][snap] (keeps the record
+  byte-identical for the tested types; backward walk is snap-ambiguous).
+  Markers + canary over keeping the manual wipe (the wipe was the nightly
+  wall's workaround; consts over real size_of close it). User reverted the
+  Block !Sync ask mid-session — both unsafe impls stay in stacks.rs.
+- measured (same box/cells; storage-layer deltas, locks-era v2 → v3):
+| cell (ns, med)          | v2    | v3    | why |
+|-------------------------|-------|-------|-----|
+| archive-only short8/long32 | 2.8 / 6.5 | 7.1 / 11.6 | cell now chains 65280-caps (u16 ceiling) |
+| stack-direct short8/long32 | 5 / 9.4 | 11.5 / 13.6 | two pushes per unit |
+| Stacks::push short8/long32 | 44 / 78 | 64 / 88 | unit cost + NODE math |
+| read closure 1-item     | 17.5  | 13.3  | |
+| lease grant             | 65    | 78    | |
+| evict b1 alternating    | 893   | 945   | record walk at reload |
+| conc t1 med             | 89    | 143   | push path |
+conditions: push remains ~10× under the channel era. suites: block 62+10,
+block-derive 8, all green; miri clean (61 lib + 8 stacks,
+-Zmiri-disable-isolation).
+- bugs found by the migration's own tests (subtle_bugs §12): pop_heap
+  collected AFTER wiping (straddler's node died with its span), the hole-
+  take leaked the old node into the caller's record, rewind dropped-holes'
+  nodes survived, the double-free predicate was inverted (false-panicked on
+  adjacent holes), alloc's free check forgot heap_len, and Stack's gap0
+  sits at the unit START not the end.
+- deferred: doa's BlockSet port to the new API (P-generics + forged S<P>
+  fields — its own pass; workspace doa build is BROKEN until then);
+  `as_record` zero-copy record path (the allocation IS the record — gap
+  always zero); read try_read fast path; multi-producer ceiling; len()
+  O(blocks) scan — unbenched, in CLAUDE.md Future Work. fresh review agent:
+  three confirmed-and-fixed (the absorbed align slack rode the taken hole's
+  node bytes into records — the pin that passed under it now asserts the gap
+  reads zero; Snapshot's pub fields let a forged hole entry reach unchecked
+  pointer math — rewind validates entries now; Vec<zero-size-handle>
+  truncated counts > 65535 and panicked in release/cmp — counts Err
+  terminally and the ZST paths guard) + grow's near-usize::MAX rounding
+  wrapped (checked now) + from_record's head-alias tightened (off ≥ NODE+len).
+  everything else checked out guarded — the full freelist arithmetic walked,
+  unit geometry per alignment class, unforgeability site audit, the derive's
+  const-expression pad/canary math re-derived by hand.
+
+## 2026-10-28 (b) — block: snapshot/rewind → the unwind protocol; lazy hole cache
+
+user-designed (devlog discussion): atomicity lives in the protocol, not in
+state capture.
+
+- landed: `Snapshot`/`Allocator::snapshot`/`rewind` DEAD — a failed
+  multi-alloc archive unwinds itself: release the children built so far
+  (children first via the new `Allocator::release_slice` — the partial
+  handle + write count is the undo log), then `Allocator::rollback(heap0)`
+  rolls the front to the entry position (fresh allocations die wholesale
+  with the roll, pre-existing holes ride through). `archive_slice` carries
+  the unwind inline; the derive generates per-arm unwind lists (fields k−1..0
+  reverse + rollback); `Stack::push_borrowed`'s Err paths = `T::release` +
+  rollback. New contract: archive impls never free on the success path —
+  the unwind is the only freeer inside archive (makes rollback sound, keeps
+  free's double-free panic a tripwire). `free` now JOINS holes across
+  sub-NODE gaps (live regions ≥ NODE ⇒ smaller gaps are provably dead align
+  slack — reclaims the crumbs unwind would otherwise leak); loads are a
+  byte copy: the hole list materializes LAZILY into `Block.holes` at first
+  use (one validating walk, corrupt links truncate there), every mutation
+  rewrites the bytes via `sync_holes` so raw reads stay canonical.
+- died: `Snapshot` (pub fields, the §3 clone-capture dance, the entry-cost
+  paid on every successful archive), the per-op list walk (free/alloc fit
+  walked + rebuilt every mutation — now once per block lifetime),
+  `rewind`'s dropped-hole clearing (rollback's wipe subsumes it).
+- decided: unwind over snapshot capture (user call: single allocs are
+  atomic + H suffices to free; snapshot's only edge was byte-exact
+  restoration of hole-takes — the sub-NODE join closes all but ≥NODE align
+  crumbs on a rare path). lazy Vec over walk-per-op (user call:
+  deserialization effectively free; first write pays the walk it already
+  would have). binary-insert + full byte sync over incremental node writes
+  (simplicity; incremental is the unbenched future candidate). short-
+  circuit kept: break-on-first-Err with ONE unwind block per arm —
+  continuing past a space-Err is only wasted work, but it IS wasted work.
+- measured (same box/cells; med, second run — the first had noisy read/push
+  reps ±8ns confirmed by rerun):
+| cell (ns, med)          | v3 snapshot | v4 unwind |
+|-------------------------|-------------|-----------|
+| archive-only short8     | 7.1         | 6.4       |
+| Stacks::push short8/long32 | 64 / 88  | 51–65 / 84 |
+| read closure 1-item     | 13.3        | 13.0      |
+| lease grant             | 78          | 73        |
+| conc t1                 | 143         | 90        |
+conditions: the common (success) path drops the entry snapshot; the
+failure path now pays frees (O(k) release + one pop) — unbenchmarked
+directly (no failure-path cell exists). suites: block 60 lib + 10
+integration, block-derive 8, all green; miri clean (61 + 8,
+-Zmiri-disable-isolation).
+- deferred: incremental node writes (free/pop_heap still rewrite the whole
+  list — O(holes) per mutation, the walk is cached but the writes aren't);
+  the failure-path cell; doa BlockSet port (still broken, still waiting on
+  its own pass). fresh review agent: one confirmed bug (Stack's handle-Err
+  shrink used the snap's ALIGNED start, stranding the alignment gap on the
+  stack front for sub-4-aligned handles — the next pop tripped the stride
+  canary; fixed to shrink to the pre-push front, regression-pinned) + the
+  corrupt head self-link (off == NODE passed the walk bound, seeding
+  phantom cache entries that sync_holes kept resurrecting; the walk now
+  rejects off ≤ NODE) + the missing coalesce-then-clip pin
+  (rollback_joins_then_clips) and subtle_bugs §13 (an earlier append had
+  been lost to the notes reorg). everything else verified guarded — unwind
+  double-free freedom walked, the no-free-mid-archive audit, lazy-cache
+  sync coverage, join-rule underflow/threshold math, derive codegen.
+
+## 2026-10-28 (c) — block: division-free last/pop; the read cell is lock-bound
+
+user question (why is read 13ns — is it the len/size division?) →
+investigation + fix.
+
+- landed: `Stack::last`/`pop` derive the last unit's position BACKWARD from
+  stack_len (handle = [len−size_h, len); snap ends gap1 before the handle —
+  every gap is a per-T constant, proof recorded at layout()). pop's shrink
+  target takes the leading gap0 into account with ONE comparison (unit0 has
+  no gap0) instead of the count. `unit_at`/`len_checked` died; the runtime
+  stride division now lives only in len()/items() (amortized/cold).
+- decided: NOT storing element counts in `H` — heap()'s len/size division is
+  by a compile-time constant (already a multiply), and byte-len is
+  load-bearing (free's span, the len ≤ off canary, String's in-line length).
+- measured: read/1-item UNCHANGED at 13.1ns — the diagnosis was wrong for
+  this cell: 13ns is the two RwLock acquisitions + shared mutex + atomic of
+  Stacks::read, not arithmetic (the division hides under lock-stall or was
+  hoisted; the cell cannot see it). the fix is real for MUTATING consumers
+  (a pop-read interleaved stream pays the division per op where it can't
+  hide) — unbenchmarked, kept on principle. suites: block 62+10, derive 8,
+  miri clean (stack module re-run).
+- deferred: a mutating pop/read bench cell (the current suite has no pop
+  cell at all); read's write-lock ensure → try_read fast path (Future Work
+  since the lock redesign — now measured to be THE read cost).
+
+## 2026-10-28 (d) — block: Stacks read/lease read-first fast path
+
+user design (why pay the write-lock ensure before checking residency?).
+
+- landed: `read` and `lease` are READ-FIRST — residency is checked under the
+  read guard and the closure/grant runs there; only a miss escalates to the
+  write path, where `ensure`'s is-none recheck under the lock is the TOCTOU
+  double (racing loaders serialize: the winner loads, the loser re-reads —
+  no double file read, no double register). The old two-phase
+  (write-ensure → release → re-read → maybe retry) and its retry loop are
+  gone: a resident block can't stop being resident under a read lock (the
+  evictor's try_write fails against the guard), so the fast path has no
+  eviction window at all. lease's reader-pin fetch_add moves to the read
+  guard on the fast path (safe: an evictor that already passed its readers
+  check fails try_write against the guard; one that acquires later sees the
+  count). the read-cell floor is now shared-mutex + one read lock +
+  atomic + closure.
+- measured (med): read/1-item 13.1 → 10.0; evict/budget16-alternating 13.3
+  → 9.4; evict/budget1-same-block 13.5 → 9.9 (the write-lock round trip was
+  ~3ns/access). lease cells unchanged (grant dominated by the 4KB
+  to_record copy + Arc alloc; the fast path is a structural consistency
+  win there, not a measured one). suites: block 62+10, miri clean (stacks
+  integration re-run).
+- deferred: the to_record copy is now the lease grant's cost — the
+  as_record zero-copy slice (Future Work since v3) would cut it; a
+  mutating pop/read bench cell still missing. fresh review agent on the
+  fast path: correctness CLEAN — all four soundness claims and both
+  adversarial interleavings (fast-path grant vs flushing evictor; two
+  concurrent miss-path leases) verified, including the Relaxed-ordering
+  case the evictor's recheck closes; five doc-drift cleanups applied
+  (Cell/Lease struct docs, the evictor recheck comment covering both grant
+  paths, the over-broad miss comment, and the touch+clone prologue deduped
+  into cell_of). three sound-by-analysis interleavings the suite cannot
+  hit deterministically, recorded here: fetch_add inside the evictor's
+  load→recheck window, the double-lease TOCTOU, and miss-path poison.
